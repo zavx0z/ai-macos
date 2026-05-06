@@ -8,6 +8,7 @@ import {
   getText,
   goBack,
   goForward,
+  hardReload,
   isRunning,
   listWindows,
   navigate,
@@ -118,9 +119,13 @@ const server = Bun.serve({
       }
 
       if (path === "/reload" && method === "POST") {
-        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number };
-        await reload(body.windowId, body.tabIndex);
-        return json({ ok: true });
+        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; hard?: boolean };
+        if (body.hard) {
+          await hardReload(body.windowId, body.tabIndex);
+        } else {
+          await reload(body.windowId, body.tabIndex);
+        }
+        return json({ ok: true, hard: body.hard === true });
       }
 
       if (path === "/back" && method === "POST") {
@@ -192,7 +197,8 @@ console.log(`  POST /tabs            { windowId?, url? }  open new tab`);
 console.log(`  DEL  /tabs/:wid/:idx                       close tab`);
 console.log(`  POST /navigate        { url, windowId?, tabIndex? }`);
 console.log(`  POST /activate        { windowId, tabIndex }`);
-console.log(`  POST /reload | /back | /forward   { windowId?, tabIndex? }`);
+console.log(`  POST /reload   { windowId?, tabIndex?, hard? }   hard=true → Cmd+Shift+R (steals focus)`);
+console.log(`  POST /back | /forward   { windowId?, tabIndex? }`);
 console.log(`  POST /eval            { js, windowId?, tabIndex? }   needs "Allow JS from Apple Events"`);
 console.log(`  GET  /source[?windowId=N&tabIndex=N]       outerHTML of <html>`);
 console.log(`  GET  /text[?windowId=N&tabIndex=N]         document.body.innerText`);

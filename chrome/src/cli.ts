@@ -68,7 +68,7 @@ usage:
   chrome close-tab    --window <id> --index <n>
   chrome activate     --window <id> --index <n>
   chrome navigate     --url <url> [--window <id>] [--index <n>]
-  chrome reload       [--window <id>] [--index <n>]
+  chrome reload       [--window <id>] [--index <n>] [--hard]
   chrome back         [--window <id>] [--index <n>]
   chrome forward      [--window <id>] [--index <n>]
   chrome eval         --js "<code>" [--window <id>] [--index <n>]
@@ -157,9 +157,12 @@ try {
       break;
     }
 
-    case "reload":
-      console.log(pretty(await send("POST", "/reload", targetBody(args))));
+    case "reload": {
+      const body: Record<string, unknown> = { ...targetBody(args) };
+      if (args.hard) body.hard = true;
+      console.log(pretty(await send("POST", "/reload", body)));
       break;
+    }
 
     case "back":
       console.log(pretty(await send("POST", "/back", targetBody(args))));

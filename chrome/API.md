@@ -112,6 +112,8 @@ bun run start  # обычный запуск
 
 Все поля опциональны — без них действие идёт в активной вкладке переднего окна.
 
+`POST /reload` дополнительно принимает `{ "hard": true }`. В этом случае выполняется **жёсткая перезагрузка с обходом кеша** через симуляцию `Cmd+Shift+R`. Реализация: AppleScript поднимает целевое окно (`set index of window id W to 1`), активирует вкладку, выводит Chrome на передний план и шлёт keystroke через System Events. Это **переносит фокус** на Chrome — обычный `reload` (без `hard`) фокус не трогает. Жёсткая перезагрузка не требует «Allow JavaScript from Apple Events», но требует разрешения Accessibility для процесса, посылающего Apple events (как и любая другая операция System Events).
+
 ### `POST /eval`
 
 Выполнить JavaScript в контексте вкладки. JS оборачивается в IIFE, результат сериализуется через `JSON.stringify`.
@@ -151,7 +153,7 @@ chrome new-tab     [--window <id>] [--url <url>]
 chrome close-tab    --window <id> --index <n>
 chrome activate     --window <id> --index <n>
 chrome navigate     --url <url> [--window <id>] [--index <n>]
-chrome reload       [--window <id>] [--index <n>]
+chrome reload       [--window <id>] [--index <n>] [--hard]
 chrome back         [--window <id>] [--index <n>]
 chrome forward      [--window <id>] [--index <n>]
 chrome eval         --js "<code>" [--window <id>] [--index <n>]

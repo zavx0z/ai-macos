@@ -229,6 +229,23 @@ export async function reload(windowId?: number, tabIndex?: number): Promise<void
   await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to reload`);
 }
 
+export async function hardReload(windowId?: number, tabIndex?: number): Promise<void> {
+  if (windowId != null) {
+    await osa(`tell application "Google Chrome" to set index of window id ${windowId} to 1`);
+  }
+  if (tabIndex != null) {
+    const target = windowId != null ? `window id ${windowId}` : "front window";
+    await osa(`tell application "Google Chrome" to set active tab index of ${target} to ${tabIndex}`);
+  }
+  await osa(`
+    tell application "Google Chrome" to activate
+    delay 0.05
+    tell application "System Events" to tell process "Google Chrome"
+      keystroke "r" using {command down, shift down}
+    end tell
+  `);
+}
+
 export async function goBack(windowId?: number, tabIndex?: number): Promise<void> {
   await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to go back`);
 }
