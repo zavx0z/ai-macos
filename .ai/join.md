@@ -1,0 +1,2979 @@
+# Проект
+
+├── "window/
+│   └── API\302\240\342\200\224 \320\272\320\276\320\277\320\270\321\217.txt"
+├── chrome/
+│   ├── src/
+│   │   ├── chrome.ts
+│   │   ├── cli.ts
+│   │   ├── index.ts
+│   │   └── osascript.ts
+│   ├── API.md
+│   ├── package.json
+│   └── tsconfig.json
+├── screen/
+│   ├── src/
+│   │   ├── capture.ts
+│   │   ├── cli.ts
+│   │   ├── index.ts
+│   │   ├── restore.ts
+│   │   └── window-api.ts
+│   ├── API.md
+│   ├── package.json
+│   └── tsconfig.json
+├── window/
+│   ├── .claude/
+│   │   └── skills/
+│   │       └── macos-window/
+│   │           └── SKILL.md
+│   ├── src/
+│   │   ├── cli.ts
+│   │   ├── index.ts
+│   │   ├── osascript.ts
+│   │   ├── pin.ts
+│   │   └── windows.ts
+│   ├── API.md
+│   ├── package.json
+│   └── tsconfig.json
+├── package.json
+└── tsconfig.json
+
+```markdown
+/Users/vladimirfilipenko/meta/macos/chrome/API.md
+# @meta/chrome
+
+Локальный REST‑сервис для управления Google Chrome на macOS через AppleScript.
+
+- База: `$CHROME_API` или `http://localhost:7880`.
+- JSON in / JSON out (кроме `/source` и `/text` — они возвращают `text/html` и `text/plain`).
+- Все операции выполняются через `osascript` поверх AppleScript‑словаря Google Chrome.
+- Идентификаторы окон (`id`) и индексы вкладок (`index`) возвращаются эндпоинтом `GET /windows`.
+
+## Запуск
+
+```bash
+cd macos/chrome
+bun run dev    # с hot reload
+bun run start  # обычный запуск
+```
+
+Переменные окружения:
+
+- `PORT` — порт сервера (по умолчанию `7880`).
+- `CHROME_API` — база для CLI (по умолчанию `http://localhost:7880`).
+
+## Разрешения
+
+- AppleScript‑автоматизация: при первом обращении macOS попросит разрешить процессу управление Google Chrome.
+- Для `/eval`, `/source`, `/text` нужно включить в Chrome: **View → Developer → Allow JavaScript from Apple Events**. Без этого `execute javascript` возвращает ошибку.
+
+## Эндпоинты
+
+### `GET /health`
+
+```json
+{ "ok": true, "running": true }
+```
+
+### `GET /windows`
+
+Список всех окон Chrome со вложенными вкладками.
+
+```json
+{
+  "count": 1,
+  "windows": [
+    {
+      "id": 12345, "index": 1, "title": "GitHub",
+      "x": 0, "y": 0, "width": 1440, "height": 900,
+      "activeTabIndex": 2, "mode": "normal",
+      "tabs": [
+        { "id": 1, "index": 1, "title": "Inbox", "url": "https://...", "loading": false },
+        { "id": 2, "index": 2, "title": "GitHub", "url": "https://...", "loading": false }
+      ]
+    }
+  ]
+}
+```
+
+### `POST /windows`
+
+Открыть новое окно.
+
+```json
+{ "url": "https://example.com", "incognito": false }
+```
+
+### `DELETE /windows/:id`
+
+Закрыть окно по `id`.
+
+### `GET /tabs[?windowId=N]`
+
+Плоский список вкладок. Без параметра — по всем окнам, иначе — только из заданного окна.
+
+### `GET /tabs/active`
+
+Информация о текущей активной вкладке переднего окна.
+
+### `POST /tabs`
+
+Открыть новую вкладку.
+
+```json
+{ "windowId": 12345, "url": "https://example.com" }
+```
+
+`windowId` опционален — без него вкладка создаётся в переднем окне.
+
+### `DELETE /tabs/:windowId/:index`
+
+Закрыть конкретную вкладку.
+
+### `POST /navigate`
+
+Перейти по URL в указанной (или активной) вкладке.
+
+```json
+{ "url": "https://example.com", "windowId": 12345, "tabIndex": 2 }
+```
+
+### `POST /activate`
+
+Сделать вкладку активной в окне.
+
+```json
+{ "windowId": 12345, "tabIndex": 3 }
+```
+
+### `POST /reload | /back | /forward`
+
+```json
+{ "windowId": 12345, "tabIndex": 2 }
+```
+
+Все поля опциональны — без них действие идёт в активной вкладке переднего окна.
+
+### `POST /eval`
+
+Выполнить JavaScript в контексте вкладки. JS оборачивается в IIFE, результат сериализуется через `JSON.stringify`.
+
+```json
+{ "js": "return document.title", "windowId": 12345, "tabIndex": 2 }
+```
+
+```json
+{ "ok": true, "result": "GitHub" }
+```
+
+### `GET /source[?windowId=N&tabIndex=N]`
+
+Возвращает `document.documentElement.outerHTML` как `text/html`.
+
+### `GET /text[?windowId=N&tabIndex=N]`
+
+Возвращает `document.body.innerText` как `text/plain`.
+
+### `GET /screenshot[?windowId=N&tabIndex=N&shadow=false&delayMs=200&format=png|json]`
+
+Скриншот окна Chrome, в котором лежит указанная вкладка. Если `tabIndex` задан и отличается от текущей активной, вкладка предварительно активируется. Запрос проксируется в `@meta/screen` (`POST /window`) с `app="Google Chrome"` и `title=` равным заголовку окна, поэтому для работы нужны живые `@meta/screen` и `@meta/window`.
+
+`POST /screenshot` принимает то же тело JSON. На выходе — `image/png` (или JSON с base64 при `format=json`). Захватывается всё окно Chrome целиком (включая адресную строку и панель вкладок), а не только viewport.
+
+## CLI
+
+```
+chrome health
+chrome windows
+chrome tabs [--window <id>]
+chrome active
+chrome new-window  [--url <url>] [--incognito]
+chrome close-window --window <id>
+chrome new-tab     [--window <id>] [--url <url>]
+chrome close-tab    --window <id> --index <n>
+chrome activate     --window <id> --index <n>
+chrome navigate     --url <url> [--window <id>] [--index <n>]
+chrome reload       [--window <id>] [--index <n>]
+chrome back         [--window <id>] [--index <n>]
+chrome forward      [--window <id>] [--index <n>]
+chrome eval         --js "<code>" [--window <id>] [--index <n>]
+chrome source       [--window <id>] [--index <n>]
+chrome text         [--window <id>] [--index <n>]
+chrome screenshot   [--window <id>] [--index <n>] [--out <path>] [--shadow false] [--delayMs 200]
+```
+
+`chrome screenshot` без `--out` сохраняет PNG в `./tmp/screenshots/chrome-<ts>.png` и печатает JSON `{ ok, path, bytes }`.
+
+```
+
+```json
+/Users/vladimirfilipenko/meta/macos/chrome/package.json
+{
+  "name": "@meta/chrome",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "chrome": "src/cli.ts"
+  },
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "bun src/index.ts",
+    "cli": "bun src/cli.ts",
+    "build": "bun build src/index.ts --target bun --outdir dist",
+    "typecheck": "tsc --noEmit"
+  }
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/chrome/src/chrome.ts
+import { osa, quote } from "./osascript.ts";
+
+export type TabInfo = {
+  id: number;
+  index: number;
+  title: string;
+  url: string;
+  loading: boolean;
+};
+
+export type WindowInfo = {
+  id: number;
+  index: number;
+  title: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  activeTabIndex: number;
+  mode: string;
+  tabs: TabInfo[];
+};
+
+const FS = String.fromCharCode(31);
+const RS = String.fromCharCode(30);
+const TS = String.fromCharCode(29);
+
+const LIST_SCRIPT = `
+set fs to (ASCII character 31)
+set rs to (ASCII character 30)
+set ts to (ASCII character 29)
+set out to ""
+if application "Google Chrome" is not running then return ""
+tell application "Google Chrome"
+  set winList to every window
+  set wIdx to 0
+  repeat with w in winList
+    set wIdx to wIdx + 1
+    try
+      set wId to id of w
+    on error
+      set wId to 0
+    end try
+    try
+      set wTitle to title of w
+    on error
+      set wTitle to ""
+    end try
+    try
+      set {wx, wy, wx2, wy2} to bounds of w
+    on error
+      set wx to 0
+      set wy to 0
+      set wx2 to 0
+      set wy2 to 0
+    end try
+    try
+      set wActive to active tab index of w
+    on error
+      set wActive to 0
+    end try
+    try
+      set wMode to mode of w
+    on error
+      set wMode to ""
+    end try
+    set out to out & wId & fs & wIdx & fs & wTitle & fs & wx & fs & wy & fs & (wx2 - wx) & fs & (wy2 - wy) & fs & wActive & fs & wMode
+    set tabList to every tab of w
+    set tIdx to 0
+    repeat with t in tabList
+      set tIdx to tIdx + 1
+      try
+        set tId to id of t
+      on error
+        set tId to 0
+      end try
+      try
+        set tTitle to title of t
+      on error
+        set tTitle to ""
+      end try
+      try
+        set tUrl to URL of t
+      on error
+        set tUrl to ""
+      end try
+      try
+        set tLoading to loading of t
+      on error
+        set tLoading to false
+      end try
+      set out to out & ts & tId & fs & tIdx & fs & tTitle & fs & tUrl & fs & tLoading
+    end repeat
+    set out to out & rs
+  end repeat
+end tell
+return out
+`;
+
+export async function listWindows(): Promise<WindowInfo[]> {
+  const raw = await osa(LIST_SCRIPT);
+  if (!raw) return [];
+  return raw
+    .split(RS)
+    .filter((r) => r.length > 0)
+    .map(parseWindowRecord);
+}
+
+function parseWindowRecord(rec: string): WindowInfo {
+  const parts = rec.split(TS);
+  const head = parts[0] ?? "";
+  const [id, index, title, x, y, width, height, activeTabIndex, mode] = head.split(FS);
+  const tabs: TabInfo[] = [];
+  for (let i = 1; i < parts.length; i++) {
+    const p = parts[i] ?? "";
+    if (!p) continue;
+    const [tId, tIdx, tTitle, tUrl, tLoading] = p.split(FS);
+    tabs.push({
+      id: Number(tId ?? 0),
+      index: Number(tIdx ?? 0),
+      title: tTitle ?? "",
+      url: tUrl ?? "",
+      loading: (tLoading ?? "false") === "true",
+    });
+  }
+  return {
+    id: Number(id ?? 0),
+    index: Number(index ?? 0),
+    title: title ?? "",
+    x: Number(x ?? 0),
+    y: Number(y ?? 0),
+    width: Number(width ?? 0),
+    height: Number(height ?? 0),
+    activeTabIndex: Number(activeTabIndex ?? 0),
+    mode: mode ?? "",
+    tabs,
+  };
+}
+
+export async function getActiveTab(): Promise<TabInfo & { windowId: number } | null> {
+  const wins = await listWindows();
+  if (wins.length === 0) return null;
+  const w = wins[0]!;
+  const tab = w.tabs.find((t) => t.index === w.activeTabIndex) ?? w.tabs[0];
+  if (!tab) return null;
+  return { ...tab, windowId: w.id };
+}
+
+function windowRef(windowId?: number): string {
+  return windowId == null ? "front window" : `window id ${windowId}`;
+}
+
+function tabRef(windowId?: number, tabIndex?: number): string {
+  if (tabIndex == null) return `active tab of ${windowRef(windowId)}`;
+  return `tab ${tabIndex} of ${windowRef(windowId)}`;
+}
+
+export type NewWindowOptions = {
+  url?: string;
+  incognito?: boolean;
+};
+
+export async function newWindow(options: NewWindowOptions = {}): Promise<{ id: number }> {
+  const props: string[] = [];
+  if (options.incognito) props.push(`mode:"incognito"`);
+  const propsExpr = props.length ? ` with properties {${props.join(", ")}}` : "";
+  const script = `
+    tell application "Google Chrome"
+      activate
+      set w to make new window${propsExpr}
+      ${options.url ? `set URL of active tab of w to ${quote(options.url)}` : ""}
+      return id of w
+    end tell
+  `;
+  const out = await osa(script);
+  return { id: Number(out) };
+}
+
+export async function closeWindow(windowId: number): Promise<void> {
+  await osa(`tell application "Google Chrome" to close window id ${windowId}`);
+}
+
+export type NewTabOptions = {
+  windowId?: number;
+  url?: string;
+};
+
+export async function newTab(options: NewTabOptions = {}): Promise<{ id: number; index: number }> {
+  const target = windowRef(options.windowId);
+  const propsExpr = options.url ? ` with properties {URL:${quote(options.url)}}` : "";
+  const script = `
+    tell application "Google Chrome"
+      activate
+      tell ${target}
+        set t to make new tab at end of tabs${propsExpr}
+        set tIdx to count of tabs
+        return (id of t as string) & "|" & tIdx
+      end tell
+    end tell
+  `;
+  const out = await osa(script);
+  const [id, idx] = out.split("|");
+  return { id: Number(id ?? 0), index: Number(idx ?? 0) };
+}
+
+export async function closeTab(windowId: number, tabIndex: number): Promise<void> {
+  await osa(
+    `tell application "Google Chrome" to close tab ${tabIndex} of window id ${windowId}`,
+  );
+}
+
+export async function activateTab(windowId: number, tabIndex: number): Promise<void> {
+  await osa(
+    `tell application "Google Chrome" to set active tab index of window id ${windowId} to ${tabIndex}`,
+  );
+}
+
+export async function navigate(
+  url: string,
+  windowId?: number,
+  tabIndex?: number,
+): Promise<void> {
+  await osa(
+    `tell application "Google Chrome" to set URL of ${tabRef(windowId, tabIndex)} to ${quote(url)}`,
+  );
+}
+
+export async function reload(windowId?: number, tabIndex?: number): Promise<void> {
+  await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to reload`);
+}
+
+export async function goBack(windowId?: number, tabIndex?: number): Promise<void> {
+  await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to go back`);
+}
+
+export async function goForward(windowId?: number, tabIndex?: number): Promise<void> {
+  await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to go forward`);
+}
+
+export async function evalJs(
+  js: string,
+  windowId?: number,
+  tabIndex?: number,
+): Promise<string> {
+  const wrapped = `(function(){try{var __r=(function(){${js}})();return (typeof __r==='undefined')?'':(typeof __r==='string'?__r:JSON.stringify(__r));}catch(e){throw e;}})()`;
+  return await osa(
+    `tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to execute javascript ${quote(wrapped)}`,
+  );
+}
+
+export async function getSource(windowId?: number, tabIndex?: number): Promise<string> {
+  return await evalJs("return document.documentElement.outerHTML;", windowId, tabIndex);
+}
+
+export async function getText(windowId?: number, tabIndex?: number): Promise<string> {
+  return await evalJs("return document.body && document.body.innerText || '';", windowId, tabIndex);
+}
+
+export async function isRunning(): Promise<boolean> {
+  const out = await osa(`tell application "System Events" to (name of processes) contains "Google Chrome"`);
+  return out === "true";
+}
+
+const SCREEN_API = Bun.env.SCREEN_API ?? "http://localhost:7879";
+
+export type ScreenshotOptions = {
+  windowId?: number;
+  tabIndex?: number;
+  shadow?: boolean;
+  delayMs?: number;
+  format?: "png" | "json";
+  restore?: boolean;
+};
+
+export type ScreenshotResult = {
+  status: number;
+  contentType: string;
+  body: ArrayBuffer;
+};
+
+export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<ScreenshotResult> {
+  const wins = await listWindows();
+  if (wins.length === 0) throw new Error("no Chrome windows");
+  const target = opts.windowId != null
+    ? wins.find((w) => w.id === opts.windowId)
+    : wins.find((w) => w.index === 1) ?? wins[0];
+  if (!target) throw new Error(`window not found: id=${opts.windowId}`);
+
+  if (opts.tabIndex != null && opts.tabIndex !== target.activeTabIndex) {
+    const tabExists = target.tabs.some((t) => t.index === opts.tabIndex);
+    if (!tabExists) throw new Error(`tab ${opts.tabIndex} not found in window ${target.id}`);
+    await activateTab(target.id, opts.tabIndex);
+  }
+
+  const fresh = (await listWindows()).find((w) => w.id === target.id) ?? target;
+
+  const body: Record<string, unknown> = {
+    app: "Google Chrome",
+    title: fresh.title,
+    restore: opts.restore !== false,
+    format: opts.format ?? "png",
+  };
+  if (opts.shadow !== undefined) body.shadow = opts.shadow;
+  if (opts.delayMs !== undefined) body.delayMs = opts.delayMs;
+
+  const res = await fetch(`${SCREEN_API}/window`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const buf = await res.arrayBuffer();
+  if (!res.ok) {
+    const text = new TextDecoder().decode(buf);
+    throw new Error(`screen api ${res.status}: ${text}`);
+  }
+  return {
+    status: res.status,
+    contentType: res.headers.get("content-type") ?? "application/octet-stream",
+    body: buf,
+  };
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/chrome/src/cli.ts
+#!/usr/bin/env bun
+export {};
+const BASE = Bun.env.CHROME_API ?? "http://localhost:7880";
+
+type Args = Record<string, string>;
+
+function parseArgs(argv: string[]): { cmd: string; args: Args; positional: string[] } {
+  const [cmd = "", ...rest] = argv;
+  const args: Args = {};
+  const positional: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = rest[i + 1];
+      if (next != null && !next.startsWith("--")) {
+        args[key] = next;
+        i++;
+      } else {
+        args[key] = "true";
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { cmd, args, positional };
+}
+
+async function get(path: string, asText = false): Promise<unknown> {
+  const res = await fetch(`${BASE}${path}`);
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(body);
+  }
+  return asText ? await res.text() : await res.json();
+}
+
+async function send(method: "POST" | "DELETE", path: string, body?: unknown): Promise<unknown> {
+  const res = await fetch(`${BASE}${path}`, {
+    method,
+    headers: body !== undefined ? { "content-type": "application/json" } : undefined,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const text = await res.text();
+  if (!res.ok) throw new Error(text);
+  try {
+    return JSON.parse(text);
+  } catch {
+    return text;
+  }
+}
+
+function pretty(v: unknown): string {
+  return typeof v === "string" ? v : JSON.stringify(v, null, 2);
+}
+
+function help(): never {
+  console.log(`chrome — REST CLI for @meta/chrome (base: ${BASE})
+
+usage:
+  chrome health
+  chrome windows
+  chrome tabs [--window <id>]
+  chrome active
+  chrome new-window  [--url <url>] [--incognito]
+  chrome close-window --window <id>
+  chrome new-tab     [--window <id>] [--url <url>]
+  chrome close-tab    --window <id> --index <n>
+  chrome activate     --window <id> --index <n>
+  chrome navigate     --url <url> [--window <id>] [--index <n>]
+  chrome reload       [--window <id>] [--index <n>]
+  chrome back         [--window <id>] [--index <n>]
+  chrome forward      [--window <id>] [--index <n>]
+  chrome eval         --js "<code>" [--window <id>] [--index <n>]
+  chrome source       [--window <id>] [--index <n>]
+  chrome text         [--window <id>] [--index <n>]
+  chrome screenshot   [--window <id>] [--index <n>] [--out <path>] [--shadow false] [--delayMs 200]
+
+env:
+  CHROME_API   override API base (default http://localhost:7880)
+`);
+  process.exit(0);
+}
+
+function targetBody(args: Args): { windowId?: number; tabIndex?: number } {
+  const out: { windowId?: number; tabIndex?: number } = {};
+  if (args.window) out.windowId = Number(args.window);
+  if (args.index) out.tabIndex = Number(args.index);
+  return out;
+}
+
+const { cmd, args } = parseArgs(Bun.argv.slice(2));
+
+try {
+  switch (cmd) {
+    case "":
+    case "help":
+    case "-h":
+    case "--help":
+      help();
+
+    case "health":
+      console.log(pretty(await get("/health")));
+      break;
+
+    case "windows":
+      console.log(pretty(await get("/windows")));
+      break;
+
+    case "tabs": {
+      const q = args.window ? `?windowId=${encodeURIComponent(args.window)}` : "";
+      console.log(pretty(await get(`/tabs${q}`)));
+      break;
+    }
+
+    case "active":
+      console.log(pretty(await get("/tabs/active")));
+      break;
+
+    case "new-window": {
+      const body: Record<string, unknown> = {};
+      if (args.url) body.url = args.url;
+      if (args.incognito) body.incognito = true;
+      console.log(pretty(await send("POST", "/windows", body)));
+      break;
+    }
+
+    case "close-window": {
+      if (!args.window) throw new Error("--window required");
+      console.log(pretty(await send("DELETE", `/windows/${encodeURIComponent(args.window)}`)));
+      break;
+    }
+
+    case "new-tab": {
+      const body: Record<string, unknown> = {};
+      if (args.window) body.windowId = Number(args.window);
+      if (args.url) body.url = args.url;
+      console.log(pretty(await send("POST", "/tabs", body)));
+      break;
+    }
+
+    case "close-tab": {
+      if (!args.window || !args.index) throw new Error("--window and --index required");
+      console.log(pretty(await send("DELETE", `/tabs/${encodeURIComponent(args.window)}/${encodeURIComponent(args.index)}`)));
+      break;
+    }
+
+    case "activate": {
+      if (!args.window || !args.index) throw new Error("--window and --index required");
+      console.log(pretty(await send("POST", "/activate", { windowId: Number(args.window), tabIndex: Number(args.index) })));
+      break;
+    }
+
+    case "navigate": {
+      if (!args.url) throw new Error("--url required");
+      console.log(pretty(await send("POST", "/navigate", { url: args.url, ...targetBody(args) })));
+      break;
+    }
+
+    case "reload":
+      console.log(pretty(await send("POST", "/reload", targetBody(args))));
+      break;
+
+    case "back":
+      console.log(pretty(await send("POST", "/back", targetBody(args))));
+      break;
+
+    case "forward":
+      console.log(pretty(await send("POST", "/forward", targetBody(args))));
+      break;
+
+    case "eval": {
+      if (!args.js) throw new Error("--js required");
+      console.log(pretty(await send("POST", "/eval", { js: args.js, ...targetBody(args) })));
+      break;
+    }
+
+    case "source": {
+      const params = new URLSearchParams();
+      if (args.window) params.set("windowId", args.window);
+      if (args.index) params.set("tabIndex", args.index);
+      const qs = params.toString();
+      console.log(await get(`/source${qs ? `?${qs}` : ""}`, true));
+      break;
+    }
+
+    case "text": {
+      const params = new URLSearchParams();
+      if (args.window) params.set("windowId", args.window);
+      if (args.index) params.set("tabIndex", args.index);
+      const qs = params.toString();
+      console.log(await get(`/text${qs ? `?${qs}` : ""}`, true));
+      break;
+    }
+
+    case "screenshot": {
+      const params = new URLSearchParams();
+      if (args.window) params.set("windowId", args.window);
+      if (args.index) params.set("tabIndex", args.index);
+      if (args.shadow) params.set("shadow", args.shadow);
+      if (args.delayMs) params.set("delayMs", args.delayMs);
+      const qs = params.toString();
+      const res = await fetch(`${BASE}/screenshot${qs ? `?${qs}` : ""}`);
+      if (!res.ok) throw new Error(await res.text());
+      const buf = new Uint8Array(await res.arrayBuffer());
+      const out = args.out ?? `./tmp/screenshots/chrome-${Date.now()}.png`;
+      const parent = out.slice(0, out.lastIndexOf("/"));
+      if (parent.length > 0) {
+        const { mkdir } = await import("node:fs/promises");
+        await mkdir(parent, { recursive: true });
+      }
+      await Bun.write(out, buf);
+      console.log(JSON.stringify({ ok: true, path: out, bytes: buf.byteLength }, null, 2));
+      break;
+    }
+
+    default:
+      console.error(`unknown command: ${cmd}`);
+      help();
+  }
+} catch (e) {
+  const msg = e instanceof Error ? e.message : String(e);
+  console.error(`error: ${msg}`);
+  process.exit(1);
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/chrome/src/index.ts
+import {
+  activateTab,
+  closeTab,
+  closeWindow,
+  evalJs,
+  getActiveTab,
+  getSource,
+  getText,
+  goBack,
+  goForward,
+  isRunning,
+  listWindows,
+  navigate,
+  newTab,
+  newWindow,
+  reload,
+  screenshotTab,
+} from "./chrome.ts";
+
+const PORT = Number(Bun.env.PORT ?? 7880);
+
+function json(body: unknown, init: ResponseInit = {}): Response {
+  return new Response(JSON.stringify(body), {
+    ...init,
+    headers: { "content-type": "application/json", ...(init.headers ?? {}) },
+  });
+}
+
+function err(status: number, message: string): Response {
+  return json({ error: message }, { status });
+}
+
+function num(v: string | null): number | undefined {
+  if (v == null) return undefined;
+  const n = Number(v);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+function parseBool(v: string | null): boolean | undefined {
+  if (v == null) return undefined;
+  const s = v.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(s)) return true;
+  if (["0", "false", "no", "off"].includes(s)) return false;
+  return undefined;
+}
+
+const server = Bun.serve({
+  port: PORT,
+  idleTimeout: 60,
+  async fetch(req) {
+    const url = new URL(req.url);
+    const path = url.pathname;
+    const method = req.method;
+
+    try {
+      if (path === "/health") {
+        return json({ ok: true, running: await isRunning() });
+      }
+
+      if (path === "/windows" && method === "GET") {
+        const wins = await listWindows();
+        return json({ count: wins.length, windows: wins });
+      }
+
+      if (path === "/windows" && method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as { url?: string; incognito?: boolean };
+        const w = await newWindow({ url: body.url, incognito: body.incognito });
+        return json({ ok: true, window: w });
+      }
+
+      const winMatch = path.match(/^\/windows\/(\d+)$/);
+      if (winMatch && method === "DELETE") {
+        await closeWindow(Number(winMatch[1]));
+        return json({ ok: true });
+      }
+
+      if (path === "/tabs" && method === "GET") {
+        const wins = await listWindows();
+        const wid = num(url.searchParams.get("windowId"));
+        const tabs = wid == null
+          ? wins.flatMap((w) => w.tabs.map((t) => ({ ...t, windowId: w.id })))
+          : (wins.find((w) => w.id === wid)?.tabs.map((t) => ({ ...t, windowId: wid })) ?? []);
+        return json({ count: tabs.length, tabs });
+      }
+
+      if (path === "/tabs/active" && method === "GET") {
+        const t = await getActiveTab();
+        if (!t) return err(404, "no active tab");
+        return json(t);
+      }
+
+      if (path === "/tabs" && method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as { windowId?: number; url?: string };
+        const t = await newTab({ windowId: body.windowId, url: body.url });
+        return json({ ok: true, tab: t });
+      }
+
+      const tabMatch = path.match(/^\/tabs\/(\d+)\/(\d+)$/);
+      if (tabMatch && method === "DELETE") {
+        await closeTab(Number(tabMatch[1]), Number(tabMatch[2]));
+        return json({ ok: true });
+      }
+
+      if (path === "/navigate" && method === "POST") {
+        const body = (await req.json()) as { url?: string; windowId?: number; tabIndex?: number };
+        if (!body.url) return err(400, "missing 'url'");
+        await navigate(body.url, body.windowId, body.tabIndex);
+        return json({ ok: true });
+      }
+
+      if (path === "/activate" && method === "POST") {
+        const body = (await req.json()) as { windowId?: number; tabIndex?: number };
+        if (body.windowId == null || body.tabIndex == null) {
+          return err(400, "need {windowId, tabIndex}");
+        }
+        await activateTab(body.windowId, body.tabIndex);
+        return json({ ok: true });
+      }
+
+      if (path === "/reload" && method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number };
+        await reload(body.windowId, body.tabIndex);
+        return json({ ok: true });
+      }
+
+      if (path === "/back" && method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number };
+        await goBack(body.windowId, body.tabIndex);
+        return json({ ok: true });
+      }
+
+      if (path === "/forward" && method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number };
+        await goForward(body.windowId, body.tabIndex);
+        return json({ ok: true });
+      }
+
+      if (path === "/eval" && method === "POST") {
+        const body = (await req.json()) as { js?: string; windowId?: number; tabIndex?: number };
+        if (!body.js) return err(400, "missing 'js'");
+        const result = await evalJs(body.js, body.windowId, body.tabIndex);
+        return json({ ok: true, result });
+      }
+
+      if (path === "/source" && method === "GET") {
+        const wid = num(url.searchParams.get("windowId"));
+        const tIdx = num(url.searchParams.get("tabIndex"));
+        const html = await getSource(wid, tIdx);
+        return new Response(html, { headers: { "content-type": "text/html; charset=utf-8" } });
+      }
+
+      if (path === "/text" && method === "GET") {
+        const wid = num(url.searchParams.get("windowId"));
+        const tIdx = num(url.searchParams.get("tabIndex"));
+        const text = await getText(wid, tIdx);
+        return new Response(text, { headers: { "content-type": "text/plain; charset=utf-8" } });
+      }
+
+      if (path === "/screenshot" && (method === "GET" || method === "POST")) {
+        const opts = method === "POST"
+          ? ((await req.json().catch(() => ({}))) as Record<string, unknown>)
+          : {
+              windowId: num(url.searchParams.get("windowId")),
+              tabIndex: num(url.searchParams.get("tabIndex")),
+              shadow: parseBool(url.searchParams.get("shadow")),
+              delayMs: num(url.searchParams.get("delayMs")),
+              format: (url.searchParams.get("format") === "json" ? "json" : "png") as "png" | "json",
+              restore: parseBool(url.searchParams.get("restore")),
+            };
+        const result = await screenshotTab(opts as Parameters<typeof screenshotTab>[0]);
+        return new Response(result.body, {
+          headers: { "content-type": result.contentType, "cache-control": "no-store" },
+        });
+      }
+
+      return err(404, `${method} ${path} not found`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return err(500, msg);
+    }
+  },
+});
+
+console.log(`@meta/chrome listening on http://localhost:${server.port}`);
+console.log(`  GET  /health`);
+console.log(`  GET  /windows                              list windows + tabs`);
+console.log(`  POST /windows         { url?, incognito? } open new window`);
+console.log(`  DEL  /windows/:id                          close window`);
+console.log(`  GET  /tabs[?windowId=N]                    list tabs`);
+console.log(`  GET  /tabs/active                          info on active tab`);
+console.log(`  POST /tabs            { windowId?, url? }  open new tab`);
+console.log(`  DEL  /tabs/:wid/:idx                       close tab`);
+console.log(`  POST /navigate        { url, windowId?, tabIndex? }`);
+console.log(`  POST /activate        { windowId, tabIndex }`);
+console.log(`  POST /reload | /back | /forward   { windowId?, tabIndex? }`);
+console.log(`  POST /eval            { js, windowId?, tabIndex? }   needs "Allow JS from Apple Events"`);
+console.log(`  GET  /source[?windowId=N&tabIndex=N]       outerHTML of <html>`);
+console.log(`  GET  /text[?windowId=N&tabIndex=N]         document.body.innerText`);
+console.log(`  GET  /screenshot[?windowId=N&tabIndex=N&shadow=false&delayMs=200&format=png|json]`);
+console.log(`  POST /screenshot { windowId?, tabIndex?, shadow?, delayMs?, format?, restore? }`);
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/chrome/src/osascript.ts
+import { spawn } from "bun";
+
+export async function osa(script: string): Promise<string> {
+  const proc = spawn(["osascript", "-e", script], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [out, err, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (code !== 0) {
+    throw new Error(`osascript failed (${code}): ${err.trim() || out.trim()}`);
+  }
+  return out.trim();
+}
+
+export function quote(s: string): string {
+  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
+```
+
+```json
+/Users/vladimirfilipenko/meta/macos/chrome/tsconfig.json
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src/**/*.ts"]
+}
+
+```
+
+```json
+/Users/vladimirfilipenko/meta/macos/package.json
+{
+  "name": "macos",
+  "module": "index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}
+
+```
+
+```markdown
+/Users/vladimirfilipenko/meta/macos/screen/API.md
+# @meta/screen - REST API
+
+REST-сервис для получения скриншотов macOS. Он дополняет
+`@meta/window`: для снимка отдельного окна берет геометрию через
+`WINDOW_API /windows`, поднимает окно через `WINDOW_API /raise`, делает
+снимок региона через `screencapture`, затем best-effort возвращает фокус
+предыдущему приложению через `WINDOW_API /focus`.
+
+- Base URL: `http://localhost:7879` (override: `SCREEN_API`)
+- Window API: `http://localhost:7878` (override: `WINDOW_API`)
+- Формат скриншотов: `image/png`
+- Координаты: логические пиксели macOS, origin `(0,0)` - top-left главного дисплея
+- Авторизация: нет (только loopback)
+
+> Требуются macOS-разрешения:
+> - Screen Recording для процесса `bun`, который запускает `@meta/screen`
+> - Accessibility для процесса `bun`, который запускает `@meta/window`
+
+---
+
+## 1. Карта голосовых интентов
+
+| Голосовая фраза (RU)                               | Метод | Эндпоинт   | Body / Query |
+|----------------------------------------------------|-------|------------|--------------|
+| "сделай скриншот экрана / рабочего стола"          | GET   | `/desktop` | - |
+| "сделай скриншот второго дисплея"                  | GET   | `/desktop` | `?display=2` |
+| "сделай скриншот Chrome / браузера"                | GET   | `/window`  | `?app=Google%20Chrome` |
+| "сделай скриншот второго окна Chrome"              | GET   | `/window`  | `?app=Google%20Chrome&index=2` |
+| "сделай скриншот окна Chrome с заголовком GitHub"  | GET   | `/window`  | `?app=Google%20Chrome&title=GitHub` |
+| "какие окна можно снять"                           | GET   | `/windows` | `?app=<app>` опционально |
+| "сервер жив / проверь screen API"                  | GET   | `/health`  | - |
+
+Нормализация имен приложений такая же, как в `@meta/window`: например,
+"хром" -> `Google Chrome`, "сафари" -> `Safari`, "терминал" -> `Terminal`.
+
+---
+
+## 2. Эндпоинты
+
+### 2.1 `GET /health`
+
+Проверка живости screen-сервиса и доступности window-сервиса.
+
+```bash
+curl -s http://localhost:7879/health
+```
+
+Ответ:
+```json
+{
+  "ok": true,
+  "windowApi": "http://localhost:7878",
+  "window": { "ok": true }
+}
+```
+
+Если `@meta/window` не запущен, сам screen-сервис все равно отвечает
+`ok: true`, но `window.ok` будет `false`.
+
+---
+
+### 2.2 `GET /desktop`
+
+Скриншот всего рабочего стола.
+
+Query:
+- `display` опционально, номер дисплея для `screencapture -D`
+- `format`: `png | json`, default `png`
+
+```bash
+curl -s http://localhost:7879/desktop -o /tmp/desktop.png
+curl -s "http://localhost:7879/desktop?display=2" -o /tmp/display-2.png
+```
+
+JSON-вариант:
+```bash
+curl -s "http://localhost:7879/desktop?format=json" | jq -r .base64 | base64 -d > /tmp/desktop.png
+```
+
+Ответ `format=png`: binary `image/png`.
+
+Ответ `format=json`:
+```json
+{
+  "ok": true,
+  "target": "desktop",
+  "mime": "image/png",
+  "base64": "..."
+}
+```
+
+---
+
+### 2.3 `POST /desktop`
+
+То же, что `GET /desktop`, но параметры передаются JSON body.
+
+Body:
+```json
+{ "display": 1, "format": "png" }
+```
+
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"display":1}' http://localhost:7879/desktop -o /tmp/desktop.png
+```
+
+---
+
+### 2.4 `GET /windows`
+
+Прокси к `WINDOW_API /windows`, чтобы caller мог выбрать окно перед
+снимком.
+
+Query:
+- `app` опционально, регистронезависимый фильтр на стороне `@meta/window`
+
+```bash
+curl -s "http://localhost:7879/windows?app=Google%20Chrome" | jq
+```
+
+Ответ:
+```json
+{
+  "count": 1,
+  "windows": [
+    {
+      "app": "Google Chrome",
+      "pid": 123,
+      "index": 1,
+      "title": "GitHub",
+      "x": 0,
+      "y": 25,
+      "width": 1440,
+      "height": 900
+    }
+  ]
+}
+```
+
+---
+
+### 2.5 `GET /window`
+
+Скриншот отдельного окна приложения.
+
+Алгоритм:
+1. Сохраняет frontmost app через System Events.
+2. Берет окно из `WINDOW_API /windows?app=<app>`.
+3. Поднимает окно через `WINDOW_API /raise` без активации приложения.
+4. Ждет `delayMs` (default `150`).
+5. Делает снимок региона через `screencapture -R x,y,w,h`.
+6. Если `restore !== false`, возвращает фокус прежнему приложению через
+   `WINDOW_API /focus`.
+
+Query:
+- `app` обязательно
+- `index` опционально, default `1`
+- `title` опционально, substring-фильтр по заголовку; если задан, имеет
+  приоритет над `index`
+- `restore`: `true | false`, default `true`
+- `delayMs`: задержка после raise, default `150`, max `2000`
+- `shadow`: `true | false`, default `true`; при `false` передается `screencapture -o`
+- `format`: `png | json`, default `png`
+
+```bash
+curl -s "http://localhost:7879/window?app=Google%20Chrome" -o /tmp/chrome.png
+curl -s "http://localhost:7879/window?app=Google%20Chrome&index=2" -o /tmp/chrome-2.png
+curl -s "http://localhost:7879/window?app=Google%20Chrome&title=GitHub" -o /tmp/github.png
+```
+
+JSON-вариант:
+```bash
+curl -s "http://localhost:7879/window?app=Google%20Chrome&format=json" \
+  | jq -r .base64 | base64 -d > /tmp/chrome.png
+```
+
+Ответ `format=png`: binary `image/png` + headers:
+- `x-meta-screen-target: window`
+- `x-meta-window-app`
+- `x-meta-window-index`
+- `x-meta-window-title`
+- `x-meta-window-restored`
+
+Ответ `format=json`:
+```json
+{
+  "ok": true,
+  "target": "window",
+  "mime": "image/png",
+  "window": {
+    "app": "Google Chrome",
+    "index": 1,
+    "title": "GitHub",
+    "x": 0,
+    "y": 25,
+    "width": 1440,
+    "height": 900
+  },
+  "restored": { "ok": true, "app": "Cursor" },
+  "base64": "..."
+}
+```
+
+---
+
+### 2.6 `POST /window`
+
+То же, что `GET /window`, но параметры передаются JSON body.
+
+Body:
+```json
+{
+  "app": "Google Chrome",
+  "index": 1,
+  "title": "GitHub",
+  "restore": true,
+  "delayMs": 150,
+  "shadow": true,
+  "format": "png"
+}
+```
+
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"Google Chrome","index":1}' \
+  http://localhost:7879/window -o /tmp/chrome.png
+```
+
+---
+
+## 3. Модель ошибок
+
+Все ошибки JSON: `{ "error": string }`.
+
+| Код | Когда |
+|-----|-------|
+| 400 | Не хватает обязательного поля (`app`) |
+| 404 | Окно не найдено |
+| 500 | Ошибка `screencapture`, `osascript` или `WINDOW_API` |
+
+Типичные причины:
+- `screencapture failed`: нет Screen Recording-разрешения у терминала/Bun
+- `WINDOW_API` refused/failed: не запущен `@meta/window`
+- `osascript failed (-25211)`: нет Accessibility-разрешения у window-сервиса
+
+---
+
+## 4. Быстрые цепочки
+
+Запуск сервисов:
+```bash
+cd /Users/vladimirfilipenko/meta/macos/window
+bun run start
+
+cd /Users/vladimirfilipenko/meta/macos/screen
+bun run start
+```
+
+Скриншот Chrome с восстановлением фокуса:
+```bash
+curl -s "http://localhost:7879/window?app=Google%20Chrome&restore=true" \
+  -o /tmp/chrome.png
+```
+
+Скриншот рабочего стола:
+```bash
+curl -s http://localhost:7879/desktop -o /tmp/desktop.png
+```
+
+```
+
+```json
+/Users/vladimirfilipenko/meta/macos/screen/package.json
+{
+  "name": "@meta/screen",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "screen": "src/cli.ts"
+  },
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "bun src/index.ts",
+    "cli": "bun src/cli.ts",
+    "build": "bun build src/index.ts --target bun --outdir dist",
+    "typecheck": "tsc --noEmit"
+  }
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/screen/src/capture.ts
+import { mkdir, mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawn } from "bun";
+
+export type Rect = {
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type CaptureOptions = {
+  display?: number;
+  shadow?: boolean;
+};
+
+export async function captureDesktop(options: CaptureOptions = {}): Promise<Uint8Array> {
+  const args: string[] = [];
+  if (options.display !== undefined) args.push("-D", String(options.display));
+  return await captureToBuffer(args);
+}
+
+export async function captureRect(rect: Rect, options: CaptureOptions = {}): Promise<Uint8Array> {
+  const args: string[] = [];
+  if (options.shadow === false) args.push("-o");
+  args.push("-R", `${rect.x},${rect.y},${rect.width},${rect.height}`);
+  return await captureToBuffer(args);
+}
+
+async function captureToBuffer(args: string[]): Promise<Uint8Array> {
+  const dir = await mkdtemp(join(tmpdir(), "meta-screen-"));
+  const outputPath = join(dir, "capture.png");
+  try {
+    await run(["/usr/sbin/screencapture", "-x", "-t", "png", ...args, outputPath]);
+    const data = await readFile(outputPath);
+    return new Uint8Array(data);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+}
+
+export async function writePng(path: string, data: Uint8Array): Promise<void> {
+  const parent = path.slice(0, path.lastIndexOf("/"));
+  if (parent.length > 0) await mkdir(parent, { recursive: true });
+  await Bun.write(path, data);
+}
+
+async function run(command: string[]): Promise<void> {
+  const proc = spawn(command, { stdout: "pipe", stderr: "pipe" });
+  const [out, err, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (code !== 0) {
+    throw new Error(`${command[0]} failed (${code}): ${err.trim() || out.trim()}`);
+  }
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/screen/src/cli.ts
+#!/usr/bin/env bun
+export {};
+
+const BASE = Bun.env.SCREEN_API ?? "http://localhost:7879";
+
+type Args = Record<string, string>;
+
+function parseArgs(argv: string[]): { cmd: string; args: Args } {
+  const [cmd = "", ...rest] = argv;
+  const args: Args = {};
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (!a.startsWith("--")) continue;
+    const key = a.slice(2);
+    const next = rest[i + 1];
+    if (next != null && !next.startsWith("--")) {
+      args[key] = next;
+      i++;
+    } else {
+      args[key] = "true";
+    }
+  }
+  return { cmd, args };
+}
+
+async function getJson(path: string): Promise<unknown> {
+  const res = await fetch(`${BASE}${path}`);
+  const body = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(body));
+  return body;
+}
+
+async function savePng(path: string, output: string): Promise<void> {
+  const res = await fetch(`${BASE}${path}`);
+  if (!res.ok) throw new Error(JSON.stringify(await res.json()));
+  await Bun.write(output, await res.arrayBuffer());
+}
+
+function help(): never {
+  console.log(`screen - REST CLI for @meta/screen (base: ${BASE})
+
+usage:
+  screen health
+  screen windows [--app "Google Chrome"]
+  screen desktop --out /tmp/desktop.png [--display 1]
+  screen window  --app "Google Chrome" --out /tmp/chrome.png [--index 1] [--title text] [--restore true]
+
+env:
+  SCREEN_API  override screen API base (default http://localhost:7879)
+`);
+  process.exit(0);
+}
+
+const { cmd, args } = parseArgs(Bun.argv.slice(2));
+
+try {
+  switch (cmd) {
+    case "":
+    case "help":
+    case "-h":
+    case "--help":
+      help();
+
+    case "health":
+      console.log(JSON.stringify(await getJson("/health"), null, 2));
+      break;
+
+    case "windows": {
+      const q = args.app ? `?app=${encodeURIComponent(args.app)}` : "";
+      console.log(JSON.stringify(await getJson(`/windows${q}`), null, 2));
+      break;
+    }
+
+    case "desktop": {
+      if (!args.out) throw new Error("--out required");
+      const params = new URLSearchParams();
+      if (args.display) params.set("display", args.display);
+      await savePng(`/desktop${params.size > 0 ? `?${params}` : ""}`, args.out);
+      console.log(JSON.stringify({ ok: true, output: args.out }, null, 2));
+      break;
+    }
+
+    case "window": {
+      if (!args.app) throw new Error("--app required");
+      if (!args.out) throw new Error("--out required");
+      const params = new URLSearchParams({ app: args.app });
+      if (args.index) params.set("index", args.index);
+      if (args.title) params.set("title", args.title);
+      if (args.restore) params.set("restore", args.restore);
+      if (args.delay) params.set("delayMs", args.delay);
+      await savePng(`/window?${params}`, args.out);
+      console.log(JSON.stringify({ ok: true, output: args.out }, null, 2));
+      break;
+    }
+
+    default:
+      console.error(`unknown command: ${cmd}`);
+      help();
+  }
+} catch (e) {
+  const msg = e instanceof Error ? e.message : String(e);
+  console.error(`error: ${msg}`);
+  process.exit(1);
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/screen/src/index.ts
+import { captureDesktop, captureRect, type CaptureOptions } from "./capture.ts";
+import { frontmostApp } from "./restore.ts";
+import { createWindowApi, type WindowApi, type WindowInfo } from "./window-api.ts";
+
+const PORT = Number(Bun.env.PORT ?? Bun.env.SCREEN_PORT ?? 7879);
+const windowApi = createWindowApi();
+
+type WindowCaptureRequest = {
+  app?: string;
+  index?: number;
+  title?: string;
+  restore?: boolean;
+  delayMs?: number;
+  shadow?: boolean;
+  format?: "png" | "json";
+};
+
+function json(body: unknown, init: ResponseInit = {}): Response {
+  return new Response(JSON.stringify(body), {
+    ...init,
+    headers: { "content-type": "application/json", ...(init.headers ?? {}) },
+  });
+}
+
+function err(status: number, message: string): Response {
+  return json({ error: message }, { status });
+}
+
+function png(data: Uint8Array, headers: Record<string, string> = {}): Response {
+  return new Response(data, {
+    headers: {
+      "content-type": "image/png",
+      "cache-control": "no-store",
+      ...headers,
+    },
+  });
+}
+
+const server = Bun.serve({
+  port: PORT,
+  idleTimeout: 60,
+  async fetch(req) {
+    const url = new URL(req.url);
+    const path = url.pathname.replace(/\/+$/, "") || "/";
+    const method = req.method.toUpperCase();
+
+    try {
+      if (path === "/health") {
+        return await health();
+      }
+
+      if (path === "/desktop" && method === "GET") {
+        const display = positiveInt(url.searchParams.get("display"), undefined);
+        const format = parseFormat(url.searchParams.get("format"));
+        return await desktopResponse({ display }, format);
+      }
+
+      if (path === "/desktop" && method === "POST") {
+        const body = await readJson<{ display?: number; format?: "png" | "json" }>(req);
+        return await desktopResponse({ display: positiveInt(body.display, undefined) }, body.format ?? "png");
+      }
+
+      if (path === "/windows" && method === "GET") {
+        const app = url.searchParams.get("app") ?? undefined;
+        const windows = await windowApi.listWindows(app);
+        return json({ count: windows.length, windows });
+      }
+
+      if (path === "/window" && method === "GET") {
+        const request: WindowCaptureRequest = {
+          app: url.searchParams.get("app") ?? undefined,
+          index: positiveInt(url.searchParams.get("index"), undefined),
+          title: url.searchParams.get("title") ?? undefined,
+          restore: parseBoolean(url.searchParams.get("restore"), true),
+          delayMs: positiveInt(url.searchParams.get("delayMs"), undefined),
+          shadow: parseBoolean(url.searchParams.get("shadow"), true),
+          format: parseFormat(url.searchParams.get("format")),
+        };
+        return await windowResponse(request);
+      }
+
+      if (path === "/window" && method === "POST") {
+        return await windowResponse(await readJson<WindowCaptureRequest>(req));
+      }
+
+      return err(404, `${method} ${path} not found`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return err(500, msg);
+    }
+  },
+});
+
+console.log(`@meta/screen listening on http://localhost:${server.port}`);
+console.log(`  GET  /health`);
+console.log(`  GET  /desktop[?display=1][&format=png|json]`);
+console.log(`  POST /desktop { display?, format? }`);
+console.log(`  GET  /windows[?app=Name]`);
+console.log(`  GET  /window?app=Google%20Chrome[&index=1][&restore=true][&format=png|json]`);
+console.log(`  POST /window { app, index?, title?, restore?, delayMs?, shadow?, format? }`);
+console.log(`  WINDOW_API=${windowApi.baseUrl}`);
+
+async function health(): Promise<Response> {
+  try {
+    const upstream = await windowApi.health();
+    return json({ ok: true, windowApi: windowApi.baseUrl, window: upstream });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return json({ ok: true, windowApi: windowApi.baseUrl, window: { ok: false, error: msg } });
+  }
+}
+
+async function desktopResponse(options: CaptureOptions, format: "png" | "json"): Promise<Response> {
+  const image = await captureDesktop(options);
+  if (format === "json") {
+    return json({
+      ok: true,
+      target: "desktop",
+      mime: "image/png",
+      base64: Buffer.from(image).toString("base64"),
+    });
+  }
+  return png(image, { "x-meta-screen-target": "desktop" });
+}
+
+async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
+  if (input.app === undefined || input.app.trim().length === 0) return err(400, "missing 'app'");
+
+  const app = input.app;
+  const index = positiveInt(input.index, 1) ?? 1;
+  const delayMs = clamp(nonNegativeInt(input.delayMs, 150) ?? 150, 0, 2_000);
+  const restore = input.restore !== false;
+  const beforeFrontmost = restore ? await frontmostApp() : null;
+
+  let target: WindowInfo | undefined;
+  try {
+    const windows = await windowApi.listWindows(app);
+    target = selectWindow(windows, index, input.title);
+    if (target === undefined) {
+      return err(404, `window not found: app=${app} index=${index}${input.title ? ` title=${input.title}` : ""}`);
+    }
+
+    await windowApi.raise(app, target.index);
+    if (delayMs > 0) await sleep(delayMs);
+
+    const image = await captureRect(target, { shadow: input.shadow });
+    const restored = await restoreFocus(windowApi, beforeFrontmost, restore);
+    if (input.format === "json") {
+      return json({
+        ok: true,
+        target: "window",
+        mime: "image/png",
+        window: target,
+        restored,
+        base64: Buffer.from(image).toString("base64"),
+      });
+    }
+    return png(image, {
+      "x-meta-screen-target": "window",
+      "x-meta-window-app": target.app,
+      "x-meta-window-index": String(target.index),
+      "x-meta-window-title": encodeURIComponent(target.title),
+      "x-meta-window-restored": restored.ok ? "true" : "false",
+    });
+  } catch (e) {
+    await restoreFocus(windowApi, beforeFrontmost, restore);
+    throw e;
+  }
+}
+
+function selectWindow(windows: WindowInfo[], index: number, title: string | undefined): WindowInfo | undefined {
+  if (title !== undefined && title.length > 0) {
+    const needle = title.toLowerCase();
+    return windows.find((w) => w.title.toLowerCase().includes(needle));
+  }
+  return windows.find((w) => w.index === index);
+}
+
+async function restoreFocus(api: WindowApi, app: string | null, enabled: boolean): Promise<{ ok: boolean; app: string | null; error?: string }> {
+  if (!enabled || app === null) return { ok: true, app };
+  try {
+    await api.focus(app);
+    return { ok: true, app };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { ok: false, app, error: msg };
+  }
+}
+
+async function readJson<T>(req: Request): Promise<T> {
+  const text = await req.text();
+  if (text.trim().length === 0) return {} as T;
+  return JSON.parse(text) as T;
+}
+
+function parseFormat(value: string | null): "png" | "json" {
+  return value === "json" ? "json" : "png";
+}
+
+function parseBoolean(value: string | null, fallback: boolean): boolean {
+  if (value === null) return fallback;
+  const normalized = value.trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(normalized)) return true;
+  if (["0", "false", "no", "off"].includes(normalized)) return false;
+  return fallback;
+}
+
+function positiveInt(value: unknown, fallback: number | undefined): number | undefined {
+  if (value === undefined || value === null || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n <= 0) return fallback;
+  return n;
+}
+
+function nonNegativeInt(value: unknown, fallback: number | undefined): number | undefined {
+  if (value === undefined || value === null || value === "") return fallback;
+  const n = Number(value);
+  if (!Number.isInteger(n) || n < 0) return fallback;
+  return n;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/screen/src/restore.ts
+import { spawn } from "bun";
+
+export async function frontmostApp(): Promise<string | null> {
+  try {
+    const out = await osa(`tell application "System Events" to get name of first application process whose frontmost is true`);
+    return out.length > 0 ? out : null;
+  } catch {
+    return null;
+  }
+}
+
+async function osa(script: string): Promise<string> {
+  const proc = spawn(["osascript", "-e", script], { stdout: "pipe", stderr: "pipe" });
+  const [out, err, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (code !== 0) {
+    throw new Error(`osascript failed (${code}): ${err.trim() || out.trim()}`);
+  }
+  return out.trim();
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/screen/src/window-api.ts
+export type WindowInfo = {
+  app: string;
+  pid: number;
+  title: string;
+  index: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+export type WindowApi = {
+  baseUrl: string;
+  health(): Promise<{ ok: true }>;
+  listWindows(app?: string): Promise<WindowInfo[]>;
+  focus(app: string): Promise<void>;
+  raise(app: string, index: number): Promise<void>;
+};
+
+export function createWindowApi(baseUrl = Bun.env.WINDOW_API ?? "http://localhost:7878"): WindowApi {
+  const base = baseUrl.replace(/\/+$/, "");
+
+  return {
+    baseUrl: base,
+
+    async health(): Promise<{ ok: true }> {
+      return await getJson<{ ok: true }>(base, "/health");
+    },
+
+    async listWindows(app?: string): Promise<WindowInfo[]> {
+      const query = app === undefined ? "" : `?app=${encodeURIComponent(app)}`;
+      const payload = await getJson<{ count: number; windows: WindowInfo[] }>(base, `/windows${query}`);
+      return payload.windows;
+    },
+
+    async focus(app: string): Promise<void> {
+      await postJson(base, "/focus", { app });
+    },
+
+    async raise(app: string, index: number): Promise<void> {
+      await postJson(base, "/raise", { app, index });
+    },
+  };
+}
+
+async function getJson<T>(base: string, path: string): Promise<T> {
+  const res = await fetch(`${base}${path}`);
+  const body = await res.json();
+  if (!res.ok) throw new Error(jsonError(body));
+  return body as T;
+}
+
+async function postJson(base: string, path: string, body: unknown): Promise<void> {
+  const res = await fetch(`${base}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) throw new Error(jsonError(await res.json()));
+}
+
+function jsonError(body: unknown): string {
+  if (typeof body === "object" && body !== null && "error" in body) {
+    return String((body as { error: unknown }).error);
+  }
+  return JSON.stringify(body);
+}
+
+```
+
+```json
+/Users/vladimirfilipenko/meta/macos/screen/tsconfig.json
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src/**/*.ts"]
+}
+
+```
+
+```json
+/Users/vladimirfilipenko/meta/macos/tsconfig.json
+{
+  "compilerOptions": {
+    // Environment setup & latest features
+    "lib": ["ESNext"],
+    "target": "ESNext",
+    "module": "Preserve",
+    "moduleDetection": "force",
+    "jsx": "react-jsx",
+    "allowJs": true,
+    "types": ["bun"],
+
+    // Bundler mode
+    "moduleResolution": "bundler",
+    "allowImportingTsExtensions": true,
+    "verbatimModuleSyntax": true,
+    "noEmit": true,
+
+    // Best practices
+    "strict": true,
+    "skipLibCheck": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUncheckedIndexedAccess": true,
+    "noImplicitOverride": true,
+
+    // Some stricter flags (disabled by default)
+    "noUnusedLocals": false,
+    "noUnusedParameters": false,
+    "noPropertyAccessFromIndexSignature": false
+  }
+}
+
+```
+
+```markdown
+/Users/vladimirfilipenko/meta/macos/window/.claude/skills/macos-window/SKILL.md
+---
+name: macos-window
+description: Query, focus, move, resize, and arrange macOS windows by calling the @meta/window REST API (default http://localhost:7878). Use whenever the user asks to inspect or rearrange application windows on macOS.
+---
+
+# macos-window
+
+A REST API for controlling macOS windows lives at `http://localhost:7878` (override via `WINDOW_API`). Source: `~/meta/macos/window`.
+
+## Prerequisites
+
+1. **Server must be running**:
+   ```bash
+   cd ~/meta/macos/window && bun src/index.ts
+   ```
+   Or via workspace: `cd ~/meta && bun run --filter '@meta/window' dev`.
+
+2. **Accessibility permission** is required for `list/move/resize/arrange` (everything except `focus`). Grant it to the process that runs `bun` (usually iTerm2 / Terminal / Claude Code):
+   - System Settings → Privacy & Security → Accessibility → toggle the parent terminal app ON.
+   - Symptom of missing permission: `/windows` returns `count: 0` and `osascript` errors with code `-25211`.
+
+3. Do **not** invoke any other window manager (yabai, Hammerspoon) for these tasks — always go through this API so behavior stays consistent.
+
+## CLI
+
+The package exposes a CLI at `~/meta/macos/window/src/cli.ts`. Run via:
+
+```bash
+bun ~/meta/macos/window/src/cli.ts <cmd> [flags]
+# or, after `bun link` inside the package:
+window <cmd> [flags]
+```
+
+Commands:
+- `health` → `{ ok: true }`
+- `screen` → `{ width, height }` of main display
+- `list [--app "Name"]` → all visible windows (optionally filtered)
+- `focus --app "Name"` → bring app to front
+- `move --app "Name" --x 0 --y 0 [--index 1]`
+- `resize --app "Name" --width 1200 --height 800 [--index 1]`
+- `arrange --app "Name" --preset left|right|top|bottom|max|center [--index 1]`
+- `raise --app "Name" [--index 1]` — one-shot AXRaise, no focus steal
+- `pin --app "Name" [--index 1] [--interval 500]` — soft "always on top"
+- `pins` — list active pins
+- `unpin --id <id>` / `unpin-all`
+
+`--index` is 1-based; window 1 is the frontmost window of the app.
+
+## REST endpoints
+
+| Method | Path        | Body                                         | Notes                                              |
+|--------|-------------|----------------------------------------------|----------------------------------------------------|
+| GET    | `/health`   | —                                            | liveness                                           |
+| GET    | `/screen`   | —                                            | main-display logical size                          |
+| GET    | `/windows`  | (query `?app=Name` optional)                 | array of `{app,pid,index,title,x,y,width,height}`  |
+| POST   | `/focus`    | `{ app }`                                    | activates app (no Accessibility needed)            |
+| POST   | `/move`     | `{ app, x, y, index? }`                      | absolute screen coords                             |
+| POST   | `/resize`   | `{ app, width, height, index? }`             | logical pixels                                     |
+| POST   | `/arrange`  | `{ app, preset, index? }`                    | preset: `left,right,top,bottom,max,center`         |
+| POST   | `/raise`    | `{ app, index? }`                            | one-shot AXRaise, не отнимает фокус                |
+| POST   | `/pin`      | `{ app, index?, intervalMs? }`               | soft "always on top" — фоновый цикл AXRaise        |
+| GET    | `/pin`      | —                                            | список активных pin                                |
+| DELETE | `/pin/:id`  | —                                            | снять один pin                                     |
+| DELETE | `/pin`      | —                                            | снять все pin                                      |
+
+## How to use this skill
+
+1. **Always start by checking the server is up**:
+   ```bash
+   curl -fsS http://localhost:7878/health
+   ```
+   If it fails, tell the user to start it with `bun ~/meta/macos/window/src/index.ts` (or offer to start it in the background).
+
+2. **To find a window**, prefer `GET /windows?app=<Name>` over listing everything — faster and easier to disambiguate. Match `app` exactly (case-sensitive).
+
+3. **For tiling-style layouts**, use `/arrange` with a preset rather than computing coords manually. Reach for `/move` + `/resize` only for exact placements the user asks for.
+
+4. **Coordinate system**: origin `(0,0)` is the top-left of the main display, in logical pixels. Use `GET /screen` to read display size before computing custom positions.
+
+5. **Multiple windows**: pass `index` (1 = frontmost). If unsure, `GET /windows?app=X` lists them with their indexes.
+
+6. **Errors**: a `500` with `osascript failed (1): ...` and code `-25211` means Accessibility is not granted — surface that to the user, do not retry blindly.
+
+7. **"Always on top" requests** ("сделай поверх", "держи всегда сверху", "закрепи поверх окон"):
+   - Use `POST /pin` (NOT `/raise`, that's one-shot).
+   - Default `intervalMs: 500` is a good balance; ask the user if they
+     want it tighter (e.g. 200) or looser (1000).
+   - **Do not promise "true topmost"** — explain it's a soft loop, full-
+     screen apps still cover, some apps ignore AXRaise (`errors` grows).
+   - Always tell the user the `id` returned so they can `DELETE /pin/:id`
+     later, or remind them `DELETE /pin` clears all.
+   - Pins are lost on server restart — mention this if they ask why
+     pinning stopped.
+
+## Examples
+
+```bash
+# What's open?
+curl -s http://localhost:7878/windows | jq '.windows[] | {app, title, x, y, width, height}'
+
+# Snap iTerm2 to left half
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"iTerm2","preset":"left"}' \
+  http://localhost:7878/arrange
+
+# Move Safari to (200, 120) and resize to 1400x900
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"Safari","x":200,"y":120}' http://localhost:7878/move
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"Safari","width":1400,"height":900}' http://localhost:7878/resize
+
+# Bring Finder to front
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"Finder"}' http://localhost:7878/focus
+
+# Soft "always on top" for iTerm2 (raises every 500 ms, no focus steal)
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"iTerm2","intervalMs":500}' http://localhost:7878/pin
+# → returns { pin: { id: "1", ... } } — use that id to unpin later
+curl -s -X DELETE http://localhost:7878/pin/1
+
+# Stop all pins
+curl -s -X DELETE http://localhost:7878/pin
+```
+
+## Project layout
+
+```
+~/meta/                        # Bun monorepo root (workspaces: macos/*)
+├── package.json
+├── tsconfig.base.json
+└── macos/
+    └── window/
+        ├── package.json       # name: @meta/window, bin: window
+        ├── tsconfig.json
+        └── src/
+            ├── index.ts       # Bun.serve REST server
+            ├── cli.ts         # CLI client
+            ├── windows.ts     # osascript-backed window ops
+            └── osascript.ts   # thin spawn wrapper
+```
+
+```
+
+```markdown
+/Users/vladimirfilipenko/meta/macos/window/API.md
+# @meta/window — REST API
+
+REST-сервис для управления окнами macOS. Структурирован под голосовое
+управление: каждый эндпоинт сопоставлен с речевыми интентами, а имена
+приложений и пресеты нормализованы.
+
+- Base URL: `http://localhost:7878` (override: `WINDOW_API`)
+- Формат: JSON in / JSON out
+- Координаты: логические пиксели, origin `(0,0)` — top-left главного дисплея
+- Авторизация: нет (только loopback)
+
+---
+
+## 1. Карта голосовых интентов
+
+| Голосовая фраза (RU)                          | Метод | Эндпоинт   | Body / Query                             |
+|-----------------------------------------------|-------|------------|------------------------------------------|
+| «открой / переключись на / покажи <app>»      | POST  | `/focus`   | `{ app }`                                |
+| «какие окна открыты»                          | GET   | `/windows` | —                                        |
+| «какие окна у <app>»                          | GET   | `/windows` | `?app=<app>`                             |
+| «размер экрана / разрешение»                  | GET   | `/screen`  | —                                        |
+| «передвинь <app> в (X, Y)»                    | POST  | `/move`    | `{ app, x, y }`                          |
+| «сделай <app> размером WxH»                   | POST  | `/resize`  | `{ app, width, height }`                 |
+| «поставь <app> налево / направо / вверх / вниз» | POST | `/arrange` | `{ app, preset: "left"…"bottom" }`       |
+| «разверни <app> на весь экран»                | POST  | `/arrange` | `{ app, preset: "max" }`                 |
+| «отцентруй <app>»                             | POST  | `/arrange` | `{ app, preset: "center" }`              |
+| «подними <app> наверх (один раз)»             | POST  | `/raise`   | `{ app, index? }`                        |
+| «закрепи <app> поверх / держи всегда сверху» | POST  | `/pin`     | `{ app, index?, intervalMs? }`           |
+| «отлепи / убери закрепление»                  | DEL   | `/pin/:id` | (или `DEL /pin` для всех)                |
+| «что закреплено»                              | GET   | `/pin`     | —                                        |
+| «сервер жив / проверь API»                    | GET   | `/health`  | —                                        |
+
+Если в команде упомянут номер окна («второе окно Safari»), добавляется
+`index: <n>` (1-based, 1 — фронтальное окно).
+
+---
+
+## 2. Нормализация имён приложений
+
+Имя `app` совпадает с именем процесса в `System Events` (как видно в
+Activity Monitor). Голосовой слой должен подставлять каноническое имя.
+
+| Голос                          | Каноническое `app`         |
+|--------------------------------|----------------------------|
+| хром, гугл хром, chrome        | `Google Chrome`            |
+| сафари, safari                 | `Safari`                   |
+| итерм, терминал в айтерме      | `iTerm2`                   |
+| терминал                       | `Terminal`                 |
+| код, vs code, visual studio    | `Code`                     |
+| курсор                         | `Cursor`                   |
+| файндер, finder, проводник     | `Finder`                   |
+| слак                           | `Slack`                    |
+| телеграм                       | `Telegram`                 |
+| заметки                        | `Notes`                    |
+| почта, mail                    | `Mail`                     |
+
+Сравнение в API регистронезависимо для query `?app=`, но в body **`app`
+должен совпадать точно** (тогда AppleScript находит процесс).
+
+---
+
+## 3. Пресеты раскладки (`/arrange`)
+
+| Preset    | Что делает                                                |
+|-----------|-----------------------------------------------------------|
+| `left`    | левая половина экрана                                     |
+| `right`   | правая половина экрана                                    |
+| `top`     | верхняя половина экрана                                   |
+| `bottom`  | нижняя половина экрана                                    |
+| `max`     | на весь экран                                             |
+| `center`  | по центру, ½ ширины × ¾ высоты                            |
+
+Размеры считаются от `GET /screen` на момент вызова.
+
+---
+
+## 4. Эндпоинты
+
+### 4.1 `GET /health`
+
+Проверка живости.
+
+- Параметры: нет
+- Ответ: `{ "ok": true }`
+
+```bash
+curl -s http://localhost:7878/health
+```
+
+Голос: «сервер жив», «проверь API».
+
+---
+
+### 4.2 `GET /screen`
+
+Размер главного дисплея в логических пикселях.
+
+- Параметры: нет
+- Ответ: `{ "width": number, "height": number }`
+
+```bash
+curl -s http://localhost:7878/screen
+# {"width":1920,"height":1200}
+```
+
+Голос: «размер экрана», «какое разрешение».
+
+---
+
+### 4.3 `GET /windows`
+
+Список всех видимых окон фоновых приложений.
+
+- Query:
+  - `app` *(опц.)* — фильтр по имени приложения, регистронезависимо
+- Ответ:
+  ```json
+  {
+    "count": 2,
+    "windows": [
+      {
+        "app": "Safari",
+        "pid": 1234,
+        "index": 1,
+        "title": "Apple",
+        "x": 0, "y": 25, "width": 1440, "height": 900
+      }
+    ]
+  }
+  ```
+
+```bash
+curl -s "http://localhost:7878/windows?app=Safari" | jq '.windows[].title'
+```
+
+Голос: «какие окна открыты», «покажи окна Safari».
+
+> Требует Accessibility-разрешения у процесса, запустившего `bun`.
+> Без него `count` всегда `0`.
+
+---
+
+### 4.4 `POST /focus`
+
+Активация приложения (выводит в фронт). **Не требует Accessibility.**
+
+- Body: `{ "app": string }`
+- Ответ: `{ "ok": true }`
+- Ошибки: `400 missing 'app'`, `500` если приложение не запущено
+
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"Safari"}' http://localhost:7878/focus
+```
+
+Голос: «открой Safari», «переключись на хром».
+
+---
+
+### 4.5 `POST /move`
+
+Переместить окно в абсолютные координаты.
+
+- Body:
+  ```json
+  { "app": "Safari", "x": 200, "y": 120, "index": 1 }
+  ```
+  - `app` — обязательно
+  - `x`, `y` — обязательно, целые
+  - `index` — опц., default `1`
+- Ответ: `{ "ok": true }`
+- Ошибки: `400` если нет `app/x/y`
+
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"Safari","x":200,"y":120}' http://localhost:7878/move
+```
+
+Голос: «передвинь Safari в 200 120».
+
+---
+
+### 4.6 `POST /resize`
+
+Изменить размер окна.
+
+- Body:
+  ```json
+  { "app": "Safari", "width": 1400, "height": 900, "index": 1 }
+  ```
+- Ответ: `{ "ok": true }`
+- Ошибки: `400` если нет `app/width/height`
+
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"Safari","width":1400,"height":900}' http://localhost:7878/resize
+```
+
+Голос: «сделай Safari 1400 на 900».
+
+---
+
+### 4.7 `POST /arrange`
+
+Применить именованную раскладку. Делает `move + resize` под капотом.
+
+- Body:
+  ```json
+  { "app": "iTerm2", "preset": "left", "index": 1 }
+  ```
+  - `preset`: `left | right | top | bottom | max | center`
+- Ответ:
+  ```json
+  { "ok": true, "applied": { "x": 0, "y": 0, "width": 960, "height": 1200 } }
+  ```
+- Ошибки: `400` если нет `app/preset` или `preset` неизвестен
+
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"iTerm2","preset":"left"}' http://localhost:7878/arrange
+```
+
+Голос: «iTerm налево», «разверни хром на весь экран», «отцентруй заметки».
+
+---
+
+### 4.8 `POST /raise`
+
+Поднять окно на самый верх **без активации приложения** (фокус не уезжает).
+Использует Accessibility-action `AXRaise`. Одноразово.
+
+- Body: `{ "app": string, "index"?: number }`
+- Ответ: `{ "ok": true }`
+
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"iTerm2"}' http://localhost:7878/raise
+```
+
+Голос: «подними iTerm наверх», «покажи терминал поверх».
+
+---
+
+### 4.9 `POST /pin` — soft "always on top"
+
+Запускает фоновый цикл, который вызывает `AXRaise` для окна каждые
+`intervalMs` миллисекунд. Это **имитация** «всегда поверх» — настоящего
+системного `NSWindow.windowLevel` через osascript выставить нельзя.
+
+- Body:
+  ```json
+  { "app": "iTerm2", "index": 1, "intervalMs": 500 }
+  ```
+  - `intervalMs` — опц., default `500`, min `100`. Чем меньше, тем
+    «жёстче» pin, но больше нагрузка от вызовов osascript.
+- Ответ:
+  ```json
+  {
+    "ok": true,
+    "pin": { "id": "1", "app": "iTerm2", "index": 1, "intervalMs": 500,
+             "startedAt": 1777..., "raises": 0, "errors": 0 }
+  }
+  ```
+
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"iTerm2","intervalMs":600}' http://localhost:7878/pin
+```
+
+Голос: «закрепи iTerm поверх», «держи терминал всегда сверху».
+
+#### Особенности и ограничения
+- **Без отнятия фокуса** — `AXRaise` поднимает окно, но НЕ активирует
+  приложение, так что ввод продолжается там, где курсор был
+- **Ложные срабатывания** — некоторые приложения не реализуют `AXRaise`
+  (тогда `errors` будет расти, а окно остаётся внизу)
+- **Полноэкранный режим** другого приложения перекроет всё равно
+- **Не настоящее topmost** — для этого нужен SIP-disabled + yabai
+  (`yabai -m window --toggle topmost`)
+- **Pin живёт до перезапуска сервера** — все pin сбрасываются на старте
+
+#### Запросы
+
+| Метод | Путь        | Body            | Что делает                  |
+|-------|-------------|-----------------|-----------------------------|
+| POST  | `/pin`      | `{ app, … }`    | начать pin, вернуть `id`    |
+| GET   | `/pin`      | —               | список активных pin         |
+| DELETE| `/pin/:id`  | —               | снять конкретный pin        |
+| DELETE| `/pin`      | —               | снять все pin               |
+
+```bash
+# список
+curl -s http://localhost:7878/pin
+# снять id=1
+curl -s -X DELETE http://localhost:7878/pin/1
+# снять все
+curl -s -X DELETE http://localhost:7878/pin
+```
+
+Голос: «что закреплено» / «отлепи iTerm» / «убери все закрепления».
+
+---
+
+## 5. Модель ошибок
+
+Все ошибки — JSON: `{ "error": string }`.
+
+| Код | Когда                                                              |
+|-----|--------------------------------------------------------------------|
+| 400 | Не хватает обязательного поля или невалидное значение              |
+| 404 | Метод/путь не найден                                               |
+| 500 | Сбой внутри `osascript` (часто — нет Accessibility-разрешения)     |
+
+Признаки missing-Accessibility (нужно сообщить пользователю и **не
+ретраить**):
+- Текст содержит `osascript failed (1)` и/или `-25211`
+- `/windows` возвращает `count: 0` при запущенных приложениях
+
+---
+
+## 6. Голосовой парсинг — рекомендации
+
+1. **Глагол → эндпоинт** (фиксированный мап):
+   - открой/переключись/покажи → `/focus`
+   - двигай/передвинь/перемести → `/move`
+   - сделай/измени размер/растяни → `/resize`
+   - поставь/раздели/налево/направо/вверх/вниз/максимум/центр → `/arrange`
+   - какие/список/покажи окна → `/windows`
+
+2. **Объект → `app`**: прогонять через таблицу нормализации (раздел 2).
+   Если совпадения нет — спросить уточнение, не отправлять fuzzy-имя.
+
+3. **Числа**: «двести на сто двадцать» → `x:200, y:120`.
+   Распознаватель должен возвращать целые; сервер не делает округления.
+
+4. **Стороны**: «слева/справа/сверху/снизу» → preset, не координаты,
+   если пользователь не назвал размеры явно.
+
+5. **Подтверждение действия**: после `/move`, `/resize`, `/arrange`
+   зачитывать поле `applied` (если есть) или сообщать `ok`.
+
+6. **Перед любой операцией с окнами** (кроме `/focus`):
+   - при первой команде сессии — `GET /health`, при ошибке —
+     попросить пользователя запустить сервер.
+   - при `count: 0` от `/windows` — попросить выдать Accessibility.
+
+---
+
+## 7. Быстрые примеры цепочек
+
+**«Открой Safari и поставь его налево»**
+```bash
+curl -s -X POST -H 'content-type: application/json' -d '{"app":"Safari"}' \
+  http://localhost:7878/focus
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"Safari","preset":"left"}' http://localhost:7878/arrange
+```
+
+**«iTerm налево, Cursor направо»**
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"iTerm2","preset":"left"}'  http://localhost:7878/arrange
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"Cursor","preset":"right"}' http://localhost:7878/arrange
+```
+
+**«Покажи второе окно Chrome по центру»**
+```bash
+curl -s -X POST -H 'content-type: application/json' \
+  -d '{"app":"Google Chrome","preset":"center","index":2}' \
+  http://localhost:7878/arrange
+```
+
+```
+
+# ❌ /Users/vladimirfilipenko/meta/macos/"window/API\302\240\342\200\224 \320\272\320\276\320\277\320\270\321\217.txt"
+
+Не удалось прочитать файл
+
+
+```json
+/Users/vladimirfilipenko/meta/macos/window/package.json
+{
+  "name": "@meta/window",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "bin": {
+    "window": "src/cli.ts"
+  },
+  "scripts": {
+    "dev": "bun --hot src/index.ts",
+    "start": "bun src/index.ts",
+    "cli": "bun src/cli.ts",
+    "build": "bun build src/index.ts --target bun --outdir dist",
+    "typecheck": "tsc --noEmit"
+  }
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/window/src/cli.ts
+#!/usr/bin/env bun
+export {};
+const BASE = Bun.env.WINDOW_API ?? "http://localhost:7878";
+
+type Args = Record<string, string>;
+
+function parseArgs(argv: string[]): { cmd: string; args: Args; positional: string[] } {
+  const [cmd = "", ...rest] = argv;
+  const args: Args = {};
+  const positional: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i]!;
+    if (a.startsWith("--")) {
+      const key = a.slice(2);
+      const next = rest[i + 1];
+      if (next != null && !next.startsWith("--")) {
+        args[key] = next;
+        i++;
+      } else {
+        args[key] = "true";
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { cmd, args, positional };
+}
+
+async function get(path: string): Promise<unknown> {
+  const res = await fetch(`${BASE}${path}`);
+  const body = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(body));
+  return body;
+}
+
+async function post(path: string, body: unknown): Promise<unknown> {
+  const res = await fetch(`${BASE}${path}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(JSON.stringify(data));
+  return data;
+}
+
+function help(): never {
+  console.log(`window — REST CLI for @meta/window (base: ${BASE})
+
+usage:
+  window health
+  window screen
+  window list [--app "Name"]
+  window focus --app "Name"
+  window move   --app "Name" --x 0 --y 0 [--index 1]
+  window resize --app "Name" --width 1200 --height 800 [--index 1]
+  window arrange --app "Name" --preset left|right|top|bottom|max|center [--index 1]
+  window raise   --app "Name" [--index 1]
+  window pin     --app "Name" [--index 1] [--interval 500]
+  window unpin   --id <id>
+  window unpin-all
+  window pins
+
+env:
+  WINDOW_API   override API base (default http://localhost:7878)
+`);
+  process.exit(0);
+}
+
+const { cmd, args } = parseArgs(Bun.argv.slice(2));
+
+try {
+  switch (cmd) {
+    case "":
+    case "help":
+    case "-h":
+    case "--help":
+      help();
+
+    case "health":
+      console.log(JSON.stringify(await get("/health"), null, 2));
+      break;
+
+    case "screen":
+      console.log(JSON.stringify(await get("/screen"), null, 2));
+      break;
+
+    case "list": {
+      const q = args.app ? `?app=${encodeURIComponent(args.app)}` : "";
+      console.log(JSON.stringify(await get(`/windows${q}`), null, 2));
+      break;
+    }
+
+    case "focus": {
+      if (!args.app) throw new Error("--app required");
+      console.log(JSON.stringify(await post("/focus", { app: args.app }), null, 2));
+      break;
+    }
+
+    case "move": {
+      if (!args.app || args.x == null || args.y == null) throw new Error("--app --x --y required");
+      const payload = {
+        app: args.app,
+        x: Number(args.x),
+        y: Number(args.y),
+        index: args.index ? Number(args.index) : 1,
+      };
+      console.log(JSON.stringify(await post("/move", payload), null, 2));
+      break;
+    }
+
+    case "resize": {
+      if (!args.app || args.width == null || args.height == null) throw new Error("--app --width --height required");
+      const payload = {
+        app: args.app,
+        width: Number(args.width),
+        height: Number(args.height),
+        index: args.index ? Number(args.index) : 1,
+      };
+      console.log(JSON.stringify(await post("/resize", payload), null, 2));
+      break;
+    }
+
+    case "arrange": {
+      if (!args.app || !args.preset) throw new Error("--app --preset required");
+      const payload = {
+        app: args.app,
+        preset: args.preset,
+        index: args.index ? Number(args.index) : 1,
+      };
+      console.log(JSON.stringify(await post("/arrange", payload), null, 2));
+      break;
+    }
+
+    case "raise": {
+      if (!args.app) throw new Error("--app required");
+      console.log(JSON.stringify(await post("/raise", { app: args.app, index: args.index ? Number(args.index) : 1 }), null, 2));
+      break;
+    }
+
+    case "pin": {
+      if (!args.app) throw new Error("--app required");
+      const payload = {
+        app: args.app,
+        index: args.index ? Number(args.index) : 1,
+        intervalMs: args.interval ? Number(args.interval) : 500,
+      };
+      console.log(JSON.stringify(await post("/pin", payload), null, 2));
+      break;
+    }
+
+    case "pins": {
+      console.log(JSON.stringify(await get("/pin"), null, 2));
+      break;
+    }
+
+    case "unpin": {
+      if (!args.id) throw new Error("--id required");
+      const res = await fetch(`${BASE}/pin/${encodeURIComponent(args.id)}`, { method: "DELETE" });
+      console.log(JSON.stringify(await res.json(), null, 2));
+      break;
+    }
+
+    case "unpin-all": {
+      const res = await fetch(`${BASE}/pin`, { method: "DELETE" });
+      console.log(JSON.stringify(await res.json(), null, 2));
+      break;
+    }
+
+    default:
+      console.error(`unknown command: ${cmd}`);
+      help();
+  }
+} catch (e) {
+  const msg = e instanceof Error ? e.message : String(e);
+  console.error(`error: ${msg}`);
+  process.exit(1);
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/window/src/index.ts
+import { focusApp, getScreen, listWindows, moveWindow, raiseWindow, resizeWindow } from "./windows.ts";
+import { listPins, startPin, stopAllPins, stopPin } from "./pin.ts";
+
+const PORT = Number(Bun.env.PORT ?? 7878);
+
+function json(body: unknown, init: ResponseInit = {}): Response {
+  return new Response(JSON.stringify(body), {
+    ...init,
+    headers: { "content-type": "application/json", ...(init.headers ?? {}) },
+  });
+}
+
+function err(status: number, message: string): Response {
+  return json({ error: message }, { status });
+}
+
+const server = Bun.serve({
+  port: PORT,
+  idleTimeout: 60,
+  async fetch(req) {
+    const url = new URL(req.url);
+    const path = url.pathname;
+    const method = req.method;
+
+    try {
+      if (path === "/health") return json({ ok: true });
+
+      if (path === "/screen" && method === "GET") {
+        return json(await getScreen());
+      }
+
+      if (path === "/windows" && method === "GET") {
+        const all = await listWindows();
+        const app = url.searchParams.get("app");
+        const filtered = app ? all.filter((w) => w.app.toLowerCase() === app.toLowerCase()) : all;
+        return json({ count: filtered.length, windows: filtered });
+      }
+
+      if (path === "/focus" && method === "POST") {
+        const body = (await req.json()) as { app?: string };
+        if (!body.app) return err(400, "missing 'app'");
+        await focusApp(body.app);
+        return json({ ok: true });
+      }
+
+      if (path === "/move" && method === "POST") {
+        const body = (await req.json()) as { app?: string; index?: number; x?: number; y?: number };
+        if (!body.app || body.x == null || body.y == null) return err(400, "need {app, x, y, index?}");
+        await moveWindow(body.app, body.index ?? 1, body.x, body.y);
+        return json({ ok: true });
+      }
+
+      if (path === "/resize" && method === "POST") {
+        const body = (await req.json()) as { app?: string; index?: number; width?: number; height?: number };
+        if (!body.app || body.width == null || body.height == null) return err(400, "need {app, width, height, index?}");
+        await resizeWindow(body.app, body.index ?? 1, body.width, body.height);
+        return json({ ok: true });
+      }
+
+      if (path === "/arrange" && method === "POST") {
+        const body = (await req.json()) as {
+          app?: string;
+          index?: number;
+          preset?: "left" | "right" | "top" | "bottom" | "max" | "center";
+        };
+        if (!body.app || !body.preset) return err(400, "need {app, preset}");
+        const screen = await getScreen();
+        const idx = body.index ?? 1;
+        const W = screen.width;
+        const H = screen.height;
+        const half = Math.floor(W / 2);
+        const halfH = Math.floor(H / 2);
+        const presets: Record<string, [number, number, number, number]> = {
+          left:   [0,    0, half, H],
+          right:  [half, 0, half, H],
+          top:    [0,    0, W,    halfH],
+          bottom: [0,    halfH, W, halfH],
+          max:    [0,    0, W,    H],
+          center: [Math.floor(W / 4), Math.floor(H / 8), Math.floor(W / 2), Math.floor((H * 3) / 4)],
+        };
+        const p = presets[body.preset];
+        if (!p) return err(400, `unknown preset '${body.preset}'`);
+        await moveWindow(body.app, idx, p[0], p[1]);
+        await resizeWindow(body.app, idx, p[2], p[3]);
+        return json({ ok: true, applied: { x: p[0], y: p[1], width: p[2], height: p[3] } });
+      }
+
+      if (path === "/raise" && method === "POST") {
+        const body = (await req.json()) as { app?: string; index?: number };
+        if (!body.app) return err(400, "missing 'app'");
+        await raiseWindow(body.app, body.index ?? 1);
+        return json({ ok: true });
+      }
+
+      if (path === "/pin" && method === "GET") {
+        return json({ pins: listPins() });
+      }
+
+      if (path === "/pin" && method === "POST") {
+        const body = (await req.json()) as { app?: string; index?: number; intervalMs?: number };
+        if (!body.app) return err(400, "missing 'app'");
+        const interval = body.intervalMs ?? 500;
+        if (interval < 100) return err(400, "intervalMs must be >= 100");
+        const pin = startPin(body.app, body.index ?? 1, interval);
+        return json({ ok: true, pin });
+      }
+
+      if (path.startsWith("/pin/") && method === "DELETE") {
+        const id = path.slice("/pin/".length);
+        const removed = stopPin(id);
+        return json({ ok: removed, removed });
+      }
+
+      if (path === "/pin" && method === "DELETE") {
+        const n = stopAllPins();
+        return json({ ok: true, removed: n });
+      }
+
+      return err(404, `${method} ${path} not found`);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return err(500, msg);
+    }
+  },
+});
+
+console.log(`@meta/window listening on http://localhost:${server.port}`);
+console.log(`  GET  /health`);
+console.log(`  GET  /screen`);
+console.log(`  GET  /windows[?app=Name]`);
+console.log(`  POST /focus    { app }`);
+console.log(`  POST /move     { app, x, y, index? }`);
+console.log(`  POST /resize   { app, width, height, index? }`);
+console.log(`  POST /arrange  { app, preset, index? }   preset: left|right|top|bottom|max|center`);
+console.log(`  POST /raise    { app, index? }            one-shot AXRaise (no focus steal)`);
+console.log(`  POST /pin      { app, index?, intervalMs? } start "soft topmost" loop`);
+console.log(`  GET  /pin                                  list active pins`);
+console.log(`  DEL  /pin/:id  | DEL /pin                  stop one / all pins`);
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/window/src/osascript.ts
+import { spawn } from "bun";
+
+export async function osa(script: string): Promise<string> {
+  const proc = spawn(["osascript", "-e", script], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [out, err, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (code !== 0) {
+    throw new Error(`osascript failed (${code}): ${err.trim() || out.trim()}`);
+  }
+  return out.trim();
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/window/src/pin.ts
+import { raiseWindow } from "./windows.ts";
+
+type Pin = {
+  id: string;
+  app: string;
+  index: number;
+  intervalMs: number;
+  timer: ReturnType<typeof setInterval>;
+  startedAt: number;
+  raises: number;
+  errors: number;
+};
+
+const pins = new Map<string, Pin>();
+let nextId = 1;
+
+export type PinPublic = Omit<Pin, "timer">;
+
+export function startPin(app: string, index = 1, intervalMs = 500): PinPublic {
+  const id = String(nextId++);
+  const pin: Pin = {
+    id,
+    app,
+    index,
+    intervalMs,
+    timer: setInterval(async () => {
+      try {
+        await raiseWindow(pin.app, pin.index);
+        pin.raises++;
+      } catch {
+        pin.errors++;
+      }
+    }, intervalMs),
+    startedAt: Date.now(),
+    raises: 0,
+    errors: 0,
+  };
+  pins.set(id, pin);
+  return toPublic(pin);
+}
+
+export function stopPin(id: string): boolean {
+  const p = pins.get(id);
+  if (!p) return false;
+  clearInterval(p.timer);
+  pins.delete(id);
+  return true;
+}
+
+export function stopAllPins(): number {
+  const n = pins.size;
+  for (const p of pins.values()) clearInterval(p.timer);
+  pins.clear();
+  return n;
+}
+
+export function listPins(): PinPublic[] {
+  return Array.from(pins.values()).map(toPublic);
+}
+
+function toPublic(p: Pin): PinPublic {
+  const { timer: _t, ...rest } = p;
+  void _t;
+  return rest;
+}
+
+```
+
+```typescript
+/Users/vladimirfilipenko/meta/macos/window/src/windows.ts
+import { osa } from "./osascript.ts";
+
+export type WindowInfo = {
+  app: string;
+  pid: number;
+  title: string;
+  index: number;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+};
+
+const SEP_FIELD = String.fromCharCode(31);
+const SEP_RECORD = String.fromCharCode(30);
+
+const LIST_WINDOWS = `
+set fs to (ASCII character 31)
+set rs to (ASCII character 30)
+set out to ""
+tell application "System Events"
+  set procList to (every process whose background only is false)
+  repeat with p in procList
+    try
+      set pName to name of p as string
+      set pPid to unix id of p
+      set winList to windows of p
+      set wIdx to 0
+      repeat with w in winList
+        set wIdx to wIdx + 1
+        try
+          set wTitle to name of w as string
+        on error
+          set wTitle to ""
+        end try
+        try
+          set {wx, wy} to position of w
+        on error
+          set wx to 0
+          set wy to 0
+        end try
+        try
+          set {ww, wh} to size of w
+        on error
+          set ww to 0
+          set wh to 0
+        end try
+        set out to out & pName & fs & pPid & fs & wIdx & fs & wTitle & fs & wx & fs & wy & fs & ww & fs & wh & rs
+      end repeat
+    end try
+  end repeat
+end tell
+return out
+`;
+
+export async function listWindows(): Promise<WindowInfo[]> {
+  const raw = await osa(LIST_WINDOWS);
+  if (!raw) return [];
+  return raw
+    .split(SEP_RECORD)
+    .filter((r) => r.length > 0)
+    .map((rec) => {
+      const [app, pid, index, title, x, y, w, h] = rec.split(SEP_FIELD);
+      return {
+        app: app ?? "",
+        pid: Number(pid ?? 0),
+        index: Number(index ?? 0),
+        title: title ?? "",
+        x: Number(x ?? 0),
+        y: Number(y ?? 0),
+        width: Number(w ?? 0),
+        height: Number(h ?? 0),
+      };
+    });
+}
+
+function quote(s: string): string {
+  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
+export async function focusApp(app: string): Promise<void> {
+  await osa(`tell application ${quote(app)} to activate`);
+}
+
+export async function raiseWindow(app: string, index: number): Promise<void> {
+  await osa(
+    `tell application "System Events" to tell process ${quote(app)} to perform action "AXRaise" of window ${index}`,
+  );
+}
+
+export async function moveWindow(app: string, index: number, x: number, y: number): Promise<void> {
+  await osa(
+    `tell application "System Events" to tell process ${quote(app)} to set position of window ${index} to {${x}, ${y}}`,
+  );
+}
+
+export async function resizeWindow(app: string, index: number, width: number, height: number): Promise<void> {
+  await osa(
+    `tell application "System Events" to tell process ${quote(app)} to set size of window ${index} to {${width}, ${height}}`,
+  );
+}
+
+export async function getScreen(): Promise<{ width: number; height: number }> {
+  const raw = await osa(
+    `tell application "Finder" to get bounds of window of desktop`,
+  );
+  const parts = raw.split(",").map((s) => Number(s.trim()));
+  return { width: parts[2] ?? 0, height: parts[3] ?? 0 };
+}
+
+```
+
+```json
+/Users/vladimirfilipenko/meta/macos/window/tsconfig.json
+{
+  "extends": "../../tsconfig.base.json",
+  "include": ["src/**/*.ts"]
+}
+
+```
