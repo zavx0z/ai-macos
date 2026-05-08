@@ -13,5 +13,8 @@
     "cli": "bun src/cli.ts",
     "build": "bun build src/index.ts --target bun --outdir dist",
     "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@meta/shared": "workspace:*"
   }
 }

@@ -1,4 +1,4 @@
-import {osa, quote} from "./osascript.ts"
+import { osa, quote } from "@meta/shared";
 
 export type TabInfo = {
   id: number;

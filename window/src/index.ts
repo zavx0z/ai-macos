@@ -1,18 +1,8 @@
-import { focusApp, getScreen, listWindows, moveWindow, raiseWindow, resizeWindow } from "./windows.ts";
+import { checkAccessibility, focusApp, getScreen, listWindows, moveWindow, raiseWindow, resizeWindow } from "./windows.ts";
 import { listPins, startPin, stopAllPins, stopPin } from "./pin.ts";
+import { err, json } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? 7878);
-
-function json(body: unknown, init: ResponseInit = {}): Response {
-  return new Response(JSON.stringify(body), {
-    ...init,
-    headers: { "content-type": "application/json", ...(init.headers ?? {}) },
-  });
-}
-
-function err(status: number, message: string): Response {
-  return json({ error: message }, { status });
-}
 
 const server = Bun.serve({
   port: PORT,
@@ -118,6 +108,16 @@ const server = Bun.serve({
         return json({ ok: true, removed: n });
       }
 
+      if (path === "/permissions/accessibility" && method === "GET") {
+        return json(await checkAccessibility());
+      }
+
+      if (path === "/permissions/accessibility" && method === "POST") {
+        const proc = Bun.spawn(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]);
+        await proc.exited;
+        return json({ ...(await checkAccessibility()), opened: true });
+      }
+
       return err(404, `${method} ${path} not found`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -141,3 +141,5 @@ console.log(`  POST /raise    { app, index? }            one-shot AXRaise (no fo
 console.log(`  POST /pin      { app, index?, intervalMs? } start "soft topmost" loop`);
 console.log(`  GET  /pin                                  list active pins`);
 console.log(`  DEL  /pin/:id  | DEL /pin                  stop one / all pins`);
+console.log(`  GET  /permissions/accessibility             check Accessibility permission`);
+console.log(`  POST /permissions/accessibility             open System Settings → Accessibility`);

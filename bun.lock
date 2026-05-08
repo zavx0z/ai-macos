@@ -11,8 +11,50 @@
         "typescript": "^5",
       },
     },
+    "chrome": {
+      "name": "@meta/chrome",
+      "version": "0.0.0",
+      "bin": {
+        "chrome": "src/cli.ts",
+      },
+      "dependencies": {
+        "@meta/shared": "workspace:*",
+      },
+    },
+    "screen": {
+      "name": "@meta/screen",
+      "version": "0.0.0",
+      "bin": {
+        "screen": "src/cli.ts",
+      },
+      "dependencies": {
+        "@meta/shared": "workspace:*",
+      },
+    },
+    "shared": {
+      "name": "@meta/shared",
+      "version": "0.0.0",
+    },
+    "window": {
+      "name": "@meta/window",
+      "version": "0.0.0",
+      "bin": {
+        "window": "src/cli.ts",
+      },
+      "dependencies": {
+        "@meta/shared": "workspace:*",
+      },
+    },
   },
   "packages": {
+    "@meta/chrome": ["@meta/chrome@workspace:chrome"],
+
+    "@meta/screen": ["@meta/screen@workspace:screen"],
+
+    "@meta/shared": ["@meta/shared@workspace:shared"],
+
+    "@meta/window": ["@meta/window@workspace:window"],
+
     "@types/bun": ["@types/bun@1.3.13", "", { "dependencies": { "bun-types": "1.3.13" } }, "sha512-9fqXWk5YIHGGnUau9TEi+qdlTYDAnOj+xLCmSTwXfAIqXr2x4tytJb43E9uCvt09zJURKXwAtkoH4nLQfzeTXw=="],
 
     "@types/node": ["@types/node@25.6.0", "", { "dependencies": { "undici-types": "~7.19.0" } }, "sha512-+qIYRKdNYJwY3vRCZMdJbPLJAtGjQBudzZzdzwQYkEPQd+PJGixUL5QfvCLDaULoLv+RhT3LDkwEfKaAkgSmNQ=="],

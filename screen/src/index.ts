@@ -1,6 +1,7 @@
 import { captureDesktop, captureRect, type CaptureOptions } from "./capture.ts";
 import { frontmostApp } from "./restore.ts";
 import { createWindowApi, type WindowApi, type WindowInfo } from "./window-api.ts";
+import { clamp, err, json, nonNegativeInt, parseBoolean, png, positiveInt, sleep } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? Bun.env.SCREEN_PORT ?? 7879);
 const windowApi = createWindowApi();
@@ -14,27 +15,6 @@ type WindowCaptureRequest = {
   shadow?: boolean;
   format?: "png" | "json";
 };
-
-function json(body: unknown, init: ResponseInit = {}): Response {
-  return new Response(JSON.stringify(body), {
-    ...init,
-    headers: { "content-type": "application/json", ...(init.headers ?? {}) },
-  });
-}
-
-function err(status: number, message: string): Response {
-  return json({ error: message }, { status });
-}
-
-function png(data: Uint8Array, headers: Record<string, string> = {}): Response {
-  return new Response(data, {
-    headers: {
-      "content-type": "image/png",
-      "cache-control": "no-store",
-      ...headers,
-    },
-  });
-}
 
 const server = Bun.serve({
   port: PORT,
@@ -85,6 +65,16 @@ const server = Bun.serve({
         return await windowResponse(await readJson<WindowCaptureRequest>(req));
       }
 
+      if (path === "/permissions/screen-recording" && method === "GET") {
+        return json(await checkScreenRecording());
+      }
+
+      if (path === "/permissions/screen-recording" && method === "POST") {
+        const proc = Bun.spawn(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"]);
+        await proc.exited;
+        return json({ ...(await checkScreenRecording()), opened: true });
+      }
+
       return err(404, `${method} ${path} not found`);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -103,6 +93,8 @@ console.log(`  POST /desktop { display?, format? }`);
 console.log(`  GET  /windows[?app=Name]`);
 console.log(`  GET  /window?app=Google%20Chrome[&index=1][&restore=true][&format=png|json]`);
 console.log(`  POST /window { app, index?, title?, restore?, delayMs?, shadow?, format? }`);
+console.log(`  GET  /permissions/screen-recording          check Screen Recording permission`);
+console.log(`  POST /permissions/screen-recording          open System Settings → Screen Recording`);
 console.log(`  WINDOW_API=${windowApi.baseUrl}`);
 
 async function health(): Promise<Response> {
@@ -203,32 +195,13 @@ function parseFormat(value: string | null): "png" | "json" {
   return value === "json" ? "json" : "png";
 }
 
-function parseBoolean(value: string | null, fallback: boolean): boolean {
-  if (value === null) return fallback;
-  const normalized = value.trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(normalized)) return true;
-  if (["0", "false", "no", "off"].includes(normalized)) return false;
-  return fallback;
-}
 
-function positiveInt(value: unknown, fallback: number | undefined): number | undefined {
-  if (value === undefined || value === null || value === "") return fallback;
-  const n = Number(value);
-  if (!Number.isInteger(n) || n <= 0) return fallback;
-  return n;
-}
-
-function nonNegativeInt(value: unknown, fallback: number | undefined): number | undefined {
-  if (value === undefined || value === null || value === "") return fallback;
-  const n = Number(value);
-  if (!Number.isInteger(n) || n < 0) return fallback;
-  return n;
-}
-
-function clamp(value: number, min: number, max: number): number {
-  return Math.max(min, Math.min(max, value));
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+async function checkScreenRecording(): Promise<{ granted: boolean; error?: string }> {
+  try {
+    await captureRect({ x: 0, y: 0, width: 1, height: 1 });
+    return { granted: true };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { granted: false, error: msg };
+  }
 }

@@ -17,33 +17,9 @@ import {
   reload,
   screenshotTab,
 } from "./chrome.ts";
+import { err, json, num, parseBool } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? 7880);
-
-function json(body: unknown, init: ResponseInit = {}): Response {
-  return new Response(JSON.stringify(body), {
-    ...init,
-    headers: { "content-type": "application/json", ...(init.headers ?? {}) },
-  });
-}
-
-function err(status: number, message: string): Response {
-  return json({ error: message }, { status });
-}
-
-function num(v: string | null): number | undefined {
-  if (v == null) return undefined;
-  const n = Number(v);
-  return Number.isFinite(n) ? n : undefined;
-}
-
-function parseBool(v: string | null): boolean | undefined {
-  if (v == null) return undefined;
-  const s = v.trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(s)) return true;
-  if (["0", "false", "no", "off"].includes(s)) return false;
-  return undefined;
-}
 
 const server = Bun.serve({
   port: PORT,

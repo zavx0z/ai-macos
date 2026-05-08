@@ -1,4 +1,4 @@
-import { osa } from "./osascript.ts";
+import { osa, quote } from "@meta/shared";
 
 export type WindowInfo = {
   app: string;
@@ -74,10 +74,6 @@ export async function listWindows(): Promise<WindowInfo[]> {
     });
 }
 
-function quote(s: string): string {
-  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
-}
-
 export async function focusApp(app: string): Promise<void> {
   await osa(`tell application ${quote(app)} to activate`);
 }
@@ -106,4 +102,14 @@ export async function getScreen(): Promise<{ width: number; height: number }> {
   );
   const parts = raw.split(",").map((s) => Number(s.trim()));
   return { width: parts[2] ?? 0, height: parts[3] ?? 0 };
+}
+
+export async function checkAccessibility(): Promise<{ granted: boolean; error?: string }> {
+  try {
+    await osa(`tell application "System Events" to get count of windows of first process whose frontmost is true`);
+    return { granted: true };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    return { granted: false, error: msg };
+  }
 }
