@@ -18,10 +18,12 @@ const server = Bun.serve({
   port: PORT,
   idleTimeout: 60,
   async fetch(req) {
+    const t0 = performance.now();
     const url = new URL(req.url);
     const path = url.pathname;
     const method = req.method;
 
+    const res = await (async () => {
     try {
       if (path === "/health") return json({ ok: true });
 
@@ -121,6 +123,9 @@ const server = Bun.serve({
       const msg = e instanceof Error ? e.message : String(e);
       return err(500, msg);
     }
+    })();
+    console.log(`${method} ${path} → ${res.status} ${Math.round(performance.now() - t0)}ms`);
+    return res;
   },
 });
 
