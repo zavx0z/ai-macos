@@ -287,6 +287,8 @@ export type ScreenshotOptions = {
   delayMs?: number;
   format?: "png" | "json";
   restore?: boolean;
+  detail?: string;
+  scale?: number;
 };
 
 export type ScreenshotResult = {
@@ -327,6 +329,8 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
   }
   if (opts.shadow !== undefined) body.shadow = opts.shadow
   if (opts.delayMs !== undefined) body.delayMs = opts.delayMs
+  if (opts.detail !== undefined) body.detail = opts.detail
+  if (opts.scale !== undefined) body.scale = opts.scale
 
   const res = await fetch(`${SCREEN_API}/rect`, {
     method: "POST",

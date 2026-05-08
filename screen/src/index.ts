@@ -1,4 +1,4 @@
-import { captureDesktop, captureRect, type CaptureOptions } from "./capture.ts";
+import { captureDesktop, captureRect, parseDetail, type CaptureOptions } from "./capture.ts";
 import { frontmostApp } from "./restore.ts";
 import { createWindowApi, type WindowApi, type WindowInfo } from "./window-api.ts";
 import { clamp, err, json, logRequest, nonNegativeInt, osa, parseBoolean, png, positiveInt, printBanner, quote, sleep } from "@meta/shared";
@@ -14,6 +14,8 @@ type WindowCaptureRequest = {
   delayMs?: number;
   shadow?: boolean;
   format?: "png" | "json";
+  detail?: string;
+  scale?: number;
 };
 
 type RectCaptureRequest = {
@@ -26,6 +28,8 @@ type RectCaptureRequest = {
   delayMs?: number;
   restore?: boolean;
   format?: "png" | "json";
+  detail?: string;
+  scale?: number;
 };
 
 const server = Bun.serve({
@@ -46,12 +50,14 @@ const server = Bun.serve({
       if (path === "/desktop" && method === "GET") {
         const display = positiveInt(url.searchParams.get("display"), undefined);
         const format = parseFormat(url.searchParams.get("format"));
-        return await desktopResponse({ display }, format);
+        const scale = parseDetail(url.searchParams.get("detail") ?? url.searchParams.get("scale"));
+        return await desktopResponse({ display, scale }, format);
       }
 
       if (path === "/desktop" && method === "POST") {
-        const body = await readJson<{ display?: number; format?: "png" | "json" }>(req);
-        return await desktopResponse({ display: positiveInt(body.display, undefined) }, body.format ?? "png");
+        const body = await readJson<{ display?: number; format?: "png" | "json"; detail?: string; scale?: number }>(req);
+        const scale = parseDetail(body.detail ?? String(body.scale ?? ""), 1.0);
+        return await desktopResponse({ display: positiveInt(body.display, undefined), scale }, body.format ?? "png");
       }
 
       if (path === "/windows" && method === "GET") {
@@ -69,6 +75,8 @@ const server = Bun.serve({
           delayMs: positiveInt(url.searchParams.get("delayMs"), undefined),
           shadow: parseBoolean(url.searchParams.get("shadow"), true),
           format: parseFormat(url.searchParams.get("format")),
+          detail: url.searchParams.get("detail") ?? undefined,
+          scale: positiveInt(url.searchParams.get("scale"), undefined),
         };
         return await windowResponse(request);
       }
@@ -90,6 +98,8 @@ const server = Bun.serve({
               delayMs: positiveInt(url.searchParams.get("delayMs"), undefined),
               restore: parseBoolean(url.searchParams.get("restore"), true),
               format: parseFormat(url.searchParams.get("format")),
+              detail: url.searchParams.get("detail") ?? undefined,
+              scale: positiveInt(url.searchParams.get("scale"), undefined),
             };
         return await rectResponse(input);
       }
@@ -120,17 +130,17 @@ printBanner("@meta/screen", PORT, [
     { method: "GET", path: "/health", description: "состояние сервиса и @meta/window" },
   ]},
   { title: "Рабочий стол", routes: [
-    { method: "GET",  path: "/desktop", description: "скриншот экрана" },
-    { method: "POST", path: "/desktop", description: "скриншот экрана" },
+    { method: "GET",  path: "/desktop", description: "скриншот экрана  (?detail=low|medium|high|full)" },
+    { method: "POST", path: "/desktop", description: "скриншот экрана  ({detail?,scale?})" },
   ]},
   { title: "Окна", routes: [
     { method: "GET",  path: "/windows", description: "список захватываемых окон" },
-    { method: "GET",  path: "/window",  description: "скриншот окна по приложению" },
-    { method: "POST", path: "/window",  description: "скриншот окна по приложению" },
+    { method: "GET",  path: "/window",  description: "скриншот окна  (?app=&detail=)" },
+    { method: "POST", path: "/window",  description: "скриншот окна  ({app,detail?,scale?})" },
   ]},
   { title: "Область", routes: [
-    { method: "GET",  path: "/rect", description: "скриншот области по координатам" },
-    { method: "POST", path: "/rect", description: "скриншот области по координатам" },
+    { method: "GET",  path: "/rect", description: "скриншот области  (?x=&y=&w=&h=&detail=)" },
+    { method: "POST", path: "/rect", description: "скриншот области  ({x,y,width,height,detail?,scale?})" },
   ]},
   { title: "Разрешения", routes: [
     { method: "GET",  path: "/permissions/screen-recording", description: "проверить Screen Recording" },
@@ -169,6 +179,7 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
   const index = positiveInt(input.index, 1) ?? 1;
   const delayMs = clamp(nonNegativeInt(input.delayMs, 150) ?? 150, 0, 2_000);
   const restore = input.restore !== false;
+  const scale = parseDetail(input.detail ?? (input.scale != null ? String(input.scale) : null));
   const beforeFrontmost = restore ? await frontmostApp() : null;
 
   let target: WindowInfo | undefined;
@@ -182,7 +193,7 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
     await windowApi.raise(app, target.index);
     if (delayMs > 0) await sleep(delayMs);
 
-    const image = await captureRect(target, { shadow: input.shadow });
+    const image = await captureRect(target, { shadow: input.shadow, scale });
     const restored = await restoreFocus(windowApi, beforeFrontmost, restore);
     if (input.format === "json") {
       return json({
@@ -245,13 +256,14 @@ async function rectResponse(input: RectCaptureRequest): Promise<Response> {
 
   const delayMs = clamp(nonNegativeInt(input.delayMs, 150) ?? 150, 0, 2_000);
   const restore = input.restore !== false;
+  const scale = parseDetail(input.detail ?? (input.scale != null ? String(input.scale) : null));
   const beforeFrontmost = restore ? await frontmostApp() : null;
 
   try {
     if (input.app) await osa(`tell application ${quote(input.app)} to activate`);
     if (delayMs > 0) await sleep(delayMs);
 
-    const image = await captureRect({ x, y, width, height }, { shadow: input.shadow });
+    const image = await captureRect({ x, y, width, height }, { shadow: input.shadow, scale });
     const restored = await restoreFocus(windowApi, beforeFrontmost, restore);
 
     if (input.format === "json") {
