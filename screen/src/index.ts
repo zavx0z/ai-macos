@@ -1,7 +1,7 @@
 import { captureDesktop, captureRect, type CaptureOptions } from "./capture.ts";
 import { frontmostApp } from "./restore.ts";
 import { createWindowApi, type WindowApi, type WindowInfo } from "./window-api.ts";
-import { clamp, err, json, nonNegativeInt, osa, parseBoolean, png, positiveInt, quote, sleep } from "@meta/shared";
+import { clamp, err, json, logRequest, nonNegativeInt, osa, parseBoolean, png, positiveInt, printBanner, quote, sleep } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? Bun.env.SCREEN_PORT ?? 7879);
 const windowApi = createWindowApi();
@@ -110,23 +110,34 @@ const server = Bun.serve({
       return err(500, msg);
     }
     })();
-    console.log(`${method} ${path} → ${res.status} ${Math.round(performance.now() - t0)}ms`);
+    logRequest(method, path, res.status, Math.round(performance.now() - t0));
     return res;
   },
 });
 
-console.log(`@meta/screen listening on http://localhost:${server.port}`);
-console.log(`  GET  /health`);
-console.log(`  GET  /desktop[?display=1][&format=png|json]`);
-console.log(`  POST /desktop { display?, format? }`);
-console.log(`  GET  /windows[?app=Name]`);
-console.log(`  GET  /window?app=Google%20Chrome[&index=1][&restore=true][&format=png|json]`);
-console.log(`  POST /window { app, index?, title?, restore?, delayMs?, shadow?, format? }`);
-console.log(`  GET  /rect?x=N&y=N&width=N&height=N[&app=Name&shadow=false&format=png|json]`);
-console.log(`  POST /rect { x, y, width, height, app?, shadow?, delayMs?, restore?, format? }`);
-console.log(`  GET  /permissions/screen-recording          check Screen Recording permission`);
-console.log(`  POST /permissions/screen-recording          open System Settings → Screen Recording`);
-console.log(`  WINDOW_API=${windowApi.baseUrl}`);
+printBanner("@meta/screen", PORT, [
+  { routes: [
+    { method: "GET", path: "/health", description: "состояние сервиса и @meta/window" },
+  ]},
+  { title: "Рабочий стол", routes: [
+    { method: "GET",  path: "/desktop", description: "скриншот экрана  { display? format? }" },
+    { method: "POST", path: "/desktop", description: "скриншот экрана  { display? format? }" },
+  ]},
+  { title: "Окна", routes: [
+    { method: "GET",  path: "/windows", description: "список захватываемых окон  { app? }" },
+    { method: "GET",  path: "/window",  description: "скриншот окна по приложению  { app index? title? restore? shadow? format? }" },
+    { method: "POST", path: "/window",  description: "скриншот окна по приложению  { app index? title? restore? shadow? format? }" },
+  ]},
+  { title: "Область", routes: [
+    { method: "GET",  path: "/rect", description: "скриншот области  { x y width height app? restore? shadow? format? }" },
+    { method: "POST", path: "/rect", description: "скриншот области  { x y width height app? restore? shadow? format? }" },
+  ]},
+  { title: "Разрешения", routes: [
+    { method: "GET",  path: "/permissions/screen-recording", description: "проверить Screen Recording" },
+    { method: "POST", path: "/permissions/screen-recording", description: "открыть Настройки → Конфиденциальность" },
+  ]},
+]);
+console.log(`  WINDOW_API  ${windowApi.baseUrl}`);
 
 async function health(): Promise<Response> {
   try {

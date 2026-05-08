@@ -1,6 +1,6 @@
 import { checkAccessibility, focusApp, getScreen, listWindows, moveWindow, raiseWindow, resizeWindow } from "./windows.ts";
 import { listPins, startPin, stopAllPins, stopPin } from "./pin.ts";
-import { err, json } from "@meta/shared";
+import { err, json, logRequest, printBanner } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? 7878);
 
@@ -124,22 +124,32 @@ const server = Bun.serve({
       return err(500, msg);
     }
     })();
-    console.log(`${method} ${path} → ${res.status} ${Math.round(performance.now() - t0)}ms`);
+    logRequest(method, path, res.status, Math.round(performance.now() - t0));
     return res;
   },
 });
 
-console.log(`@meta/window listening on http://localhost:${server.port}`);
-console.log(`  GET  /health`);
-console.log(`  GET  /screen`);
-console.log(`  GET  /windows[?app=Name]`);
-console.log(`  POST /focus    { app }`);
-console.log(`  POST /move     { app, x, y, index? }`);
-console.log(`  POST /resize   { app, width, height, index? }`);
-console.log(`  POST /arrange  { app, preset, index? }   preset: left|right|top|bottom|max|center`);
-console.log(`  POST /raise    { app, index? }            one-shot AXRaise (no focus steal)`);
-console.log(`  POST /pin      { app, index?, intervalMs? } start "soft topmost" loop`);
-console.log(`  GET  /pin                                  list active pins`);
-console.log(`  DEL  /pin/:id  | DEL /pin                  stop one / all pins`);
-console.log(`  GET  /permissions/accessibility             check Accessibility permission`);
-console.log(`  POST /permissions/accessibility             open System Settings → Accessibility`);
+printBanner("@meta/window", PORT, [
+  { routes: [
+    { method: "GET", path: "/health", description: "состояние сервиса" },
+  ]},
+  { title: "Экран и окна", routes: [
+    { method: "GET",  path: "/screen",       description: "размер дисплея" },
+    { method: "GET",  path: "/windows",      description: "список окон  { app? }" },
+    { method: "POST", path: "/focus",        description: "переключить фокус  { app }" },
+    { method: "POST", path: "/move",         description: "переместить окно  { app x y index? }" },
+    { method: "POST", path: "/resize",       description: "изменить размер  { app width height index? }" },
+    { method: "POST", path: "/arrange",      description: "расположить по пресету  { app preset index? }  left|right|top|bottom|max|center" },
+    { method: "POST", path: "/raise",        description: "поднять без фокуса  { app index? }" },
+  ]},
+  { title: "Поверх других окон", routes: [
+    { method: "POST",   path: "/pin",      description: "закрепить окно поверх  { app index? intervalMs? }" },
+    { method: "GET",    path: "/pin",      description: "список закреплённых окон" },
+    { method: "DELETE", path: "/pin/:id",  description: "снять закрепление" },
+    { method: "DELETE", path: "/pin",      description: "снять все закрепления" },
+  ]},
+  { title: "Разрешения", routes: [
+    { method: "GET",  path: "/permissions/accessibility", description: "проверить Accessibility" },
+    { method: "POST", path: "/permissions/accessibility", description: "открыть Настройки → Конфиденциальность" },
+  ]},
+]);

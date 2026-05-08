@@ -17,7 +17,7 @@ import {
   reload,
   screenshotTab,
 } from "./chrome.ts";
-import { err, json, num, parseBool } from "@meta/shared";
+import { err, json, logRequest, num, parseBool, printBanner } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? 7880);
 
@@ -162,26 +162,38 @@ const server = Bun.serve({
       return err(500, msg);
     }
     })();
-    console.log(`${method} ${path} → ${res.status} ${Math.round(performance.now() - t0)}ms`);
+    logRequest(method, path, res.status, Math.round(performance.now() - t0));
     return res;
   },
 });
 
-console.log(`@meta/chrome listening on http://localhost:${server.port}`);
-console.log(`  GET  /health`);
-console.log(`  GET  /windows                              list windows + tabs`);
-console.log(`  POST /windows         { url?, incognito? } open new window`);
-console.log(`  DEL  /windows/:id                          close window`);
-console.log(`  GET  /tabs[?windowId=N]                    list tabs`);
-console.log(`  GET  /tabs/active                          info on active tab`);
-console.log(`  POST /tabs            { windowId?, url? }  open new tab`);
-console.log(`  DEL  /tabs/:wid/:idx                       close tab`);
-console.log(`  POST /navigate        { url, windowId?, tabIndex? }`);
-console.log(`  POST /activate        { windowId, tabIndex }`);
-console.log(`  POST /reload   { windowId?, tabIndex?, hard? }   hard=true → Cmd+Shift+R (steals focus)`);
-console.log(`  POST /back | /forward   { windowId?, tabIndex? }`);
-console.log(`  POST /eval            { js, windowId?, tabIndex? }   needs "Allow JS from Apple Events"`);
-console.log(`  GET  /source[?windowId=N&tabIndex=N]       outerHTML of <html>`);
-console.log(`  GET  /text[?windowId=N&tabIndex=N]         document.body.innerText`);
-console.log(`  GET  /screenshot[?windowId=N&tabIndex=N&shadow=false&delayMs=200&format=png|json]`);
-console.log(`  POST /screenshot { windowId?, tabIndex?, shadow?, delayMs?, format?, restore? }`);
+printBanner("@meta/chrome", PORT, [
+  { routes: [
+    { method: "GET", path: "/health", description: "состояние Chrome и сервиса" },
+  ]},
+  { title: "Окна и вкладки", routes: [
+    { method: "GET",    path: "/windows",        description: "список окон с вкладками" },
+    { method: "POST",   path: "/windows",        description: "открыть окно  { url? incognito? }" },
+    { method: "DELETE", path: "/windows/:id",    description: "закрыть окно" },
+    { method: "GET",    path: "/tabs",           description: "список вкладок  { windowId? }" },
+    { method: "GET",    path: "/tabs/active",    description: "активная вкладка" },
+    { method: "POST",   path: "/tabs",           description: "открыть вкладку  { windowId? url? }" },
+    { method: "DELETE", path: "/tabs/:wid/:idx", description: "закрыть вкладку" },
+  ]},
+  { title: "Навигация", routes: [
+    { method: "POST", path: "/navigate", description: "перейти по URL  { url windowId? tabIndex? }" },
+    { method: "POST", path: "/activate", description: "активировать вкладку  { windowId tabIndex }" },
+    { method: "POST", path: "/reload",   description: "перезагрузить  { hard? → Cmd+Shift+R }" },
+    { method: "POST", path: "/back",     description: "назад" },
+    { method: "POST", path: "/forward",  description: "вперёд" },
+  ]},
+  { title: "Контент", routes: [
+    { method: "POST", path: "/eval",   description: "выполнить JS в вкладке  { js windowId? tabIndex? }" },
+    { method: "GET",  path: "/source", description: "HTML страницы  { windowId? tabIndex? }" },
+    { method: "GET",  path: "/text",   description: "текст страницы  { windowId? tabIndex? }" },
+  ]},
+  { title: "Скриншот", routes: [
+    { method: "GET",  path: "/screenshot", description: "скриншот вкладки  { windowId? tabIndex? shadow? delayMs? format? }" },
+    { method: "POST", path: "/screenshot", description: "скриншот вкладки  { windowId? tabIndex? shadow? delayMs? restore? format? }" },
+  ]},
+]);
