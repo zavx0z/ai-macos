@@ -313,7 +313,7 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
 
   const body: Record<string, unknown> = {
     app: "Google Chrome",
-    title: fresh.title,
+    index: fresh.index,
     restore: opts.restore !== false,
     format: opts.format ?? "png",
   }

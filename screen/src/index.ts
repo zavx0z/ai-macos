@@ -171,7 +171,8 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
 function selectWindow(windows: WindowInfo[], index: number, title: string | undefined): WindowInfo | undefined {
   if (title !== undefined && title.length > 0) {
     const needle = title.toLowerCase();
-    return windows.find((w) => w.title.toLowerCase().includes(needle));
+    const byTitle = windows.find((w) => w.title.toLowerCase().includes(needle));
+    if (byTitle !== undefined) return byTitle;
   }
   return windows.find((w) => w.index === index);
 }
