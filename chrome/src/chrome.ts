@@ -312,6 +312,13 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
   }
 
   const fresh = (await listWindows()).find((w) => w.id === target.id) ?? target
+  const restore = opts.restore !== false
+
+  // Save frontmost app BEFORE activating Chrome
+  let prevApp: string | null = null
+  if (restore) {
+    prevApp = await osa(`tell application "System Events" to get name of first application process whose frontmost is true`).catch(() => null)
+  }
 
   // Bring the exact Chrome window to front before capture
   await osa(`tell application "Google Chrome"
@@ -324,7 +331,7 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
     y: fresh.y,
     width: fresh.width,
     height: fresh.height,
-    restore: opts.restore !== false,
+    restore: false,
     format: opts.format ?? "png",
   }
   if (opts.shadow !== undefined) body.shadow = opts.shadow
@@ -338,6 +345,12 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
     body: JSON.stringify(body),
   })
   const buf = await res.arrayBuffer()
+
+  // Restore focus after screenshot
+  if (restore && prevApp && prevApp !== "Google Chrome") {
+    await osa(`tell application ${quote(prevApp)} to activate`).catch(() => {})
+  }
+
   if (!res.ok) {
     const text = new TextDecoder().decode(buf)
     throw new Error(`screen api ${res.status}: ${text}`)
