@@ -120,17 +120,17 @@ printBanner("@meta/screen", PORT, [
     { method: "GET", path: "/health", description: "состояние сервиса и @meta/window" },
   ]},
   { title: "Рабочий стол", routes: [
-    { method: "GET",  path: "/desktop", description: "скриншот экрана  { display? format? }" },
-    { method: "POST", path: "/desktop", description: "скриншот экрана  { display? format? }" },
+    { method: "GET",  path: "/desktop", description: "скриншот экрана" },
+    { method: "POST", path: "/desktop", description: "скриншот экрана" },
   ]},
   { title: "Окна", routes: [
-    { method: "GET",  path: "/windows", description: "список захватываемых окон  { app? }" },
-    { method: "GET",  path: "/window",  description: "скриншот окна по приложению  { app index? title? restore? shadow? format? }" },
-    { method: "POST", path: "/window",  description: "скриншот окна по приложению  { app index? title? restore? shadow? format? }" },
+    { method: "GET",  path: "/windows", description: "список захватываемых окон" },
+    { method: "GET",  path: "/window",  description: "скриншот окна по приложению" },
+    { method: "POST", path: "/window",  description: "скриншот окна по приложению" },
   ]},
   { title: "Область", routes: [
-    { method: "GET",  path: "/rect", description: "скриншот области  { x y width height app? restore? shadow? format? }" },
-    { method: "POST", path: "/rect", description: "скриншот области  { x y width height app? restore? shadow? format? }" },
+    { method: "GET",  path: "/rect", description: "скриншот области по координатам" },
+    { method: "POST", path: "/rect", description: "скриншот области по координатам" },
   ]},
   { title: "Разрешения", routes: [
     { method: "GET",  path: "/permissions/screen-recording", description: "проверить Screen Recording" },
