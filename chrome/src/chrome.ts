@@ -311,12 +311,17 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
 
   const fresh = (await listWindows()).find((w) => w.id === target.id) ?? target
 
+  // Bring the exact Chrome window to front before capture
+  await osa(`tell application "Google Chrome"
+    set index of (first window whose id is ${fresh.id}) to 1
+    activate
+  end tell`)
+
   const body: Record<string, unknown> = {
     x: fresh.x,
     y: fresh.y,
     width: fresh.width,
     height: fresh.height,
-    app: "Google Chrome",
     restore: opts.restore !== false,
     format: opts.format ?? "png",
   }
