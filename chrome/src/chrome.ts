@@ -312,15 +312,18 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
   const fresh = (await listWindows()).find((w) => w.id === target.id) ?? target
 
   const body: Record<string, unknown> = {
+    x: fresh.x,
+    y: fresh.y,
+    width: fresh.width,
+    height: fresh.height,
     app: "Google Chrome",
-    index: fresh.index,
     restore: opts.restore !== false,
     format: opts.format ?? "png",
   }
   if (opts.shadow !== undefined) body.shadow = opts.shadow
   if (opts.delayMs !== undefined) body.delayMs = opts.delayMs
 
-  const res = await fetch(`${SCREEN_API}/window`, {
+  const res = await fetch(`${SCREEN_API}/rect`, {
     method: "POST",
     headers: {"content-type": "application/json"},
     body: JSON.stringify(body),

@@ -1,7 +1,7 @@
 import { captureDesktop, captureRect, type CaptureOptions } from "./capture.ts";
 import { frontmostApp } from "./restore.ts";
 import { createWindowApi, type WindowApi, type WindowInfo } from "./window-api.ts";
-import { clamp, err, json, nonNegativeInt, parseBoolean, png, positiveInt, sleep } from "@meta/shared";
+import { clamp, err, json, nonNegativeInt, osa, parseBoolean, png, positiveInt, quote, sleep } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? Bun.env.SCREEN_PORT ?? 7879);
 const windowApi = createWindowApi();
@@ -13,6 +13,18 @@ type WindowCaptureRequest = {
   restore?: boolean;
   delayMs?: number;
   shadow?: boolean;
+  format?: "png" | "json";
+};
+
+type RectCaptureRequest = {
+  x?: number;
+  y?: number;
+  width?: number;
+  height?: number;
+  app?: string;
+  shadow?: boolean;
+  delayMs?: number;
+  restore?: boolean;
   format?: "png" | "json";
 };
 
@@ -65,6 +77,23 @@ const server = Bun.serve({
         return await windowResponse(await readJson<WindowCaptureRequest>(req));
       }
 
+      if (path === "/rect" && (method === "GET" || method === "POST")) {
+        const input: RectCaptureRequest = method === "POST"
+          ? await readJson<RectCaptureRequest>(req)
+          : {
+              x: nonNegativeInt(url.searchParams.get("x"), undefined),
+              y: nonNegativeInt(url.searchParams.get("y"), undefined),
+              width: positiveInt(url.searchParams.get("width"), undefined),
+              height: positiveInt(url.searchParams.get("height"), undefined),
+              app: url.searchParams.get("app") ?? undefined,
+              shadow: parseBoolean(url.searchParams.get("shadow"), true),
+              delayMs: positiveInt(url.searchParams.get("delayMs"), undefined),
+              restore: parseBoolean(url.searchParams.get("restore"), true),
+              format: parseFormat(url.searchParams.get("format")),
+            };
+        return await rectResponse(input);
+      }
+
       if (path === "/permissions/screen-recording" && method === "GET") {
         return json(await checkScreenRecording());
       }
@@ -93,6 +122,8 @@ console.log(`  POST /desktop { display?, format? }`);
 console.log(`  GET  /windows[?app=Name]`);
 console.log(`  GET  /window?app=Google%20Chrome[&index=1][&restore=true][&format=png|json]`);
 console.log(`  POST /window { app, index?, title?, restore?, delayMs?, shadow?, format? }`);
+console.log(`  GET  /rect?x=N&y=N&width=N&height=N[&app=Name&shadow=false&format=png|json]`);
+console.log(`  POST /rect { x, y, width, height, app?, shadow?, delayMs?, restore?, format? }`);
 console.log(`  GET  /permissions/screen-recording          check Screen Recording permission`);
 console.log(`  POST /permissions/screen-recording          open System Settings → Screen Recording`);
 console.log(`  WINDOW_API=${windowApi.baseUrl}`);
@@ -195,6 +226,43 @@ function parseFormat(value: string | null): "png" | "json" {
   return value === "json" ? "json" : "png";
 }
 
+
+async function rectResponse(input: RectCaptureRequest): Promise<Response> {
+  const { x, y, width, height } = input;
+  if (x == null || y == null || width == null || height == null)
+    return err(400, "need {x, y, width, height}");
+
+  const delayMs = clamp(nonNegativeInt(input.delayMs, 150) ?? 150, 0, 2_000);
+  const restore = input.restore !== false;
+  const beforeFrontmost = restore ? await frontmostApp() : null;
+
+  try {
+    if (input.app) await osa(`tell application ${quote(input.app)} to activate`);
+    if (delayMs > 0) await sleep(delayMs);
+
+    const image = await captureRect({ x, y, width, height }, { shadow: input.shadow });
+    const restored = await restoreFocus(windowApi, beforeFrontmost, restore);
+
+    if (input.format === "json") {
+      return json({
+        ok: true,
+        target: "rect",
+        mime: "image/png",
+        rect: { x, y, width, height },
+        restored,
+        base64: Buffer.from(image).toString("base64"),
+      });
+    }
+    return png(image, {
+      "x-meta-screen-target": "rect",
+      "x-meta-rect": `${x},${y},${width},${height}`,
+      "x-meta-window-restored": restored.ok ? "true" : "false",
+    });
+  } catch (e) {
+    await restoreFocus(windowApi, beforeFrontmost, restore);
+    throw e;
+  }
+}
 
 async function checkScreenRecording(): Promise<{ granted: boolean; error?: string }> {
   try {
