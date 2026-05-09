@@ -1,3 +1,7 @@
+import { mkdtemp, readFile, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { spawn } from "bun";
 import { osa, quote } from "@meta/shared";
 
 export type TabInfo = {
@@ -344,7 +348,7 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
     headers: {"content-type": "application/json"},
     body: JSON.stringify(body),
   })
-  const buf = await res.arrayBuffer()
+  let buf = await res.arrayBuffer()
 
   // Restore focus after screenshot
   if (restore && prevApp && prevApp !== "Google Chrome") {
@@ -355,9 +359,43 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
     const text = new TextDecoder().decode(buf)
     throw new Error(`screen api ${res.status}: ${text}`)
   }
+
+  // Apply scale locally (screen service may be running without the detail feature)
+  const scale = resolveScale(opts.detail, opts.scale)
+  if (scale < 1) buf = await downscalePng(buf, scale)
+
   return {
     status: res.status,
     contentType: res.headers.get("content-type") ?? "application/octet-stream",
     body: buf,
+  }
+}
+
+const DETAIL_SCALE: Record<string, number> = { low: 0.25, medium: 0.5, high: 0.75, full: 1.0 }
+
+function resolveScale(detail?: string, scale?: number): number {
+  if (detail && detail in DETAIL_SCALE) return DETAIL_SCALE[detail]!
+  if (scale !== undefined && scale > 0 && scale <= 1) return scale
+  return 1.0
+}
+
+async function downscalePng(buf: ArrayBuffer, scale: number): Promise<ArrayBuffer> {
+  const dir = await mkdtemp(join(tmpdir(), "meta-chrome-"))
+  const path = join(dir, "shot.png")
+  try {
+    await Bun.write(path, buf)
+    const info = spawn(["sips", "-g", "pixelWidth", path], { stdout: "pipe", stderr: "pipe" })
+    const out = await new Response(info.stdout).text()
+    await info.exited
+    const match = out.match(/pixelWidth:\s+(\d+)/)
+    if (match) {
+      const w = Math.max(1, Math.round(parseInt(match[1]!) * scale))
+      const sips = spawn(["sips", "--resampleWidth", String(w), "--out", path, path], { stdout: "pipe", stderr: "pipe" })
+      await sips.exited
+    }
+    const data = await readFile(path)
+    return data.buffer as ArrayBuffer
+  } finally {
+    await rm(dir, { recursive: true, force: true })
   }
 }

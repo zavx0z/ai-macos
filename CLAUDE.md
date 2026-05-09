@@ -176,12 +176,31 @@ curl -s -X POST http://localhost:7880/screenshot \
   -d '{"detail":"medium","windowId":12345,"tabIndex":2}' -o /tmp/chrome.png
 ```
 
+## ⚠️ Скриншот Chrome — только через @meta/chrome
+
+**НЕЛЬЗЯ** делать скриншот Chrome через `@meta/screen` (`/window` или `/rect` напрямую):
+- `GET /window?app=Google%20Chrome` → вернёт 404 (нет Accessibility к Chrome окнам)
+- `POST /window` → то же самое
+
+**ПРАВИЛЬНО** — только через `@meta/chrome`:
+```bash
+curl -s -X POST http://localhost:7880/screenshot \
+  -H 'content-type: application/json' \
+  -d '{"detail":"medium"}' -o screenshot.png
+```
+
+`@meta/chrome` сам:
+1. Получает координаты окна через AppleScript (не нужна Accessibility)
+2. Приводит нужное окно/вкладку на передний план
+3. Вызывает `/rect` у `@meta/screen` с готовыми координатами
+4. Масштабирует результат согласно `detail` / `scale`
+5. Возвращает фокус предыдущему приложению
+
 ## Важные правила
 
 - Никогда не использовать `osascript` / AppleScript / `screencapture` напрямую — только через REST API.
 - Перед первой операцией вызвать `GET /health` нужного сервиса.
 - При `granted: false` — вызвать `POST /permissions/*`, сообщить пользователю. **Не ретраить.**
-- Для скриншота Chrome — `POST /screenshot` у `@meta/chrome`, не напрямую в `@meta/screen`.
 - Имена приложений в `app` — каноническое имя процесса macOS (`"Google Chrome"`, не `"chrome"`).
 - `windowId` в Chrome-сервисе — стабильный AppleScript ID из `GET /windows`, предпочтительнее `index`.
 - При ошибке `osascript failed (-1743)` — нет разрешения Automation.

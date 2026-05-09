@@ -30,21 +30,23 @@ const server = Bun.serve({
 
       if (path === "/focus" && method === "POST") {
         const body = (await req.json()) as { app?: string };
-        if (!body.app) return err(400, "missing 'app'");
+        if (!body.app) return err(400, "missing 'app'", "Укажите имя процесса macOS: {\"app\": \"Google Chrome\"}");
         await focusApp(body.app);
         return json({ ok: true });
       }
 
       if (path === "/move" && method === "POST") {
         const body = (await req.json()) as { app?: string; index?: number; x?: number; y?: number };
-        if (!body.app || body.x == null || body.y == null) return err(400, "need {app, x, y, index?}");
+        if (!body.app || body.x == null || body.y == null)
+          return err(400, "need {app, x, y, index?}", "Пример: {\"app\":\"iTerm2\",\"x\":0,\"y\":0}");
         await moveWindow(body.app, body.index ?? 1, body.x, body.y);
         return json({ ok: true });
       }
 
       if (path === "/resize" && method === "POST") {
         const body = (await req.json()) as { app?: string; index?: number; width?: number; height?: number };
-        if (!body.app || body.width == null || body.height == null) return err(400, "need {app, width, height, index?}");
+        if (!body.app || body.width == null || body.height == null)
+          return err(400, "need {app, width, height, index?}", "Пример: {\"app\":\"iTerm2\",\"width\":960,\"height\":600}");
         await resizeWindow(body.app, body.index ?? 1, body.width, body.height);
         return json({ ok: true });
       }
@@ -55,7 +57,8 @@ const server = Bun.serve({
           index?: number;
           preset?: "left" | "right" | "top" | "bottom" | "max" | "center";
         };
-        if (!body.app || !body.preset) return err(400, "need {app, preset}");
+        if (!body.app || !body.preset)
+          return err(400, "need {app, preset}", "Пресеты: left | right | top | bottom | max | center");
         const screen = await getScreen();
         const idx = body.index ?? 1;
         const W = screen.width;
@@ -71,7 +74,7 @@ const server = Bun.serve({
           center: [Math.floor(W / 4), Math.floor(H / 8), Math.floor(W / 2), Math.floor((H * 3) / 4)],
         };
         const p = presets[body.preset];
-        if (!p) return err(400, `unknown preset '${body.preset}'`);
+        if (!p) return err(400, `unknown preset '${body.preset}'`, "Доступные пресеты: left | right | top | bottom | max | center");
         await moveWindow(body.app, idx, p[0], p[1]);
         await resizeWindow(body.app, idx, p[2], p[3]);
         return json({ ok: true, applied: { x: p[0], y: p[1], width: p[2], height: p[3] } });
@@ -79,7 +82,7 @@ const server = Bun.serve({
 
       if (path === "/raise" && method === "POST") {
         const body = (await req.json()) as { app?: string; index?: number };
-        if (!body.app) return err(400, "missing 'app'");
+        if (!body.app) return err(400, "missing 'app'", "Укажите имя процесса macOS: {\"app\": \"Google Chrome\"}");
         await raiseWindow(body.app, body.index ?? 1);
         return json({ ok: true });
       }
@@ -90,9 +93,9 @@ const server = Bun.serve({
 
       if (path === "/pin" && method === "POST") {
         const body = (await req.json()) as { app?: string; index?: number; intervalMs?: number };
-        if (!body.app) return err(400, "missing 'app'");
+        if (!body.app) return err(400, "missing 'app'", "Пример: {\"app\":\"iTerm2\",\"intervalMs\":500}");
         const interval = body.intervalMs ?? 500;
-        if (interval < 100) return err(400, "intervalMs must be >= 100");
+        if (interval < 100) return err(400, "intervalMs must be >= 100", "Минимальный интервал 100 мс чтобы не перегружать систему");
         const pin = startPin(body.app, body.index ?? 1, interval);
         return json({ ok: true, pin });
       }
@@ -118,10 +121,11 @@ const server = Bun.serve({
         return json({ ...(await checkAccessibility()), opened: true });
       }
 
-      return err(404, `${method} ${path} not found`);
+      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /screen /windows /pin, POST /focus /move /resize /arrange /raise /pin, DELETE /pin /pin/:id");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      return err(500, msg);
+      const isAccessibility = msg.includes("-25211") || msg.includes("osascript failed (1)");
+      return err(500, msg, isAccessibility ? "Нет разрешения Accessibility. Выдайте его в POST http://localhost:7878/permissions/accessibility" : undefined);
     }
     })();
     logRequest(method, path, res.status, Math.round(performance.now() - t0));

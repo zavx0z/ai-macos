@@ -114,10 +114,11 @@ const server = Bun.serve({
         return json({ ...(await checkScreenRecording()), opened: true });
       }
 
-      return err(404, `${method} ${path} not found`);
+      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /desktop /windows /window /rect, POST /desktop /window /rect, GET|POST /permissions/screen-recording");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      return err(500, msg);
+      const isScreenRecording = msg.includes("screencapture failed") || msg.includes("kCGErrorFailure");
+      return err(500, msg, isScreenRecording ? "Нет разрешения Screen Recording. Выдайте его в POST http://localhost:7879/permissions/screen-recording" : undefined);
     }
     })();
     logRequest(method, path, res.status, Math.round(performance.now() - t0));
@@ -173,7 +174,8 @@ async function desktopResponse(options: CaptureOptions, format: "png" | "json"):
 }
 
 async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
-  if (input.app === undefined || input.app.trim().length === 0) return err(400, "missing 'app'");
+  if (input.app === undefined || input.app.trim().length === 0)
+    return err(400, "missing 'app'", "Укажите имя приложения: {\"app\": \"Google Chrome\"}");
 
   const app = input.app;
   const index = positiveInt(input.index, 1) ?? 1;
@@ -187,7 +189,11 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
     const windows = await windowApi.listWindows(app);
     target = selectWindow(windows, index, input.title);
     if (target === undefined) {
-      return err(404, `window not found: app=${app} index=${index}${input.title ? ` title=${input.title}` : ""}`);
+      const isChrome = app.toLowerCase().includes("chrome");
+      const hint = isChrome
+        ? `Для скриншота Chrome используйте POST http://localhost:7880/screenshot — не нужна Accessibility`
+        : `Проверьте: 1) приложение открыто, 2) разрешение Accessibility выдано (GET http://localhost:7878/permissions/accessibility)`;
+      return err(404, `window not found: app=${app} index=${index}${input.title ? ` title=${input.title}` : ""}`, hint);
     }
 
     await windowApi.raise(app, target.index);

@@ -82,7 +82,7 @@ const server = Bun.serve({
 
       if (path === "/navigate" && method === "POST") {
         const body = (await req.json()) as { url?: string; windowId?: number; tabIndex?: number };
-        if (!body.url) return err(400, "missing 'url'");
+        if (!body.url) return err(400, "missing 'url'", "Пример: {\"url\":\"https://example.com\"}");
         await navigate(body.url, body.windowId, body.tabIndex);
         return json({ ok: true });
       }
@@ -90,7 +90,7 @@ const server = Bun.serve({
       if (path === "/activate" && method === "POST") {
         const body = (await req.json()) as { windowId?: number; tabIndex?: number };
         if (body.windowId == null || body.tabIndex == null) {
-          return err(400, "need {windowId, tabIndex}");
+          return err(400, "need {windowId, tabIndex}", "Получите windowId из GET /windows, tabIndex — из списка tabs");
         }
         await activateTab(body.windowId, body.tabIndex);
         return json({ ok: true });
@@ -120,7 +120,7 @@ const server = Bun.serve({
 
       if (path === "/eval" && method === "POST") {
         const body = (await req.json()) as { js?: string; windowId?: number; tabIndex?: number };
-        if (!body.js) return err(400, "missing 'js'");
+        if (!body.js) return err(400, "missing 'js'", "Пример: {\"js\":\"return document.title\"}");
         const result = await evalJs(body.js, body.windowId, body.tabIndex);
         return json({ ok: true, result });
       }
@@ -156,10 +156,18 @@ const server = Bun.serve({
         });
       }
 
-      return err(404, `${method} ${path} not found`);
+      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /windows /tabs /tabs/active /source /text /screenshot, POST /windows /tabs /navigate /activate /reload /back /forward /eval /screenshot, DELETE /windows/:id /tabs/:wid/:idx");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      return err(500, msg);
+      let hint: string | undefined;
+      if (msg.includes("-1743") || msg.includes("not authorized to send Apple events")) {
+        hint = "Нет разрешения Automation для Chrome. Выдайте в System Settings → Privacy → Automation";
+      } else if (msg.includes("JavaScript") && msg.includes("Apple Events")) {
+        hint = "Включите View → Developer → Allow JavaScript from Apple Events в Chrome";
+      } else if (msg.includes("screen api")) {
+        hint = "Сервис @meta/screen недоступен. Убедитесь что он запущен: cd screen && bun src/index.ts";
+      }
+      return err(500, msg, hint);
     }
     })();
     logRequest(method, path, res.status, Math.round(performance.now() - t0));
