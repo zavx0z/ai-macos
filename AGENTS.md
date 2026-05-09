@@ -204,6 +204,8 @@ curl -s -X POST http://localhost:7880/screenshot \
 
 Chrome на Android-телефоне через ADB + CDP. **`adb` устанавливается автоматически** на старте сервиса (через `brew install --cask android-platform-tools`). От пользователя нужно: USB Debugging на телефоне, кабель, открытый Chrome. `ANDROID_AUTO_INSTALL=false` отключает авто-установку.
 
+> ⚠️ ADB forward использует порт **9223** (не 9222). Порт 9222 зарезервирован под десктопный Chrome CDP. Если сервис возвращает корректный `browser` в `/health`, но скриншоты/вкладки выглядят как с маковского Chrome — порты конфликтуют, нужен `POST /bootstrap`.
+
 ```bash
 # Проверка состояния
 curl http://localhost:7881/health

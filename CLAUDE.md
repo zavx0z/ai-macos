@@ -209,6 +209,8 @@ curl -s -X POST http://localhost:7880/screenshot \
 
 Требования: USB Debugging на телефоне, Chrome открыт хотя бы с одной вкладкой. **`adb` ставится автоматически** через `brew install --cask android-platform-tools` при старте сервиса (можно отключить переменной `ANDROID_AUTO_INSTALL=false`). При ошибках — `POST /bootstrap` пере-проверяет и пытается установить заново.
 
+> ⚠️ ADB forward использует порт **9223** (не 9222). Порт 9222 зарезервирован под десктопный Chrome CDP (`bun run cdp`). Если `/forward` падает с "Address already in use" на 9223 — другой процесс занял этот порт. Если сервис ошибочно подключается к маковскому Chrome вместо телефона — признак конфликта портов.
+
 ```bash
 # Health: статус adb + список устройств + проверка CDP
 curl http://localhost:7881/health
