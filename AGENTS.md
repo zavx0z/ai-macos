@@ -131,7 +131,16 @@ curl -s -X POST http://localhost:7879/rect \
 
 ## @meta/chrome — порт 7880
 
-Health: `{ ok, running }` — `running: false` означает Chrome не запущен.
+Health: `{ ok, running, cdp }` — `running: false` Chrome не запущен; `cdp.available: true` если Chrome запущен с `--remote-debugging-port=9222`.
+
+**Гибрид CDP / AppleScript:** при доступном CDP `evalJs`/`navigate`/`reload` идут через CDP — не нужны "Allow JavaScript from Apple Events" и Automation. Без флага debug-port — обычный AppleScript-путь. Ответы `/navigate` и `/reload` содержат `via: "cdp" | "applescript"`.
+
+Чтобы поднять Chrome с CDP:
+```bash
+osascript -e 'quit app "Google Chrome"' && sleep 1 && \
+open -a "Google Chrome" --args --remote-debugging-port=9222
+curl http://localhost:7880/cdp     # { available: true, browser: "Chrome/..." }
+```
 
 ```bash
 # Окна
