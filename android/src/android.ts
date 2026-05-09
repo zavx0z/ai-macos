@@ -1,5 +1,5 @@
 import { mkdtemp, readFile, rm } from "node:fs/promises"
-import { tmpdir } from "node:os"
+import { networkInterfaces, tmpdir } from "node:os"
 import { join } from "node:path"
 import { spawn } from "bun"
 import { logCaption } from "@meta/shared"
@@ -112,6 +112,36 @@ export async function getSource(tabId?: string): Promise<string> {
 
 export async function getText(tabId?: string): Promise<string> {
   return await evalJs("return document.body && document.body.innerText || '';", tabId)
+}
+
+export function getLocalIp(): string | null {
+  const nets = networkInterfaces()
+  for (const name of Object.keys(nets)) {
+    for (const net of nets[name] ?? []) {
+      if (net.family === "IPv4" && !net.internal) return net.address
+    }
+  }
+  return null
+}
+
+export async function openDev(opts: { port: number; tabId?: string; path?: string }): Promise<{ url: string; tab: TabInfo }> {
+  const ip = getLocalIp()
+  if (!ip) throw new Error("локальный IPv4-адрес не найден")
+  const url = `http://${ip}:${opts.port}${opts.path ?? "/"}`
+  if (opts.tabId) {
+    await navigate(url, opts.tabId)
+    const tabs = await listTabs()
+    const tab = tabs.find((t) => t.id === opts.tabId) ?? tabs[0]!
+    return { url, tab }
+  }
+  // Android Chrome не поддерживает CDP /json/new — открываем через ADB intent
+  const { spawn: spawnProc } = await import("bun")
+  const proc = spawnProc(["adb", "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url, "com.android.chrome"], { stdout: "pipe", stderr: "pipe" })
+  await proc.exited
+  await new Promise((r) => setTimeout(r, 800))
+  const tabs = await listTabs()
+  const tab = tabs[0]!
+  return { url, tab }
 }
 
 export type ScreenshotOptions = {

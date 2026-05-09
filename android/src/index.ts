@@ -4,11 +4,13 @@ import {
   ensureForward,
   evalJs,
   getActiveTab,
+  getLocalIp,
   getSource,
   getText,
   listTabs,
   navigate,
   newTab,
+  openDev,
   reload,
   screenshot,
 } from "./android.ts"
@@ -97,6 +99,19 @@ const server = Bun.serve({
           if (!body.tabId) return err(400, "missing 'tabId'", "Получите tabId из GET /tabs")
           await activateTab(body.tabId)
           return json({ ok: true, tabId: body.tabId })
+        }
+
+        if (path === "/dev" && method === "POST") {
+          const body = (await req.json().catch(() => ({}))) as { port?: number; tabId?: string; path?: string }
+          if (!body.port) return err(400, "missing 'port'", "Пример: {\"port\":3000}")
+          const result = await openDev({ port: body.port, tabId: body.tabId, path: body.path })
+          return json({ ok: true, url: result.url, tab: result.tab })
+        }
+
+        if (path === "/dev/ip" && method === "GET") {
+          const ip = getLocalIp()
+          if (!ip) return err(500, "локальный IP не найден")
+          return json({ ok: true, ip })
         }
 
         if (path === "/navigate" && method === "POST") {
@@ -192,6 +207,10 @@ printBanner("@meta/android", PORT, [
     { method: "POST",   path: "/tabs",         description: "открыть вкладку  ({url?})" },
     { method: "DELETE", path: "/tabs/:id",     description: "закрыть вкладку" },
     { method: "POST",   path: "/activate",     description: "активировать  ({tabId})" },
+  ]},
+  { title: "Разработка", routes: [
+    { method: "POST", path: "/dev",    description: "открыть локальный сервер в Chrome телефона  ({port,tabId?,path?})" },
+    { method: "GET",  path: "/dev/ip", description: "локальный IPv4 мака" },
   ]},
   { title: "Навигация", routes: [
     { method: "POST", path: "/navigate", description: "перейти по URL  ({url,tabId?})" },
