@@ -155,6 +155,7 @@ curl -X DELETE http://localhost:7880/tabs/12345/2   # /tabs/:windowId/:index
 curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' -d '{"url":"https://example.com"}'
 curl -X POST http://localhost:7880/activate -H 'content-type: application/json' \
   -d '{"windowId":12345,"tabIndex":2}'   # ← оба поля обязательны
+# → { ok, windowId, tabIndex }   ← передай windowId в следующий /screenshot!
 curl -X POST http://localhost:7880/reload
 curl -X POST http://localhost:7880/reload -H 'content-type: application/json' \
   -d '{"hard":true}'     # → Cmd+Shift+R, переносит фокус на Chrome
@@ -169,12 +170,12 @@ curl http://localhost:7880/source              # outerHTML (text/html)
 curl http://localhost:7880/text                # innerText (text/plain)
 curl "http://localhost:7880/source?windowId=12345&tabIndex=2"
 
-# Скриншот — всегда передавать caption с ожиданием
+# Скриншот — всегда передавать windowId и caption
+# windowId берём из GET /windows или из ответа POST /activate
 curl -s -X POST http://localhost:7880/screenshot \
   -H 'content-type: application/json' \
-  -d '{"detail":"medium","caption":"Ожидаю увидеть форму логина"}' -o /tmp/chrome.png
-# caption логируется до захвата, возвращается в x-meta-caption заголовке
-# После получения: сравнить ожидание с реальностью
+  -d '{"windowId":12345,"detail":"medium","caption":"Ожидаю увидеть форму логина"}' -o /tmp/chrome.png
+# Без windowId берётся первое окно Chrome — может быть не то!
 ```
 
 ## ⚠️ Скриншот Chrome — только через @meta/chrome

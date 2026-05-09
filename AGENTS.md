@@ -155,6 +155,7 @@ curl -X DELETE http://localhost:7880/tabs/12345/2   # /tabs/:windowId/:index
 curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' -d '{"url":"https://example.com"}'
 curl -X POST http://localhost:7880/activate -H 'content-type: application/json' \
   -d '{"windowId":12345,"tabIndex":2}'   # ← оба поля обязательны
+# → { ok, windowId, tabIndex }   ← сохрани windowId для следующего /screenshot!
 curl -X POST http://localhost:7880/reload
 curl -X POST http://localhost:7880/reload -H 'content-type: application/json' \
   -d '{"hard":true}'     # → Cmd+Shift+R, переносит фокус на Chrome
@@ -169,10 +170,11 @@ curl http://localhost:7880/source              # outerHTML (text/html)
 curl http://localhost:7880/text                # innerText (text/plain)
 curl "http://localhost:7880/source?windowId=12345&tabIndex=2"
 
-# Скриншот — всегда передавать caption
+# Скриншот — всегда передавать windowId (из /windows или из ответа /activate) и caption
 curl -s -X POST http://localhost:7880/screenshot \
   -H 'content-type: application/json' \
-  -d '{"detail":"medium","caption":"Ожидаю увидеть главную страницу с навигацией"}' -o chrome.png
+  -d '{"windowId":12345,"detail":"medium","caption":"Ожидаю увидеть главную страницу с навигацией"}' -o chrome.png
+# Без windowId берётся первое окно Chrome — может быть не то!
 # caption логируется до захвата, возвращается в x-meta-caption заголовке
 ```
 
@@ -184,8 +186,9 @@ curl -s -X POST http://localhost:7880/screenshot \
 4. Для скриншотов передавать `detail="medium"` если пользователь не указал иное.
 5. Использовать только REST API — никакого прямого `osascript`, `screencapture` или AppleScript.
 6. Имя приложения (`app`) — каноническое имя процесса macOS, строго по системному.
-7. `windowId` в Chrome-сервисе — стабильный AppleScript ID из `GET /windows`, предпочтительнее `index`.
+7. `windowId` в Chrome-сервисе — стабильный AppleScript ID из `GET /windows`. **Всегда передавать `windowId` в `/screenshot`** — без него берётся первое окно и можно попасть на неверное.
 8. Для скриншота Chrome использовать `POST /screenshot` у `@meta/chrome`, **не** напрямую в `@meta/screen` (`/window` или `/rect` не видят Chrome без Accessibility).
+   Сценарий: `GET /windows` → взять нужный `windowId` → `POST /activate {windowId, tabIndex}` → `POST /screenshot {windowId, detail, caption}`.
 9. `hard: true` в `/reload` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
 10. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
 11. При ошибке `osascript failed (-1743)` — нет разрешения Automation.

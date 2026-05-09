@@ -93,7 +93,7 @@ const server = Bun.serve({
           return err(400, "need {windowId, tabIndex}", "Получите windowId из GET /windows, tabIndex — из списка tabs");
         }
         await activateTab(body.windowId, body.tabIndex);
-        return json({ ok: true });
+        return json({ ok: true, windowId: body.windowId, tabIndex: body.tabIndex });
       }
 
       if (path === "/reload" && method === "POST") {

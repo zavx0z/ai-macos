@@ -214,9 +214,10 @@ export async function closeTab(windowId: number, tabIndex: number): Promise<void
 }
 
 export async function activateTab(windowId: number, tabIndex: number): Promise<void> {
-  await osa(
-    `tell application "Google Chrome" to set active tab index of window id ${windowId} to ${tabIndex}`,
-  )
+  await osa(`tell application "Google Chrome"
+    set active tab index of window id ${windowId} to ${tabIndex}
+    set index of window id ${windowId} to 1
+  end tell`)
 }
 
 export async function navigate(
