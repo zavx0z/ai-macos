@@ -18,6 +18,13 @@ export const KEY_CODES: Record<string, number> = {
   escape: 53, esc: 53,
   capslock: 57,
 
+  // Modifier keys (как самостоятельные клавиши, не модификаторы)
+  shift: 56, "shift-right": 60,
+  control: 59, "control-right": 62, ctrl: 59,
+  option: 58, "option-right": 61, alt: 58, opt: 58,
+  command: 55, "command-right": 54, cmd: 55, meta: 55,
+  fn: 63, function: 63,
+
   // Arrows
   left: 123, right: 124, down: 125, up: 126,
   arrowleft: 123, arrowright: 124, arrowdown: 125, arrowup: 126,
