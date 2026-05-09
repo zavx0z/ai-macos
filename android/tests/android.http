@@ -2,6 +2,8 @@
 # Требует: USB Debugging, кабель/wifi, открытый Chrome на телефоне.
 # adb auto-installs at startup via brew/port.
 
+@androidHost = http://localhost:7881
+
 ### Health
 GET {{androidHost}}/health
 Accept: application/json

@@ -2,6 +2,8 @@
 # cliclick для мыши + AppleScript System Events для клавиатуры.
 # Требует Accessibility для bun или терминала, из которого запущен сервис.
 
+@inputHost = http://localhost:7882
+
 ### Health (включает active probe Accessibility)
 GET {{inputHost}}/health
 Accept: application/json
@@ -23,13 +25,13 @@ Accept: application/json
 ### Открыть System Settings → Privacy → Accessibility
 POST {{inputHost}}/permissions/accessibility
 
-# ════════════════════════════════════════════════════════════════════
-# Проверка Accessibility — запускать ПОДРЯД сверху вниз после
-# выдачи прав. Тесты должны стать зелёными.
-# Что добавить в Accessibility:
-#   - /opt/local/bin/cliclick (или путь из /health.cliclick)
-#   - /Users/vladimirfilipenko/.bun/bin/bun
-# ════════════════════════════════════════════════════════════════════
+// ════════════════════════════════════════════════════════════════════
+// Проверка Accessibility — запускать ПОДРЯД сверху вниз после
+// выдачи прав. Тесты должны стать зелёными.
+// Что добавить в Accessibility:
+//   - /opt/local/bin/cliclick (или путь из /health.cliclick)
+//   - /Users/vladimirfilipenko/.bun/bin/bun
+// ════════════════════════════════════════════════════════════════════
 
 ### 1. Bootstrap → проверить флаг accessibility
 POST {{inputHost}}/bootstrap
@@ -115,9 +117,7 @@ Content-Type: application/json
   })
 %}
 
-# ════════════════════════════════════════════════════════════════════
-
-# ─── Мышь ──────────────────────────────────────────────────────────
+// ─── Мышь ──────────────────────────────────────────────────────────
 
 ### Текущая позиция курсора
 GET {{inputHost}}/mouse/position
@@ -224,7 +224,7 @@ Content-Type: application/json
   "dy": 0
 }
 
-# ─── Клавиатура ────────────────────────────────────────────────────
+// ─── Клавиатура ────────────────────────────────────────────────────
 
 ### Набрать текст
 POST {{inputHost}}/keyboard/type

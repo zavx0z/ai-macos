@@ -2,6 +2,8 @@
 # Гибридный режим: CDP при наличии --remote-debugging-port=9222, иначе AppleScript.
 # Включить CDP: cd chrome && bun run cdp
 
+@chromeHost = http://localhost:7880
+
 ### Health
 GET {{chromeHost}}/health
 Accept: application/json

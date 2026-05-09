@@ -1,6 +1,8 @@
 # @meta/window — управление окнами macOS (порт 7878)
 # Запуск: cd .. && bun run dev   (или cd window && bun --hot src/index.ts)
 
+@windowHost = http://localhost:7878
+
 ### Health
 GET {{windowHost}}/health
 Accept: application/json

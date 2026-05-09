@@ -1,6 +1,8 @@
 # @meta/screen — скриншоты (порт 7879)
 # Зависит от @meta/window для геометрии и фокус-восстановления.
 
+@screenHost = http://localhost:7879
+
 ### Health
 GET {{screenHost}}/health
 Accept: application/json
