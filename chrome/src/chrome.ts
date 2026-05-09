@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
 import { logCaption, osa, quote } from "@meta/shared";
+import { cdpEval, cdpNavigate, cdpReload, findTargetByUrl, isCdpAvailable } from "./cdp-mode.ts";
 
 export type TabInfo = {
   id: number;
@@ -220,23 +221,57 @@ export async function activateTab(windowId: number, tabIndex: number): Promise<v
   end tell`)
 }
 
+async function tabUrl(windowId?: number, tabIndex?: number): Promise<string> {
+  return (await osa(`tell application "Google Chrome" to return URL of ${tabRef(windowId, tabIndex)}`)).trim()
+}
+
 export async function navigate(
   url: string,
   windowId?: number,
   tabIndex?: number,
-): Promise<void> {
+): Promise<{ via: "cdp" | "applescript" }> {
+  if (await isCdpAvailable()) {
+    const currentUrl = await tabUrl(windowId, tabIndex).catch(() => "")
+    const target = currentUrl ? await findTargetByUrl(currentUrl) : null
+    if (target) {
+      await cdpNavigate(target, url)
+      return { via: "cdp" }
+    }
+  }
   await osa(
     `tell application "Google Chrome" to set URL of ${tabRef(windowId, tabIndex)} to ${quote(url)}`,
   )
+  return { via: "applescript" }
 }
 
-export async function reload(windowId?: number, tabIndex?: number, wait = true): Promise<number> {
+export async function reload(
+  windowId?: number,
+  tabIndex?: number,
+  wait = true,
+): Promise<{ waitMs: number; via: "cdp" | "applescript" }> {
+  if (await isCdpAvailable()) {
+    const url = await tabUrl(windowId, tabIndex).catch(() => "")
+    const target = url ? await findTargetByUrl(url) : null
+    if (target) {
+      const waitMs = await cdpReload(target, false, wait)
+      return { waitMs, via: "cdp" }
+    }
+  }
   await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to reload`)
-  if (wait) return await waitForTabLoad(windowId, tabIndex)
-  return 0
+  const waitMs = wait ? await waitForTabLoad(windowId, tabIndex) : 0
+  return { waitMs, via: "applescript" }
 }
 
-export async function hardReload(windowId?: number, tabIndex?: number, wait = true): Promise<number> {
+export async function hardReload(windowId?: number, tabIndex?: number, wait = true): Promise<{ waitMs: number; via: "cdp" | "applescript" }> {
+  // CDP path: ignoreCache:true is the equivalent of Cmd+Shift+R, без воровства фокуса
+  if (await isCdpAvailable()) {
+    const url = await tabUrl(windowId, tabIndex).catch(() => "")
+    const target = url ? await findTargetByUrl(url) : null
+    if (target) {
+      const waitMs = await cdpReload(target, true, wait)
+      return { waitMs, via: "cdp" }
+    }
+  }
   if (windowId != null) {
     await osa(`tell application "Google Chrome" to set index of window id ${windowId} to 1`)
   }
@@ -251,8 +286,8 @@ export async function hardReload(windowId?: number, tabIndex?: number, wait = tr
       key code 15 using {command down, shift down}
     end tell
   `)
-  if (wait) return await waitForTabLoad(windowId, tabIndex)
-  return 0
+  const waitMs = wait ? await waitForTabLoad(windowId, tabIndex) : 0
+  return { waitMs, via: "applescript" }
 }
 
 async function waitForTabLoad(windowId?: number, tabIndex?: number, timeoutMs = 10_000): Promise<number> {
@@ -280,6 +315,11 @@ export async function evalJs(
   windowId?: number,
   tabIndex?: number,
 ): Promise<string> {
+  if (await isCdpAvailable()) {
+    const url = await tabUrl(windowId, tabIndex).catch(() => "")
+    const target = url ? await findTargetByUrl(url) : null
+    if (target) return await cdpEval(target, js)
+  }
   const wrapped = `(function(){try{var __r=(function(){${js}})();return (typeof __r==='undefined')?'':(typeof __r==='string'?__r:JSON.stringify(__r));}catch(e){throw e;}})()`
   return await osa(
     `tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to execute javascript ${quote(wrapped)}`,

@@ -18,6 +18,7 @@ import {
   screenshotTab,
 } from "./chrome.ts";
 import { err, json, logRequest, num, parseBool, printBanner } from "@meta/shared";
+import { detectCdp } from "./cdp-mode.ts";
 
 const PORT = Number(Bun.env.PORT ?? 7880);
 
@@ -33,7 +34,12 @@ const server = Bun.serve({
     const res = await (async () => {
     try {
       if (path === "/health") {
-        return json({ ok: true, running: await isRunning() });
+        const cdp = await detectCdp();
+        return json({ ok: true, running: await isRunning(), cdp });
+      }
+
+      if (path === "/cdp" && method === "GET") {
+        return json(await detectCdp(true));
       }
 
       if (path === "/windows" && method === "GET") {
@@ -83,8 +89,8 @@ const server = Bun.serve({
       if (path === "/navigate" && method === "POST") {
         const body = (await req.json()) as { url?: string; windowId?: number; tabIndex?: number };
         if (!body.url) return err(400, "missing 'url'", "Пример: {\"url\":\"https://example.com\"}");
-        await navigate(body.url, body.windowId, body.tabIndex);
-        return json({ ok: true });
+        const result = await navigate(body.url, body.windowId, body.tabIndex);
+        return json({ ok: true, via: result.via });
       }
 
       if (path === "/activate" && method === "POST") {
@@ -99,10 +105,10 @@ const server = Bun.serve({
       if (path === "/reload" && method === "POST") {
         const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; hard?: boolean; wait?: boolean };
         const wait = body.wait !== false;
-        const waitMs = body.hard
+        const result = body.hard
           ? await hardReload(body.windowId, body.tabIndex, wait)
           : await reload(body.windowId, body.tabIndex, wait);
-        return json({ ok: true, hard: body.hard === true, waited: wait, waitMs });
+        return json({ ok: true, hard: body.hard === true, waited: wait, ...result });
       }
 
       if (path === "/back" && method === "POST") {
@@ -177,7 +183,8 @@ const server = Bun.serve({
 
 printBanner("@meta/chrome", PORT, [
   { routes: [
-    { method: "GET", path: "/health", description: "состояние Chrome и сервиса" },
+    { method: "GET", path: "/health", description: "состояние Chrome, CDP и сервиса" },
+    { method: "GET", path: "/cdp",    description: "проверить CDP (--remote-debugging-port)" },
   ]},
   { title: "Окна и вкладки", routes: [
     { method: "GET",    path: "/windows",        description: "список окон с вкладками" },
