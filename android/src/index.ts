@@ -43,7 +43,7 @@ const server = Bun.serve({
             return json({ ok: false, adb: true, devices, hint: bootStatus.hint ?? "Подключите телефон и включите USB Debugging" })
           }
           try {
-            const r = await fetch("http://localhost:9222/json/version")
+            const r = await fetch("http://localhost:9223/json/version")
             if (!r.ok) throw new Error(`HTTP ${r.status}`)
             const v = await r.json() as { Browser?: string }
             return json({ ok: true, adb: true, devices, browser: v.Browser })
@@ -183,7 +183,7 @@ printBanner("@meta/android", PORT, [
   ]},
   { title: "Устройства", routes: [
     { method: "GET",  path: "/devices",   description: "список подключённых Android" },
-    { method: "POST", path: "/forward",   description: "пересоздать adb forward 9222" },
+    { method: "POST", path: "/forward",   description: "пересоздать adb forward 9223" },
     { method: "POST", path: "/bootstrap", description: "повторить проверки и установку (с правами)" },
   ]},
   { title: "Вкладки Chrome на телефоне", routes: [
@@ -207,4 +207,4 @@ printBanner("@meta/android", PORT, [
     { method: "POST", path: "/screenshot", description: "({tabId?,detail?,scale?,caption?,fullPage?})" },
   ]},
 ])
-console.log(`  ADB forward → localhost:9222 → localabstract:chrome_devtools_remote`)
+console.log(`  ADB forward → localhost:9223 → localabstract:chrome_devtools_remote`)

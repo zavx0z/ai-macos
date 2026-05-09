@@ -1,6 +1,6 @@
 import { spawn } from "bun"
 
-export const DEFAULT_DEBUG_PORT = 9222
+export const DEFAULT_DEBUG_PORT = 9223
 
 export type AdbDevice = {
   serial: string
