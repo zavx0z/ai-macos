@@ -179,7 +179,7 @@ curl -s -X POST http://localhost:7880/screenshot \
 
 ## @meta/android — порт 7881
 
-Chrome на Android-телефоне через ADB + CDP. Требует `brew install --cask android-platform-tools`, USB Debugging на устройстве, открытый Chrome.
+Chrome на Android-телефоне через ADB + CDP. **`adb` устанавливается автоматически** на старте сервиса (через `brew install --cask android-platform-tools`). От пользователя нужно: USB Debugging на телефоне, кабель, открытый Chrome. `ANDROID_AUTO_INSTALL=false` отключает авто-установку.
 
 ```bash
 # Проверка состояния
@@ -189,7 +189,8 @@ curl http://localhost:7881/health
 curl http://localhost:7881/devices
 # → { devices: [{ serial, state }] }
 
-curl -X POST http://localhost:7881/forward    # пересоздать adb forward (если потерялся)
+curl -X POST http://localhost:7881/forward      # пересоздать adb forward
+curl -X POST http://localhost:7881/bootstrap    # пере-проверить всё + автоустановка adb
 
 # Список вкладок (CDP target ID — стабильный)
 curl http://localhost:7881/tabs

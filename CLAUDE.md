@@ -183,7 +183,7 @@ curl -s -X POST http://localhost:7880/screenshot \
 
 Управление Chrome на **Android-телефоне** через ADB + Chrome DevTools Protocol.
 
-Требования: `brew install --cask android-platform-tools`, USB Debugging на телефоне, Chrome открыт хотя бы с одной вкладкой.
+Требования: USB Debugging на телефоне, Chrome открыт хотя бы с одной вкладкой. **`adb` ставится автоматически** через `brew install --cask android-platform-tools` при старте сервиса (можно отключить переменной `ANDROID_AUTO_INSTALL=false`). При ошибках — `POST /bootstrap` пере-проверяет и пытается установить заново.
 
 ```bash
 # Health: статус adb + список устройств + проверка CDP

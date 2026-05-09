@@ -12,15 +12,14 @@ import {
   reload,
   screenshot,
 } from "./android.ts"
-import { adbAvailable, adbDevices, adbForward } from "./adb.ts"
+import { adbAvailable, adbDevices } from "./adb.ts"
+import { bootstrap, type BootstrapStatus } from "./bootstrap.ts"
 import { err, json, logRequest, parseBool, printBanner } from "@meta/shared"
 
 const PORT = Number(Bun.env.PORT ?? 7881)
+const AUTO_INSTALL = Bun.env.ANDROID_AUTO_INSTALL !== "false"
 
-// Try to set up forward on startup; failures are non-fatal — endpoints will report
-ensureForward().catch((e) => {
-  console.error(`  initial adb forward failed: ${e instanceof Error ? e.message : String(e)}`)
-})
+let bootStatus: BootstrapStatus = await bootstrap(AUTO_INSTALL)
 
 const server = Bun.serve({
   port: PORT,
@@ -34,40 +33,32 @@ const server = Bun.serve({
     const res = await (async () => {
       try {
         if (path === "/health") {
-          const adb = await adbAvailable()
-          if (!adb) {
-            return json({
-              ok: false,
-              adb: false,
-              error: "adb not found",
-              hint: "Установите Android platform-tools: brew install --cask android-platform-tools",
-            })
+          // Live re-check, lighter than full bootstrap (no install)
+          if (!(await adbAvailable())) {
+            return json({ ok: false, ...bootStatus, adb: false })
           }
           const devices = await adbDevices()
           const ready = devices.find((d) => d.state === "device")
           if (!ready) {
-            return json({
-              ok: false,
-              adb: true,
-              devices,
-              hint: "Подключите телефон по USB и включите USB Debugging в Developer options",
-            })
+            return json({ ok: false, adb: true, devices, hint: bootStatus.hint ?? "Подключите телефон и включите USB Debugging" })
           }
-          // Try CDP HTTP — verifies forward is set up and Chrome remote debug is reachable
           try {
             const r = await fetch("http://localhost:9222/json/version")
             if (!r.ok) throw new Error(`HTTP ${r.status}`)
-            const v = await r.json() as { Browser?: string; "User-Agent"?: string }
-            return json({ ok: true, adb: true, devices, browser: v.Browser, userAgent: v["User-Agent"] })
+            const v = await r.json() as { Browser?: string }
+            return json({ ok: true, adb: true, devices, browser: v.Browser })
           } catch (e) {
             return json({
-              ok: false,
-              adb: true,
-              devices,
+              ok: false, adb: true, devices,
               error: e instanceof Error ? e.message : String(e),
-              hint: "Откройте Chrome на телефоне и chrome://inspect/#devices на маке. Если не помогает — adb forward tcp:9222 localabstract:chrome_devtools_remote",
+              hint: "Откройте Chrome на телефоне с минимум одной вкладкой. Если не помогает — POST /bootstrap",
             })
           }
+        }
+
+        if (path === "/bootstrap" && method === "POST") {
+          bootStatus = await bootstrap(AUTO_INSTALL)
+          return json({ ok: bootStatus.cdp, ...bootStatus })
         }
 
         if (path === "/devices" && method === "GET") {
@@ -191,8 +182,9 @@ printBanner("@meta/android", PORT, [
     { method: "GET", path: "/health", description: "состояние ADB и CDP" },
   ]},
   { title: "Устройства", routes: [
-    { method: "GET",  path: "/devices",  description: "список подключённых Android" },
-    { method: "POST", path: "/forward",  description: "пересоздать adb forward 9222" },
+    { method: "GET",  path: "/devices",   description: "список подключённых Android" },
+    { method: "POST", path: "/forward",   description: "пересоздать adb forward 9222" },
+    { method: "POST", path: "/bootstrap", description: "повторить проверки и установку (с правами)" },
   ]},
   { title: "Вкладки Chrome на телефоне", routes: [
     { method: "GET",    path: "/tabs",         description: "список вкладок" },
