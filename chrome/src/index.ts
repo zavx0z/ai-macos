@@ -202,7 +202,7 @@ printBanner("@meta/chrome", PORT, [
     { method: "GET",  path: "/text",   description: "текст страницы" },
   ]},
   { title: "Скриншот", routes: [
-    { method: "GET",  path: "/screenshot", description: "скриншот вкладки  (?detail=low|medium|high|full)" },
-    { method: "POST", path: "/screenshot", description: "скриншот вкладки  ({detail?,scale?})" },
+    { method: "GET",  path: "/screenshot", description: "скриншот вкладки  (?detail=low|medium|high|full&caption=)" },
+    { method: "POST", path: "/screenshot", description: "скриншот вкладки  ({detail?,scale?,caption?})" },
   ]},
 ]);
