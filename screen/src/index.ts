@@ -4,6 +4,7 @@ import { createWindowApi, type WindowApi, type WindowInfo } from "./window-api.t
 import { clamp, err, json, logCaption, logRequest, nonNegativeInt, osa, parseBoolean, png, positiveInt, printBanner, quote, sleep } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? Bun.env.SCREEN_PORT ?? 7879);
+const CHROME_API = Bun.env.CHROME_API ?? "http://localhost:7880";
 const windowApi = createWindowApi();
 
 type WindowCaptureRequest = {
@@ -177,6 +178,29 @@ async function desktopResponse(options: CaptureOptions, format: "png" | "json"):
   return png(image, { "x-meta-screen-target": "desktop" });
 }
 
+async function proxyChromeScreenshot(input: WindowCaptureRequest): Promise<Response> {
+  const body: Record<string, unknown> = { restore: input.restore !== false, format: input.format ?? "png" };
+  if (input.detail !== undefined) body.detail = input.detail;
+  if (input.scale !== undefined) body.scale = input.scale;
+  if (input.shadow !== undefined) body.shadow = input.shadow;
+  if (input.delayMs !== undefined) body.delayMs = input.delayMs;
+  if (input.caption !== undefined) body.caption = input.caption;
+  const res = await fetch(`${CHROME_API}/screenshot`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const buf = await res.arrayBuffer();
+  if (!res.ok) {
+    const text = new TextDecoder().decode(buf);
+    return err(res.status, `chrome proxy: ${text}`, `Убедитесь что @meta/chrome запущен: cd chrome && bun src/index.ts`);
+  }
+  const headers: Record<string, string> = { "content-type": res.headers.get("content-type") ?? "image/png", "x-meta-proxied-to": "chrome" };
+  const caption = res.headers.get("x-meta-caption");
+  if (caption) headers["x-meta-caption"] = caption;
+  return new Response(buf, { headers });
+}
+
 async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
   if (input.app === undefined || input.app.trim().length === 0)
     return err(400, "missing 'app'", "Укажите имя приложения: {\"app\": \"Google Chrome\"}");
@@ -195,11 +219,11 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
     const windows = await windowApi.listWindows(app);
     target = selectWindow(windows, index, input.title);
     if (target === undefined) {
-      const isChrome = app.toLowerCase().includes("chrome");
-      const hint = isChrome
-        ? `Для скриншота Chrome используйте POST http://localhost:7880/screenshot — не нужна Accessibility`
-        : `Проверьте: 1) приложение открыто, 2) разрешение Accessibility выдано (GET http://localhost:7878/permissions/accessibility)`;
-      return err(404, `window not found: app=${app} index=${index}${input.title ? ` title=${input.title}` : ""}`, hint);
+      if (app.toLowerCase().includes("chrome")) {
+        return await proxyChromeScreenshot(input);
+      }
+      return err(404, `window not found: app=${app} index=${index}${input.title ? ` title=${input.title}` : ""}`,
+        `Проверьте: 1) приложение открыто, 2) разрешение Accessibility выдано (GET http://localhost:7878/permissions/accessibility)`);
     }
 
     await windowApi.raise(app, target.index);
