@@ -11,6 +11,13 @@
         "typescript": "^5",
       },
     },
+    "android": {
+      "name": "@meta/android",
+      "version": "0.0.0",
+      "dependencies": {
+        "@meta/shared": "workspace:*",
+      },
+    },
     "chrome": {
       "name": "@meta/chrome",
       "version": "0.0.0",
@@ -47,6 +54,8 @@
     },
   },
   "packages": {
+    "@meta/android": ["@meta/android@workspace:android"],
+
     "@meta/chrome": ["@meta/chrome@workspace:chrome"],
 
     "@meta/screen": ["@meta/screen@workspace:screen"],

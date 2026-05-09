@@ -2,24 +2,23 @@
 
 ## Структура
 
-Bun monorepo. Четыре пакета:
+Bun monorepo. Пять пакетов:
 
 | Пакет | Порт | Назначение |
 |---|---|---|
 | `@meta/shared` | — | Общие утилиты: http, osa, params, log |
 | `@meta/window` | 7878 | Управление окнами macOS через Accessibility API |
 | `@meta/screen` | 7879 | Скриншоты через `screencapture` |
-| `@meta/chrome` | 7880 | Управление Google Chrome через AppleScript |
+| `@meta/chrome` | 7880 | Управление десктопным Chrome через AppleScript |
+| `@meta/android` | 7881 | Управление Chrome на Android через ADB + CDP |
 
-Зависимости: `chrome` → `screen` → `window` → (system).
+Зависимости: `chrome` → `screen` → `window` → (system); `android` → adb + CDP.
 
 ## Запуск сервисов
 
 ```bash
 cd /Users/vladimirfilipenko/meta/macos
-cd window && bun src/index.ts   # порт 7878
-cd screen && bun src/index.ts   # порт 7879
-cd chrome && bun src/index.ts   # порт 7880
+bun run dev    # все сервисы параллельно (--hot)
 ```
 
 ## Разрешения macOS
@@ -179,6 +178,55 @@ curl -s -X POST http://localhost:7880/screenshot \
   -d '{"windowId":12345,"detail":"medium","caption":"Ожидаю увидеть форму логина"}' -o /tmp/chrome.png
 # Без windowId берётся первое окно Chrome — может быть не то!
 ```
+
+## @meta/android — порт 7881
+
+Управление Chrome на **Android-телефоне** через ADB + Chrome DevTools Protocol.
+
+Требования: `brew install --cask android-platform-tools`, USB Debugging на телефоне, Chrome открыт хотя бы с одной вкладкой.
+
+```bash
+# Health: статус adb + список устройств + проверка CDP
+curl http://localhost:7881/health
+# ok:false если adb не установлен / телефон не подключён / Chrome не отвечает
+
+# Список устройств
+curl http://localhost:7881/devices
+# → { devices: [{ serial, state }] }
+
+# Пересоздать adb forward (на случай если телефон был отключён)
+curl -X POST http://localhost:7881/forward
+
+# Список вкладок Chrome на телефоне
+curl http://localhost:7881/tabs
+# → { tabs: [{ id, title, url, type }] }   id — стабильный CDP target ID
+
+# Навигация / перезагрузка / eval — те же правила что у десктопа
+curl -X POST http://localhost:7881/navigate \
+  -H 'content-type: application/json' \
+  -d '{"url":"https://example.com","tabId":"ABC123"}'
+
+curl -X POST http://localhost:7881/reload \
+  -H 'content-type: application/json' \
+  -d '{"tabId":"ABC123","wait":true}'
+# По умолчанию ждёт document.readyState === "complete" (до 10 с)
+
+curl -X POST http://localhost:7881/eval \
+  -H 'content-type: application/json' \
+  -d '{"js":"return navigator.userAgent","tabId":"ABC123"}'
+
+# Скриншот вкладки — caption и detail работают так же
+curl -s -X POST http://localhost:7881/screenshot \
+  -H 'content-type: application/json' \
+  -d '{"tabId":"ABC123","detail":"medium","caption":"Ожидаю мобильную версию формы логина"}' \
+  -o phone.png
+# fullPage:true → захват всей страницы (не только viewport)
+```
+
+Отличия от `@meta/chrome` (десктоп):
+- Идентификатор вкладки — `tabId` (строка) вместо `windowId`+`tabIndex`
+- Захват через CDP `Page.captureScreenshot` (только сама страница, без UI Chrome)
+- `hard:true` в `/reload` = `ignoreCache:true` (без Cmd+Shift+R, фокус не перетаскивается)
 
 ## ⚠️ Скриншот Chrome — только через @meta/chrome
 

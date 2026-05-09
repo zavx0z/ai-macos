@@ -2,24 +2,21 @@
 
 ## Структура
 
-Bun monorepo. Четыре пакета:
+Bun monorepo. Пять пакетов:
 
 | Пакет | Порт | Назначение |
 |---|---|---|
-| `@meta/shared` | — | Общие утилиты: http, osa, params, log |
-| `@meta/window` | 7878 | Управление окнами macOS через Accessibility API |
-| `@meta/screen` | 7879 | Скриншоты через `screencapture` |
-| `@meta/chrome` | 7880 | Управление Google Chrome через AppleScript |
-
-Зависимости: `chrome` → `screen` → `window` → (system).
+| `@meta/shared` | — | Общие утилиты |
+| `@meta/window` | 7878 | Окна macOS (Accessibility) |
+| `@meta/screen` | 7879 | Скриншоты (`screencapture`) |
+| `@meta/chrome` | 7880 | Десктопный Chrome (AppleScript) |
+| `@meta/android` | 7881 | Chrome на Android (ADB + CDP) |
 
 ## Запуск сервисов
 
 ```bash
 cd /Users/vladimirfilipenko/meta/macos
-cd window && bun src/index.ts   # порт 7878
-cd screen && bun src/index.ts   # порт 7879
-cd chrome && bun src/index.ts   # порт 7880
+bun run dev      # все сервисы параллельно с --hot
 ```
 
 ## Разрешения macOS
@@ -178,6 +175,45 @@ curl -s -X POST http://localhost:7880/screenshot \
   -d '{"windowId":12345,"detail":"medium","caption":"Ожидаю увидеть главную страницу с навигацией"}' -o chrome.png
 # Без windowId берётся первое окно Chrome — может быть не то!
 # caption логируется до захвата, возвращается в x-meta-caption заголовке
+```
+
+## @meta/android — порт 7881
+
+Chrome на Android-телефоне через ADB + CDP. Требует `brew install --cask android-platform-tools`, USB Debugging на устройстве, открытый Chrome.
+
+```bash
+# Проверка состояния
+curl http://localhost:7881/health
+# → { ok, adb, devices, browser?, hint? }
+
+curl http://localhost:7881/devices
+# → { devices: [{ serial, state }] }
+
+curl -X POST http://localhost:7881/forward    # пересоздать adb forward (если потерялся)
+
+# Список вкладок (CDP target ID — стабильный)
+curl http://localhost:7881/tabs
+# → { tabs: [{ id, title, url, type }] }
+
+curl -X POST http://localhost:7881/navigate -H 'content-type: application/json' \
+  -d '{"url":"https://example.com","tabId":"ABC"}'
+
+curl -X POST http://localhost:7881/reload -H 'content-type: application/json' \
+  -d '{"tabId":"ABC","wait":true}'   # ждёт document.readyState === complete
+
+curl -X POST http://localhost:7881/eval -H 'content-type: application/json' \
+  -d '{"js":"return navigator.userAgent","tabId":"ABC"}'
+
+curl http://localhost:7881/source            # outerHTML
+curl http://localhost:7881/text              # innerText
+
+# Скриншот — caption и detail обязательны как и везде
+curl -s -X POST http://localhost:7881/screenshot \
+  -H 'content-type: application/json' \
+  -d '{"tabId":"ABC","detail":"medium","caption":"Ожидаю мобильную форму логина","fullPage":false}' \
+  -o phone.png
+# fullPage:true → захват всей страницы (не только viewport)
+# CDP снимает только содержимое страницы — без UI Chrome (адресной строки, табов)
 ```
 
 ## Правила для агентов
