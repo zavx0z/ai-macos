@@ -11,7 +11,7 @@ Bun monorepo. Пять пакетов:
 | `@meta/screen` | 7879 | Скриншоты через `screencapture` |
 | `@meta/chrome` | 7880 | Управление десктопным Chrome через AppleScript |
 | `@meta/android` | 7881 | Управление Chrome на Android через ADB + CDP |
-| `@meta/input` | 7882 | Клавиатура и мышь (cliclick + System Events) |
+| `@meta/input` | 7882 | Клавиатура и мышь (python3+CoreGraphics + System Events) |
 
 Зависимости: `chrome` → `screen` → `window` → (system); `android` → adb + CDP.
 
@@ -254,14 +254,15 @@ curl -s -X POST http://localhost:7881/screenshot \
 
 ## @meta/input — порт 7882
 
-Клавиатура и мышь. Мышь через `cliclick` (auto-install через brew/port на старте), клавиатура через AppleScript System Events.
+Клавиатура и мышь. Мышь — через **python3 + CoreGraphics (ctypes)**, клавиатура — через AppleScript System Events. `cliclick` используется как опциональный fallback если python3 недоступен.
 
-Требует **Accessibility** для бинарника `bun` или для терминала, из которого запущен сервис. Bootstrap проверяет это активной пробой (двигает курсор и читает обратно).
+Требует **Accessibility** для терминала, из которого запущен сервис, или для бинарника `bun`. Bootstrap проверяет это активной пробой через Python: двигает курсор и читает обратно. Установка `cliclick` **не нужна** — достаточно системного `/usr/bin/python3`.
 
 ```bash
 # Проверка
 curl http://localhost:7882/health
-# → { ok, cliclick, python3, accessibility, hint? }
+# → { ok, cliclick, python3, accessibility, packageManager, hint? }
+# ok: true = python3 доступен И Accessibility разрешён
 
 # Открыть System Settings для выдачи Accessibility
 curl -X POST http://localhost:7882/permissions/accessibility
@@ -285,7 +286,7 @@ curl -X POST http://localhost:7882/mouse/drag \
 
 curl -X POST http://localhost:7882/mouse/scroll \
   -H 'content-type: application/json' -d '{"dy":3}'
-# dy>0 — вниз, dy<0 — вверх; dx — горизонтальная (Quartz scroll, требует python3+Quartz)
+# dy>0 — вниз, dy<0 — вверх; dx — горизонтальная (CGEventScrollWheelEvent через ctypes)
 
 # Клавиатура
 curl -X POST http://localhost:7882/keyboard/type \
