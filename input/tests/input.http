@@ -1,0 +1,241 @@
+# @meta/input — клавиатура и мышь (порт 7882)
+# cliclick для мыши + AppleScript System Events для клавиатуры.
+# Требует Accessibility для bun или терминала, из которого запущен сервис.
+
+### Health (включает active probe Accessibility)
+GET {{inputHost}}/health
+Accept: application/json
+
+> {%
+  client.test("ok=true когда cliclick + accessibility", () => {
+    client.assert(typeof response.body.cliclick === "string" || response.body.cliclick === null, "cliclick string|null")
+    client.assert(typeof response.body.accessibility === "boolean", "accessibility is boolean")
+  })
+%}
+
+### Bootstrap (повторная проверка + установка)
+POST {{inputHost}}/bootstrap
+
+### Проверить Accessibility разрешение
+GET {{inputHost}}/permissions/accessibility
+Accept: application/json
+
+### Открыть System Settings → Privacy → Accessibility
+POST {{inputHost}}/permissions/accessibility
+
+# ─── Мышь ──────────────────────────────────────────────────────────
+
+### Текущая позиция курсора
+GET {{inputHost}}/mouse/position
+Accept: application/json
+
+> {%
+  client.test("есть x и y", () => {
+    client.assert(typeof response.body.x === "number", "x is number")
+    client.assert(typeof response.body.y === "number", "y is number")
+  })
+  client.global.set("mouseStartX", response.body.x)
+  client.global.set("mouseStartY", response.body.y)
+%}
+
+### Переместить курсор в (500, 400)
+POST {{inputHost}}/mouse/move
+Content-Type: application/json
+
+{
+  "x": 500,
+  "y": 400
+}
+
+### Вернуть курсор на исходную позицию
+POST {{inputHost}}/mouse/move
+Content-Type: application/json
+
+{
+  "x": {{mouseStartX}},
+  "y": {{mouseStartY}}
+}
+
+### Левый клик в (500, 400)
+POST {{inputHost}}/mouse/click
+Content-Type: application/json
+
+{
+  "x": 500,
+  "y": 400,
+  "button": "left",
+  "count": 1
+}
+
+### Двойной клик
+POST {{inputHost}}/mouse/click
+Content-Type: application/json
+
+{
+  "x": 500,
+  "y": 400,
+  "count": 2
+}
+
+### Тройной клик (выделить параграф)
+POST {{inputHost}}/mouse/click
+Content-Type: application/json
+
+{
+  "count": 3
+}
+
+### Правый клик (контекстное меню)
+POST {{inputHost}}/mouse/click
+Content-Type: application/json
+
+{
+  "x": 500,
+  "y": 400,
+  "button": "right"
+}
+
+### Drag from→to
+POST {{inputHost}}/mouse/drag
+Content-Type: application/json
+
+{
+  "from": { "x": 200, "y": 200 },
+  "to":   { "x": 500, "y": 500 },
+  "durationMs": 200
+}
+
+### Прокрутка вниз 3 строки
+POST {{inputHost}}/mouse/scroll
+Content-Type: application/json
+
+{
+  "dy": 3
+}
+
+### Прокрутка вверх 5 строк
+POST {{inputHost}}/mouse/scroll
+Content-Type: application/json
+
+{
+  "dy": -5
+}
+
+### Горизонтальная прокрутка
+POST {{inputHost}}/mouse/scroll
+Content-Type: application/json
+
+{
+  "dx": 3,
+  "dy": 0
+}
+
+# ─── Клавиатура ────────────────────────────────────────────────────
+
+### Набрать текст
+POST {{inputHost}}/keyboard/type
+Content-Type: application/json
+
+{
+  "text": "Hello, World!"
+}
+
+### Набрать с задержкой между символами (для медленных приложений)
+POST {{inputHost}}/keyboard/type
+Content-Type: application/json
+
+{
+  "text": "Привет, мир!",
+  "delayMs": 50
+}
+
+### Нажать Enter
+POST {{inputHost}}/keyboard/key
+Content-Type: application/json
+
+{
+  "key": "enter"
+}
+
+### Нажать Escape
+POST {{inputHost}}/keyboard/key
+Content-Type: application/json
+
+{
+  "key": "escape"
+}
+
+### Нажать стрелку вверх
+POST {{inputHost}}/keyboard/key
+Content-Type: application/json
+
+{
+  "key": "up"
+}
+
+### Cmd+Shift+A
+POST {{inputHost}}/keyboard/key
+Content-Type: application/json
+
+{
+  "key": "a",
+  "modifiers": ["cmd", "shift"]
+}
+
+### F5 (рефреш)
+POST {{inputHost}}/keyboard/key
+Content-Type: application/json
+
+{
+  "key": "f5"
+}
+
+### Сочетание Cmd+Shift+T (открыть закрытую вкладку)
+POST {{inputHost}}/keyboard/shortcut
+Content-Type: application/json
+
+{
+  "shortcut": "cmd+shift+t"
+}
+
+### Cmd+A → Cmd+C → Cmd+V (последовательность)
+POST {{inputHost}}/keyboard/shortcut
+Content-Type: application/json
+
+{
+  "sequence": ["cmd+a", "cmd+c", "cmd+v"],
+  "delayMs": 80
+}
+
+### Cmd+Tab между приложениями
+POST {{inputHost}}/keyboard/shortcut
+Content-Type: application/json
+
+{
+  "shortcut": "cmd+tab"
+}
+
+### Сценарий: открыть Spotlight, найти приложение, открыть
+POST {{inputHost}}/keyboard/shortcut
+Content-Type: application/json
+
+{
+  "shortcut": "cmd+space"
+}
+
+### (потом) набрать имя
+POST {{inputHost}}/keyboard/type
+Content-Type: application/json
+
+{
+  "text": "TextEdit",
+  "delayMs": 30
+}
+
+### (потом) Enter
+POST {{inputHost}}/keyboard/key
+Content-Type: application/json
+
+{
+  "key": "enter"
+}

@@ -1,0 +1,152 @@
+# @meta/window — управление окнами macOS (порт 7878)
+# Запуск: cd .. && bun run dev   (или cd window && bun --hot src/index.ts)
+
+### Health
+GET {{windowHost}}/health
+Accept: application/json
+
+> {%
+  client.test("ok=true", () => {
+    client.assert(response.status === 200, "status 200")
+    client.assert(response.body.ok === true, "ok=true")
+  })
+%}
+
+### Размер экрана
+GET {{windowHost}}/screen
+Accept: application/json
+
+> {%
+  client.global.set("screenWidth", response.body.width)
+  client.global.set("screenHeight", response.body.height)
+  client.test("есть размеры", () => {
+    client.assert(response.body.width > 0, "width > 0")
+    client.assert(response.body.height > 0, "height > 0")
+  })
+%}
+
+### Все окна
+GET {{windowHost}}/windows
+Accept: application/json
+
+> {%
+  client.test("count >= 0", () => {
+    client.assert(typeof response.body.count === "number", "count is number")
+    client.assert(Array.isArray(response.body.windows), "windows is array")
+  })
+%}
+
+### Окна Chrome
+GET {{windowHost}}/windows?app=Google%20Chrome
+Accept: application/json
+
+### Фокус на Chrome
+POST {{windowHost}}/focus
+Content-Type: application/json
+
+{
+  "app": "Google Chrome"
+}
+
+### Переместить iTerm в (0, 0)
+POST {{windowHost}}/move
+Content-Type: application/json
+
+{
+  "app": "iTerm2",
+  "x": 0,
+  "y": 0
+}
+
+### Изменить размер iTerm
+POST {{windowHost}}/resize
+Content-Type: application/json
+
+{
+  "app": "iTerm2",
+  "width": 960,
+  "height": 600
+}
+
+### Расположить iTerm слева (preset)
+POST {{windowHost}}/arrange
+Content-Type: application/json
+
+{
+  "app": "iTerm2",
+  "preset": "left"
+}
+
+> {%
+  client.test("returns applied rect", () => {
+    client.assert(response.body.applied, "applied rect")
+  })
+%}
+
+### Расположить iTerm справа
+POST {{windowHost}}/arrange
+Content-Type: application/json
+
+{
+  "app": "iTerm2",
+  "preset": "right"
+}
+
+### Расположить iTerm на весь экран
+POST {{windowHost}}/arrange
+Content-Type: application/json
+
+{
+  "app": "iTerm2",
+  "preset": "max"
+}
+
+### Поднять iTerm без отнятия фокуса
+POST {{windowHost}}/raise
+Content-Type: application/json
+
+{
+  "app": "iTerm2",
+  "index": 1
+}
+
+### Закрепить iTerm поверх (soft always-on-top)
+POST {{windowHost}}/pin
+Content-Type: application/json
+
+{
+  "app": "iTerm2",
+  "index": 1,
+  "intervalMs": 500
+}
+
+> {%
+  if (response.body.pin) {
+    client.global.set("pinId", response.body.pin.id)
+  }
+%}
+
+### Список pin
+GET {{windowHost}}/pin
+Accept: application/json
+
+### Снять конкретный pin
+DELETE {{windowHost}}/pin/{{pinId}}
+Accept: application/json
+
+### Снять все pin
+DELETE {{windowHost}}/pin
+Accept: application/json
+
+### Проверить разрешение Accessibility
+GET {{windowHost}}/permissions/accessibility
+Accept: application/json
+
+> {%
+  client.test("granted: bool", () => {
+    client.assert(typeof response.body.granted === "boolean", "granted is boolean")
+  })
+%}
+
+### Открыть System Settings → Privacy → Accessibility
+POST {{windowHost}}/permissions/accessibility

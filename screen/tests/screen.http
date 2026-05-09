@@ -1,0 +1,103 @@
+# @meta/screen — скриншоты (порт 7879)
+# Зависит от @meta/window для геометрии и фокус-восстановления.
+
+### Health
+GET {{screenHost}}/health
+Accept: application/json
+
+> {%
+  client.test("ok=true", () => {
+    client.assert(response.body.ok === true, "ok=true")
+  })
+%}
+
+### Скриншот рабочего стола (PNG)
+GET {{screenHost}}/desktop
+
+### Скриншот рабочего стола, medium detail
+POST {{screenHost}}/desktop
+Content-Type: application/json
+
+{
+  "detail": "medium"
+}
+
+### Скриншот рабочего стола, второй дисплей
+GET {{screenHost}}/desktop?display=2
+
+### Скриншот рабочего стола в JSON+base64
+GET {{screenHost}}/desktop?format=json
+Accept: application/json
+
+> {%
+  client.test("returns base64", () => {
+    client.assert(response.body.base64, "base64 present")
+    client.assert(response.body.mime === "image/png", "mime png")
+  })
+%}
+
+### Список захватываемых окон (прокси к window API)
+GET {{screenHost}}/windows
+Accept: application/json
+
+### Окна Chrome
+GET {{screenHost}}/windows?app=Google%20Chrome
+Accept: application/json
+
+### Скриншот окна Safari (medium)
+GET {{screenHost}}/window?app=Safari&detail=medium
+
+### Скриншот окна iTerm2 без тени
+POST {{screenHost}}/window
+Content-Type: application/json
+
+{
+  "app": "iTerm2",
+  "detail": "medium",
+  "shadow": false,
+  "caption": "Ожидаю окно iTerm с приглашением шелла"
+}
+
+### Скриншот области экрана
+POST {{screenHost}}/rect
+Content-Type: application/json
+
+{
+  "x": 0,
+  "y": 0,
+  "width": 1920,
+  "height": 1200,
+  "detail": "medium",
+  "caption": "Ожидаю верхнюю левую область экрана"
+}
+
+### Скриншот области с указанием app для активации
+POST {{screenHost}}/rect
+Content-Type: application/json
+
+{
+  "app": "Safari",
+  "x": 100,
+  "y": 100,
+  "width": 800,
+  "height": 600,
+  "detail": "low"
+}
+
+### Проверить Screen Recording разрешение
+GET {{screenHost}}/permissions/screen-recording
+Accept: application/json
+
+### Открыть System Settings → Privacy → Screen Recording
+POST {{screenHost}}/permissions/screen-recording
+
+### Скриншот Chrome через автопрокси (на screen, не chrome)
+# Вернёт PNG из @meta/chrome /screenshot. Demo "не нужно знать что это Chrome".
+POST {{screenHost}}/window
+Content-Type: application/json
+
+{
+  "app": "Google Chrome",
+  "detail": "medium",
+  "caption": "Ожидаю активную вкладку Chrome"
+}

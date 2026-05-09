@@ -1,0 +1,133 @@
+# @meta/android — Chrome на Android через ADB + CDP (порт 7881)
+# Требует: USB Debugging, кабель/wifi, открытый Chrome на телефоне.
+# adb auto-installs at startup via brew/port.
+
+### Health
+GET {{androidHost}}/health
+Accept: application/json
+
+> {%
+  client.test("health structure", () => {
+    client.assert(typeof response.body.ok === "boolean", "ok is boolean")
+  })
+%}
+
+### Список устройств
+GET {{androidHost}}/devices
+Accept: application/json
+
+> {%
+  if (response.body.devices && response.body.devices.length > 0) {
+    const ready = response.body.devices.find(d => d.state === "device")
+    if (ready) client.global.set("deviceSerial", ready.serial)
+  }
+%}
+
+### Пере-проверка + автоустановка (диалог пароля если нужно ставить через port)
+POST {{androidHost}}/bootstrap
+Accept: application/json
+
+### Пересоздать adb forward 9222
+POST {{androidHost}}/forward
+Accept: application/json
+
+### Список вкладок Chrome на телефоне
+GET {{androidHost}}/tabs
+Accept: application/json
+
+> {%
+  if (response.body.tabs && response.body.tabs.length > 0) {
+    client.global.set("androidTabId", response.body.tabs[0].id)
+  }
+%}
+
+### Активная (первая) вкладка
+GET {{androidHost}}/tabs/active
+Accept: application/json
+
+### Открыть новую вкладку
+POST {{androidHost}}/tabs
+Content-Type: application/json
+
+{
+  "url": "https://example.com"
+}
+
+> {%
+  if (response.body.tab) client.global.set("newAndroidTabId", response.body.tab.id)
+%}
+
+### Активировать вкладку
+POST {{androidHost}}/activate
+Content-Type: application/json
+
+{
+  "tabId": "{{androidTabId}}"
+}
+
+### Навигация
+POST {{androidHost}}/navigate
+Content-Type: application/json
+
+{
+  "url": "https://github.com",
+  "tabId": "{{androidTabId}}"
+}
+
+### Перезагрузить (ждёт document.readyState === complete до 10 с)
+POST {{androidHost}}/reload
+Content-Type: application/json
+
+{
+  "tabId": "{{androidTabId}}",
+  "wait": true
+}
+
+### Hard reload (ignoreCache, без воровства фокуса)
+POST {{androidHost}}/reload
+Content-Type: application/json
+
+{
+  "tabId": "{{androidTabId}}",
+  "hard": true
+}
+
+### Eval JS
+POST {{androidHost}}/eval
+Content-Type: application/json
+
+{
+  "js": "return { ua: navigator.userAgent, w: innerWidth, h: innerHeight, dpr: devicePixelRatio }",
+  "tabId": "{{androidTabId}}"
+}
+
+### HTML страницы
+GET {{androidHost}}/source?tabId={{androidTabId}}
+
+### innerText
+GET {{androidHost}}/text?tabId={{androidTabId}}
+
+### Скриншот вкладки (только viewport)
+POST {{androidHost}}/screenshot
+Content-Type: application/json
+
+{
+  "tabId": "{{androidTabId}}",
+  "detail": "medium",
+  "caption": "Ожидаю мобильную версию страницы"
+}
+
+### Скриншот всей страницы (включая то что за viewport)
+POST {{androidHost}}/screenshot
+Content-Type: application/json
+
+{
+  "tabId": "{{androidTabId}}",
+  "detail": "medium",
+  "fullPage": true,
+  "caption": "Полная страница со скроллом"
+}
+
+### Закрыть вкладку
+DELETE {{androidHost}}/tabs/{{newAndroidTabId}}
+Accept: application/json

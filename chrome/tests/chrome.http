@@ -1,0 +1,231 @@
+# @meta/chrome — управление десктопным Chrome (порт 7880)
+# Гибридный режим: CDP при наличии --remote-debugging-port=9222, иначе AppleScript.
+# Включить CDP: cd chrome && bun run cdp
+
+### Health
+GET {{chromeHost}}/health
+Accept: application/json
+
+> {%
+  client.test("ok+running", () => {
+    client.assert(response.body.ok === true, "ok=true")
+    client.assert(response.body.running === true, "running=true")
+  })
+  if (response.body.cdp) {
+    client.global.set("cdpAvailable", String(response.body.cdp.available))
+  }
+%}
+
+### CDP: проверка доступности --remote-debugging-port
+GET {{chromeHost}}/cdp
+Accept: application/json
+
+### Список окон Chrome (с вкладками)
+GET {{chromeHost}}/windows
+Accept: application/json
+
+> {%
+  client.test("есть окна", () => {
+    client.assert(response.body.count >= 1, "count >= 1")
+  })
+  if (response.body.windows && response.body.windows.length > 0) {
+    const w = response.body.windows[0]
+    client.global.set("windowId", w.id)
+    if (w.tabs && w.tabs.length > 0) {
+      client.global.set("tabIndex", w.tabs[0].index)
+    }
+  }
+%}
+
+### Открыть новое окно
+POST {{chromeHost}}/windows
+Content-Type: application/json
+
+{
+  "url": "https://example.com",
+  "incognito": false
+}
+
+> {%
+  if (response.body.window && response.body.window.id) {
+    client.global.set("newWindowId", response.body.window.id)
+  }
+%}
+
+### Закрыть окно
+DELETE {{chromeHost}}/windows/{{newWindowId}}
+Accept: application/json
+
+### Список всех вкладок (плоский)
+GET {{chromeHost}}/tabs
+Accept: application/json
+
+### Вкладки конкретного окна
+GET {{chromeHost}}/tabs?windowId={{windowId}}
+Accept: application/json
+
+### Активная вкладка
+GET {{chromeHost}}/tabs/active
+Accept: application/json
+
+### Открыть новую вкладку
+POST {{chromeHost}}/tabs
+Content-Type: application/json
+
+{
+  "windowId": {{windowId}},
+  "url": "https://example.com"
+}
+
+> {%
+  if (response.body.tab) {
+    client.global.set("newTabIndex", response.body.tab.index)
+  }
+%}
+
+### Закрыть вкладку
+DELETE {{chromeHost}}/tabs/{{windowId}}/{{newTabIndex}}
+Accept: application/json
+
+### Навигация (через CDP если доступен, иначе AppleScript)
+POST {{chromeHost}}/navigate
+Content-Type: application/json
+
+{
+  "url": "https://github.com",
+  "windowId": {{windowId}},
+  "tabIndex": {{tabIndex}}
+}
+
+> {%
+  client.test("via присутствует", () => {
+    client.assert(response.body.via === "cdp" || response.body.via === "applescript", "via cdp/applescript")
+  })
+%}
+
+### Активация вкладки (поднимает окно в стек Chrome)
+POST {{chromeHost}}/activate
+Content-Type: application/json
+
+{
+  "windowId": {{windowId}},
+  "tabIndex": {{tabIndex}}
+}
+
+### Перезагрузить вкладку (ждёт загрузки до 10 с)
+POST {{chromeHost}}/reload
+Content-Type: application/json
+
+{
+  "windowId": {{windowId}},
+  "tabIndex": {{tabIndex}}
+}
+
+### Hard reload (Cmd+Shift+R или CDP ignoreCache)
+POST {{chromeHost}}/reload
+Content-Type: application/json
+
+{
+  "windowId": {{windowId}},
+  "tabIndex": {{tabIndex}},
+  "hard": true
+}
+
+### Reload без ожидания загрузки
+POST {{chromeHost}}/reload
+Content-Type: application/json
+
+{
+  "windowId": {{windowId}},
+  "tabIndex": {{tabIndex}},
+  "wait": false
+}
+
+### Назад
+POST {{chromeHost}}/back
+
+### Вперёд
+POST {{chromeHost}}/forward
+
+### Eval JS (через CDP если доступен)
+POST {{chromeHost}}/eval
+Content-Type: application/json
+
+{
+  "js": "return document.title",
+  "windowId": {{windowId}},
+  "tabIndex": {{tabIndex}}
+}
+
+> {%
+  client.test("есть result", () => {
+    client.assert(typeof response.body.result === "string", "result is string")
+  })
+%}
+
+### Eval с возвратом объекта
+POST {{chromeHost}}/eval
+Content-Type: application/json
+
+{
+  "js": "return { title: document.title, url: location.href, tabs: document.querySelectorAll('a').length }",
+  "windowId": {{windowId}},
+  "tabIndex": {{tabIndex}}
+}
+
+### Eval canvas → base64 (для случаев когда скриншот не подходит)
+POST {{chromeHost}}/eval
+Content-Type: application/json
+
+{
+  "js": "var c = document.querySelector('canvas'); return c ? c.toDataURL('image/png') : null",
+  "windowId": {{windowId}},
+  "tabIndex": {{tabIndex}}
+}
+
+### Слушать console 1.5 секунды (только в CDP режиме)
+POST {{chromeHost}}/console
+Content-Type: application/json
+
+{
+  "windowId": {{windowId}},
+  "tabIndex": {{tabIndex}},
+  "durationMs": 1500
+}
+
+> {%
+  if (response.status === 200) {
+    client.test("entries массив", () => {
+      client.assert(Array.isArray(response.body.entries), "entries is array")
+      client.assert(response.body.via === "cdp", "via=cdp")
+    })
+  }
+%}
+
+### HTML страницы
+GET {{chromeHost}}/source?windowId={{windowId}}&tabIndex={{tabIndex}}
+
+### Текст страницы (innerText)
+GET {{chromeHost}}/text?windowId={{windowId}}&tabIndex={{tabIndex}}
+
+### Скриншот вкладки (caption обязателен!)
+POST {{chromeHost}}/screenshot
+Content-Type: application/json
+
+{
+  "windowId": {{windowId}},
+  "tabIndex": {{tabIndex}},
+  "detail": "medium",
+  "caption": "Ожидаю главную страницу с навигацией"
+}
+
+### Скриншот в JSON+base64
+POST {{chromeHost}}/screenshot
+Content-Type: application/json
+
+{
+  "windowId": {{windowId}},
+  "detail": "low",
+  "format": "json",
+  "caption": "Превью первого окна Chrome"
+}
