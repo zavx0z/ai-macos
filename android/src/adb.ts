@@ -53,3 +53,12 @@ export async function adbAvailable(): Promise<boolean> {
     return false
   }
 }
+
+export async function adbStartServer(): Promise<void> {
+  // Idempotent — prints "* daemon started" the first time, no-op afterwards
+  await run(["adb", "start-server"])
+}
+
+export async function adbKillServer(): Promise<void> {
+  await run(["adb", "kill-server"])
+}
