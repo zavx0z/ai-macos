@@ -139,10 +139,24 @@ Health: `{ ok, running, cdp: { available, browser? } }` — `running: false` Chr
 
 Запуск Chrome с CDP:
 ```bash
-cd chrome && bun run cdp        # перезапуск Chrome с --remote-debugging-port=9222
-cd chrome && bun run cdp:check  # проверка что CDP доступен
-# или прямо: curl http://localhost:7880/cdp → { available: true, browser: "Chrome/..." }
+cd chrome && bun run cdp        # запускает отдельный Chrome с --remote-debugging-port=9222
+cd chrome && bun run cdp:check  # проверка
+# или: curl http://localhost:7880/cdp → { available: true, browser: "Chrome/..." }
 ```
+
+Важно: Chrome 137+ блокирует `--remote-debugging-port` с дефолтным профилем. Скрипт `cdp` запускает **отдельный** экземпляр с `--user-data-dir=~/Library/Application Support/Google/Chrome-CDP` — основной Chrome пользователя не трогается. Это два независимых процесса; AppleScript увидит оба, но `tell application "Google Chrome"` обычно адресует тот, что был активен последним.
+
+### Чтение console.log из вкладки
+
+Когда CDP доступен:
+```bash
+# Слушать консоль 1500 мс — все console.* и Log.entryAdded (в т.ч. network errors)
+curl -s -X POST http://localhost:7880/console \
+  -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2,"durationMs":1500}'
+# → { ok, count, entries: [{ type, level: "log|info|warn|error|debug", text, url, line, timestamp }], via: "cdp" }
+```
+Если CDP недоступен — 503 с подсказкой `bun run cdp`.
 
 ```bash
 # Окна

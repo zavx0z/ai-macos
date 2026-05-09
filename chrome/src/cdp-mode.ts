@@ -60,6 +60,91 @@ export async function cdpNavigate(target: CdpTarget, url: string): Promise<void>
   })
 }
 
+export type ConsoleEntry = {
+  type: string
+  level: "log" | "info" | "warn" | "error" | "debug" | "verbose"
+  text: string
+  url?: string
+  line?: number
+  timestamp: number
+}
+
+export async function cdpConsoleListen(
+  target: CdpTarget,
+  durationMs: number,
+  collectExisting = true,
+): Promise<ConsoleEntry[]> {
+  return await withSession(target, async (s) => {
+    const entries: ConsoleEntry[] = []
+
+    if (collectExisting) {
+      // Enable Log domain to also catch network errors / browser warnings logged to console
+      await s.send("Log.enable")
+    }
+    await s.send("Runtime.enable")
+
+    // Listen via raw WebSocket events
+    const ws = (s as unknown as { ws: WebSocket }).ws
+    const handler = (ev: MessageEvent) => {
+      try {
+        const m = JSON.parse(ev.data as string) as {
+          method?: string
+          params?: {
+            type?: string
+            args?: { value?: unknown; description?: string }[]
+            stackTrace?: { callFrames: { url: string; lineNumber: number }[] }
+            timestamp?: number
+            entry?: { source: string; level: string; text: string; url?: string; lineNumber?: number; timestamp?: number }
+          }
+        }
+        if (m.method === "Runtime.consoleAPICalled" && m.params) {
+          const args = (m.params.args ?? []).map((a) => {
+            if (a.value !== undefined) return typeof a.value === "string" ? a.value : JSON.stringify(a.value)
+            return a.description ?? ""
+          })
+          const frame = m.params.stackTrace?.callFrames?.[0]
+          const rawType = String(m.params.type ?? "log")
+          // CDP типы: log, info, warning, error, debug, dir, ...
+          const lvl: ConsoleEntry["level"] =
+            rawType === "warning" ? "warn"
+            : rawType === "error" ? "error"
+            : rawType === "info" ? "info"
+            : rawType === "debug" ? "debug"
+            : rawType === "verbose" ? "verbose"
+            : "log"
+          entries.push({
+            type: "console",
+            level: lvl,
+            text: args.join(" "),
+            url: frame?.url,
+            line: frame?.lineNumber,
+            timestamp: m.params.timestamp ?? Date.now(),
+          })
+        } else if (m.method === "Log.entryAdded" && m.params?.entry) {
+          const e = m.params.entry
+          entries.push({
+            type: e.source ?? "browser",
+            level: (["error", "warning", "info", "verbose"].includes(e.level) ? (e.level === "warning" ? "warn" : e.level) : "log") as ConsoleEntry["level"],
+            text: e.text,
+            url: e.url,
+            line: e.lineNumber,
+            timestamp: e.timestamp ?? Date.now(),
+          })
+        }
+      } catch {
+        /* ignore parse errors */
+      }
+    }
+    ws.addEventListener("message", handler)
+    try {
+      await new Promise((r) => setTimeout(r, durationMs))
+    } finally {
+      ws.removeEventListener("message", handler)
+    }
+    return entries
+  })
+}
+
 export async function cdpReload(target: CdpTarget, ignoreCache = false, wait = true, timeoutMs = 10_000): Promise<number> {
   return await withSession(target, async (s) => {
     await s.send("Page.enable")

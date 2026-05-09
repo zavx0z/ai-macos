@@ -3,7 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
 import { logCaption, osa, quote } from "@meta/shared";
-import { cdpEval, cdpNavigate, cdpReload, findTargetByUrl, isCdpAvailable } from "./cdp-mode.ts";
+import { cdpConsoleListen, cdpEval, cdpNavigate, cdpReload, findTargetByUrl, isCdpAvailable, type ConsoleEntry } from "./cdp-mode.ts";
 
 export type TabInfo = {
   id: number;
@@ -324,6 +324,23 @@ export async function evalJs(
   return await osa(
     `tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to execute javascript ${quote(wrapped)}`,
   )
+}
+
+export async function consoleListen(
+  windowId?: number,
+  tabIndex?: number,
+  durationMs = 1000,
+): Promise<{ entries: ConsoleEntry[]; via: "cdp" } | { entries: []; via: "unavailable"; error: string }> {
+  if (!(await isCdpAvailable())) {
+    return { entries: [], via: "unavailable", error: "CDP not available — bun run cdp" }
+  }
+  const url = await tabUrl(windowId, tabIndex).catch(() => "")
+  const target = url ? await findTargetByUrl(url) : null
+  if (!target) {
+    return { entries: [], via: "unavailable", error: `CDP target not found for URL: ${url || "(unknown)"}` }
+  }
+  const entries = await cdpConsoleListen(target, Math.max(50, Math.min(durationMs, 60_000)))
+  return { entries, via: "cdp" }
 }
 
 export async function getSource(windowId?: number, tabIndex?: number): Promise<string> {

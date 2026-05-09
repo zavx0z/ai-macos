@@ -2,6 +2,7 @@ import {
   activateTab,
   closeTab,
   closeWindow,
+  consoleListen,
   evalJs,
   getActiveTab,
   getSource,
@@ -130,6 +131,21 @@ const server = Bun.serve({
         return json({ ok: true, result });
       }
 
+      if (path === "/console" && (method === "GET" || method === "POST")) {
+        const opts = method === "POST"
+          ? ((await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; durationMs?: number })
+          : {
+              windowId: num(url.searchParams.get("windowId")),
+              tabIndex: num(url.searchParams.get("tabIndex")),
+              durationMs: num(url.searchParams.get("durationMs")),
+            };
+        const result = await consoleListen(opts.windowId, opts.tabIndex, opts.durationMs ?? 1000);
+        if (result.via === "unavailable") {
+          return err(503, result.error, "Запустите Chrome с CDP: bun run cdp (в директории chrome/)");
+        }
+        return json({ ok: true, count: result.entries.length, entries: result.entries, via: result.via });
+      }
+
       if (path === "/source" && method === "GET") {
         const wid = num(url.searchParams.get("windowId"));
         const tIdx = num(url.searchParams.get("tabIndex"));
@@ -203,9 +219,10 @@ printBanner("@meta/chrome", PORT, [
     { method: "POST", path: "/forward",  description: "вперёд" },
   ]},
   { title: "Контент", routes: [
-    { method: "POST", path: "/eval",   description: "выполнить JS в вкладке" },
-    { method: "GET",  path: "/source", description: "HTML страницы" },
-    { method: "GET",  path: "/text",   description: "текст страницы" },
+    { method: "POST", path: "/eval",    description: "выполнить JS в вкладке" },
+    { method: "GET",  path: "/source",  description: "HTML страницы" },
+    { method: "GET",  path: "/text",    description: "текст страницы" },
+    { method: "POST", path: "/console", description: "слушать console (CDP) ({durationMs?})" },
   ]},
   { title: "Скриншот", routes: [
     { method: "GET",  path: "/screenshot", description: "скриншот вкладки  (?detail=low|medium|high|full&caption=)" },

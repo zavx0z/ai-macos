@@ -137,10 +137,23 @@ Health: `{ ok, running, cdp }` — `running: false` Chrome не запущен; 
 
 Чтобы поднять Chrome с CDP:
 ```bash
-cd chrome && bun run cdp          # перезапуск Chrome с флагом
+cd chrome && bun run cdp          # запускает отдельный Chrome (отдельный профиль)
 cd chrome && bun run cdp:check    # проверка
 # или: curl http://localhost:7880/cdp → { available: true, browser: "Chrome/..." }
 ```
+
+Chrome 137+ запрещает `--remote-debugging-port` на дефолтном профиле, поэтому скрипт открывает экземпляр с `--user-data-dir=~/Library/Application Support/Google/Chrome-CDP` — это **отдельный** Chrome рядом с основным.
+
+### Чтение консоли через CDP
+
+```bash
+# Прослушать консоль вкладки 1500 мс
+curl -s -X POST http://localhost:7880/console \
+  -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2,"durationMs":1500}'
+# → { entries: [{ type, level: "log|info|warn|error|debug", text, url, line, timestamp }], via: "cdp" }
+```
+Захватываются `console.log/info/warn/error/debug` + `Log.entryAdded` (network errors, browser warnings). Без CDP → 503 с подсказкой `bun run cdp`.
 
 ```bash
 # Окна
