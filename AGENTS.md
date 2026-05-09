@@ -193,3 +193,4 @@ curl -s -X POST http://localhost:7880/screenshot \
 10. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
 11. При ошибке `osascript failed (-1743)` — нет разрешения Automation.
 12. При ошибке `osascript failed (-25211)` — нет разрешения Accessibility.
+13. **Canvas-приложения** (графики, редакторы, кастомные рендереры): `POST /screenshot` снимает окно Chrome целиком, но canvas-пиксели могут не совпасть из-за DPR-масштабирования или тайминга. Вместо этого использовать `POST /eval` с JS `return document.querySelector('canvas').toDataURL('image/png')` — получить base64-строку, отрезать префикс `data:image/png;base64,`, декодировать через `base64 -d` в PNG-файл. При нескольких canvas — `document.querySelectorAll('canvas')[N]`.
