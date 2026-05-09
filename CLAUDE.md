@@ -156,9 +156,11 @@ curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' 
 curl -X POST http://localhost:7880/activate -H 'content-type: application/json' \
   -d '{"windowId":12345,"tabIndex":2}'   # ← оба поля обязательны
 # → { ok, windowId, tabIndex }   ← передай windowId в следующий /screenshot!
-curl -X POST http://localhost:7880/reload
 curl -X POST http://localhost:7880/reload -H 'content-type: application/json' \
-  -d '{"hard":true}'     # → Cmd+Shift+R, переносит фокус на Chrome
+  -d '{"windowId":12345,"tabIndex":2}'
+# → { ok, hard, waited, waitMs }  — ждёт окончания загрузки по умолчанию
+# hard: true → Cmd+Shift+R (сброс кеша, переносит фокус на Chrome)
+# wait: false → вернуть немедленно без ожидания загрузки
 curl -X POST http://localhost:7880/back
 curl -X POST http://localhost:7880/forward
 

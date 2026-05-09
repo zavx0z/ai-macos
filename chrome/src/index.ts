@@ -97,13 +97,12 @@ const server = Bun.serve({
       }
 
       if (path === "/reload" && method === "POST") {
-        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; hard?: boolean };
-        if (body.hard) {
-          await hardReload(body.windowId, body.tabIndex);
-        } else {
-          await reload(body.windowId, body.tabIndex);
-        }
-        return json({ ok: true, hard: body.hard === true });
+        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; hard?: boolean; wait?: boolean };
+        const wait = body.wait !== false;
+        const waitMs = body.hard
+          ? await hardReload(body.windowId, body.tabIndex, wait)
+          : await reload(body.windowId, body.tabIndex, wait);
+        return json({ ok: true, hard: body.hard === true, waited: wait, waitMs });
       }
 
       if (path === "/back" && method === "POST") {
@@ -192,7 +191,7 @@ printBanner("@meta/chrome", PORT, [
   { title: "Навигация", routes: [
     { method: "POST", path: "/navigate", description: "перейти по URL" },
     { method: "POST", path: "/activate", description: "активировать вкладку" },
-    { method: "POST", path: "/reload",   description: "перезагрузить  (hard → Cmd+Shift+R)" },
+    { method: "POST", path: "/reload",   description: "перезагрузить  ({hard?,wait?}) — ждёт загрузки" },
     { method: "POST", path: "/back",     description: "назад" },
     { method: "POST", path: "/forward",  description: "вперёд" },
   ]},

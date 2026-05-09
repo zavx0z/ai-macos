@@ -230,11 +230,13 @@ export async function navigate(
   )
 }
 
-export async function reload(windowId?: number, tabIndex?: number): Promise<void> {
+export async function reload(windowId?: number, tabIndex?: number, wait = true): Promise<number> {
   await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to reload`)
+  if (wait) return await waitForTabLoad(windowId, tabIndex)
+  return 0
 }
 
-export async function hardReload(windowId?: number, tabIndex?: number): Promise<void> {
+export async function hardReload(windowId?: number, tabIndex?: number, wait = true): Promise<number> {
   if (windowId != null) {
     await osa(`tell application "Google Chrome" to set index of window id ${windowId} to 1`)
   }
@@ -249,6 +251,20 @@ export async function hardReload(windowId?: number, tabIndex?: number): Promise<
       key code 15 using {command down, shift down}
     end tell
   `)
+  if (wait) return await waitForTabLoad(windowId, tabIndex)
+  return 0
+}
+
+async function waitForTabLoad(windowId?: number, tabIndex?: number, timeoutMs = 10_000): Promise<number> {
+  const t0 = Date.now()
+  // brief initial delay so loading=true has time to register
+  await new Promise((r) => setTimeout(r, 150))
+  while (Date.now() - t0 < timeoutMs) {
+    const out = await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to return loading`).catch(() => "false")
+    if (out.trim() === "false") return Date.now() - t0
+    await new Promise((r) => setTimeout(r, 200))
+  }
+  return Date.now() - t0
 }
 
 export async function goBack(windowId?: number, tabIndex?: number): Promise<void> {
