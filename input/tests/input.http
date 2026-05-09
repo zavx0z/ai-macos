@@ -23,6 +23,100 @@ Accept: application/json
 ### Открыть System Settings → Privacy → Accessibility
 POST {{inputHost}}/permissions/accessibility
 
+# ════════════════════════════════════════════════════════════════════
+# Проверка Accessibility — запускать ПОДРЯД сверху вниз после
+# выдачи прав. Тесты должны стать зелёными.
+# Что добавить в Accessibility:
+#   - /opt/local/bin/cliclick (или путь из /health.cliclick)
+#   - /Users/vladimirfilipenko/.bun/bin/bun
+# ════════════════════════════════════════════════════════════════════
+
+### 1. Bootstrap → проверить флаг accessibility
+POST {{inputHost}}/bootstrap
+
+> {%
+  client.test("cliclick установлен", () => {
+    client.assert(response.body.cliclick !== null,
+      "cliclick не найден. Установите: brew install cliclick (или sudo port install cliclick)")
+  })
+  client.test("Accessibility выдан", () => {
+    client.assert(response.body.accessibility === true,
+      "Accessibility НЕ выдан! Добавьте в System Settings → Privacy → Accessibility:\n" +
+      "  • " + (response.body.cliclick || "/opt/local/bin/cliclick") + "\n" +
+      "  • /Users/vladimirfilipenko/.bun/bin/bun")
+  })
+%}
+
+### 2. Запомнить текущую позицию курсора
+GET {{inputHost}}/mouse/position
+
+> {%
+  client.global.set("probeStartX", response.body.x)
+  client.global.set("probeStartY", response.body.y)
+  client.log(`старт: (${response.body.x}, ${response.body.y})`)
+  client.test("позиция получена", () => {
+    client.assert(typeof response.body.x === "number" && typeof response.body.y === "number")
+  })
+%}
+
+### 3. Двинуть курсор в (100, 100)
+POST {{inputHost}}/mouse/move
+Content-Type: application/json
+
+{
+  "x": 100,
+  "y": 100
+}
+
+> {%
+  client.test("via=cliclick", () => {
+    client.assert(response.body.via === "cliclick", "ожидался via=cliclick, получили: " + response.body.via)
+  })
+%}
+
+### 4. Проверить что курсор РЕАЛЬНО переместился
+GET {{inputHost}}/mouse/position
+
+> {%
+  const x = response.body.x
+  const y = response.body.y
+  client.log(`после move: (${x}, ${y})`)
+  client.test("курсор реально в (100, 100)", () => {
+    const dx = Math.abs(x - 100)
+    const dy = Math.abs(y - 100)
+    client.assert(dx <= 2 && dy <= 2,
+      `курсор НЕ переместился: ожидалось (100, 100), получено (${x}, ${y}). ` +
+      "API вернул ok, но cliclick молча проигнорировался → нет Accessibility. " +
+      "Откройте System Settings → Privacy → Accessibility и добавьте бинарники cliclick и bun.")
+  })
+%}
+
+### 5. Вернуть курсор на исходное место
+POST {{inputHost}}/mouse/move
+Content-Type: application/json
+
+{
+  "x": {{probeStartX}},
+  "y": {{probeStartY}}
+}
+
+### 6. Проверить клавиатуру (без побочных эффектов — нажмём Shift)
+POST {{inputHost}}/keyboard/key
+Content-Type: application/json
+
+{
+  "key": "shift"
+}
+
+> {%
+  client.test("keyboard работает", () => {
+    client.assert(response.body.ok === true,
+      "keyboard вернул ошибку — проверьте Accessibility для bun (или терминала)")
+  })
+%}
+
+# ════════════════════════════════════════════════════════════════════
+
 # ─── Мышь ──────────────────────────────────────────────────────────
 
 ### Текущая позиция курсора
