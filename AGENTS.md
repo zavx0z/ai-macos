@@ -11,7 +11,7 @@ Bun monorepo. Пять пакетов:
 | `@meta/screen` | 7879 | Скриншоты (`screencapture`) |
 | `@meta/chrome` | 7880 | Десктопный Chrome (AppleScript) |
 | `@meta/android` | 7881 | Chrome на Android (ADB + CDP) |
-| `@meta/input` | 7882 | Клавиатура и мышь (cliclick + System Events) |
+| `@meta/input`  | 7882 | Клавиатура и мышь (python3+CoreGraphics + System Events) |
 
 ## Запуск сервисов
 
@@ -242,11 +242,12 @@ curl -s -X POST http://localhost:7881/screenshot \
 
 ## @meta/input — порт 7882
 
-Клавиатура и мышь. `cliclick` ставится автоматически (brew/port). Нужно **Accessibility** для bun или терминала — без него API возвращает `ok` но события не доходят. Bootstrap проверяет это активной пробой.
+Клавиатура и мышь. Мышь — через **python3+CoreGraphics (ctypes)**, клавиатура — через AppleScript System Events. Нужно **Accessibility** для терминала или bun. Bootstrap проверяет это активной пробой через Python. Установка `cliclick` не нужна.
 
 ```bash
 curl http://localhost:7882/health
-# → { ok, cliclick, accessibility, hint? }
+# → { ok, cliclick, python3, accessibility, packageManager, hint? }
+# ok: true = python3 есть И Accessibility разрешён
 
 curl -X POST http://localhost:7882/permissions/accessibility   # открыть System Settings
 
