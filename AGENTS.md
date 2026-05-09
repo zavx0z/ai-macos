@@ -169,23 +169,23 @@ curl http://localhost:7880/source              # outerHTML (text/html)
 curl http://localhost:7880/text                # innerText (text/plain)
 curl "http://localhost:7880/source?windowId=12345&tabIndex=2"
 
-# Скриншот (GET и POST принимают одинаковые параметры)
-curl -s http://localhost:7880/screenshot -o chrome.png
+# Скриншот — всегда передавать caption
 curl -s -X POST http://localhost:7880/screenshot \
   -H 'content-type: application/json' \
-  -d '{"detail":"medium","windowId":12345,"tabIndex":2}' -o chrome.png
+  -d '{"detail":"medium","caption":"Ожидаю увидеть главную страницу с навигацией"}' -o chrome.png
+# caption логируется до захвата, возвращается в x-meta-caption заголовке
 ```
 
 ## Правила для агентов
 
-1. Перед вызовом любого эндпоинта скриншота — сформулировать одним предложением, что ожидается увидеть: какое окно, какой контент, какое состояние UI. Использовать это ожидание для проверки полученного изображения и сообщить о расхождении, если оно есть.
+1. **Перед каждым скриншотом** — сформулировать одним предложением, что ожидается увидеть, и передать это в поле `caption`. После получения изображения — сравнить ожидание с реальностью и сообщить о расхождении.
 2. Перед первой операцией с сервисом вызвать `GET /health`. При ошибке — сообщить пользователю, не ретраить.
 3. При `granted: false` от `/permissions/*` — вызвать `POST /permissions/*` (откроет Settings), сообщить пользователю, не ретраить.
 4. Для скриншотов передавать `detail="medium"` если пользователь не указал иное.
 5. Использовать только REST API — никакого прямого `osascript`, `screencapture` или AppleScript.
 6. Имя приложения (`app`) — каноническое имя процесса macOS, строго по системному.
 7. `windowId` в Chrome-сервисе — стабильный AppleScript ID из `GET /windows`, предпочтительнее `index`.
-8. Для скриншота Chrome использовать `GET /screenshot` или `POST /screenshot` у `@meta/chrome`, не напрямую в `@meta/screen`.
+8. Для скриншота Chrome использовать `POST /screenshot` у `@meta/chrome`, **не** напрямую в `@meta/screen` (`/window` или `/rect` не видят Chrome без Accessibility).
 9. `hard: true` в `/reload` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
 10. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
 11. При ошибке `osascript failed (-1743)` — нет разрешения Automation.

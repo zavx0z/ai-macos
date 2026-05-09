@@ -169,11 +169,12 @@ curl http://localhost:7880/source              # outerHTML (text/html)
 curl http://localhost:7880/text                # innerText (text/plain)
 curl "http://localhost:7880/source?windowId=12345&tabIndex=2"
 
-# Скриншот (GET и POST принимают одинаковые параметры)
-curl -s http://localhost:7880/screenshot -o /tmp/chrome.png
+# Скриншот — всегда передавать caption с ожиданием
 curl -s -X POST http://localhost:7880/screenshot \
   -H 'content-type: application/json' \
-  -d '{"detail":"medium","windowId":12345,"tabIndex":2}' -o /tmp/chrome.png
+  -d '{"detail":"medium","caption":"Ожидаю увидеть форму логина"}' -o /tmp/chrome.png
+# caption логируется до захвата, возвращается в x-meta-caption заголовке
+# После получения: сравнить ожидание с реальностью
 ```
 
 ## ⚠️ Скриншот Chrome — только через @meta/chrome
@@ -186,8 +187,10 @@ curl -s -X POST http://localhost:7880/screenshot \
 ```bash
 curl -s -X POST http://localhost:7880/screenshot \
   -H 'content-type: application/json' \
-  -d '{"detail":"medium"}' -o screenshot.png
+  -d '{"detail":"medium","caption":"Ожидаю увидеть главную страницу приложения"}' -o screenshot.png
 ```
+
+`caption` — обязательно формулировать перед каждым скриншотом: одно предложение о том, что агент ожидает увидеть. После получения — сравнить ожидание с реальностью.
 
 `@meta/chrome` сам:
 1. Получает координаты окна через AppleScript (не нужна Accessibility)
