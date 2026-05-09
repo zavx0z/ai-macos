@@ -191,7 +191,7 @@ curl -s -X POST http://localhost:7880/screenshot \
 7. `windowId` в Chrome-сервисе — стабильный AppleScript ID из `GET /windows`. **Всегда передавать `windowId` в `/screenshot`** — без него берётся первое окно и можно попасть на неверное.
 8. Для скриншота Chrome использовать `POST /screenshot` у `@meta/chrome`, **не** напрямую в `@meta/screen` (`/window` или `/rect` не видят Chrome без Accessibility).
    Сценарий: `GET /windows` → взять нужный `windowId` → `POST /activate {windowId, tabIndex}` → `POST /screenshot {windowId, detail, caption}`.
-9. `hard: true` в `/reload` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
+9. После `POST /reload` страница гарантированно загружена (сервис ждёт до 10 с) — можно сразу делать скриншот без `sleep`. `hard: true` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
 10. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
 11. При ошибке `osascript failed (-1743)` — нет разрешения Automation.
 12. При ошибке `osascript failed (-25211)` — нет разрешения Accessibility.

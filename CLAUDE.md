@@ -209,5 +209,6 @@ curl -s -X POST http://localhost:7880/screenshot \
 - При `granted: false` — вызвать `POST /permissions/*`, сообщить пользователю. **Не ретраить.**
 - Имена приложений в `app` — каноническое имя процесса macOS (`"Google Chrome"`, не `"chrome"`).
 - `windowId` в Chrome-сервисе — стабильный AppleScript ID из `GET /windows`, предпочтительнее `index`.
+- **После `POST /reload` страница гарантированно загружена** (сервис ждёт `loading=false`, до 10 с) — скриншот сразу, без `sleep`.
 - При ошибке `osascript failed (-1743)` — нет разрешения Automation.
 - При ошибке `osascript failed (-25211)` — нет разрешения Accessibility.
