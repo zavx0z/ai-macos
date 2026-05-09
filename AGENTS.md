@@ -137,9 +137,9 @@ Health: `{ ok, running, cdp }` — `running: false` Chrome не запущен; 
 
 Чтобы поднять Chrome с CDP:
 ```bash
-osascript -e 'quit app "Google Chrome"' && sleep 1 && \
-open -a "Google Chrome" --args --remote-debugging-port=9222
-curl http://localhost:7880/cdp     # { available: true, browser: "Chrome/..." }
+cd chrome && bun run cdp          # перезапуск Chrome с флагом
+cd chrome && bun run cdp:check    # проверка
+# или: curl http://localhost:7880/cdp → { available: true, browser: "Chrome/..." }
 ```
 
 ```bash

@@ -12,7 +12,9 @@
     "start": "bun src/index.ts",
     "cli": "bun src/cli.ts",
     "build": "bun build src/index.ts --target bun --outdir dist",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "cdp": "osascript -e 'quit app \"Google Chrome\"' 2>/dev/null ; sleep 1 ; open -a 'Google Chrome' --args --remote-debugging-port=9222 && echo 'Chrome перезапущен с --remote-debugging-port=9222'",
+    "cdp:check": "curl -sf http://localhost:9222/json/version | python3 -m json.tool || echo 'CDP недоступен — запустите: bun run cdp'"
   },
   "dependencies": {
     "@meta/shared": "workspace:*"

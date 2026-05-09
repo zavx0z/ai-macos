@@ -139,12 +139,9 @@ Health: `{ ok, running, cdp: { available, browser? } }` — `running: false` Chr
 
 Запуск Chrome с CDP:
 ```bash
-osascript -e 'quit app "Google Chrome"'
-sleep 1
-open -a "Google Chrome" --args --remote-debugging-port=9222
-# проверка:
-curl http://localhost:7880/cdp
-# → { available: true, browser: "Chrome/..." }
+cd chrome && bun run cdp        # перезапуск Chrome с --remote-debugging-port=9222
+cd chrome && bun run cdp:check  # проверка что CDP доступен
+# или прямо: curl http://localhost:7880/cdp → { available: true, browser: "Chrome/..." }
 ```
 
 ```bash
