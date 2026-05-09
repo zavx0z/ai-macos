@@ -22,7 +22,7 @@ Bun.serve({
       try {
         if (path === "/health") {
           return json({
-            ok: bootStatus.cliclick != null && bootStatus.accessibility,
+            ok: bootStatus.accessibility,
             cliclick: bootStatus.cliclick,
             python3: bootStatus.python3,
             accessibility: bootStatus.accessibility,
@@ -38,11 +38,10 @@ Bun.serve({
         }
 
         if (path === "/permissions/accessibility" && method === "GET") {
-          // Активная проба прямо сейчас — после выдачи прав не нужно перезапускать сервис
-          if (!bootStatus.cliclick) {
-            return json({ granted: false, hint: "cliclick не установлен — POST /bootstrap" })
+          if (!bootStatus.python3) {
+            return json({ granted: false, hint: "python3 не найден — POST /bootstrap" })
           }
-          const granted = await probeAccessibilityNow(bootStatus.cliclick)
+          const granted = await probeAccessibilityNow(bootStatus.python3)
           bootStatus = { ...bootStatus, accessibility: granted, hint: granted ? undefined : bootStatus.hint }
           return json({ granted })
         }
@@ -50,15 +49,14 @@ Bun.serve({
         if (path === "/permissions/accessibility" && method === "POST") {
           const proc = Bun.spawn(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
           await proc.exited
-          // Тоже пере-пробуем — на случай если уже выдали и просто хотят подтвердить
-          const granted = bootStatus.cliclick ? await probeAccessibilityNow(bootStatus.cliclick) : false
+          const granted = bootStatus.python3 ? await probeAccessibilityNow(bootStatus.python3) : false
           bootStatus = { ...bootStatus, accessibility: granted }
           return json({
             granted,
             opened: true,
             hint: granted
               ? undefined
-              : `Добавьте в открывшийся список и поставьте галочку:\n  • ${bootStatus.cliclick ?? "/opt/local/bin/cliclick"}\n  • /Users/vladimirfilipenko/.bun/bin/bun\nПотом GET /permissions/accessibility ещё раз — должно стать granted: true`,
+              : "Добавьте в открывшийся список: ваш терминал (iTerm2/Terminal) или /Users/vladimirfilipenko/.bun/bin/bun, затем GET /permissions/accessibility",
           })
         }
 
@@ -84,7 +82,7 @@ Bun.serve({
           const body = (await req.json()) as { from?: { x: number; y: number }; to?: { x: number; y: number }; durationMs?: number }
           if (!body.from || !body.to) return err(400, "need {from:{x,y}, to:{x,y}}", "Пример: {\"from\":{\"x\":100,\"y\":100},\"to\":{\"x\":300,\"y\":300}}")
           const r = await drag({ from: body.from, to: body.to, durationMs: body.durationMs })
-          if (r.via === "unsupported") return err(503, "drag требует cliclick", "Установите: brew install cliclick (или sudo port install cliclick), затем POST /bootstrap")
+          if (r.via === "unsupported") return err(503, "drag требует python3 или cliclick", "Убедитесь что python3 доступен, затем POST /bootstrap")
           return json({ ok: true, ...r })
         }
 

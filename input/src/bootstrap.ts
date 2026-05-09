@@ -17,35 +17,39 @@ export type InputBootstrapStatus = {
   hint?: string
 }
 
-/**
- * Молчаливый тест Accessibility: пытаемся подвинуть курсор обратно туда же.
- * Если процесс не имеет Accessibility, cliclick exit=0 но реально ничего не делает.
- */
 /** Активная проверка Accessibility — экспортирована для re-probe из /permissions/accessibility */
-export async function probeAccessibilityNow(cliclick: string): Promise<boolean> {
-  return await probeAccessibility(cliclick)
+export async function probeAccessibilityNow(tool: string): Promise<boolean> {
+  return await probeAccessibility(tool)
 }
 
-async function probeAccessibility(cliclick: string): Promise<boolean> {
+const PY_PROBE = `
+import ctypes, time
+CG=ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')
+class P(ctypes.Structure):_fields_=[('x',ctypes.c_double),('y',ctypes.c_double)]
+CG.CGEventCreate.restype=ctypes.c_void_p
+CG.CGEventCreate.argtypes=[ctypes.c_void_p]
+CG.CGEventGetLocation.restype=P
+CG.CGEventGetLocation.argtypes=[ctypes.c_void_p]
+CG.CGEventCreateMouseEvent.restype=ctypes.c_void_p
+CG.CGEventCreateMouseEvent.argtypes=[ctypes.c_void_p,ctypes.c_uint32,P,ctypes.c_uint32]
+CG.CGEventPost.argtypes=[ctypes.c_uint32,ctypes.c_void_p]
+CG.CFRelease.argtypes=[ctypes.c_void_p]
+def pos():
+  e=CG.CGEventCreate(None);loc=CG.CGEventGetLocation(e);CG.CFRelease(e);return int(loc.x),int(loc.y)
+bx,by=pos()
+e=CG.CGEventCreateMouseEvent(None,5,P(bx+1,by),0)
+CG.CGEventPost(0,e);CG.CFRelease(e)
+time.sleep(0.1)
+ax,ay=pos()
+e=CG.CGEventCreateMouseEvent(None,5,P(bx,by),0)
+CG.CGEventPost(0,e);CG.CFRelease(e)
+exit(0 if ax==bx+1 else 1)
+`.trim()
+
+async function probeAccessibility(python3: string): Promise<boolean> {
   try {
-    const before = spawn([cliclick, "p"], { stdout: "pipe", stderr: "pipe" })
-    const outBefore = (await new Response(before.stdout).text()).trim()
-    await before.exited
-    const [bx, by] = outBefore.split(",").map(Number)
-    if (bx == null || by == null) return false
-
-    // Двигаем на 1 пиксель вправо, читаем, возвращаем
-    const target = `${bx + 1},${by}`
-    await spawn([cliclick, `m:${target}`], { stdout: "pipe", stderr: "pipe" }).exited
-    await new Promise((r) => setTimeout(r, 80))
-    const after = spawn([cliclick, "p"], { stdout: "pipe", stderr: "pipe" })
-    const outAfter = (await new Response(after.stdout).text()).trim()
-    await after.exited
-    // Возвращаем на место
-    await spawn([cliclick, `m:${bx},${by}`], { stdout: "pipe", stderr: "pipe" }).exited
-
-    const [ax] = outAfter.split(",").map(Number)
-    return ax === bx + 1
+    const proc = spawn([python3, "-c", PY_PROBE], { stdout: "pipe", stderr: "pipe" })
+    return (await proc.exited) === 0
   } catch {
     return false
   }
@@ -69,9 +73,9 @@ async function which(cmd: string): Promise<string | null> {
   return null
 }
 
-async function pythonHasQuartz(pythonPath: string): Promise<boolean> {
+async function pythonWorks(pythonPath: string): Promise<boolean> {
   try {
-    const proc = spawn([pythonPath, "-c", "import Quartz"], { stdout: "pipe", stderr: "pipe" })
+    const proc = spawn([pythonPath, "-c", "import ctypes; ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics')"], { stdout: "pipe", stderr: "pipe" })
     return (await proc.exited) === 0
   } catch {
     return false
@@ -84,84 +88,36 @@ async function detectPackageManager(): Promise<"brew" | "port" | null> {
   return null
 }
 
-async function installCliclick(pm: "brew" | "port"): Promise<boolean> {
-  if (pm === "brew") {
-    const brewPath = await which("brew")
-    if (!brewPath) return false
-    console.log(`  ${D}запускаю: ${brewPath} install cliclick${RESET}`)
-    const proc = spawn([brewPath, "install", "cliclick"], { stdout: "inherit", stderr: "inherit" })
-    return (await proc.exited) === 0
-  }
-  const portPath = await which("port")
-  if (!portPath) return false
-  console.log(`  ${D}запускаю: sudo ${portPath} install cliclick (диалог пароля macOS)${RESET}`)
-  const script = `do shell script "${portPath} install -N cliclick" with administrator privileges`
-  const proc = spawn(["osascript", "-e", script], { stdout: "inherit", stderr: "inherit" })
-  return (await proc.exited) === 0
-}
 
 export async function bootstrap(autoInstall = true): Promise<InputBootstrapStatus> {
   console.log()
   console.log(`  ${C}@meta/input bootstrap${RESET}`)
 
+  const cliclick = await which("cliclick")
+  if (cliclick) console.log(`  ${OK} cliclick (${cliclick})`)
+
   const pythonRaw = await which("python3")
   let python3: string | null = null
-  if (pythonRaw && (await pythonHasQuartz(pythonRaw))) {
+  if (pythonRaw && (await pythonWorks(pythonRaw))) {
     python3 = pythonRaw
-    console.log(`  ${OK} python3+Quartz (${python3})  — доступен fallback для мыши`)
-  } else if (pythonRaw) {
-    console.log(`  ${WARN} python3 без модуля Quartz (PyObjC не установлен) — используется только cliclick`)
+    console.log(`  ${OK} python3+ctypes (${python3})`)
   }
 
-  let cliclick = await which("cliclick")
   const pm = await detectPackageManager()
 
-  if (cliclick) {
-    console.log(`  ${OK} cliclick (${cliclick})`)
-    const acc = await probeAccessibility(cliclick)
+  if (python3) {
+    const acc = await probeAccessibility(python3)
     if (acc) {
       console.log(`  ${OK} Accessibility разрешён`)
       console.log()
       return { cliclick, python3, packageManager: pm, accessibility: true }
     }
-    console.log(`  ${WARN} Accessibility не выдан процессу bun/терминалу`)
-    console.log(`  ${D}↳ Откройте: open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'${RESET}`)
-    console.log(`  ${D}  Добавьте: ваш терминал (iTerm/Terminal) или сам бинарник bun${RESET}`)
-    console.log()
-    return { cliclick, python3, packageManager: pm, accessibility: false,
-      hint: "Выдайте Accessibility терминалу/bun: System Settings → Privacy → Accessibility (или GET http://localhost:7882/permissions/accessibility)" }
   }
 
-  console.log(`  ${WARN} cliclick не установлен (рекомендуется для надёжной работы с мышью)`)
-
-  if (!autoInstall) {
-    return { cliclick: null, python3, packageManager: pm, accessibility: false,
-      hint: pm === "brew" ? "brew install cliclick" : pm === "port" ? "sudo port install cliclick" : "Установите brew или MacPorts, затем cliclick" }
-  }
-
-  if (!pm) {
-    console.log(`  ${WARN} brew/port не найдены — cliclick недоступен`)
-    console.log()
-    return { cliclick: null, python3, packageManager: null, accessibility: false }
-  }
-
-  const ok = await installCliclick(pm)
-  if (ok) {
-    cliclick = await which("cliclick")
-    if (cliclick) {
-      console.log(`  ${OK} cliclick установлен (${cliclick})`)
-      const acc = await probeAccessibility(cliclick)
-      if (!acc) {
-        console.log(`  ${WARN} Accessibility не выдан — выдайте в System Settings → Privacy → Accessibility`)
-      }
-      console.log()
-      return { cliclick, python3, packageManager: pm, accessibility: acc,
-        hint: acc ? undefined : "Выдайте Accessibility терминалу/bun" }
-    }
-  }
-
-  console.log(`  ${WARN} установка cliclick не удалась — работаем без него`)
+  console.log(`  ${WARN} Accessibility не выдан процессу bun/терминалу`)
+  console.log(`  ${D}↳ Откройте: open 'x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'${RESET}`)
+  console.log(`  ${D}  Добавьте: ваш терминал (iTerm/Terminal) или сам бинарник bun${RESET}`)
   console.log()
-  return { cliclick: null, python3, packageManager: pm, accessibility: false,
-    hint: pm === "brew" ? "Попробуйте вручную: brew install cliclick" : "Попробуйте вручную: sudo port install cliclick" }
+  return { cliclick, python3, packageManager: pm, accessibility: false,
+    hint: "Выдайте Accessibility терминалу/bun: System Settings → Privacy → Accessibility (или GET http://localhost:7882/permissions/accessibility)" }
 }
