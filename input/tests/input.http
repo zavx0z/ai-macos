@@ -117,8 +117,6 @@ Content-Type: application/json
   })
 %}
 
-// ─── Мышь ──────────────────────────────────────────────────────────
-
 ### Текущая позиция курсора
 GET {{inputHost}}/mouse/position
 Accept: application/json
@@ -223,8 +221,6 @@ Content-Type: application/json
   "dx": 3,
   "dy": 0
 }
-
-// ─── Клавиатура ────────────────────────────────────────────────────
 
 ### Набрать текст
 POST {{inputHost}}/keyboard/type

@@ -1,5 +1,5 @@
 import { err, json, logRequest, num, printBanner } from "@meta/shared"
-import { bootstrap, type InputBootstrapStatus } from "./bootstrap.ts"
+import { bootstrap, probeAccessibilityNow, type InputBootstrapStatus } from "./bootstrap.ts"
 import { click, drag, getPosition, move, scroll, setTools } from "./mouse.ts"
 import { pressKey, pressShortcut, pressShortcuts, typeText } from "./keyboard.ts"
 
@@ -38,14 +38,28 @@ Bun.serve({
         }
 
         if (path === "/permissions/accessibility" && method === "GET") {
-          return json({ granted: bootStatus.accessibility })
+          // Активная проба прямо сейчас — после выдачи прав не нужно перезапускать сервис
+          if (!bootStatus.cliclick) {
+            return json({ granted: false, hint: "cliclick не установлен — POST /bootstrap" })
+          }
+          const granted = await probeAccessibilityNow(bootStatus.cliclick)
+          bootStatus = { ...bootStatus, accessibility: granted, hint: granted ? undefined : bootStatus.hint }
+          return json({ granted })
         }
 
         if (path === "/permissions/accessibility" && method === "POST") {
           const proc = Bun.spawn(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"])
           await proc.exited
-          return json({ granted: bootStatus.accessibility, opened: true,
-            hint: "Добавьте бинарник /Users/vladimirfilipenko/.bun/bin/bun (или ваш терминал) в список и поставьте галочку" })
+          // Тоже пере-пробуем — на случай если уже выдали и просто хотят подтвердить
+          const granted = bootStatus.cliclick ? await probeAccessibilityNow(bootStatus.cliclick) : false
+          bootStatus = { ...bootStatus, accessibility: granted }
+          return json({
+            granted,
+            opened: true,
+            hint: granted
+              ? undefined
+              : `Добавьте в открывшийся список и поставьте галочку:\n  • ${bootStatus.cliclick ?? "/opt/local/bin/cliclick"}\n  • /Users/vladimirfilipenko/.bun/bin/bun\nПотом GET /permissions/accessibility ещё раз — должно стать granted: true`,
+          })
         }
 
         // ─── Mouse ───────────────────────────────────────────────────────

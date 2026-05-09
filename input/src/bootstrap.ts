@@ -21,6 +21,11 @@ export type InputBootstrapStatus = {
  * Молчаливый тест Accessibility: пытаемся подвинуть курсор обратно туда же.
  * Если процесс не имеет Accessibility, cliclick exit=0 но реально ничего не делает.
  */
+/** Активная проверка Accessibility — экспортирована для re-probe из /permissions/accessibility */
+export async function probeAccessibilityNow(cliclick: string): Promise<boolean> {
+  return await probeAccessibility(cliclick)
+}
+
 async function probeAccessibility(cliclick: string): Promise<boolean> {
   try {
     const before = spawn([cliclick, "p"], { stdout: "pipe", stderr: "pipe" })
