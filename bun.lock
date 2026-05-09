@@ -28,6 +28,13 @@
         "@meta/shared": "workspace:*",
       },
     },
+    "input": {
+      "name": "@meta/input",
+      "version": "0.0.0",
+      "dependencies": {
+        "@meta/shared": "workspace:*",
+      },
+    },
     "screen": {
       "name": "@meta/screen",
       "version": "0.0.0",
@@ -57,6 +64,8 @@
     "@meta/android": ["@meta/android@workspace:android"],
 
     "@meta/chrome": ["@meta/chrome@workspace:chrome"],
+
+    "@meta/input": ["@meta/input@workspace:input"],
 
     "@meta/screen": ["@meta/screen@workspace:screen"],
 

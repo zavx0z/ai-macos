@@ -11,6 +11,7 @@ Bun monorepo. Пять пакетов:
 | `@meta/screen` | 7879 | Скриншоты через `screencapture` |
 | `@meta/chrome` | 7880 | Управление десктопным Chrome через AppleScript |
 | `@meta/android` | 7881 | Управление Chrome на Android через ADB + CDP |
+| `@meta/input` | 7882 | Клавиатура и мышь (cliclick + System Events) |
 
 Зависимости: `chrome` → `screen` → `window` → (system); `android` → adb + CDP.
 
@@ -250,6 +251,61 @@ curl -s -X POST http://localhost:7881/screenshot \
 - Идентификатор вкладки — `tabId` (строка) вместо `windowId`+`tabIndex`
 - Захват через CDP `Page.captureScreenshot` (только сама страница, без UI Chrome)
 - `hard:true` в `/reload` = `ignoreCache:true` (без Cmd+Shift+R, фокус не перетаскивается)
+
+## @meta/input — порт 7882
+
+Клавиатура и мышь. Мышь через `cliclick` (auto-install через brew/port на старте), клавиатура через AppleScript System Events.
+
+Требует **Accessibility** для бинарника `bun` или для терминала, из которого запущен сервис. Bootstrap проверяет это активной пробой (двигает курсор и читает обратно).
+
+```bash
+# Проверка
+curl http://localhost:7882/health
+# → { ok, cliclick, python3, accessibility, hint? }
+
+# Открыть System Settings для выдачи Accessibility
+curl -X POST http://localhost:7882/permissions/accessibility
+
+# Мышь
+curl http://localhost:7882/mouse/position
+# → { x, y }
+
+curl -X POST http://localhost:7882/mouse/move \
+  -H 'content-type: application/json' -d '{"x":500,"y":400}'
+
+curl -X POST http://localhost:7882/mouse/click \
+  -H 'content-type: application/json' \
+  -d '{"x":500,"y":400,"button":"left","count":1}'
+# button: left | right | middle, count: 1|2|3 (double/triple)
+# без x/y — клик по текущей позиции
+
+curl -X POST http://localhost:7882/mouse/drag \
+  -H 'content-type: application/json' \
+  -d '{"from":{"x":100,"y":100},"to":{"x":300,"y":300},"durationMs":200}'
+
+curl -X POST http://localhost:7882/mouse/scroll \
+  -H 'content-type: application/json' -d '{"dy":3}'
+# dy>0 — вниз, dy<0 — вверх; dx — горизонтальная (Quartz scroll, требует python3+Quartz)
+
+# Клавиатура
+curl -X POST http://localhost:7882/keyboard/type \
+  -H 'content-type: application/json' -d '{"text":"Привет!","delayMs":30}'
+
+curl -X POST http://localhost:7882/keyboard/key \
+  -H 'content-type: application/json' \
+  -d '{"key":"enter"}'
+# key: enter, return, tab, space, escape, delete, left, right, up, down,
+#      home, end, pageup, pagedown, f1..f20, или одиночный символ "a", "1", "."
+
+curl -X POST http://localhost:7882/keyboard/shortcut \
+  -H 'content-type: application/json' \
+  -d '{"shortcut":"cmd+shift+t"}'
+# модификаторы: cmd | command | meta, shift, alt | option | opt, ctrl | control, fn
+
+curl -X POST http://localhost:7882/keyboard/shortcut \
+  -H 'content-type: application/json' \
+  -d '{"sequence":["cmd+a","cmd+c","cmd+t","cmd+v"],"delayMs":100}'
+```
 
 ## ⚠️ Скриншот Chrome — только через @meta/chrome
 

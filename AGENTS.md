@@ -11,6 +11,7 @@ Bun monorepo. Пять пакетов:
 | `@meta/screen` | 7879 | Скриншоты (`screencapture`) |
 | `@meta/chrome` | 7880 | Десктопный Chrome (AppleScript) |
 | `@meta/android` | 7881 | Chrome на Android (ADB + CDP) |
+| `@meta/input` | 7882 | Клавиатура и мышь (cliclick + System Events) |
 
 ## Запуск сервисов
 
@@ -238,6 +239,34 @@ curl -s -X POST http://localhost:7881/screenshot \
 # fullPage:true → захват всей страницы (не только viewport)
 # CDP снимает только содержимое страницы — без UI Chrome (адресной строки, табов)
 ```
+
+## @meta/input — порт 7882
+
+Клавиатура и мышь. `cliclick` ставится автоматически (brew/port). Нужно **Accessibility** для bun или терминала — без него API возвращает `ok` но события не доходят. Bootstrap проверяет это активной пробой.
+
+```bash
+curl http://localhost:7882/health
+# → { ok, cliclick, accessibility, hint? }
+
+curl -X POST http://localhost:7882/permissions/accessibility   # открыть System Settings
+
+# Мышь
+curl http://localhost:7882/mouse/position                       # { x, y }
+curl -X POST http://localhost:7882/mouse/move    -d '{"x":500,"y":400}'
+curl -X POST http://localhost:7882/mouse/click   -d '{"x":500,"y":400,"button":"left","count":2}'
+curl -X POST http://localhost:7882/mouse/drag    -d '{"from":{"x":100,"y":100},"to":{"x":300,"y":300}}'
+curl -X POST http://localhost:7882/mouse/scroll  -d '{"dy":3}'
+
+# Клавиатура
+curl -X POST http://localhost:7882/keyboard/type     -d '{"text":"Hello","delayMs":30}'
+curl -X POST http://localhost:7882/keyboard/key      -d '{"key":"enter"}'
+curl -X POST http://localhost:7882/keyboard/key      -d '{"key":"a","modifiers":["cmd","shift"]}'
+curl -X POST http://localhost:7882/keyboard/shortcut -d '{"shortcut":"cmd+shift+t"}'
+curl -X POST http://localhost:7882/keyboard/shortcut -d '{"sequence":["cmd+a","cmd+c"],"delayMs":80}'
+```
+
+Имена клавиш: `enter|return`, `tab`, `space`, `escape|esc`, `delete|backspace`, `forwarddelete`, `left|right|up|down`, `home`, `end`, `pageup`, `pagedown`, `f1..f20`, или одиночный символ.
+Модификаторы: `cmd|command|meta|⌘`, `shift|⇧`, `alt|option|opt|⌥`, `ctrl|control|⌃`, `fn`.
 
 ## Правила для агентов
 

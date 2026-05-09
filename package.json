@@ -3,9 +3,9 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
-  "workspaces": ["shared", "window", "screen", "chrome", "android"],
+  "workspaces": ["shared", "window", "screen", "chrome", "android", "input"],
   "scripts": {
-    "dev": "bun run --filter '@meta/window' --filter '@meta/screen' --filter '@meta/chrome' --filter '@meta/android' dev"
+    "dev": "bun run --filter '@meta/window' --filter '@meta/screen' --filter '@meta/chrome' --filter '@meta/android' --filter '@meta/input' dev"
   },
   "devDependencies": {
     "@types/bun": "latest"
