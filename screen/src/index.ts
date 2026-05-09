@@ -1,7 +1,7 @@
 import { captureDesktop, captureRect, parseDetail, type CaptureOptions } from "./capture.ts";
 import { frontmostApp } from "./restore.ts";
 import { createWindowApi, type WindowApi, type WindowInfo } from "./window-api.ts";
-import { clamp, err, json, logRequest, nonNegativeInt, osa, parseBoolean, png, positiveInt, printBanner, quote, sleep } from "@meta/shared";
+import { clamp, err, json, logCaption, logRequest, nonNegativeInt, osa, parseBoolean, png, positiveInt, printBanner, quote, sleep } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? Bun.env.SCREEN_PORT ?? 7879);
 const windowApi = createWindowApi();
@@ -16,6 +16,7 @@ type WindowCaptureRequest = {
   format?: "png" | "json";
   detail?: string;
   scale?: number;
+  caption?: string;
 };
 
 type RectCaptureRequest = {
@@ -30,6 +31,7 @@ type RectCaptureRequest = {
   format?: "png" | "json";
   detail?: string;
   scale?: number;
+  caption?: string;
 };
 
 const server = Bun.serve({
@@ -77,6 +79,7 @@ const server = Bun.serve({
           format: parseFormat(url.searchParams.get("format")),
           detail: url.searchParams.get("detail") ?? undefined,
           scale: positiveInt(url.searchParams.get("scale"), undefined),
+          caption: url.searchParams.get("caption") ?? undefined,
         };
         return await windowResponse(request);
       }
@@ -100,6 +103,7 @@ const server = Bun.serve({
               format: parseFormat(url.searchParams.get("format")),
               detail: url.searchParams.get("detail") ?? undefined,
               scale: positiveInt(url.searchParams.get("scale"), undefined),
+              caption: url.searchParams.get("caption") ?? undefined,
             };
         return await rectResponse(input);
       }
@@ -184,6 +188,8 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
   const scale = parseDetail(input.detail ?? (input.scale != null ? String(input.scale) : null));
   const beforeFrontmost = restore ? await frontmostApp() : null;
 
+  if (input.caption) logCaption(input.caption)
+
   let target: WindowInfo | undefined;
   try {
     const windows = await windowApi.listWindows(app);
@@ -208,15 +214,19 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
         mime: "image/png",
         window: target,
         restored,
+        ...(input.caption ? { caption: input.caption } : {}),
         base64: Buffer.from(image).toString("base64"),
       });
     }
+    const extraHeaders: Record<string, string> = {};
+    if (input.caption) extraHeaders["x-meta-caption"] = encodeURIComponent(input.caption);
     return png(image, {
       "x-meta-screen-target": "window",
       "x-meta-window-app": target.app,
       "x-meta-window-index": String(target.index),
       "x-meta-window-title": encodeURIComponent(target.title),
       "x-meta-window-restored": restored.ok ? "true" : "false",
+      ...extraHeaders,
     });
   } catch (e) {
     await restoreFocus(windowApi, beforeFrontmost, restore);
@@ -265,6 +275,8 @@ async function rectResponse(input: RectCaptureRequest): Promise<Response> {
   const scale = parseDetail(input.detail ?? (input.scale != null ? String(input.scale) : null));
   const beforeFrontmost = restore ? await frontmostApp() : null;
 
+  if (input.caption) logCaption(input.caption)
+
   try {
     if (input.app) await osa(`tell application ${quote(input.app)} to activate`);
     if (delayMs > 0) await sleep(delayMs);
@@ -279,13 +291,17 @@ async function rectResponse(input: RectCaptureRequest): Promise<Response> {
         mime: "image/png",
         rect: { x, y, width, height },
         restored,
+        ...(input.caption ? { caption: input.caption } : {}),
         base64: Buffer.from(image).toString("base64"),
       });
     }
+    const extraHeaders: Record<string, string> = {};
+    if (input.caption) extraHeaders["x-meta-caption"] = encodeURIComponent(input.caption);
     return png(image, {
       "x-meta-screen-target": "rect",
       "x-meta-rect": `${x},${y},${width},${height}`,
       "x-meta-window-restored": restored.ok ? "true" : "false",
+      ...extraHeaders,
     });
   } catch (e) {
     await restoreFocus(windowApi, beforeFrontmost, restore);

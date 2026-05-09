@@ -4,6 +4,9 @@
   "type": "module",
   "private": true,
   "workspaces": ["shared", "window", "screen", "chrome"],
+  "scripts": {
+    "dev": "bun run --filter '@meta/window' --filter '@meta/screen' --filter '@meta/chrome' dev"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },

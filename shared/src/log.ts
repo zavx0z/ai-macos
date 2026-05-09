@@ -19,6 +19,10 @@ function scolor(status: number): string {
 }
 function abbrev(method: string): string { return method === 'DELETE' ? 'DEL' : method }
 
+export function logCaption(caption: string): void {
+  console.log(`  ${CYAN}▸${R} ${caption}`)
+}
+
 export function logRequest(method: string, path: string, status: number, ms: number): void {
   const m = abbrev(method)
   const sc = scolor(status)

@@ -2,7 +2,7 @@ import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
-import { osa, quote } from "@meta/shared";
+import { logCaption, osa, quote } from "@meta/shared";
 
 export type TabInfo = {
   id: number;
@@ -293,12 +293,14 @@ export type ScreenshotOptions = {
   restore?: boolean;
   detail?: string;
   scale?: number;
+  caption?: string;
 };
 
 export type ScreenshotResult = {
   status: number;
   contentType: string;
   body: ArrayBuffer;
+  caption?: string;
 };
 
 export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<ScreenshotResult> {
@@ -324,6 +326,8 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
     prevApp = await osa(`tell application "System Events" to get name of first application process whose frontmost is true`).catch(() => null)
   }
 
+  if (opts.caption) logCaption(opts.caption)
+
   // Bring the exact Chrome window to front before capture
   await osa(`tell application "Google Chrome"
     set index of (first window whose id is ${fresh.id}) to 1
@@ -342,6 +346,7 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
   if (opts.delayMs !== undefined) body.delayMs = opts.delayMs
   if (opts.detail !== undefined) body.detail = opts.detail
   if (opts.scale !== undefined) body.scale = opts.scale
+  if (opts.caption !== undefined) body.caption = opts.caption
 
   const res = await fetch(`${SCREEN_API}/rect`, {
     method: "POST",
@@ -368,6 +373,7 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
     status: res.status,
     contentType: res.headers.get("content-type") ?? "application/octet-stream",
     body: buf,
+    caption: opts.caption,
   }
 }
 

@@ -149,11 +149,12 @@ const server = Bun.serve({
               delayMs: num(url.searchParams.get("delayMs")),
               format: (url.searchParams.get("format") === "json" ? "json" : "png") as "png" | "json",
               restore: parseBool(url.searchParams.get("restore")),
+              caption: url.searchParams.get("caption") ?? undefined,
             };
         const result = await screenshotTab(opts as Parameters<typeof screenshotTab>[0]);
-        return new Response(result.body, {
-          headers: { "content-type": result.contentType, "cache-control": "no-store" },
-        });
+        const headers: Record<string, string> = { "content-type": result.contentType, "cache-control": "no-store" };
+        if (result.caption) headers["x-meta-caption"] = encodeURIComponent(result.caption);
+        return new Response(result.body, { headers });
       }
 
       return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /windows /tabs /tabs/active /source /text /screenshot, POST /windows /tabs /navigate /activate /reload /back /forward /eval /screenshot, DELETE /windows/:id /tabs/:wid/:idx");
