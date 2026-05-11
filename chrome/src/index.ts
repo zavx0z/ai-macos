@@ -1,5 +1,6 @@
 import {
   activateTab,
+  clearViewport,
   closeTab,
   closeWindow,
   consoleListen,
@@ -17,9 +18,12 @@ import {
   newWindow,
   reload,
   screenshotTab,
+  setViewport,
+  waitReady,
 } from "./chrome.ts";
 import { err, json, logRequest, num, parseBool, printBanner } from "@meta/shared";
-import { detectCdp } from "./cdp-mode.ts";
+import { detectCdp, type ViewportMode, type ViewportOverride } from "./cdp-mode.ts";
+import type { WaitReadyOptions } from "./wait-ready.ts";
 
 const PORT = Number(Bun.env.PORT ?? 7880);
 
@@ -88,10 +92,11 @@ const server = Bun.serve({
       }
 
       if (path === "/navigate" && method === "POST") {
-        const body = (await req.json()) as { url?: string; windowId?: number; tabIndex?: number };
+        const body = (await req.json()) as { url?: string; windowId?: number; tabIndex?: number; waitReady?: boolean; waitOpts?: WaitReadyOptions };
         if (!body.url) return err(400, "missing 'url'", "Пример: {\"url\":\"https://example.com\"}");
-        const result = await navigate(body.url, body.windowId, body.tabIndex);
-        return json({ ok: true, via: result.via });
+        const wait = body.waitReady !== false
+        const result = await navigate(body.url, body.windowId, body.tabIndex, wait, body.waitOpts);
+        return json({ ok: true, ...result });
       }
 
       if (path === "/activate" && method === "POST") {
@@ -104,12 +109,56 @@ const server = Bun.serve({
       }
 
       if (path === "/reload" && method === "POST") {
-        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; hard?: boolean; wait?: boolean };
+        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; hard?: boolean; wait?: boolean; waitOpts?: WaitReadyOptions };
         const wait = body.wait !== false;
         const result = body.hard
-          ? await hardReload(body.windowId, body.tabIndex, wait)
-          : await reload(body.windowId, body.tabIndex, wait);
+          ? await hardReload(body.windowId, body.tabIndex, wait, body.waitOpts)
+          : await reload(body.windowId, body.tabIndex, wait, body.waitOpts);
         return json({ ok: true, hard: body.hard === true, waited: wait, ...result });
+      }
+
+      if (path === "/wait-ready" && method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; options?: WaitReadyOptions };
+        const r = await waitReady(body.windowId, body.tabIndex, body.options ?? {});
+        if (r.via === "unavailable") {
+          return err(503, r.error, "Запустите Chrome с CDP: bun run cdp (в директории chrome/)");
+        }
+        return json({ via: r.via, ...r.result });
+      }
+
+      if (path === "/viewport" && method === "POST") {
+        const body = (await req.json()) as { windowId?: number; tabIndex?: number; width?: number; height?: number; deviceScaleFactor?: number; mobile?: boolean; mode?: ViewportMode; waitReady?: boolean; waitOpts?: WaitReadyOptions; reload?: boolean };
+        if (body.width == null || body.height == null || body.width <= 0 || body.height <= 0) {
+          return err(400, "need {width, height}", "Пример: {\"width\":1280,\"height\":800,\"mode\":\"window\"} (default), для mobile: {\"width\":390,\"height\":844,\"deviceScaleFactor\":3,\"mobile\":true,\"mode\":\"emulation\"}");
+        }
+        if (body.mode && body.mode !== "window" && body.mode !== "emulation") {
+          return err(400, `unknown mode '${body.mode}'`, "mode: \"window\" (physical Browser.setWindowBounds) | \"emulation\" (Emulation.setDeviceMetricsOverride)");
+        }
+        const override: ViewportOverride = {
+          width: Math.round(body.width),
+          height: Math.round(body.height),
+          deviceScaleFactor: body.deviceScaleFactor,
+          mobile: body.mobile,
+          mode: body.mode,
+        };
+        const wait = body.waitReady !== false;
+        const reload = body.reload !== false;
+        const r = await setViewport(body.windowId, body.tabIndex, override, wait, body.waitOpts, reload);
+        if (r.via === "unavailable") {
+          return err(503, r.error, "Запустите Chrome с CDP: bun run cdp (в директории chrome/)");
+        }
+        return json({ ok: true, ...r });
+      }
+
+      if (path === "/viewport" && method === "DELETE") {
+        const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; waitReady?: boolean; waitOpts?: WaitReadyOptions; reload?: boolean };
+        const wait = body.waitReady !== false;
+        const reload = body.reload !== false;
+        const r = await clearViewport(body.windowId, body.tabIndex, wait, body.waitOpts, reload);
+        if (r.via === "unavailable") {
+          return err(503, r.error, "Запустите Chrome с CDP: bun run cdp (в директории chrome/)");
+        }
+        return json({ ok: true, ...r });
       }
 
       if (path === "/back" && method === "POST") {
@@ -171,6 +220,7 @@ const server = Bun.serve({
               format: (url.searchParams.get("format") === "json" ? "json" : "png") as "png" | "json",
               restore: parseBool(url.searchParams.get("restore")),
               caption: url.searchParams.get("caption") ?? undefined,
+              waitReady: parseBool(url.searchParams.get("waitReady")),
             };
         const result = await screenshotTab(opts as Parameters<typeof screenshotTab>[0]);
         const headers: Record<string, string> = { "content-type": result.contentType, "cache-control": "no-store" };
@@ -178,7 +228,7 @@ const server = Bun.serve({
         return new Response(result.body, { headers });
       }
 
-      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /windows /tabs /tabs/active /source /text /screenshot, POST /windows /tabs /navigate /activate /reload /back /forward /eval /screenshot, DELETE /windows/:id /tabs/:wid/:idx");
+      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /windows /tabs /tabs/active /source /text /screenshot, POST /windows /tabs /navigate /activate /reload /back /forward /eval /screenshot /wait-ready /viewport, DELETE /windows/:id /tabs/:wid/:idx /viewport");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       let hint: string | undefined;
@@ -212,11 +262,14 @@ printBanner("@meta/chrome", PORT, [
     { method: "DELETE", path: "/tabs/:wid/:idx", description: "закрыть вкладку" },
   ]},
   { title: "Навигация", routes: [
-    { method: "POST", path: "/navigate", description: "перейти по URL" },
-    { method: "POST", path: "/activate", description: "активировать вкладку" },
-    { method: "POST", path: "/reload",   description: "перезагрузить  ({hard?,wait?}) — ждёт загрузки" },
-    { method: "POST", path: "/back",     description: "назад" },
-    { method: "POST", path: "/forward",  description: "вперёд" },
+    { method: "POST",   path: "/navigate",   description: "перейти по URL  ({url,waitReady?,waitOpts?})" },
+    { method: "POST",   path: "/activate",   description: "активировать вкладку" },
+    { method: "POST",   path: "/reload",     description: "перезагрузить  ({hard?,wait?,waitOpts?}) — ждёт полной готовности" },
+    { method: "POST",   path: "/wait-ready", description: "дождаться полной готовности страницы  ({windowId?,tabIndex?,options?})" },
+    { method: "POST",   path: "/viewport",   description: "ресайз viewport вкладки  ({width,height,deviceScaleFactor?,mobile?,waitReady?})" },
+    { method: "DELETE", path: "/viewport",   description: "сбросить override viewport" },
+    { method: "POST",   path: "/back",       description: "назад" },
+    { method: "POST",   path: "/forward",    description: "вперёд" },
   ]},
   { title: "Контент", routes: [
     { method: "POST", path: "/eval",    description: "выполнить JS в вкладке" },

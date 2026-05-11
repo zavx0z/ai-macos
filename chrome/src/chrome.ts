@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
 import { logCaption, osa, quote } from "@meta/shared";
-import { cdpConsoleListen, cdpEval, cdpNavigate, cdpReload, findTargetByUrl, isCdpAvailable, type ConsoleEntry } from "./cdp-mode.ts";
+import { cdpClearViewport, cdpConsoleListen, cdpEval, cdpNavigate, cdpReload, cdpSetViewport, cdpWaitReady, findTargetByUrl, isCdpAvailable, type ConsoleEntry, type ViewportOverride, type ViewportMode } from "./cdp-mode.ts";
+import type { WaitReadyOptions, WaitReadyResult } from "./wait-ready.ts";
 
 export type TabInfo = {
   id: number;
@@ -229,32 +230,36 @@ export async function navigate(
   url: string,
   windowId?: number,
   tabIndex?: number,
-): Promise<{ via: "cdp" | "applescript" }> {
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+): Promise<{ via: "cdp" | "applescript"; waitMs?: number; ready?: WaitReadyResult }> {
   if (await isCdpAvailable()) {
     const currentUrl = await tabUrl(windowId, tabIndex).catch(() => "")
     const target = currentUrl ? await findTargetByUrl(currentUrl) : null
     if (target) {
-      await cdpNavigate(target, url)
-      return { via: "cdp" }
+      const r = await cdpNavigate(target, url, wait, waitOpts)
+      return { via: "cdp", ...r }
     }
   }
   await osa(
     `tell application "Google Chrome" to set URL of ${tabRef(windowId, tabIndex)} to ${quote(url)}`,
   )
-  return { via: "applescript" }
+  const waitMs = wait ? await waitForTabLoad(windowId, tabIndex) : 0
+  return { via: "applescript", waitMs }
 }
 
 export async function reload(
   windowId?: number,
   tabIndex?: number,
   wait = true,
-): Promise<{ waitMs: number; via: "cdp" | "applescript" }> {
+  waitOpts: WaitReadyOptions = {},
+): Promise<{ waitMs: number; via: "cdp" | "applescript"; ready?: WaitReadyResult }> {
   if (await isCdpAvailable()) {
     const url = await tabUrl(windowId, tabIndex).catch(() => "")
     const target = url ? await findTargetByUrl(url) : null
     if (target) {
-      const waitMs = await cdpReload(target, false, wait)
-      return { waitMs, via: "cdp" }
+      const r = await cdpReload(target, false, wait, waitOpts)
+      return { via: "cdp", ...r }
     }
   }
   await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to reload`)
@@ -262,14 +267,19 @@ export async function reload(
   return { waitMs, via: "applescript" }
 }
 
-export async function hardReload(windowId?: number, tabIndex?: number, wait = true): Promise<{ waitMs: number; via: "cdp" | "applescript" }> {
+export async function hardReload(
+  windowId?: number,
+  tabIndex?: number,
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+): Promise<{ waitMs: number; via: "cdp" | "applescript"; ready?: WaitReadyResult }> {
   // CDP path: ignoreCache:true is the equivalent of Cmd+Shift+R, без воровства фокуса
   if (await isCdpAvailable()) {
     const url = await tabUrl(windowId, tabIndex).catch(() => "")
     const target = url ? await findTargetByUrl(url) : null
     if (target) {
-      const waitMs = await cdpReload(target, true, wait)
-      return { waitMs, via: "cdp" }
+      const r = await cdpReload(target, true, wait, waitOpts)
+      return { via: "cdp", ...r }
     }
   }
   if (windowId != null) {
@@ -368,7 +378,65 @@ export type ScreenshotOptions = {
   detail?: string;
   scale?: number;
   caption?: string;
+  waitReady?: boolean;
+  waitOpts?: WaitReadyOptions;
 };
+
+export async function waitReady(
+  windowId?: number,
+  tabIndex?: number,
+  opts: WaitReadyOptions = {},
+): Promise<{ via: "cdp"; result: WaitReadyResult } | { via: "unavailable"; error: string }> {
+  if (!(await isCdpAvailable())) {
+    return { via: "unavailable", error: "CDP not available — start Chrome with --remote-debugging-port=9222 (bun run cdp)" }
+  }
+  const url = await tabUrl(windowId, tabIndex).catch(() => "")
+  const target = url ? await findTargetByUrl(url) : null
+  if (!target) {
+    return { via: "unavailable", error: `CDP target not found for URL: ${url || "(unknown)"}` }
+  }
+  const result = await cdpWaitReady(target, opts)
+  return { via: "cdp", result }
+}
+
+export async function setViewport(
+  windowId: number | undefined,
+  tabIndex: number | undefined,
+  override: ViewportOverride,
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+  reload = true,
+): Promise<{ via: "cdp"; applied: { width: number; height: number; deviceScaleFactor: number; mobile: boolean; mode: ViewportMode }; bounds?: { before: unknown; after: unknown }; reloaded: boolean; ready?: WaitReadyResult } | { via: "unavailable"; error: string }> {
+  if (!(await isCdpAvailable())) {
+    return { via: "unavailable", error: "CDP not available — start Chrome with --remote-debugging-port=9222 (bun run cdp)" }
+  }
+  const url = await tabUrl(windowId, tabIndex).catch(() => "")
+  const target = url ? await findTargetByUrl(url) : null
+  if (!target) {
+    return { via: "unavailable", error: `CDP target not found for URL: ${url || "(unknown)"}` }
+  }
+  const r = await cdpSetViewport(target, override, wait, waitOpts, reload)
+  return { via: "cdp", ...r }
+}
+
+export async function clearViewport(
+  windowId: number | undefined,
+  tabIndex: number | undefined,
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+  reload = true,
+): Promise<{ via: "cdp"; reloaded: boolean; ready?: WaitReadyResult } | { via: "unavailable"; error: string }> {
+  if (!(await isCdpAvailable())) {
+    return { via: "unavailable", error: "CDP not available — start Chrome with --remote-debugging-port=9222 (bun run cdp)" }
+  }
+  const url = await tabUrl(windowId, tabIndex).catch(() => "")
+  const target = url ? await findTargetByUrl(url) : null
+  if (!target) {
+    return { via: "unavailable", error: `CDP target not found for URL: ${url || "(unknown)"}` }
+  }
+  const r = await cdpClearViewport(target, wait, waitOpts, reload)
+  return { via: "cdp", ...r }
+}
 
 export type ScreenshotResult = {
   status: number;
@@ -407,6 +475,15 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
     set index of (first window whose id is ${fresh.id}) to 1
     activate
   end tell`)
+
+  // Wait for page to be fully ready before capture (lazy images, fonts, animations, ...).
+  // Best-effort: silently skip if CDP is unavailable or target can't be matched.
+  const shouldWait = opts.waitReady !== false
+  if (shouldWait && await isCdpAvailable()) {
+    const u = fresh.tabs.find((t) => t.index === fresh.activeTabIndex)?.url ?? ""
+    const target = u ? await findTargetByUrl(u) : null
+    if (target) await cdpWaitReady(target, opts.waitOpts ?? {})
+  }
 
   const body: Record<string, unknown> = {
     x: fresh.x,

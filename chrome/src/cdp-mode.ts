@@ -1,4 +1,5 @@
-import { CdpHttp, withSession, type CdpTarget } from "@meta/shared"
+import { CdpHttp, withSession, type CdpSession, type CdpTarget } from "@meta/shared"
+import { waitOnSession, type WaitReadyOptions, type WaitReadyResult } from "./wait-ready.ts"
 
 const CDP_HOST = Bun.env.CHROME_CDP_HOST ?? "localhost"
 const CDP_PORT = Number(Bun.env.CHROME_CDP_PORT ?? 9222)
@@ -54,9 +55,20 @@ export async function cdpEval(target: CdpTarget, js: string): Promise<string> {
   })
 }
 
-export async function cdpNavigate(target: CdpTarget, url: string): Promise<void> {
-  await withSession(target, async (s) => {
+export async function cdpNavigate(
+  target: CdpTarget,
+  url: string,
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+): Promise<{ waitMs: number; ready?: WaitReadyResult }> {
+  return await withSession(target, async (s) => {
+    await s.send("Page.enable")
+    const t0 = Date.now()
     await s.send("Page.navigate", { url })
+    if (!wait) return { waitMs: 0 }
+    await waitForLoadEvent(s, 8_000)
+    const ready = await waitOnSession(s, waitOpts)
+    return { waitMs: Date.now() - t0, ready }
   })
 }
 
@@ -145,21 +157,155 @@ export async function cdpConsoleListen(
   })
 }
 
-export async function cdpReload(target: CdpTarget, ignoreCache = false, wait = true, timeoutMs = 10_000): Promise<number> {
+export async function cdpReload(
+  target: CdpTarget,
+  ignoreCache = false,
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+): Promise<{ waitMs: number; ready?: WaitReadyResult }> {
   return await withSession(target, async (s) => {
     await s.send("Page.enable")
     const t0 = Date.now()
     await s.send("Page.reload", { ignoreCache })
-    if (!wait) return 0
-    await new Promise((r) => setTimeout(r, 150))
-    while (Date.now() - t0 < timeoutMs) {
-      const result = await s.send<{ result: { value?: string } }>("Runtime.evaluate", {
-        expression: "document.readyState",
-        returnByValue: true,
-      })
-      if (result.result.value === "complete") return Date.now() - t0
-      await new Promise((r) => setTimeout(r, 200))
+    if (!wait) return { waitMs: 0 }
+    await waitForLoadEvent(s, 8_000)
+    const ready = await waitOnSession(s, waitOpts)
+    return { waitMs: Date.now() - t0, ready }
+  })
+}
+
+/**
+ * Triple-step viewport override reset. A single `clearDeviceMetricsOverride` is not
+ * always sufficient — Chrome can resurrect a previously-applied override after
+ * session teardown (observed when switching from mobile-emulation to window-mode
+ * resize). The intermediate `setDeviceMetricsOverride({0,0,0,false})` writes a
+ * neutral state that the final `clear` then wipes.
+ */
+async function forceClearMetrics(s: CdpSession): Promise<void> {
+  await s.send("Emulation.clearDeviceMetricsOverride")
+  await s.send("Emulation.setDeviceMetricsOverride", { width: 0, height: 0, deviceScaleFactor: 0, mobile: false })
+  await s.send("Emulation.clearDeviceMetricsOverride")
+}
+
+/**
+ * Wait for Page.loadEventFired (or a short fallback timeout). After Page.reload /
+ * Page.navigate, the old Runtime context is destroyed and Runtime.evaluate calls
+ * issued before the new context is created can hang indefinitely. Listening for
+ * loadEventFired makes downstream evaluates safe.
+ */
+async function waitForLoadEvent(s: CdpSession, timeoutMs: number): Promise<void> {
+  const ws = (s as unknown as { ws: WebSocket }).ws
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => { ws.removeEventListener("message", onMsg); resolve() }, timeoutMs)
+    const onMsg = (ev: MessageEvent) => {
+      try {
+        const m = JSON.parse(ev.data as string) as { method?: string }
+        if (m.method === "Page.loadEventFired" || m.method === "Page.frameStoppedLoading") {
+          clearTimeout(timer)
+          ws.removeEventListener("message", onMsg)
+          resolve()
+        }
+      } catch {}
     }
-    return Date.now() - t0
+    ws.addEventListener("message", onMsg)
+  })
+}
+
+export async function cdpWaitReady(target: CdpTarget, waitOpts: WaitReadyOptions = {}): Promise<WaitReadyResult> {
+  return await withSession(target, async (s) => waitOnSession(s, waitOpts))
+}
+
+export type ViewportMode = "window" | "emulation"
+
+export type ViewportOverride = {
+  width: number
+  height: number
+  deviceScaleFactor?: number
+  mobile?: boolean
+  mode?: ViewportMode
+}
+
+type WindowBounds = { left: number; top: number; width: number; height: number; windowState: string }
+type WindowForTarget = { windowId: number; bounds: WindowBounds }
+
+export async function cdpSetViewport(
+  target: CdpTarget,
+  override: ViewportOverride,
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+  reload = true,
+): Promise<{
+  applied: { width: number; height: number; deviceScaleFactor: number; mobile: boolean; mode: ViewportMode }
+  bounds?: { before: WindowBounds; after: WindowBounds }
+  reloaded: boolean
+  ready?: WaitReadyResult
+}> {
+  // Default mode: physical window resize. Emulation override only when explicitly requested
+  // or when mobile=true (need touch/meta-viewport emulation).
+  const mode: ViewportMode = override.mode ?? (override.mobile ? "emulation" : "window")
+  return await withSession(target, async (s) => {
+    let bounds: { before: WindowBounds; after: WindowBounds } | undefined
+    if (mode === "window") {
+      // Drop any leftover emulation override from a previous mobile-emulation call —
+      // otherwise the page keeps the old virtual viewport regardless of physical resize.
+      // A bare clearDeviceMetricsOverride can be silently restored by Chrome between
+      // sessions; the triple-step (clear → set zeros → clear) reliably wipes it.
+      await forceClearMetrics(s)
+      const wfor = await s.send<WindowForTarget>("Browser.getWindowForTarget", { targetId: target.id })
+      const before = wfor.bounds
+      // setWindowBounds rejects width/height changes while window is maximized/minimized.
+      if (before.windowState !== "normal") {
+        await s.send("Browser.setWindowBounds", { windowId: wfor.windowId, bounds: { windowState: "normal" } })
+      }
+      await s.send("Browser.setWindowBounds", {
+        windowId: wfor.windowId,
+        bounds: { width: Math.round(override.width), height: Math.round(override.height) },
+      })
+      const fresh = await s.send<WindowForTarget>("Browser.getWindowForTarget", { targetId: target.id })
+      bounds = { before, after: fresh.bounds }
+    } else {
+      await s.send("Emulation.setDeviceMetricsOverride", {
+        width: Math.round(override.width),
+        height: Math.round(override.height),
+        deviceScaleFactor: override.deviceScaleFactor ?? 1,
+        mobile: override.mobile ?? false,
+      })
+    }
+    const applied = {
+      width: Math.round(override.width),
+      height: Math.round(override.height),
+      deviceScaleFactor: override.deviceScaleFactor ?? 1,
+      mobile: override.mobile ?? false,
+      mode,
+    }
+    if (reload) {
+      await s.send("Page.enable")
+      await s.send("Page.reload", { ignoreCache: false })
+      await waitForLoadEvent(s, 8_000)
+    }
+    if (!wait) return { applied, bounds, reloaded: reload }
+    const ready = await waitOnSession(s, waitOpts)
+    return { applied, bounds, reloaded: reload, ready }
+  })
+}
+
+export async function cdpClearViewport(
+  target: CdpTarget,
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+  reload = true,
+): Promise<{ reloaded: boolean; ready?: WaitReadyResult }> {
+  return await withSession(target, async (s) => {
+    // Only clears emulation override. Physical window resize is not auto-reverted —
+    // call POST /viewport again with desired size, or use @meta/window /resize.
+    await forceClearMetrics(s)
+    if (reload) {
+      await s.send("Page.enable")
+      await s.send("Page.reload", { ignoreCache: false })
+      await waitForLoadEvent(s, 8_000)
+    }
+    if (!wait) return { reloaded: reload }
+    const ready = await waitOnSession(s, waitOpts)
+    return { reloaded: reload, ready }
   })
 }
