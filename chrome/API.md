@@ -93,8 +93,10 @@ bun run start  # обычный запуск
 Перейти по URL в указанной (или активной) вкладке.
 
 ```json
-{ "url": "https://example.com", "windowId": 12345, "tabIndex": 2 }
+{ "url": "https://example.com", "windowId": 12345, "tabIndex": 2, "waitReady": true, "waitOpts": {} }
 ```
+
+`waitReady: true` (по умолчанию) — после `Page.navigate` сервис ждёт полной готовности через `waitFullyReady`. Возвращает `{ ok, via, waitMs, ready }`. `waitReady: false` — поведение как было раньше, возврат сразу после `Page.navigate`.
 
 ### `POST /activate`
 
@@ -112,7 +114,91 @@ bun run start  # обычный запуск
 
 Все поля опциональны — без них действие идёт в активной вкладке переднего окна.
 
-`POST /reload` дополнительно принимает `{ "hard": true }`. В этом случае выполняется **жёсткая перезагрузка с обходом кеша** через симуляцию `Cmd+Shift+R`. Реализация: AppleScript поднимает целевое окно (`set index of window id W to 1`), активирует вкладку, выводит Chrome на передний план и шлёт keystroke через System Events. Это **переносит фокус** на Chrome — обычный `reload` (без `hard`) фокус не трогает. Жёсткая перезагрузка не требует «Allow JavaScript from Apple Events», но требует разрешения Accessibility для процесса, посылающего Apple events (как и любая другая операция System Events).
+`POST /reload` дополнительно принимает `{ "hard": true, "wait": true, "waitOpts": {...} }`. По умолчанию (`wait: true`) после перезагрузки сервис **ждёт полной готовности страницы** через `waitFullyReady` — см. `POST /wait-ready` ниже. Возвращает `{ ok, hard, waited, waitMs, via, ready }` где `ready` — детальный отчёт по шагам. `wait: false` → вернуться сразу после `Page.reload`. `waitOpts` пробрасывается в `waitFullyReady` (можно отключить отдельные шаги или поднять/опустить таймауты).
+
+`hard: true` через CDP — это `Page.reload({ignoreCache: true})`, без отнятия фокуса. Без CDP — fallback на AppleScript+System Events с симуляцией `Cmd+Shift+R`, что **переносит фокус** на Chrome.
+
+### `POST /wait-ready`
+
+Дождаться, пока страница полностью прогрузится — `document.readyState === 'complete'`, шрифты загружены, network idle, все `<img>` (включая `loading="lazy"`) полностью загружены и декодированы, layout стабилизировался, все конечные CSS-анимации завершены, финальный двойной rAF.
+
+```json
+{ "windowId": 12345, "tabIndex": 2, "options": { /* see below */ } }
+```
+
+```json
+{
+  "via": "cdp",
+  "ok": true,
+  "reached": ["readyState","fonts","networkIdle","images","reflowStable","animations","finalCommit"],
+  "skipped": [],
+  "timedOut": false,
+  "durationMs": 933,
+  "steps": [
+    { "name": "readyState", "ok": true, "durationMs": 2 },
+    { "name": "fonts", "ok": true, "durationMs": 1 },
+    { "name": "networkIdle", "ok": true, "durationMs": 715 },
+    { "name": "images", "ok": true, "durationMs": 167 },
+    { "name": "reflowStable", "ok": true, "durationMs": 15 },
+    { "name": "animations", "ok": true, "durationMs": 1 },
+    { "name": "finalCommit", "ok": true, "durationMs": 33 }
+  ]
+}
+```
+
+Опции `options` (все опциональные):
+
+| Поле | По умолчанию | Что делает |
+|---|---|---|
+| `readyState` | `true` | дождаться `document.readyState === 'complete'` |
+| `fonts` | `true` | `await document.fonts.ready` |
+| `networkIdle` | `true` | нет inflight HTTP за `idleMs`. Счётчик ведётся снаружи через `Network.requestWillBeSent/loadingFinished/loadingFailed` |
+| `images` | `true` | принудительный `loading='eager'` + `Promise.all(load)` + `decode()` для всех `<img>` |
+| `reflowStable` | `true` | дождаться двух подряд rAF, между которыми `documentElement.scrollWidth/scrollHeight` не изменились (internal deadline 2.5 с) |
+| `animations` | `true` | дождаться завершения всех конечных `getAnimations()` |
+| `finalCommit` | `true` | финальный двойной rAF — коммит в композитор |
+| `idleMs` | `700` | окно тишины network для шага `networkIdle` |
+| `stepMs` | `8000` | таймаут одного шага (защита от зависшего шрифта/img) |
+| `maxMs` | `15000` | общий таймаут |
+
+Требует CDP (порт 9222). Без CDP — `503` с подсказкой запустить `bun run cdp`. Сервис сам вызывает `Emulation.setFocusEmulationEnabled` чтобы Chrome не тротлил `rAF`/`setTimeout` в фоновой вкладке (без отнятия OS-уровневого фокуса).
+
+**После `Emulation.setDeviceMetricsOverride` через CDP — вызвать `/wait-ready` перед скриншотом**, иначе layout не успевает пересчитаться, lazy-картинки не подгружаются под новый viewport.
+
+### `POST /viewport`
+
+Изменить размер окна / viewport вкладки. Два режима:
+
+- **`mode: "window"`** (по умолчанию для desktop) — физический ресайз окна Chrome через CDP `Browser.setWindowBounds`. То, что видит пользователь в браузере, совпадает с запрошенными `width`/`height`. Возвращает `bounds: { before, after }`.
+- **`mode: "emulation"`** (автоматически при `mobile: true`) — виртуальный viewport через `Emulation.setDeviceMetricsOverride`. Физическое окно не меняется, страница видит запрошенные `width`/`height` плюс `deviceScaleFactor` и mobile-флаг (touch events, mobile UA, meta-viewport).
+
+```json
+{ "windowId": 12345, "tabIndex": 2, "width": 1440, "height": 900, "mode": "window", "reload": true, "waitReady": true, "waitOpts": {} }
+```
+
+```json
+{
+  "ok": true, "via": "cdp",
+  "applied": { "width": 1440, "height": 900, "deviceScaleFactor": 1, "mobile": false, "mode": "window" },
+  "bounds": { "before": { "width": 1280, "height": 800, ... }, "after": { "width": 1440, "height": 900, ... } },
+  "reloaded": true,
+  "ready": { "ok": true, "reached": [...], ... }
+}
+```
+
+Оба режима по умолчанию **перезагружают страницу** (`Page.reload`) и запускают `waitFullyReady` — это критично для SPA/React-приложений, которые читают viewport один раз на mount и не реагируют на чистый `resize`-event без перезагрузки. `reload: false` оставляет страницу как есть (подходит для статики с обработчиком `resize`).
+
+Window-mode требует, чтобы окно было в состоянии `"normal"` — если оно maximized/minimized, сервис сначала вернёт его в normal через `Browser.setWindowBounds({ windowState: "normal" })`.
+
+### `DELETE /viewport`
+
+Снимает emulation-override (`Emulation.clearDeviceMetricsOverride`) и (по умолчанию) делает reload + waitFullyReady.
+
+```json
+{ "windowId": 12345, "tabIndex": 2, "reload": true, "waitReady": true }
+```
+
+**Внимание:** DELETE НЕ возвращает physical resize (`mode: "window"`). Чтобы вернуть исходный размер окна — повторный `POST /viewport` с нужным размером, или `@meta/window /resize`.
 
 ### `POST /eval`
 
@@ -139,6 +225,10 @@ bun run start  # обычный запуск
 Скриншот окна Chrome, в котором лежит указанная вкладка. Если `tabIndex` задан и отличается от текущей активной, вкладка предварительно активируется. Запрос проксируется в `@meta/screen` (`POST /window`) с `app="Google Chrome"` и `title=` равным заголовку окна, поэтому для работы нужны живые `@meta/screen` и `@meta/window`.
 
 `POST /screenshot` принимает то же тело JSON. На выходе — `image/png` (или JSON с base64 при `format=json`). Захватывается всё окно Chrome целиком (включая адресную строку и панель вкладок), а не только viewport.
+
+Дополнительные поля:
+- `waitReady` (boolean, default `true`) — перед захватом дождаться полной готовности страницы через `waitFullyReady` (если CDP доступен). Отключить через `waitReady: false` или `?waitReady=false` если страница динамическая и заведомо не «успокоится».
+- `waitOpts` (object, body-only) — параметры `waitFullyReady` (см. `POST /wait-ready`).
 
 ## CLI
 

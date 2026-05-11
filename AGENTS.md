@@ -171,16 +171,21 @@ curl -X POST http://localhost:7880/tabs \
   -H 'content-type: application/json' -d '{"windowId":12345,"url":"https://example.com"}'
 curl -X DELETE http://localhost:7880/tabs/12345/2   # /tabs/:windowId/:index
 
-# Навигация
+# Навигация — по умолчанию waitReady:true (ждём полной готовности через waitFullyReady)
 curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' -d '{"url":"https://example.com"}'
+# Старое поведение (без wait):
+curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' -d '{"url":"https://example.com","waitReady":false}'
 curl -X POST http://localhost:7880/activate -H 'content-type: application/json' \
   -d '{"windowId":12345,"tabIndex":2}'   # ← оба поля обязательны
 # → { ok, windowId, tabIndex }   ← сохрани windowId для следующего /screenshot!
 curl -X POST http://localhost:7880/reload -H 'content-type: application/json' \
   -d '{"windowId":12345,"tabIndex":2}'
-# → { ok, hard, waited, waitMs }  — по умолчанию ждёт окончания загрузки (до 10 с)
-# hard: true  → Cmd+Shift+R (сброс кеша, переносит фокус на Chrome)
-# wait: false → вернуть немедленно, не ждать загрузки
+# → { ok, hard, waited, waitMs, via, ready }
+# wait:true (по умолчанию) → после Page.reload запускает waitFullyReady (полная готовность)
+# hard:true → CDP Page.reload({ignoreCache:true}) — без отнятия фокуса
+#             AppleScript-фоллбек: Cmd+Shift+R через System Events — отнимает фокус
+# wait:false → вернуть немедленно
+# waitOpts: пробрасывается в waitFullyReady
 curl -X POST http://localhost:7880/back
 curl -X POST http://localhost:7880/forward
 
@@ -199,6 +204,52 @@ curl -s -X POST http://localhost:7880/screenshot \
 # Без windowId берётся первое окно Chrome — может быть не то!
 # caption логируется до захвата, возвращается в x-meta-caption заголовке
 ```
+
+### /wait-ready и /viewport (CDP only)
+
+```bash
+# Полная готовность страницы: readyState, fonts, networkIdle, eager-load всех <img>,
+# reflowStable, animations, finalCommit. Каждый шаг — отдельный stepMs, общий maxMs.
+curl -X POST http://localhost:7880/wait-ready -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2}'
+# → { via:"cdp", ok, reached:[...], skipped:[...], timedOut, durationMs, steps:[...] }
+# options: { readyState?, fonts?, networkIdle?, images?, reflowStable?, animations?,
+#            finalCommit?, idleMs?(700), stepMs?(8000), maxMs?(15000) }
+# Для страниц с бесконечной rAF-анимацией: { "options": { "reflowStable": false } }
+
+# Resize окна Chrome — физический ресайз через Browser.setWindowBounds (mode:"window", default)
+curl -X POST http://localhost:7880/viewport -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2,"width":1440,"height":900}'
+# → { ok, applied:{...,mode:"window"}, bounds:{before,after}, reloaded:true, ready:{...} }
+
+# Mobile-эмуляция — виртуальный viewport (mode:"emulation"; авто при mobile:true)
+curl -X POST http://localhost:7880/viewport -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2,"width":390,"height":844,"deviceScaleFactor":3,"mobile":true}'
+# Физическое окно НЕ меняется — страница видит виртуальный viewport, есть touch + mobile UA.
+
+# По умолчанию reload:true → после resize страница перезагружается + waitFullyReady.
+# reload:false — оставить страницу как есть (для статики с resize-listener).
+
+# DELETE снимает emulation-override (но не возвращает physical resize — для него надо
+# повторно POST /viewport или @meta/window /resize):
+curl -X DELETE http://localhost:7880/viewport -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2}'
+```
+
+`POST /screenshot` теперь по умолчанию дёргает waitFullyReady перед захватом — `waitReady:true`. Отключить: `{"waitReady":false}` в body или `?waitReady=false` в query.
+
+Сервис вызывает `Emulation.setFocusEmulationEnabled` чтобы Chrome не тротлил rAF/setTimeout в фоновых вкладках — wait работает даже когда окно Chrome не в фокусе.
+
+### CDP-ловушки (если работаешь с CDP напрямую, минуя сервис)
+
+Сервис всё это уже учитывает — этот блок для случаев когда агент сам открывает WS к 9222.
+
+- **`Emulation.clearDeviceMetricsOverride` в одиночку ненадёжен.** Chrome может «восстановить» предыдущий override после закрытия CDP-сессии — встречалось при переключении с mobile-emulation на physical resize: одиночный `clear` отвечает `{}` ok, но следующая сессия снова видит `innerWidth=390`. Надёжная последовательность: `clear → setDeviceMetricsOverride({width:0,height:0,deviceScaleFactor:0,mobile:false}) → clear`. В коде сервиса это `forceClearMetrics()` (chrome/src/cdp-mode.ts), вызывается в `mode:"window"` и в `DELETE /viewport`.
+- **`Runtime.evaluate` зависает сразу после `Page.reload`/`Page.navigate`.** Старый Runtime context разрушен, новый ещё не создан — вызов висит в pending бесконечно. Перед evaluate подпишись на `Page.loadEventFired` (или `Page.frameStoppedLoading`) с fallback-таймаутом. В сервисе — `waitForLoadEvent()`.
+- **`window.addEventListener("load", …, {once:true})` после уже-firеd события не сработает.** Не строй ожидание на нём. Polling `document.readyState === "complete"` — надёжнее (`setTimeout` ок, если вкладка не тротлится).
+- **Тротлинг фоновых вкладок:** rAF падает до ~1 Hz, минимальный `setTimeout` — до ~1000 мс в неактивных вкладках. Любой wait-loop на них зависает. В начале сессии: `Emulation.setFocusEmulationEnabled({enabled:true})` — рендерер думает что страница в фокусе, тротлинг выключен, OS-фокус не трогается.
+- **`Browser.setWindowBounds` ругается на width/height при `windowState:"maximized"` или `"minimized"`.** Сначала `setWindowBounds({windowState:"normal"})`, потом размер вторым вызовом.
+- **CDP-override живёт на target, не на сессии.** Закрытие WS не откатывает override автоматически. Что установил — то и сними явно, желательно в той же сессии.
 
 ## @meta/android — порт 7881
 
