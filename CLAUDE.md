@@ -195,7 +195,9 @@ curl -X POST http://localhost:7880/forward
 # Контент (требует View → Developer → Allow JavaScript from Apple Events)
 curl -X POST http://localhost:7880/eval \
   -H 'content-type: application/json' -d '{"js":"return document.title"}'
-# → { ok, result }
+# → { ok, result: "GitHub", parsed: "GitHub" } — result всегда строка (JSON.stringify),
+# parsed — попытка JSON.parse: для return {a:1} parsed = {a:1}, для return 42 parsed = 42.
+# Бери parsed для объектов/чисел/булевых; result для исходной строки.
 curl http://localhost:7880/source              # outerHTML (text/html)
 curl http://localhost:7880/text                # innerText (text/plain)
 curl "http://localhost:7880/source?windowId=12345&tabIndex=2"
@@ -330,8 +332,15 @@ curl -X POST http://localhost:7880/wait-ready -H 'content-type: application/json
 # Resize окна Chrome — физический ресайз через Browser.setWindowBounds (default mode:"window")
 curl -X POST http://localhost:7880/viewport -H 'content-type: application/json' \
   -d '{"windowId":12345,"tabIndex":2,"width":1440,"height":900}'
-# → { ok, via:"cdp", applied:{width,height,deviceScaleFactor:1,mobile:false,mode:"window"},
-#     bounds:{before:{...},after:{1440x900}}, reloaded:true, ready:{...} }
+# → { ok, via:"cdp", applied:{width,height,deviceScaleFactor:1,mobile:false,mode:"window",innerSize:false},
+#     bounds:{before:{...},after:{1440x900}}, inner:{...}, reloaded:true, ready:{...} }
+
+# Точный content viewport (innerWidth × innerHeight) — сервис измеряет фактический
+# innerSize после resize и докручивает окно компенсируя Chrome UI (tab bar + address bar ≈ 80–90px).
+# Используй когда нужен ровно конкретный viewport (responsive брейкпоинты, скриншоты под precise разрешение).
+curl -X POST http://localhost:7880/viewport -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2,"width":1024,"height":768,"innerSize":true}'
+# → applied.innerSize:true, bounds.after:{1024x855}, inner:{width:1024, height:768}
 
 # Mobile-эмуляция — виртуальный viewport через Emulation.setDeviceMetricsOverride (mode:"emulation")
 # Активируется автоматически при mobile:true, или явно "mode":"emulation".

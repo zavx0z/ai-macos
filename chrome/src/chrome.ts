@@ -406,7 +406,7 @@ export async function setViewport(
   wait = true,
   waitOpts: WaitReadyOptions = {},
   reload = true,
-): Promise<{ via: "cdp"; applied: { width: number; height: number; deviceScaleFactor: number; mobile: boolean; mode: ViewportMode }; bounds?: { before: unknown; after: unknown }; reloaded: boolean; ready?: WaitReadyResult } | { via: "unavailable"; error: string }> {
+): Promise<{ via: "cdp"; applied: { width: number; height: number; deviceScaleFactor: number; mobile: boolean; mode: ViewportMode; innerSize: boolean }; bounds?: { before: unknown; after: unknown }; inner?: { width: number; height: number }; reloaded: boolean; ready?: WaitReadyResult } | { via: "unavailable"; error: string }> {
   if (!(await isCdpAvailable())) {
     return { via: "unavailable", error: "CDP not available — start Chrome with --remote-debugging-port=9222 (bun run cdp)" }
   }

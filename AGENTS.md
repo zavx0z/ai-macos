@@ -192,7 +192,9 @@ curl -X POST http://localhost:7880/forward
 # Контент (требует View → Developer → Allow JavaScript from Apple Events)
 curl -X POST http://localhost:7880/eval \
   -H 'content-type: application/json' -d '{"js":"return document.title"}'
-# → { ok, result }
+# → { ok, result: "...", parsed: ... }
+# result — всегда строка (JSON.stringify результата JS). parsed — JSON.parse(result)
+# для объектов/массивов/чисел/булевых, null для не-JSON строк.
 curl http://localhost:7880/source              # outerHTML (text/html)
 curl http://localhost:7880/text                # innerText (text/plain)
 curl "http://localhost:7880/source?windowId=12345&tabIndex=2"
@@ -220,7 +222,12 @@ curl -X POST http://localhost:7880/wait-ready -H 'content-type: application/json
 # Resize окна Chrome — физический ресайз через Browser.setWindowBounds (mode:"window", default)
 curl -X POST http://localhost:7880/viewport -H 'content-type: application/json' \
   -d '{"windowId":12345,"tabIndex":2,"width":1440,"height":900}'
-# → { ok, applied:{...,mode:"window"}, bounds:{before,after}, reloaded:true, ready:{...} }
+# → { ok, applied:{...,mode:"window",innerSize:false}, bounds:{before,after}, inner:{...}, reloaded:true, ready:{...} }
+
+# Точный content viewport — innerSize:true. Сервис компенсирует Chrome UI (~80-90px высоты).
+curl -X POST http://localhost:7880/viewport -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2,"width":1024,"height":768,"innerSize":true}'
+# → applied.innerSize:true, inner:{width:1024,height:768}, bounds.after.height ≈ 855
 
 # Mobile-эмуляция — виртуальный viewport (mode:"emulation"; авто при mobile:true)
 curl -X POST http://localhost:7880/viewport -H 'content-type: application/json' \

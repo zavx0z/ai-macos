@@ -76,7 +76,20 @@ export async function waitOnSession(s: CdpSession, opts: WaitReadyOptions = {}):
   }
 
   await runStep("readyState", o.readyState, async () => {
-    await pageEval(s, READY_STATE_JS)
+    // Poll document.readyState via plain Runtime.evaluate (no awaitPromise / no async
+    // wrapper). After Page.reload the first async IIFE evaluate in a fresh session
+    // sometimes hangs forever despite the context existing — a simple sync read is
+    // bulletproof. We retry every 50 ms until 'complete' or the step budget runs out.
+    const deadline = Date.now() + Math.max(50, Math.min(o.stepMs, remaining()))
+    while (Date.now() < deadline) {
+      const res = await s.send<{ result: { value?: string } }>("Runtime.evaluate", {
+        expression: "document.readyState",
+        returnByValue: true,
+      })
+      if (res.result.value === "complete") return
+      await new Promise((r) => setTimeout(r, 50))
+    }
+    throw new Error("readyState did not reach 'complete'")
   })
 
   await runStep("fonts", o.fonts, async () => {

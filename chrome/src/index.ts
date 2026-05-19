@@ -127,9 +127,9 @@ const server = Bun.serve({
       }
 
       if (path === "/viewport" && method === "POST") {
-        const body = (await req.json()) as { windowId?: number; tabIndex?: number; width?: number; height?: number; deviceScaleFactor?: number; mobile?: boolean; mode?: ViewportMode; waitReady?: boolean; waitOpts?: WaitReadyOptions; reload?: boolean };
+        const body = (await req.json()) as { windowId?: number; tabIndex?: number; width?: number; height?: number; deviceScaleFactor?: number; mobile?: boolean; mode?: ViewportMode; innerSize?: boolean; waitReady?: boolean; waitOpts?: WaitReadyOptions; reload?: boolean };
         if (body.width == null || body.height == null || body.width <= 0 || body.height <= 0) {
-          return err(400, "need {width, height}", "Пример: {\"width\":1280,\"height\":800,\"mode\":\"window\"} (default), для mobile: {\"width\":390,\"height\":844,\"deviceScaleFactor\":3,\"mobile\":true,\"mode\":\"emulation\"}");
+          return err(400, "need {width, height}", "Пример: {\"width\":1280,\"height\":800,\"mode\":\"window\"} (default), для mobile: {\"width\":390,\"height\":844,\"deviceScaleFactor\":3,\"mobile\":true,\"mode\":\"emulation\"}, для точного content viewport: {\"width\":1280,\"height\":800,\"innerSize\":true}");
         }
         if (body.mode && body.mode !== "window" && body.mode !== "emulation") {
           return err(400, `unknown mode '${body.mode}'`, "mode: \"window\" (physical Browser.setWindowBounds) | \"emulation\" (Emulation.setDeviceMetricsOverride)");
@@ -140,6 +140,7 @@ const server = Bun.serve({
           deviceScaleFactor: body.deviceScaleFactor,
           mobile: body.mobile,
           mode: body.mode,
+          innerSize: body.innerSize,
         };
         const wait = body.waitReady !== false;
         const reload = body.reload !== false;
@@ -177,7 +178,16 @@ const server = Bun.serve({
         const body = (await req.json()) as { js?: string; windowId?: number; tabIndex?: number };
         if (!body.js) return err(400, "missing 'js'", "Пример: {\"js\":\"return document.title\"}");
         const result = await evalJs(body.js, body.windowId, body.tabIndex);
-        return json({ ok: true, result });
+        // The eval wrapper always JSON.stringify-s non-string return values, so `result`
+        // is a string like '{"foo":42}'. Surface a pre-parsed copy as `parsed` so clients
+        // don't need to JSON.parse(result) themselves. Strings that don't look like JSON
+        // get parsed:null.
+        let parsed: unknown = null;
+        const trimmed = typeof result === "string" ? result.trim() : "";
+        if (trimmed && (trimmed[0] === "{" || trimmed[0] === "[" || trimmed === "true" || trimmed === "false" || trimmed === "null" || /^-?\d/.test(trimmed) || (trimmed[0] === '"' && trimmed[trimmed.length - 1] === '"'))) {
+          try { parsed = JSON.parse(trimmed); } catch { parsed = null; }
+        }
+        return json({ ok: true, result, parsed });
       }
 
       if (path === "/console" && (method === "GET" || method === "POST")) {

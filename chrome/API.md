@@ -167,10 +167,11 @@ bun run start  # обычный запуск
 
 ### `POST /viewport`
 
-Изменить размер окна / viewport вкладки. Два режима:
+Изменить размер окна / viewport вкладки. Два режима плюс sizing-флаг:
 
 - **`mode: "window"`** (по умолчанию для desktop) — физический ресайз окна Chrome через CDP `Browser.setWindowBounds`. То, что видит пользователь в браузере, совпадает с запрошенными `width`/`height`. Возвращает `bounds: { before, after }`.
 - **`mode: "emulation"`** (автоматически при `mobile: true`) — виртуальный viewport через `Emulation.setDeviceMetricsOverride`. Физическое окно не меняется, страница видит запрошенные `width`/`height` плюс `deviceScaleFactor` и mobile-флаг (touch events, mobile UA, meta-viewport).
+- **`innerSize: true`** (только с `mode: "window"`) — трактовать `width`/`height` как **content viewport** (`innerWidth × innerHeight`), а не outer-bounds окна. Сервис измеряет фактический `innerWidth/innerHeight` после первого resize и докручивает окно компенсируя Chrome UI (tab bar + address bar ≈ 80–90 px). Возвращает `inner: { width, height }` с фактическим content viewport.
 
 ```json
 { "windowId": 12345, "tabIndex": 2, "width": 1440, "height": 900, "mode": "window", "reload": true, "waitReady": true, "waitOpts": {} }
@@ -202,14 +203,14 @@ Window-mode требует, чтобы окно было в состоянии `
 
 ### `POST /eval`
 
-Выполнить JavaScript в контексте вкладки. JS оборачивается в IIFE, результат сериализуется через `JSON.stringify`.
+Выполнить JavaScript в контексте вкладки. JS оборачивается в IIFE, результат сериализуется через `JSON.stringify` и возвращается как `result` (всегда строка). Сервис дополнительно делает `JSON.parse(result)` и кладёт распарсенное значение в `parsed` — для объектов/массивов/чисел/булевых это удобнее чем парсить руками. Для не-JSON строк `parsed` будет `null`.
 
 ```json
-{ "js": "return document.title", "windowId": 12345, "tabIndex": 2 }
+{ "js": "return {iw:innerWidth, ih:innerHeight}", "windowId": 12345, "tabIndex": 2 }
 ```
 
 ```json
-{ "ok": true, "result": "GitHub" }
+{ "ok": true, "result": "{\"iw\":1024,\"ih\":768}", "parsed": {"iw":1024,"ih":768} }
 ```
 
 ### `GET /source[?windowId=N&tabIndex=N]`
