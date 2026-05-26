@@ -147,6 +147,11 @@ cd chrome && bun run cdp:check  # проверка
 
 Важно: Chrome 137+ блокирует `--remote-debugging-port` с дефолтным профилем. Скрипт `cdp` запускает **отдельный** экземпляр с `--user-data-dir=~/Library/Application Support/Google/Chrome-CDP` — основной Chrome пользователя не трогается. Это два независимых процесса; AppleScript увидит оба, но `tell application "Google Chrome"` обычно адресует тот, что был активен последним.
 
+`GET /windows` возвращает смешанный список Chrome-окон:
+
+- `kind:"browser"` — обычное окно Chrome с массивом `tabs`; только такие окна можно использовать для операций с вкладками (`/tabs`, `/activate`, `/navigate`, `/reload`, `/eval`, `/source`, `/text`, `/viewport`, `/console`, `/wait-ready`).
+- `kind:"appWindow"` — Chrome app-mode окно, найденное по процессу `Google Chrome --app=<url>`; у него есть `id`, `title`, `url`, `pid`, геометрия и `tabs: []`. Не подставлять его в tab-операции и не выдумывать `tabIndex`.
+
 ### Чтение console.log из вкладки
 
 Когда CDP доступен:
@@ -162,6 +167,7 @@ curl -s -X POST http://localhost:7880/console \
 ```bash
 # Окна
 curl http://localhost:7880/windows
+# → windows: [{ kind:"browser", tabs:[...] }, { kind:"appWindow", url, pid, tabs:[] }]
 curl -X POST http://localhost:7880/windows \
   -H 'content-type: application/json' -d '{"url":"https://example.com","incognito":false}'
 curl -X DELETE http://localhost:7880/windows/12345
@@ -175,9 +181,11 @@ curl -X POST http://localhost:7880/tabs \
 curl -X DELETE http://localhost:7880/tabs/12345/2   # /tabs/:windowId/:index
 
 # Навигация — по умолчанию waitReady:true (ждём полной готовности через waitFullyReady)
-curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' -d '{"url":"https://example.com"}'
+curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2,"url":"https://example.com"}'
 # Старое поведение (вернуться сразу после Page.navigate):
-curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' -d '{"url":"https://example.com","waitReady":false}'
+curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2,"url":"https://example.com","waitReady":false}'
 curl -X POST http://localhost:7880/activate -H 'content-type: application/json' \
   -d '{"windowId":12345,"tabIndex":2}'   # ← оба поля обязательны
 # → { ok, windowId, tabIndex }   ← передай windowId в следующий /screenshot!
@@ -206,7 +214,7 @@ curl "http://localhost:7880/source?windowId=12345&tabIndex=2"
 # windowId берём из GET /windows или из ответа POST /activate
 curl -s -X POST http://localhost:7880/screenshot \
   -H 'content-type: application/json' \
-  -d '{"windowId":12345,"detail":"medium","caption":"Ожидаю увидеть форму логина"}' -o /tmp/chrome.png
+  -d '{"windowId":12345,"tabIndex":2,"detail":"medium","caption":"Ожидаю увидеть форму логина"}' -o /tmp/chrome.png
 # Без windowId берётся первое окно Chrome — может быть не то!
 ```
 
@@ -401,7 +409,8 @@ curl -s -X POST http://localhost:7880/screenshot \
 - Перед первой операцией вызвать `GET /health` нужного сервиса.
 - При `granted: false` — вызвать `POST /permissions/*`, сообщить пользователю. **Не ретраить.**
 - Имена приложений в `app` — каноническое имя процесса macOS (`"Google Chrome"`, не `"chrome"`).
-- Для Chrome сначала вызвать `GET /windows`, выбрать текущую нужную вкладку, затем во всех операциях с вкладкой передавать **оба** поля `windowId` и `tabIndex`. Не полагаться на `front window`, активное окно, `/tabs/active` или отсутствующий `windowId`: при нескольких окнах/профилях это легко попадает не туда.
+- Для Chrome сначала вызвать `GET /windows`. Для операций с вкладкой выбирать только окно `kind:"browser"` и конкретную вкладку из `tabs`, затем во всех tab-операциях передавать **оба** поля `windowId` и `tabIndex`. Не полагаться на `front window`, активное окно, `/tabs/active` или отсутствующий `windowId`: при нескольких окнах/профилях это легко попадает не туда.
+- Окна `kind:"appWindow"` из `GET /windows` — это Chrome app-mode (`Google Chrome --app=<url>`). Они нужны для видимости/диагностики Chrome app окон, но не имеют вкладок; не использовать их с `/activate`, `/navigate`, `/reload`, `/eval`, `/source`, `/text`, `/viewport`, `/console`, `/wait-ready` и не придумывать `tabIndex`.
 - **После `POST /reload` страница гарантированно загружена** (сервис ждёт `loading=false`, до 10 с) — скриншот сразу, без `sleep`.
 - При ошибке `osascript failed (-1743)` — нет разрешения Automation.
 - При ошибке `osascript failed (-25211)` — нет разрешения Accessibility.

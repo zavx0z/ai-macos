@@ -145,6 +145,11 @@ cd chrome && bun run cdp:check    # проверка
 
 Chrome 137+ запрещает `--remote-debugging-port` на дефолтном профиле, поэтому скрипт открывает экземпляр с `--user-data-dir=~/Library/Application Support/Google/Chrome-CDP` — это **отдельный** Chrome рядом с основным.
 
+`GET /windows` возвращает смешанный список Chrome-окон:
+
+- `kind:"browser"` — обычное окно Chrome с массивом `tabs`; только такие окна можно использовать для операций с вкладками (`/tabs`, `/activate`, `/navigate`, `/reload`, `/eval`, `/source`, `/text`, `/viewport`, `/console`, `/wait-ready`).
+- `kind:"appWindow"` — Chrome app-mode окно, найденное по процессу `Google Chrome --app=<url>`; у него есть `id`, `title`, `url`, `pid`, геометрия и `tabs: []`. Не подставлять его в tab-операции и не выдумывать `tabIndex`.
+
 ### Чтение консоли через CDP
 
 ```bash
@@ -159,6 +164,7 @@ curl -s -X POST http://localhost:7880/console \
 ```bash
 # Окна
 curl http://localhost:7880/windows
+# → windows: [{ kind:"browser", tabs:[...] }, { kind:"appWindow", url, pid, tabs:[] }]
 curl -X POST http://localhost:7880/windows \
   -H 'content-type: application/json' -d '{"url":"https://example.com","incognito":false}'
 curl -X DELETE http://localhost:7880/windows/12345
@@ -172,9 +178,11 @@ curl -X POST http://localhost:7880/tabs \
 curl -X DELETE http://localhost:7880/tabs/12345/2   # /tabs/:windowId/:index
 
 # Навигация — по умолчанию waitReady:true (ждём полной готовности через waitFullyReady)
-curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' -d '{"url":"https://example.com"}'
+curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2,"url":"https://example.com"}'
 # Старое поведение (без wait):
-curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' -d '{"url":"https://example.com","waitReady":false}'
+curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' \
+  -d '{"windowId":12345,"tabIndex":2,"url":"https://example.com","waitReady":false}'
 curl -X POST http://localhost:7880/activate -H 'content-type: application/json' \
   -d '{"windowId":12345,"tabIndex":2}'   # ← оба поля обязательны
 # → { ok, windowId, tabIndex }   ← сохрани windowId для следующего /screenshot!
@@ -202,7 +210,7 @@ curl "http://localhost:7880/source?windowId=12345&tabIndex=2"
 # Скриншот — всегда передавать windowId (из /windows или из ответа /activate) и caption
 curl -s -X POST http://localhost:7880/screenshot \
   -H 'content-type: application/json' \
-  -d '{"windowId":12345,"detail":"medium","caption":"Ожидаю увидеть главную страницу с навигацией"}' -o chrome.png
+  -d '{"windowId":12345,"tabIndex":2,"detail":"medium","caption":"Ожидаю увидеть главную страницу с навигацией"}' -o chrome.png
 # Без windowId берётся первое окно Chrome — может быть не то!
 # caption логируется до захвата, возвращается в x-meta-caption заголовке
 ```
@@ -337,11 +345,12 @@ curl -X POST http://localhost:7882/keyboard/shortcut -d '{"sequence":["cmd+a","c
 4. Для скриншотов передавать `detail="medium"` если пользователь не указал иное.
 5. Использовать только REST API — никакого прямого `osascript`, `screencapture` или AppleScript.
 6. Имя приложения (`app`) — каноническое имя процесса macOS, строго по системному.
-7. Для Chrome сначала вызвать `GET /windows`, выбрать текущую нужную вкладку, затем во всех операциях с вкладкой передавать **оба** поля `windowId` и `tabIndex`. Не полагаться на `front window`, активное окно, `/tabs/active` или отсутствующий `windowId`: при нескольких окнах/профилях это легко попадает не туда.
+7. Для Chrome сначала вызвать `GET /windows`. Для операций с вкладкой выбирать только окно `kind:"browser"` и конкретную вкладку из `tabs`, затем во всех tab-операциях передавать **оба** поля `windowId` и `tabIndex`. Не полагаться на `front window`, активное окно, `/tabs/active` или отсутствующий `windowId`: при нескольких окнах/профилях это легко попадает не туда.
 8. Для скриншота Chrome использовать `POST /screenshot` у `@meta/chrome`, **не** напрямую в `@meta/screen` (`/window` или `/rect` не видят Chrome без Accessibility).
    Сценарий: `GET /windows` → выбрать нужные `windowId` и `tabIndex` → `POST /activate {windowId, tabIndex}` → `POST /screenshot {windowId, tabIndex, detail, caption}`.
-9. После `POST /reload` страница гарантированно загружена (сервис ждёт до 10 с) — можно сразу делать скриншот без `sleep`. `hard: true` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
-10. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
-11. При ошибке `osascript failed (-1743)` — нет разрешения Automation.
-12. При ошибке `osascript failed (-25211)` — нет разрешения Accessibility.
-13. **Canvas-приложения** (графики, редакторы, кастомные рендереры): `POST /screenshot` снимает окно Chrome целиком, но canvas-пиксели могут не совпасть из-за DPR-масштабирования или тайминга. Вместо этого использовать `POST /eval` с JS `return document.querySelector('canvas').toDataURL('image/png')` — получить base64-строку, отрезать префикс `data:image/png;base64,`, декодировать через `base64 -d` в PNG-файл. При нескольких canvas — `document.querySelectorAll('canvas')[N]`.
+9. Окна `kind:"appWindow"` из `GET /windows` — это Chrome app-mode (`Google Chrome --app=<url>`). Они нужны для видимости/диагностики Chrome app окон, но не имеют вкладок; не использовать их с `/activate`, `/navigate`, `/reload`, `/eval`, `/source`, `/text`, `/viewport`, `/console`, `/wait-ready` и не придумывать `tabIndex`.
+10. После `POST /reload` страница гарантированно загружена (сервис ждёт до 10 с) — можно сразу делать скриншот без `sleep`. `hard: true` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
+11. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
+12. При ошибке `osascript failed (-1743)` — нет разрешения Automation.
+13. При ошибке `osascript failed (-25211)` — нет разрешения Accessibility.
+14. **Canvas-приложения** (графики, редакторы, кастомные рендереры): `POST /screenshot` снимает окно Chrome целиком, но canvas-пиксели могут не совпасть из-за DPR-масштабирования или тайминга. Вместо этого использовать `POST /eval` с JS `return document.querySelector('canvas').toDataURL('image/png')` — получить base64-строку, отрезать префикс `data:image/png;base64,`, декодировать через `base64 -d` в PNG-файл. При нескольких canvas — `document.querySelectorAll('canvas')[N]`.

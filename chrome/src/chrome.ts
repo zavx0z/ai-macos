@@ -18,6 +18,10 @@ export type WindowInfo = {
   id: number;
   index: number;
   title: string;
+  kind: "browser" | "appWindow";
+  app?: string;
+  pid?: number;
+  url?: string;
   x: number;
   y: number;
   width: number;
@@ -26,6 +30,82 @@ export type WindowInfo = {
   mode: string;
   tabs: TabInfo[];
 };
+
+const FS = String.fromCharCode(31)
+const RS = String.fromCharCode(30)
+const TS = String.fromCharCode(29)
+
+const APPLE_SCRIPT_LIST_WINDOWS = `
+set fs to (ASCII character 31)
+set rs to (ASCII character 30)
+set ts to (ASCII character 29)
+set out to ""
+if application "Google Chrome" is not running then return ""
+tell application "Google Chrome"
+  set winList to every window
+  set wIdx to 0
+  repeat with w in winList
+    set wIdx to wIdx + 1
+    try
+      set wId to id of w
+    on error
+      set wId to 0
+    end try
+    try
+      set wTitle to title of w
+    on error
+      set wTitle to ""
+    end try
+    try
+      set {wx, wy, wx2, wy2} to bounds of w
+    on error
+      set wx to 0
+      set wy to 0
+      set wx2 to 0
+      set wy2 to 0
+    end try
+    try
+      set wActive to active tab index of w
+    on error
+      set wActive to 0
+    end try
+    try
+      set wMode to mode of w
+    on error
+      set wMode to ""
+    end try
+    set out to out & wId & fs & wIdx & fs & wTitle & fs & wx & fs & wy & fs & (wx2 - wx) & fs & (wy2 - wy) & fs & wActive & fs & wMode
+    set tabList to every tab of w
+    set tIdx to 0
+    repeat with t in tabList
+      set tIdx to tIdx + 1
+      try
+        set tId to id of t
+      on error
+        set tId to 0
+      end try
+      try
+        set tTitle to title of t
+      on error
+        set tTitle to ""
+      end try
+      try
+        set tUrl to URL of t
+      on error
+        set tUrl to ""
+      end try
+      try
+        set tLoading to loading of t
+      on error
+        set tLoading to false
+      end try
+      set out to out & ts & tId & fs & tIdx & fs & tTitle & fs & tUrl & fs & tLoading
+    end repeat
+    set out to out & rs
+  end repeat
+end tell
+return out
+`
 
 const JXA_CHROME_HELPERS = `
 function chromeWindow(app, id) {
@@ -49,6 +129,8 @@ function chromeWindowPayload(w, fallbackIndex) {
     id: Number(w.id()),
     index: Number(w.index()) || fallbackIndex,
     title: String(w.name() || ""),
+    kind: "browser",
+    app: "Google Chrome",
     x: Number(b.x) || 0,
     y: Number(b.y) || 0,
     width: Number(b.width) || 0,
@@ -113,12 +195,97 @@ ${JXA_CHROME_HELPERS}
 }
 
 export async function listWindows(): Promise<WindowInfo[]> {
-  return await jxaValue<WindowInfo[]>(`
+  const browserWindows = await jxaValue<WindowInfo[]>(`
     if (!app.running()) return [];
     return app.windows().map(function(w, i) {
       return chromeWindowPayload(w, i + 1);
     });
   `)
+  const appWindows = await listChromeAppWindows(browserWindows).catch(() => [])
+  return [...browserWindows, ...appWindows]
+}
+
+async function listChromeAppWindows(browserWindows: WindowInfo[]): Promise<WindowInfo[]> {
+  const appProcesses = await listChromeAppProcesses()
+  if (appProcesses.length === 0) return []
+
+  const appByUrl = new Map(appProcesses.map((p) => [p.url, p]))
+  const browserUrls = new Set(browserWindows.flatMap((w) => w.tabs.map((t) => t.url)))
+  const raw = await osa(APPLE_SCRIPT_LIST_WINDOWS)
+  if (!raw) return []
+
+  const out: WindowInfo[] = []
+  for (const win of parseAppleScriptWindows(raw)) {
+    const url = win.tabs[0]?.url ?? ""
+    const appProcess = appByUrl.get(url)
+    if (!appProcess || browserUrls.has(url)) continue
+    out.push({
+      ...win,
+      kind: "appWindow",
+      app: "Google Chrome",
+      pid: appProcess.pid,
+      url,
+      activeTabIndex: 0,
+      tabs: [],
+    })
+  }
+  return out
+}
+
+function parseAppleScriptWindows(raw: string): WindowInfo[] {
+  return raw
+    .split(RS)
+    .filter((r) => r.length > 0)
+    .map((rec) => {
+      const parts = rec.split(TS)
+      const head = parts[0] ?? ""
+      const [id, index, title, x, y, width, height, activeTabIndex, mode] = head.split(FS)
+      const tabs: TabInfo[] = []
+      for (let i = 1; i < parts.length; i++) {
+        const p = parts[i] ?? ""
+        if (!p) continue
+        const [tId, tIdx, tTitle, tUrl, tLoading] = p.split(FS)
+        tabs.push({
+          id: Number(tId ?? 0),
+          index: Number(tIdx ?? 0),
+          title: tTitle ?? "",
+          url: tUrl ?? "",
+          loading: (tLoading ?? "false") === "true",
+        })
+      }
+      return {
+        id: Number(id ?? 0),
+        index: Number(index ?? 0),
+        title: title ?? "",
+        kind: "browser" as const,
+        app: "Google Chrome",
+        x: Number(x ?? 0),
+        y: Number(y ?? 0),
+        width: Number(width ?? 0),
+        height: Number(height ?? 0),
+        activeTabIndex: Number(activeTabIndex ?? 0),
+        mode: mode ?? "",
+        tabs,
+      }
+    })
+}
+
+async function listChromeAppProcesses(): Promise<Array<{ pid: number; url: string }>> {
+  const proc = spawn(["ps", "-axo", "pid,args"], { stdout: "pipe", stderr: "pipe" })
+  const [out, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    proc.exited,
+  ])
+  if (code !== 0) return []
+  const processes: Array<{ pid: number; url: string }> = []
+  for (const line of out.split("\n")) {
+    if (!line.includes("/Google Chrome") || !line.includes(" --app=")) continue
+    const row = line.match(/^\s*(\d+)\s+(.+)$/)
+    const app = line.match(/(?:^|\s)--app=([^\s]+)/)
+    if (!row || !app) continue
+    processes.push({ pid: Number(row[1]), url: app[1] ?? "" })
+  }
+  return processes.filter((p) => p.pid > 0 && p.url.length > 0)
 }
 
 export async function getActiveTab(): Promise<TabInfo & { windowId: number } | null> {
