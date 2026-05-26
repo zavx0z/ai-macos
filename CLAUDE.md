@@ -401,7 +401,7 @@ curl -s -X POST http://localhost:7880/screenshot \
 - Перед первой операцией вызвать `GET /health` нужного сервиса.
 - При `granted: false` — вызвать `POST /permissions/*`, сообщить пользователю. **Не ретраить.**
 - Имена приложений в `app` — каноническое имя процесса macOS (`"Google Chrome"`, не `"chrome"`).
-- `windowId` в Chrome-сервисе — стабильный AppleScript ID из `GET /windows`, предпочтительнее `index`.
+- Для Chrome сначала вызвать `GET /windows`, выбрать текущую нужную вкладку, затем во всех операциях с вкладкой передавать **оба** поля `windowId` и `tabIndex`. Не полагаться на `front window`, активное окно, `/tabs/active` или отсутствующий `windowId`: при нескольких окнах/профилях это легко попадает не туда.
 - **После `POST /reload` страница гарантированно загружена** (сервис ждёт `loading=false`, до 10 с) — скриншот сразу, без `sleep`.
 - При ошибке `osascript failed (-1743)` — нет разрешения Automation.
 - При ошибке `osascript failed (-25211)` — нет разрешения Accessibility.

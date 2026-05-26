@@ -337,9 +337,9 @@ curl -X POST http://localhost:7882/keyboard/shortcut -d '{"sequence":["cmd+a","c
 4. Для скриншотов передавать `detail="medium"` если пользователь не указал иное.
 5. Использовать только REST API — никакого прямого `osascript`, `screencapture` или AppleScript.
 6. Имя приложения (`app`) — каноническое имя процесса macOS, строго по системному.
-7. `windowId` в Chrome-сервисе — стабильный AppleScript ID из `GET /windows`. **Всегда передавать `windowId` в `/screenshot`** — без него берётся первое окно и можно попасть на неверное.
+7. Для Chrome сначала вызвать `GET /windows`, выбрать текущую нужную вкладку, затем во всех операциях с вкладкой передавать **оба** поля `windowId` и `tabIndex`. Не полагаться на `front window`, активное окно, `/tabs/active` или отсутствующий `windowId`: при нескольких окнах/профилях это легко попадает не туда.
 8. Для скриншота Chrome использовать `POST /screenshot` у `@meta/chrome`, **не** напрямую в `@meta/screen` (`/window` или `/rect` не видят Chrome без Accessibility).
-   Сценарий: `GET /windows` → взять нужный `windowId` → `POST /activate {windowId, tabIndex}` → `POST /screenshot {windowId, detail, caption}`.
+   Сценарий: `GET /windows` → выбрать нужные `windowId` и `tabIndex` → `POST /activate {windowId, tabIndex}` → `POST /screenshot {windowId, tabIndex, detail, caption}`.
 9. После `POST /reload` страница гарантированно загружена (сервис ждёт до 10 с) — можно сразу делать скриншот без `sleep`. `hard: true` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
 10. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
 11. При ошибке `osascript failed (-1743)` — нет разрешения Automation.

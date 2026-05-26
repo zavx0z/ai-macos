@@ -56,7 +56,7 @@ return out
 export async function listWindows(): Promise<WindowInfo[]> {
   const raw = await osa(LIST_WINDOWS);
   if (!raw) return [];
-  return raw
+  const windows = raw
     .split(SEP_RECORD)
     .filter((r) => r.length > 0)
     .map((rec) => {
@@ -72,6 +72,28 @@ export async function listWindows(): Promise<WindowInfo[]> {
         height: Number(h ?? 0),
       };
     });
+  return uniqueWindows(windows);
+}
+
+function uniqueWindows(windows: WindowInfo[]): WindowInfo[] {
+  const seen = new Set<string>();
+  const out: WindowInfo[] = [];
+  for (const win of windows) {
+    const key = [
+      win.app,
+      win.pid,
+      win.index,
+      win.title,
+      win.x,
+      win.y,
+      win.width,
+      win.height,
+    ].join(SEP_FIELD);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(win);
+  }
+  return out;
 }
 
 export async function focusApp(app: string): Promise<void> {
