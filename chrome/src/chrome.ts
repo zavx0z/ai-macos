@@ -27,120 +27,98 @@ export type WindowInfo = {
   tabs: TabInfo[];
 };
 
-const FS = String.fromCharCode(31)
-const RS = String.fromCharCode(30)
-const TS = String.fromCharCode(29)
-
-const LIST_SCRIPT = `
-set fs to (ASCII character 31)
-set rs to (ASCII character 30)
-set ts to (ASCII character 29)
-set out to ""
-if application "Google Chrome" is not running then return ""
-tell application "Google Chrome"
-  set winList to every window
-  set wIdx to 0
-  repeat with w in winList
-    set wIdx to wIdx + 1
-    try
-      set wId to id of w
-    on error
-      set wId to 0
-    end try
-    try
-      set wTitle to title of w
-    on error
-      set wTitle to ""
-    end try
-    try
-      set {wx, wy, wx2, wy2} to bounds of w
-    on error
-      set wx to 0
-      set wy to 0
-      set wx2 to 0
-      set wy2 to 0
-    end try
-    try
-      set wActive to active tab index of w
-    on error
-      set wActive to 0
-    end try
-    try
-      set wMode to mode of w
-    on error
-      set wMode to ""
-    end try
-    set out to out & wId & fs & wIdx & fs & wTitle & fs & wx & fs & wy & fs & (wx2 - wx) & fs & (wy2 - wy) & fs & wActive & fs & wMode
-    set tabList to every tab of w
-    set tIdx to 0
-    repeat with t in tabList
-      set tIdx to tIdx + 1
-      try
-        set tId to id of t
-      on error
-        set tId to 0
-      end try
-      try
-        set tTitle to title of t
-      on error
-        set tTitle to ""
-      end try
-      try
-        set tUrl to URL of t
-      on error
-        set tUrl to ""
-      end try
-      try
-        set tLoading to loading of t
-      on error
-        set tLoading to false
-      end try
-      set out to out & ts & tId & fs & tIdx & fs & tTitle & fs & tUrl & fs & tLoading
-    end repeat
-    set out to out & rs
-  end repeat
-end tell
-return out
-`
-
-export async function listWindows(): Promise<WindowInfo[]> {
-  const raw = await osa(LIST_SCRIPT)
-  if (!raw) return []
-  return raw
-    .split(RS)
-    .filter((r) => r.length > 0)
-    .map(parseWindowRecord)
+const JXA_CHROME_HELPERS = `
+function chromeWindow(app, id) {
+  if (id === null || id === undefined) {
+    var wins = app.windows();
+    if (!wins.length) throw new Error("no Chrome windows");
+    return wins[0];
+  }
+  return app.windows.byId(Number(id));
 }
 
-function parseWindowRecord(rec: string): WindowInfo {
-  const parts = rec.split(TS)
-  const head = parts[0] ?? ""
-  const [id, index, title, x, y, width, height, activeTabIndex, mode] = head.split(FS)
-  const tabs: TabInfo[] = []
-  for (let i = 1; i < parts.length; i++) {
-    const p = parts[i] ?? ""
-    if (!p) continue
-    const [tId, tIdx, tTitle, tUrl, tLoading] = p.split(FS)
-    tabs.push({
-      id: Number(tId ?? 0),
-      index: Number(tIdx ?? 0),
-      title: tTitle ?? "",
-      url: tUrl ?? "",
-      loading: (tLoading ?? "false") === "true",
-    })
-  }
+function chromeTab(w, index) {
+  var n = index === null || index === undefined ? Number(w.activeTabIndex()) : Number(index);
+  if (!n || n < 1) throw new Error("invalid tab index: " + index);
+  return w.tabs[n - 1];
+}
+
+function chromeWindowPayload(w, fallbackIndex) {
+  var b = w.bounds();
   return {
-    id: Number(id ?? 0),
-    index: Number(index ?? 0),
-    title: title ?? "",
-    x: Number(x ?? 0),
-    y: Number(y ?? 0),
-    width: Number(width ?? 0),
-    height: Number(height ?? 0),
-    activeTabIndex: Number(activeTabIndex ?? 0),
-    mode: mode ?? "",
-    tabs,
-  }
+    id: Number(w.id()),
+    index: Number(w.index()) || fallbackIndex,
+    title: String(w.name() || ""),
+    x: Number(b.x) || 0,
+    y: Number(b.y) || 0,
+    width: Number(b.width) || 0,
+    height: Number(b.height) || 0,
+    activeTabIndex: Number(w.activeTabIndex()) || 0,
+    mode: String(w.mode() || ""),
+    tabs: w.tabs().map(function(t, i) {
+      return {
+        id: Number(t.id()) || 0,
+        index: i + 1,
+        title: String(t.title() || ""),
+        url: String(t.url() || ""),
+        loading: Boolean(t.loading()),
+      };
+    }),
+  };
+}
+`
+
+function jxaArg(value?: number): string {
+  return value == null ? "null" : String(value)
+}
+
+function jsString(value: string): string {
+  return JSON.stringify(value)
+}
+
+async function jxa(script: string): Promise<string> {
+  const proc = spawn(["osascript", "-l", "JavaScript", "-e", script], { stdout: "pipe", stderr: "pipe" })
+  const [out, errText, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ])
+  if (code !== 0) throw new Error(`jxa failed (${code}): ${errText.trim() || out.trim()}`)
+  return out.trim()
+}
+
+async function jxaJson<T>(script: string): Promise<T> {
+  const raw = await jxa(script)
+  return JSON.parse(raw) as T
+}
+
+async function jxaValue<T>(body: string): Promise<T> {
+  return await jxaJson<T>(`
+${JXA_CHROME_HELPERS}
+JSON.stringify((function() {
+  var app = Application("Google Chrome");
+  ${body}
+})())
+`)
+}
+
+async function runJxa(body: string): Promise<void> {
+  await jxa(`
+${JXA_CHROME_HELPERS}
+(function() {
+  var app = Application("Google Chrome");
+  ${body}
+})()
+`)
+}
+
+export async function listWindows(): Promise<WindowInfo[]> {
+  return await jxaValue<WindowInfo[]>(`
+    if (!app.running()) return [];
+    return app.windows().map(function(w, i) {
+      return chromeWindowPayload(w, i + 1);
+    });
+  `)
 }
 
 export async function getActiveTab(): Promise<TabInfo & { windowId: number } | null> {
@@ -152,38 +130,32 @@ export async function getActiveTab(): Promise<TabInfo & { windowId: number } | n
   return {...tab, windowId: w.id}
 }
 
-function windowRef(windowId?: number): string {
-  return windowId == null ? "front window" : `window id ${windowId}`
-}
-
-function tabRef(windowId?: number, tabIndex?: number): string {
-  if (tabIndex == null) return `active tab of ${windowRef(windowId)}`
-  return `tab ${tabIndex} of ${windowRef(windowId)}`
-}
-
 export type NewWindowOptions = {
   url?: string;
   incognito?: boolean;
 };
 
 export async function newWindow(options: NewWindowOptions = {}): Promise<{ id: number }> {
-  const props: string[] = []
-  if (options.incognito) props.push(`mode:"incognito"`)
-  const propsExpr = props.length ? ` with properties {${props.join(", ")}}` : ""
-  const script = `
-    tell application "Google Chrome"
-      activate
-      set w to make new window${propsExpr}
-      ${options.url ? `set URL of active tab of w to ${quote(options.url)}` : ""}
-      return id of w
-    end tell
-  `
-  const out = await osa(script)
-  return {id: Number(out)}
+  const id = await jxaValue<number>(`
+    var before = app.windows().map(function(w) { return Number(w.id()); });
+    try {
+      app.windows.push(app.Window(${options.incognito ? `{mode: "incognito"}` : ""}));
+    } catch (e) {
+      // Chrome creates the window before JXA reports an invalid-index error.
+    }
+    var created = app.windows().filter(function(w) {
+      return before.indexOf(Number(w.id())) === -1;
+    })[0] || chromeWindow(app, null);
+    ${options.url ? `chromeTab(created, 1).url = ${jsString(options.url)};` : ""}
+    created.index = 1;
+    app.activate();
+    return Number(created.id());
+  `)
+  return {id}
 }
 
 export async function closeWindow(windowId: number): Promise<void> {
-  await osa(`tell application "Google Chrome" to close window id ${windowId}`)
+  await runJxa(`chromeWindow(app, ${jxaArg(windowId)}).close();`)
 }
 
 export type NewTabOptions = {
@@ -192,38 +164,41 @@ export type NewTabOptions = {
 };
 
 export async function newTab(options: NewTabOptions = {}): Promise<{ id: number; index: number }> {
-  const target = windowRef(options.windowId)
-  const propsExpr = options.url ? ` with properties {URL:${quote(options.url)}}` : ""
-  const script = `
-    tell application "Google Chrome"
-      activate
-      tell ${target}
-        set t to make new tab at end of tabs${propsExpr}
-        set tIdx to count of tabs
-        return (id of t as string) & "|" & tIdx
-      end tell
-    end tell
-  `
-  const out = await osa(script)
-  const [id, idx] = out.split("|")
-  return {id: Number(id ?? 0), index: Number(idx ?? 0)}
+  return await jxaValue<{ id: number; index: number }>(`
+    var w = chromeWindow(app, ${jxaArg(options.windowId)});
+    var t = app.Tab({url: ${options.url ? jsString(options.url) : jsString("about:blank")}});
+    w.tabs.push(t);
+    var index = w.tabs().length;
+    var created = chromeTab(w, index);
+    w.activeTabIndex = index;
+    w.index = 1;
+    app.activate();
+    return {id: Number(created.id()) || 0, index: index};
+  `)
 }
 
 export async function closeTab(windowId: number, tabIndex: number): Promise<void> {
-  await osa(
-    `tell application "Google Chrome" to close tab ${tabIndex} of window id ${windowId}`,
-  )
+  await runJxa(`
+    var w = chromeWindow(app, ${jxaArg(windowId)});
+    chromeTab(w, ${jxaArg(tabIndex)}).close();
+  `)
 }
 
 export async function activateTab(windowId: number, tabIndex: number): Promise<void> {
-  await osa(`tell application "Google Chrome"
-    set active tab index of window id ${windowId} to ${tabIndex}
-    set index of window id ${windowId} to 1
-  end tell`)
+  await runJxa(`
+    var w = chromeWindow(app, ${jxaArg(windowId)});
+    chromeTab(w, ${jxaArg(tabIndex)});
+    w.activeTabIndex = ${tabIndex};
+    w.index = 1;
+    app.activate();
+  `)
 }
 
 async function tabUrl(windowId?: number, tabIndex?: number): Promise<string> {
-  return (await osa(`tell application "Google Chrome" to return URL of ${tabRef(windowId, tabIndex)}`)).trim()
+  return await jxaValue<string>(`
+    var w = chromeWindow(app, ${jxaArg(windowId)});
+    return String(chromeTab(w, ${jxaArg(tabIndex)}).url() || "");
+  `)
 }
 
 export async function navigate(
@@ -241,9 +216,10 @@ export async function navigate(
       return { via: "cdp", ...r }
     }
   }
-  await osa(
-    `tell application "Google Chrome" to set URL of ${tabRef(windowId, tabIndex)} to ${quote(url)}`,
-  )
+  await runJxa(`
+    var w = chromeWindow(app, ${jxaArg(windowId)});
+    chromeTab(w, ${jxaArg(tabIndex)}).url = ${jsString(url)};
+  `)
   const waitMs = wait ? await waitForTabLoad(windowId, tabIndex) : 0
   return { via: "applescript", waitMs }
 }
@@ -262,7 +238,10 @@ export async function reload(
       return { via: "cdp", ...r }
     }
   }
-  await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to reload`)
+  await runJxa(`
+    var w = chromeWindow(app, ${jxaArg(windowId)});
+    chromeTab(w, ${jxaArg(tabIndex)}).reload();
+  `)
   const waitMs = wait ? await waitForTabLoad(windowId, tabIndex) : 0
   return { waitMs, via: "applescript" }
 }
@@ -282,15 +261,16 @@ export async function hardReload(
       return { via: "cdp", ...r }
     }
   }
-  if (windowId != null) {
-    await osa(`tell application "Google Chrome" to set index of window id ${windowId} to 1`)
-  }
-  if (tabIndex != null) {
-    const target = windowId != null ? `window id ${windowId}` : "front window"
-    await osa(`tell application "Google Chrome" to set active tab index of ${target} to ${tabIndex}`)
-  }
+  await runJxa(`
+    var w = chromeWindow(app, ${jxaArg(windowId)});
+    if (${jxaArg(tabIndex)} !== null) {
+      chromeTab(w, ${jxaArg(tabIndex)});
+      w.activeTabIndex = ${jxaArg(tabIndex)};
+    }
+    w.index = 1;
+    app.activate();
+  `)
   await osa(`
-    tell application "Google Chrome" to activate
     delay 0.05
     tell application "System Events" to tell process "Google Chrome"
       key code 15 using {command down, shift down}
@@ -305,19 +285,28 @@ async function waitForTabLoad(windowId?: number, tabIndex?: number, timeoutMs = 
   // brief initial delay so loading=true has time to register
   await new Promise((r) => setTimeout(r, 150))
   while (Date.now() - t0 < timeoutMs) {
-    const out = await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to return loading`).catch(() => "false")
-    if (out.trim() === "false") return Date.now() - t0
+    const loading = await jxaValue<boolean>(`
+      var w = chromeWindow(app, ${jxaArg(windowId)});
+      return Boolean(chromeTab(w, ${jxaArg(tabIndex)}).loading());
+    `).catch(() => false)
+    if (!loading) return Date.now() - t0
     await new Promise((r) => setTimeout(r, 200))
   }
   return Date.now() - t0
 }
 
 export async function goBack(windowId?: number, tabIndex?: number): Promise<void> {
-  await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to go back`)
+  await runJxa(`
+    var w = chromeWindow(app, ${jxaArg(windowId)});
+    chromeTab(w, ${jxaArg(tabIndex)}).goBack();
+  `)
 }
 
 export async function goForward(windowId?: number, tabIndex?: number): Promise<void> {
-  await osa(`tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to go forward`)
+  await runJxa(`
+    var w = chromeWindow(app, ${jxaArg(windowId)});
+    chromeTab(w, ${jxaArg(tabIndex)}).goForward();
+  `)
 }
 
 export async function evalJs(
@@ -331,9 +320,10 @@ export async function evalJs(
     if (target) return await cdpEval(target, js)
   }
   const wrapped = `(function(){try{var __r=(function(){${js}})();return (typeof __r==='undefined')?'':(typeof __r==='string'?__r:JSON.stringify(__r));}catch(e){throw e;}})()`
-  return await osa(
-    `tell application "Google Chrome" to tell ${tabRef(windowId, tabIndex)} to execute javascript ${quote(wrapped)}`,
-  )
+  return await jxaValue<string>(`
+    var w = chromeWindow(app, ${jxaArg(windowId)});
+    return String(chromeTab(w, ${jxaArg(tabIndex)}).execute({javascript: ${jsString(wrapped)}}) || "");
+  `)
 }
 
 export async function consoleListen(
@@ -362,8 +352,7 @@ export async function getText(windowId?: number, tabIndex?: number): Promise<str
 }
 
 export async function isRunning(): Promise<boolean> {
-  const out = await osa(`tell application "System Events" to (name of processes) contains "Google Chrome"`)
-  return out === "true"
+  return await jxaValue<boolean>(`return Boolean(app.running());`).catch(() => false)
 }
 
 const SCREEN_API = Bun.env.SCREEN_API ?? "http://localhost:7879"
@@ -470,11 +459,12 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
 
   if (opts.caption) logCaption(opts.caption)
 
-  // Bring the exact Chrome window to front before capture
-  await osa(`tell application "Google Chrome"
-    set index of (first window whose id is ${fresh.id}) to 1
-    activate
-  end tell`)
+  // Bring the exact Chrome window to front before capture.
+  await runJxa(`
+    var w = chromeWindow(app, ${fresh.id});
+    w.index = 1;
+    app.activate();
+  `)
 
   // Wait for page to be fully ready before capture (lazy images, fonts, animations, ...).
   // Best-effort: silently skip if CDP is unavailable or target can't be matched.
