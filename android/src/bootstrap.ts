@@ -1,5 +1,5 @@
 import { spawn } from "bun"
-import { adbAvailable, adbDevices, adbForward, adbKillServer, adbStartServer, type AdbDevice } from "./adb.ts"
+import { adbAvailable, adbDevices, adbForward, adbKillServer, adbStartServer, DEFAULT_DEBUG_PORT, type AdbDevice } from "./adb.ts"
 
 const G = "\x1b[32m"
 const Y = "\x1b[33m"
@@ -161,8 +161,8 @@ export async function bootstrap(autoInstall = true): Promise<BootstrapStatus> {
 
   // 3) Forward
   try {
-    await adbForward(9222, ready.serial)
-    console.log(`  ${OK} adb forward tcp:9222 → chrome_devtools_remote`)
+    await adbForward(DEFAULT_DEBUG_PORT, ready.serial)
+    console.log(`  ${OK} adb forward tcp:${DEFAULT_DEBUG_PORT} → chrome_devtools_remote`)
   } catch (e) {
     return await fail({ adb, packageManager: pm, device: ready },
       "Не удалось пробросить порт. Откройте Chrome на телефоне (хотя бы одну вкладку), затем POST /forward",
@@ -171,7 +171,7 @@ export async function bootstrap(autoInstall = true): Promise<BootstrapStatus> {
 
   // 4) CDP reachable
   try {
-    const r = await fetch("http://localhost:9222/json/version")
+    const r = await fetch(`http://localhost:${DEFAULT_DEBUG_PORT}/json/version`)
     if (!r.ok) throw new Error(`HTTP ${r.status}`)
     const v = (await r.json()) as { Browser?: string; "User-Agent"?: string }
     console.log(`  ${OK} Chrome: ${v.Browser ?? "unknown"}`)
