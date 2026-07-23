@@ -11,7 +11,7 @@ Bun monorepo. Пять пакетов:
 | `@meta/screen` | 7879 | Скриншоты через `screencapture` |
 | `@meta/chrome` | 7880 | Управление десктопным Chrome через AppleScript |
 | `@meta/android` | 7881 | Управление Chrome на Android через ADB + CDP |
-| `@meta/input` | 7882 | Клавиатура и мышь (python3+CoreGraphics + System Events) |
+| `@meta/input` | 7882 | Клавиатура и мышь (Bun/TypeScript + native CoreGraphics helper) |
 
 Зависимости: `chrome` → `screen` → `window` → (system); `android` → adb + CDP.
 
@@ -271,15 +271,15 @@ curl -s -X POST http://localhost:7881/screenshot \
 
 ## @meta/input — порт 7882
 
-Клавиатура и мышь. Мышь — через **python3 + CoreGraphics (ctypes)**, клавиатура — через AppleScript System Events. `cliclick` используется как опциональный fallback если python3 недоступен.
+HTTP API и логика реализованы на **Bun + TypeScript**. Единственный backend ввода — собираемый локально `input/bin/meta-input-helper`, который вызывает официальные CoreGraphics/Accessibility API. Python, `cliclick` и AppleScript не используются.
 
-Требует **Accessibility** для терминала, из которого запущен сервис, или для бинарника `bun`. Bootstrap проверяет это активной пробой через Python: двигает курсор и читает обратно. Установка `cliclick` **не нужна** — достаточно системного `/usr/bin/python3`.
+Требует **Accessibility** для `meta-input-helper`. Bootstrap собирает и подписывает helper, регистрирует запрос TCC и проверяет доступ активной пробой: двигает курсор на один пиксель, читает позицию и возвращает его обратно. При отсутствии фактического доступа API закрывается с `503` и не сообщает ложный успех.
 
 ```bash
 # Проверка
 curl http://localhost:7882/health
-# → { ok, cliclick, python3, accessibility, packageManager, hint? }
-# ok: true = python3 доступен И Accessibility разрешён
+# → { ok, backend:"native-helper", helper, accessibility, hint? }
+# ok: true = helper собран И тестовое CoreGraphics-событие прошло
 
 # Открыть System Settings для выдачи Accessibility
 curl -X POST http://localhost:7882/permissions/accessibility
@@ -303,7 +303,7 @@ curl -X POST http://localhost:7882/mouse/drag \
 
 curl -X POST http://localhost:7882/mouse/scroll \
   -H 'content-type: application/json' -d '{"dy":3}'
-# dy>0 — вниз, dy<0 — вверх; dx — горизонтальная (CGEventScrollWheelEvent через ctypes)
+# dy>0 — вниз, dy<0 — вверх; dx — горизонтальная
 
 # Клавиатура
 curl -X POST http://localhost:7882/keyboard/type \
@@ -406,11 +406,11 @@ curl -s -X POST http://localhost:7880/screenshot \
 ## Важные правила
 
 - Никогда не использовать `osascript` / AppleScript / `screencapture` напрямую — только через REST API.
-- Перед первой операцией вызвать `GET /health` нужного сервиса.
+- Перед первой операцией вызвать `GET /health` нужного сервиса. У `@meta/input` это активная проверка доставки события.
 - При `granted: false` — вызвать `POST /permissions/*`, сообщить пользователю. **Не ретраить.**
 - Имена приложений в `app` — каноническое имя процесса macOS (`"Google Chrome"`, не `"chrome"`).
 - Для Chrome сначала вызвать `GET /windows`. Для операций с вкладкой выбирать только окно `kind:"browser"` и конкретную вкладку из `tabs`, затем во всех tab-операциях передавать **оба** поля `windowId` и `tabIndex`. Не полагаться на `front window`, активное окно, `/tabs/active` или отсутствующий `windowId`: при нескольких окнах/профилях это легко попадает не туда.
 - Окна `kind:"appWindow"` из `GET /windows` — это Chrome app-mode (`Google Chrome --app=<url>`). Они нужны для видимости/диагностики Chrome app окон, но не имеют вкладок; не использовать их с `/activate`, `/navigate`, `/reload`, `/eval`, `/source`, `/text`, `/viewport`, `/console`, `/wait-ready` и не придумывать `tabIndex`.
 - **После `POST /reload` страница гарантированно загружена** (сервис ждёт `loading=false`, до 10 с) — скриншот сразу, без `sleep`.
 - При ошибке `osascript failed (-1743)` — нет разрешения Automation.
-- При ошибке `osascript failed (-25211)` — нет разрешения Accessibility.
+- При `503` от `@meta/input` — нет разрешения Accessibility для пути из `/health.helper`; вызвать `POST /permissions/accessibility`, сообщить пользователю и не ретраить.

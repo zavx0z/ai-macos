@@ -52,12 +52,12 @@ export const KEY_CODES: Record<string, number> = {
   "numenter": 76, "numclear": 71,
 }
 
-export const MODIFIERS: Record<string, string> = {
-  cmd: "command down", command: "command down", meta: "command down", "⌘": "command down",
-  shift: "shift down", "⇧": "shift down",
-  alt: "option down", option: "option down", opt: "option down", "⌥": "option down",
-  ctrl: "control down", control: "control down", "⌃": "control down",
-  fn: "function down",
+export const MODIFIER_FLAGS: Record<string, number> = {
+  cmd: 0x0010_0000, command: 0x0010_0000, meta: 0x0010_0000, "⌘": 0x0010_0000,
+  shift: 0x0002_0000, "⇧": 0x0002_0000,
+  alt: 0x0008_0000, option: 0x0008_0000, opt: 0x0008_0000, "⌥": 0x0008_0000,
+  ctrl: 0x0004_0000, control: 0x0004_0000, "⌃": 0x0004_0000,
+  fn: 0x0080_0000,
 }
 
 export type ParsedShortcut = {
@@ -77,10 +77,10 @@ export function parseShortcut(shortcut: string): ParsedShortcut {
   return { key, modifiers }
 }
 
-export function modifiersUsing(modifiers: string[]): string {
-  const mapped = modifiers
-    .map((m) => MODIFIERS[m.toLowerCase()])
-    .filter((m): m is string => Boolean(m))
-  if (mapped.length === 0) return ""
-  return ` using {${mapped.join(", ")}}`
+export function modifierFlags(modifiers: string[]): number {
+  return modifiers.reduce((flags, modifier) => {
+    const flag = MODIFIER_FLAGS[modifier.toLowerCase()]
+    if (flag == null) throw new Error(`unknown modifier: '${modifier}'`)
+    return flags | flag
+  }, 0)
 }

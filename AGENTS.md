@@ -11,7 +11,7 @@ Bun monorepo. Пять пакетов:
 | `@meta/screen` | 7879 | Скриншоты (`screencapture`) |
 | `@meta/chrome` | 7880 | Десктопный Chrome (AppleScript) |
 | `@meta/android` | 7881 | Chrome на Android (ADB + CDP) |
-| `@meta/input`  | 7882 | Клавиатура и мышь (python3+CoreGraphics + System Events) |
+| `@meta/input`  | 7882 | Клавиатура и мышь (Bun/TypeScript + native CoreGraphics helper) |
 
 ## Запуск сервисов
 
@@ -310,14 +310,15 @@ curl -s -X POST http://localhost:7881/screenshot \
 
 ## @meta/input — порт 7882
 
-Клавиатура и мышь. Мышь — через **python3+CoreGraphics (ctypes)**, клавиатура — через AppleScript System Events. Нужно **Accessibility** для терминала или bun. Bootstrap проверяет это активной пробой через Python. Установка `cliclick` не нужна.
+Клавиатура и мышь. HTTP API и вся логика реализованы на **Bun + TypeScript**. Единственный backend ввода — собираемый локально `input/bin/meta-input-helper`, который вызывает официальные CoreGraphics/Accessibility API. Python, `cliclick` и AppleScript не используются. Нужно один раз выдать **Accessibility** именно `meta-input-helper`; при отсутствии разрешения API закрывается с `503` и не сообщает ложный успех.
 
 ```bash
 curl http://localhost:7882/health
-# → { ok, cliclick, python3, accessibility, packageManager, hint? }
-# ok: true = python3 есть И Accessibility разрешён
+# → { ok, backend:"native-helper", helper, accessibility, hint? }
+# ok: true = helper собран И тестовое CoreGraphics-событие фактически прошло
 
-curl -X POST http://localhost:7882/permissions/accessibility   # открыть System Settings
+curl -X POST http://localhost:7882/permissions/accessibility
+# регистрирует запрос TCC и открывает System Settings
 
 # Мышь
 curl http://localhost:7882/mouse/position                       # { x, y }
@@ -340,7 +341,7 @@ curl -X POST http://localhost:7882/keyboard/shortcut -d '{"sequence":["cmd+a","c
 ## Правила для агентов
 
 1. **Перед каждым скриншотом** — сформулировать одним предложением, что ожидается увидеть, и передать это в поле `caption`. После получения изображения — сравнить ожидание с реальностью и сообщить о расхождении.
-2. Перед первой операцией с сервисом вызвать `GET /health`. При ошибке — сообщить пользователю, не ретраить.
+2. Перед первой операцией с сервисом вызвать `GET /health`. Для `@meta/input` это активная проба события, а не только TCC preflight. При ошибке — сообщить пользователю, не ретраить.
 3. При `granted: false` от `/permissions/*` — вызвать `POST /permissions/*` (откроет Settings), сообщить пользователю, не ретраить.
 4. Для скриншотов передавать `detail="medium"` если пользователь не указал иное.
 5. Использовать только REST API — никакого прямого `osascript`, `screencapture` или AppleScript.
@@ -352,5 +353,5 @@ curl -X POST http://localhost:7882/keyboard/shortcut -d '{"sequence":["cmd+a","c
 10. После `POST /reload` страница гарантированно загружена (сервис ждёт до 10 с) — можно сразу делать скриншот без `sleep`. `hard: true` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
 11. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
 12. При ошибке `osascript failed (-1743)` — нет разрешения Automation.
-13. При ошибке `osascript failed (-25211)` — нет разрешения Accessibility.
+13. При `503` от `@meta/input` — нет разрешения Accessibility для пути из `/health.helper`; вызвать `POST /permissions/accessibility`, сообщить пользователю и не ретраить.
 14. **Canvas-приложения** (графики, редакторы, кастомные рендереры): `POST /screenshot` снимает окно Chrome целиком, но canvas-пиксели могут не совпасть из-за DPR-масштабирования или тайминга. Вместо этого использовать `POST /eval` с JS `return document.querySelector('canvas').toDataURL('image/png')` — получить base64-строку, отрезать префикс `data:image/png;base64,`, декодировать через `base64 -d` в PNG-файл. При нескольких canvas — `document.querySelectorAll('canvas')[N]`.

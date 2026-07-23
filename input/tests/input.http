@@ -1,6 +1,6 @@
 # @meta/input — клавиатура и мышь (порт 7882)
-# cliclick для мыши + AppleScript System Events для клавиатуры.
-# Требует Accessibility для bun или терминала, из которого запущен сервис.
+# Bun/TypeScript API + один native CoreGraphics helper.
+# Требует Accessibility для пути из /health.helper.
 
 @inputHost = http://localhost:7882
 
@@ -9,13 +9,14 @@ GET {{inputHost}}/health
 Accept: application/json
 
 > {%
-  client.test("ok=true когда cliclick + accessibility", () => {
-    client.assert(typeof response.body.cliclick === "string" || response.body.cliclick === null, "cliclick string|null")
+  client.test("ok=true только когда native helper имеет Accessibility", () => {
+    client.assert(response.body.backend === "native-helper", "backend=native-helper")
+    client.assert(typeof response.body.helper === "string" || response.body.helper === null, "helper string|null")
     client.assert(typeof response.body.accessibility === "boolean", "accessibility is boolean")
   })
 %}
 
-### Bootstrap (повторная проверка + установка)
+### Bootstrap (сборка helper + повторная проверка)
 POST {{inputHost}}/bootstrap
 
 ### Проверить Accessibility разрешение
@@ -29,23 +30,21 @@ POST {{inputHost}}/permissions/accessibility
 // Проверка Accessibility — запускать ПОДРЯД сверху вниз после
 // выдачи прав. Тесты должны стать зелёными.
 // Что добавить в Accessibility:
-//   - /opt/local/bin/cliclick (или путь из /health.cliclick)
-//   - /Users/vladimirfilipenko/.bun/bin/bun
+//   - путь из /health.helper
 // ════════════════════════════════════════════════════════════════════
 
 ### 1. Bootstrap → проверить флаг accessibility
 POST {{inputHost}}/bootstrap
 
 > {%
-  client.test("cliclick установлен", () => {
-    client.assert(response.body.cliclick !== null,
-      "cliclick не найден. Установите: brew install cliclick (или sudo port install cliclick)")
+  client.test("native helper собран", () => {
+    client.assert(response.body.helper !== null,
+      "native helper не собран — проверьте /usr/bin/clang и поле hint")
   })
   client.test("Accessibility выдан", () => {
     client.assert(response.body.accessibility === true,
       "Accessibility НЕ выдан! Добавьте в System Settings → Privacy → Accessibility:\n" +
-      "  • " + (response.body.cliclick || "/opt/local/bin/cliclick") + "\n" +
-      "  • /Users/vladimirfilipenko/.bun/bin/bun")
+      "  • " + (response.body.helper || "input/bin/meta-input-helper"))
   })
 %}
 
@@ -71,8 +70,8 @@ Content-Type: application/json
 }
 
 > {%
-  client.test("via=cliclick", () => {
-    client.assert(response.body.via === "cliclick", "ожидался via=cliclick, получили: " + response.body.via)
+  client.test("via=native-helper", () => {
+    client.assert(response.body.via === "native-helper", "ожидался via=native-helper, получили: " + response.body.via)
   })
 %}
 
@@ -88,8 +87,8 @@ GET {{inputHost}}/mouse/position
     const dy = Math.abs(y - 100)
     client.assert(dx <= 2 && dy <= 2,
       `курсор НЕ переместился: ожидалось (100, 100), получено (${x}, ${y}). ` +
-      "API вернул ok, но cliclick молча проигнорировался → нет Accessibility. " +
-      "Откройте System Settings → Privacy → Accessibility и добавьте бинарники cliclick и bun.")
+      "API не должен возвращать ok при отсутствии Accessibility. " +
+      "Откройте System Settings → Privacy → Accessibility и включите путь из /health.helper.")
   })
 %}
 
@@ -113,7 +112,7 @@ Content-Type: application/json
 > {%
   client.test("keyboard работает", () => {
     client.assert(response.body.ok === true,
-      "keyboard вернул ошибку — проверьте Accessibility для bun (или терминала)")
+      "keyboard вернул ошибку — проверьте Accessibility для /health.helper")
   })
 %}
 
