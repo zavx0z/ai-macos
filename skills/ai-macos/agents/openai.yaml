@@ -1,0 +1,4 @@
+interface:
+  display_name: "ai-macos"
+  short_description: "Control local macOS apps through REST APIs"
+  default_prompt: "Use $ai-macos to inspect the current desktop and complete the requested UI action safely."
