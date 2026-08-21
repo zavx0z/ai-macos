@@ -1,4 +1,4 @@
-export const SCREENSHOT_UI_URI = "ui://ai-macos/screenshot.html"
+export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot.html"
 
 export const screenshotUiHtml = String.raw`<!doctype html>
 <html lang="en">

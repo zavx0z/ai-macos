@@ -58,7 +58,7 @@ async function capture(path: "/desktop" | "/window", body: JsonObject) {
 }
 
 const server = new McpServer(
-  { name: "ai-macos", version: "0.2.0" },
+  { name: "ai-macos", version: "0.2.1" },
   {
     instructions:
       "Control this Mac only for the user's explicit request. Before desktop input, call list_windows, then capture_window or capture_desktop with a precise expectation in caption. Compare the image with that expectation before acting. After every mouse or keyboard action, capture again and verify. Use clipboard_read and clipboard_write instead of Cmd+C/Cmd+V; read clipboard content only when explicitly requested and never expose secrets. Never type secrets or confirm authentication, purchases, account changes, sending, deletion, or other consequential actions without the user's explicit confirmation.",
@@ -75,6 +75,7 @@ server.registerResource("ai-macos-screenshot", SCREENSHOT_UI_URI, {
       text: screenshotUiHtml,
       _meta: {
         ui: { prefersBorder: true },
+        "openai/widgetDescription": "Displays the PNG returned by capture_desktop or capture_window.",
         "openai/widgetPrefersBorder": true,
       },
     },

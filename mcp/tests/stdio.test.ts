@@ -42,20 +42,20 @@ describe("ai-macos MCP server", () => {
 
     const captureTool = listed.tools.find((tool) => tool.name === "capture_desktop")
     expect(captureTool?._meta).toMatchObject({
-      ui: { resourceUri: "ui://ai-macos/screenshot.html" },
-      "openai/outputTemplate": "ui://ai-macos/screenshot.html",
+      ui: { resourceUri: "ui://widget/ai-macos-screenshot.html" },
+      "openai/outputTemplate": "ui://widget/ai-macos-screenshot.html",
     })
 
     const resources = await client.listResources()
     expect(resources.resources).toContainEqual(expect.objectContaining({
-      uri: "ui://ai-macos/screenshot.html",
+      uri: "ui://widget/ai-macos-screenshot.html",
       mimeType: "text/html;profile=mcp-app",
     }))
-    const resource = await client.readResource({ uri: "ui://ai-macos/screenshot.html" })
+    const resource = await client.readResource({ uri: "ui://widget/ai-macos-screenshot.html" })
     const screenshotResource = resource.contents[0]
     expect(screenshotResource).toBeDefined()
     expect(screenshotResource).toMatchObject({
-      uri: "ui://ai-macos/screenshot.html",
+      uri: "ui://widget/ai-macos-screenshot.html",
       mimeType: "text/html;profile=mcp-app",
     })
     expect(screenshotResource && "text" in screenshotResource ? screenshotResource.text : "").toContain("ui/notifications/tool-result")
