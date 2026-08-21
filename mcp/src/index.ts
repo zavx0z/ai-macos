@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
-import { SCREENSHOT_UI_URI, screenshotUiHtml } from "./screenshot-ui.ts"
+import { SCREENSHOT_UI_DOMAIN, SCREENSHOT_UI_URI, screenshotUiHtml } from "./screenshot-ui.ts"
 
 const WINDOW_API = Bun.env.WINDOW_API ?? "http://127.0.0.1:7878"
 const SCREEN_API = Bun.env.SCREEN_API ?? "http://127.0.0.1:7879"
@@ -54,7 +54,34 @@ async function capture(path: "/desktop" | "/window", body: JsonObject) {
       { type: "text" as const, text: JSON.stringify(metadata, null, 2) },
       { type: "image" as const, data, mimeType: "image/png" },
     ],
+    _meta: {
+      screenshot: { data, mimeType: "image/png" },
+    },
   }
+}
+
+const screenshotOutputSchema = {
+  ok: z.boolean(),
+  target: z.enum(["desktop", "window"]),
+  mime: z.literal("image/png"),
+  caption: z.string().optional(),
+  imageIncluded: z.literal(true),
+  mimeType: z.literal("image/png"),
+  window: z.object({
+    app: z.string(),
+    pid: z.number().int(),
+    title: z.string(),
+    index: z.number().int(),
+    x: z.number(),
+    y: z.number(),
+    width: z.number(),
+    height: z.number(),
+  }).optional(),
+  restored: z.object({
+    ok: z.boolean(),
+    app: z.string().nullable(),
+    error: z.string().optional(),
+  }).optional(),
 }
 
 const server = new McpServer(
@@ -74,9 +101,15 @@ server.registerResource("ai-macos-screenshot", SCREENSHOT_UI_URI, {
       mimeType: "text/html;profile=mcp-app",
       text: screenshotUiHtml,
       _meta: {
-        ui: { prefersBorder: true },
+        ui: {
+          prefersBorder: true,
+          domain: SCREENSHOT_UI_DOMAIN,
+          csp: { connectDomains: [], resourceDomains: [] },
+        },
         "openai/widgetDescription": "Displays the PNG returned by capture_desktop or capture_window.",
         "openai/widgetPrefersBorder": true,
+        "openai/widgetDomain": SCREENSHOT_UI_DOMAIN,
+        "openai/widgetCSP": { connect_domains: [], resource_domains: [] },
       },
     },
   ],
@@ -121,6 +154,7 @@ server.registerTool(
     title: "Capture the macOS desktop",
     description: "Take a medium-detail desktop screenshot. State exactly what should be visible in caption before calling.",
     inputSchema: { caption: z.string().min(1).describe("One sentence describing what should be visible") },
+    outputSchema: screenshotOutputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     _meta: {
       ui: { resourceUri: SCREENSHOT_UI_URI },
@@ -143,6 +177,7 @@ server.registerTool(
       title: z.string().min(1).optional().describe("Optional window-title substring"),
       caption: z.string().min(1).describe("One sentence describing what should be visible"),
     },
+    outputSchema: screenshotOutputSchema,
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
     _meta: {
       ui: { resourceUri: SCREENSHOT_UI_URI },

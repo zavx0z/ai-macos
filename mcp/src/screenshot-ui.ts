@@ -1,4 +1,7 @@
-export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot.html"
+export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot-v2.html"
+
+export const SCREENSHOT_UI_DOMAIN =
+  "https://asdk_app_6a885263357481919e6ad1311f67a874.web-sandbox.oaiusercontent.com"
 
 export const screenshotUiHtml = String.raw`<!doctype html>
 <html lang="en">
@@ -36,14 +39,16 @@ export const screenshotUiHtml = String.raw`<!doctype html>
       const empty = document.getElementById("empty");
 
       function render(toolResult) {
-        const result = toolResult?.result ?? toolResult ?? {};
+        const result = toolResult?.mcp_tool_result ?? toolResult?.call_tool_result ?? toolResult?.result ?? toolResult ?? {};
         const content = Array.isArray(result.content) ? result.content : [];
         const imageBlock = content.find((item) => item?.type === "image" && typeof item?.data === "string");
+        const privateImage = result._meta?.screenshot;
         const metadata = result.structuredContent ?? {};
-        if (!imageBlock) return;
+        const imageData = imageBlock?.data ?? privateImage?.data;
+        if (typeof imageData !== "string") return;
 
-        const mimeType = imageBlock.mimeType || "image/png";
-        image.src = "data:" + mimeType + ";base64," + imageBlock.data;
+        const mimeType = imageBlock?.mimeType || privateImage?.mimeType || "image/png";
+        image.src = "data:" + mimeType + ";base64," + imageData;
         image.alt = metadata.caption || "macOS screenshot";
         caption.textContent = metadata.caption || metadata.target || "macOS screenshot";
         const windowTitle = metadata.window?.title;
@@ -59,7 +64,13 @@ export const screenshotUiHtml = String.raw`<!doctype html>
         if (message.method === "ui/notifications/tool-result") render(message.params);
       }, { passive: true });
 
-      if (window.openai?.toolOutput) render(window.openai.toolOutput);
+      window.addEventListener("openai:set_globals", (event) => {
+        const globals = event.detail?.globals;
+        render(globals?.toolResponseMetadata);
+      }, { passive: true });
+
+      render(window.openai?.toolResponseMetadata);
+      render(window.openai?.toolOutput);
     </script>
   </body>
 </html>`
