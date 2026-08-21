@@ -19,6 +19,18 @@ Accept: application/json
 ### Bootstrap (сборка helper + повторная проверка)
 POST {{inputHost}}/bootstrap
 
+### Прочитать системный clipboard как текст (без Accessibility)
+GET {{inputHost}}/clipboard
+Accept: application/json
+
+### Записать системный clipboard как текст (без Accessibility)
+POST {{inputHost}}/clipboard
+Content-Type: application/json
+
+{
+  "text": "ai-macos clipboard test"
+}
+
 ### Проверить Accessibility разрешение
 GET {{inputHost}}/permissions/accessibility
 Accept: application/json

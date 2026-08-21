@@ -11,7 +11,7 @@ Bun monorepo. Пять пакетов:
 | `@meta/screen` | 7879 | Скриншоты (`screencapture`) |
 | `@meta/chrome` | 7880 | Десктопный Chrome (AppleScript) |
 | `@meta/android` | 7881 | Chrome на Android (ADB + CDP) |
-| `@meta/input`  | 7882 | Клавиатура и мышь (Bun/TypeScript + native CoreGraphics helper) |
+| `@meta/input`  | 7882 | Клавиатура, мышь и системный clipboard (CoreGraphics + pbpaste/pbcopy) |
 
 ## Запуск сервисов
 
@@ -337,6 +337,18 @@ curl -X POST http://localhost:7882/keyboard/shortcut -d '{"sequence":["cmd+a","c
 
 Имена клавиш: `enter|return`, `tab`, `space`, `escape|esc`, `delete|backspace`, `forwarddelete`, `left|right|up|down`, `home`, `end`, `pageup`, `pagedown`, `f1..f20`, или одиночный символ.
 Модификаторы: `cmd|command|meta|⌘`, `shift|⇧`, `alt|option|opt|⌥`, `ctrl|control|⌃`, `fn`.
+
+### Системный clipboard
+
+Clipboard работает напрямую через системные `/usr/bin/pbpaste` и `/usr/bin/pbcopy`, не требует Accessibility и не использует UI-эмуляцию `Cmd+C`/`Cmd+V`.
+
+```bash
+curl http://localhost:7882/clipboard
+curl -X POST http://localhost:7882/clipboard \
+  -H 'content-type: application/json' -d '{"text":"Hello from ai-macos"}'
+```
+
+`GET /health` возвращает отдельный объект `clipboard` с backend и состоянием доступности обеих системных команд.
 
 ## Правила для агентов
 

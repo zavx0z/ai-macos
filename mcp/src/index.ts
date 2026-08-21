@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
+import { SCREENSHOT_UI_URI, screenshotUiHtml } from "./screenshot-ui.ts"
 
 const WINDOW_API = Bun.env.WINDOW_API ?? "http://127.0.0.1:7878"
 const SCREEN_API = Bun.env.SCREEN_API ?? "http://127.0.0.1:7879"
@@ -48,7 +49,7 @@ async function capture(path: "/desktop" | "/window", body: JsonObject) {
 
   const { base64: _base64, ...metadata } = result
   return {
-    structuredContent: metadata,
+    structuredContent: { ...metadata, imageIncluded: true, mimeType: "image/png" },
     content: [
       { type: "text" as const, text: JSON.stringify(metadata, null, 2) },
       { type: "image" as const, data, mimeType: "image/png" },
@@ -57,12 +58,28 @@ async function capture(path: "/desktop" | "/window", body: JsonObject) {
 }
 
 const server = new McpServer(
-  { name: "ai-macos", version: "0.1.0" },
+  { name: "ai-macos", version: "0.2.0" },
   {
     instructions:
-      "Control this Mac only for the user's explicit request. Before desktop input, call list_windows, then capture_window or capture_desktop with a precise expectation in caption. Compare the image with that expectation before acting. After every mouse or keyboard action, capture again and verify. Never type secrets or confirm authentication, purchases, account changes, sending, deletion, or other consequential actions without the user's explicit confirmation.",
+      "Control this Mac only for the user's explicit request. Before desktop input, call list_windows, then capture_window or capture_desktop with a precise expectation in caption. Compare the image with that expectation before acting. After every mouse or keyboard action, capture again and verify. Use clipboard_read and clipboard_write instead of Cmd+C/Cmd+V; read clipboard content only when explicitly requested and never expose secrets. Never type secrets or confirm authentication, purchases, account changes, sending, deletion, or other consequential actions without the user's explicit confirmation.",
   },
 )
+
+server.registerResource("ai-macos-screenshot", SCREENSHOT_UI_URI, {
+  mimeType: "text/html;profile=mcp-app",
+}, async () => ({
+  contents: [
+    {
+      uri: SCREENSHOT_UI_URI,
+      mimeType: "text/html;profile=mcp-app",
+      text: screenshotUiHtml,
+      _meta: {
+        ui: { prefersBorder: true },
+        "openai/widgetPrefersBorder": true,
+      },
+    },
+  ],
+}))
 
 server.registerTool(
   "system_health",
@@ -104,6 +121,12 @@ server.registerTool(
     description: "Take a medium-detail desktop screenshot. State exactly what should be visible in caption before calling.",
     inputSchema: { caption: z.string().min(1).describe("One sentence describing what should be visible") },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    _meta: {
+      ui: { resourceUri: SCREENSHOT_UI_URI },
+      "openai/outputTemplate": SCREENSHOT_UI_URI,
+      "openai/toolInvocation/invoking": "Capturing desktop…",
+      "openai/toolInvocation/invoked": "Desktop captured.",
+    },
   },
   async ({ caption }) => capture("/desktop", { caption }),
 )
@@ -120,8 +143,67 @@ server.registerTool(
       caption: z.string().min(1).describe("One sentence describing what should be visible"),
     },
     annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+    _meta: {
+      ui: { resourceUri: SCREENSHOT_UI_URI },
+      "openai/outputTemplate": SCREENSHOT_UI_URI,
+      "openai/toolInvocation/invoking": "Capturing window…",
+      "openai/toolInvocation/invoked": "Window captured.",
+    },
   },
   async ({ app, index, title, caption }) => capture("/window", { app, index, title, caption }),
+)
+
+server.registerTool(
+  "clipboard_read",
+  {
+    title: "Read macOS clipboard text",
+    description: "Read plain text directly from the macOS system clipboard using pbpaste. Use only when the user explicitly asks to inspect clipboard content.",
+    inputSchema: {},
+    outputSchema: {
+      text: z.string(),
+      length: z.number().int().nonnegative(),
+      bytes: z.number().int().nonnegative(),
+    },
+    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  },
+  async () => {
+    const result = await requestJson(INPUT_API, "/clipboard")
+    const text = typeof result.text === "string" ? result.text : ""
+    const structuredContent = {
+      text,
+      length: typeof result.length === "number" ? result.length : text.length,
+      bytes: typeof result.bytes === "number" ? result.bytes : new TextEncoder().encode(text).byteLength,
+    }
+    return {
+      structuredContent,
+      content: [{ type: "text" as const, text: `Clipboard text (${structuredContent.length} characters):\n${text}` }],
+    }
+  },
+)
+
+server.registerTool(
+  "clipboard_write",
+  {
+    title: "Write macOS clipboard text",
+    description: "Write plain text directly to the macOS system clipboard using pbcopy, without keyboard shortcuts or UI automation.",
+    inputSchema: { text: z.string().max(1_000_000) },
+    outputSchema: {
+      length: z.number().int().nonnegative(),
+      bytes: z.number().int().nonnegative(),
+    },
+    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+  },
+  async ({ text }) => {
+    const result = await requestJson(INPUT_API, "/clipboard", { method: "POST", body: { text } })
+    const structuredContent = {
+      length: typeof result.length === "number" ? result.length : text.length,
+      bytes: typeof result.bytes === "number" ? result.bytes : new TextEncoder().encode(text).byteLength,
+    }
+    return {
+      structuredContent,
+      content: [{ type: "text" as const, text: `Wrote ${structuredContent.length} characters to the macOS clipboard.` }],
+    }
+  },
 )
 
 server.registerTool(

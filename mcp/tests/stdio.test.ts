@@ -23,6 +23,8 @@ describe("ai-macos MCP server", () => {
     const names = listed.tools.map((tool) => tool.name)
     expect(names).toContain("list_windows")
     expect(names).toContain("capture_window")
+    expect(names).toContain("clipboard_read")
+    expect(names).toContain("clipboard_write")
     expect(names).toContain("mouse_click")
     expect(names).toContain("keyboard_type")
 
@@ -31,7 +33,43 @@ describe("ai-macos MCP server", () => {
     expect(health.structuredContent).toMatchObject({
       window: { ok: true },
       screen: { ok: true },
-      input: { ok: true, accessibility: true },
+      input: {
+        ok: true,
+        accessibility: true,
+        clipboard: { ok: true, backend: "pbpaste/pbcopy" },
+      },
     })
+
+    const captureTool = listed.tools.find((tool) => tool.name === "capture_desktop")
+    expect(captureTool?._meta).toMatchObject({
+      ui: { resourceUri: "ui://ai-macos/screenshot.html" },
+      "openai/outputTemplate": "ui://ai-macos/screenshot.html",
+    })
+
+    const resources = await client.listResources()
+    expect(resources.resources).toContainEqual(expect.objectContaining({
+      uri: "ui://ai-macos/screenshot.html",
+      mimeType: "text/html;profile=mcp-app",
+    }))
+    const resource = await client.readResource({ uri: "ui://ai-macos/screenshot.html" })
+    const screenshotResource = resource.contents[0]
+    expect(screenshotResource).toBeDefined()
+    expect(screenshotResource).toMatchObject({
+      uri: "ui://ai-macos/screenshot.html",
+      mimeType: "text/html;profile=mcp-app",
+    })
+    expect(screenshotResource && "text" in screenshotResource ? screenshotResource.text : "").toContain("ui/notifications/tool-result")
+
+    const originalClipboard = await client.callTool({ name: "clipboard_read", arguments: {} })
+    const originalText = String((originalClipboard.structuredContent as { text?: unknown })?.text ?? "")
+    const marker = `ai-macos-mcp-${crypto.randomUUID()}-Привет`
+    try {
+      const written = await client.callTool({ name: "clipboard_write", arguments: { text: marker } })
+      expect(written.isError).not.toBe(true)
+      const read = await client.callTool({ name: "clipboard_read", arguments: {} })
+      expect(read.structuredContent).toMatchObject({ text: marker, length: marker.length })
+    } finally {
+      await client.callTool({ name: "clipboard_write", arguments: { text: originalText } })
+    }
   })
 })

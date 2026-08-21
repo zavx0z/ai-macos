@@ -6,6 +6,12 @@ import {
   type InputBootstrapStatus,
 } from "./bootstrap.ts"
 import { NativeInputError } from "./native.ts"
+import {
+  clipboardHealth,
+  MAX_CLIPBOARD_TEXT_BYTES,
+  readClipboardText,
+  writeClipboardText,
+} from "./clipboard.ts"
 import { click, drag, getPosition, move, scroll, setNativeHelper } from "./mouse.ts"
 import {
   pressKey,
@@ -55,11 +61,13 @@ Bun.serve({
       try {
         if (path === "/health") {
           await refreshAccessibility()
+          const clipboard = await clipboardHealth()
           return json({
-            ok: bootStatus.accessibility,
+            ok: bootStatus.accessibility && clipboard.ok,
             backend: bootStatus.backend,
             helper: bootStatus.helper,
             accessibility: bootStatus.accessibility,
+            clipboard,
             hint: bootStatus.hint,
           })
         }
@@ -104,6 +112,23 @@ Bun.serve({
             hint: granted
               ? undefined
               : `Включите в открывшемся списке: ${bootStatus.helper ?? "meta-input-helper"}, затем GET /permissions/accessibility`,
+          })
+        }
+
+        // ─── System clipboard (does not require Accessibility) ──────────
+        if (path === "/clipboard" && method === "GET") {
+          return json({ ok: true, backend: "pbpaste/pbcopy", ...(await readClipboardText()) })
+        }
+
+        if (path === "/clipboard" && method === "POST") {
+          const body = (await req.json()) as { text?: unknown }
+          if (typeof body.text !== "string") {
+            return err(400, "missing string 'text'", `Максимум ${MAX_CLIPBOARD_TEXT_BYTES} UTF-8 байт`)
+          }
+          return json({
+            ok: true,
+            backend: "pbpaste/pbcopy",
+            ...(await writeClipboardText(body.text)),
           })
         }
 
@@ -192,7 +217,7 @@ Bun.serve({
         }
 
         return err(404, `${method} ${path} not found`,
-          "Маршруты: GET /health /mouse/position; POST /mouse/{move,click,drag,scroll} /keyboard/{type,key,shortcut} /bootstrap")
+          "Маршруты: GET /health /clipboard /mouse/position; POST /clipboard /mouse/{move,click,drag,scroll} /keyboard/{type,key,shortcut} /bootstrap")
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         if (e instanceof NativeInputError && e.code === 77) {
@@ -222,6 +247,10 @@ printBanner("@meta/input", PORT, [
     { method: "POST", path: "/mouse/click",    description: "клик  ({x?,y?,button?,count?})" },
     { method: "POST", path: "/mouse/drag",     description: "drag  ({from,to,durationMs?})" },
     { method: "POST", path: "/mouse/scroll",   description: "прокрутка  ({dx?,dy?})" },
+  ]},
+  { title: "Системный буфер обмена", routes: [
+    { method: "GET",  path: "/clipboard", description: "прочитать текст через pbpaste" },
+    { method: "POST", path: "/clipboard", description: "записать текст через pbcopy  ({text})" },
   ]},
   { title: "Клавиатура", routes: [
     { method: "POST", path: "/keyboard/type",     description: "набрать текст  ({text,delayMs?})" },
