@@ -1,7 +1,7 @@
-export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot-v2.html"
+export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot-v3.html"
 
 export const SCREENSHOT_UI_DOMAIN =
-  "https://asdk_app_6a885263357481919e6ad1311f67a874.web-sandbox.oaiusercontent.com"
+  "https://ai-macos-local.zavx0z.app"
 
 export const screenshotUiHtml = String.raw`<!doctype html>
 <html lang="en">

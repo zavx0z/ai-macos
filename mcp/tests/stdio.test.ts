@@ -42,26 +42,26 @@ describe("ai-macos MCP server", () => {
 
     const captureTool = listed.tools.find((tool) => tool.name === "capture_desktop")
     expect(captureTool?._meta).toMatchObject({
-      ui: { resourceUri: "ui://widget/ai-macos-screenshot-v2.html" },
-      "openai/outputTemplate": "ui://widget/ai-macos-screenshot-v2.html",
+      ui: { resourceUri: "ui://widget/ai-macos-screenshot-v3.html" },
+      "openai/outputTemplate": "ui://widget/ai-macos-screenshot-v3.html",
     })
     expect(captureTool?.outputSchema).toBeDefined()
 
     const resources = await client.listResources()
     expect(resources.resources).toContainEqual(expect.objectContaining({
-      uri: "ui://widget/ai-macos-screenshot-v2.html",
+      uri: "ui://widget/ai-macos-screenshot-v3.html",
       mimeType: "text/html;profile=mcp-app",
     }))
-    const resource = await client.readResource({ uri: "ui://widget/ai-macos-screenshot-v2.html" })
+    const resource = await client.readResource({ uri: "ui://widget/ai-macos-screenshot-v3.html" })
     const screenshotResource = resource.contents[0]
     expect(screenshotResource).toBeDefined()
     expect(screenshotResource).toMatchObject({
-      uri: "ui://widget/ai-macos-screenshot-v2.html",
+      uri: "ui://widget/ai-macos-screenshot-v3.html",
       mimeType: "text/html;profile=mcp-app",
     })
     expect(screenshotResource?._meta).toMatchObject({
       ui: {
-        domain: "https://asdk_app_6a885263357481919e6ad1311f67a874.web-sandbox.oaiusercontent.com",
+        domain: "https://ai-macos-local.zavx0z.app",
         csp: { connectDomains: [], resourceDomains: [] },
       },
     })
