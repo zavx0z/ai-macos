@@ -231,7 +231,10 @@ static int command_key(int argc, char **argv) {
     return EXIT_USAGE;
   if (!post_key((CGKeyCode)key_code, true, (CGEventFlags)flags)) return 1;
   usleep(30000);
-  if (!post_key((CGKeyCode)key_code, false, (CGEventFlags)flags)) return 1;
+  // A key-up event must not retain synthetic modifier flags. Keeping Command
+  // on the key-up made the next independently-created Unicode events inherit
+  // Command, so typing text after Cmd+L was interpreted as more shortcuts.
+  if (!post_key((CGKeyCode)key_code, false, 0)) return 1;
   usleep(50000);
   return 0;
 }
@@ -268,6 +271,10 @@ static int command_type(int argc, char **argv) {
       CFRelease(text);
       return 1;
     }
+    // Unicode input is plain text. Explicitly clear flags instead of relying
+    // on the process-wide CoreGraphics event-source state left by a shortcut.
+    CGEventSetFlags(down, 0);
+    CGEventSetFlags(up, 0);
     CGEventKeyboardSetUnicodeString(down, count, buffer);
     CGEventKeyboardSetUnicodeString(up, count, buffer);
     CGEventPost(kCGHIDEventTap, down);
