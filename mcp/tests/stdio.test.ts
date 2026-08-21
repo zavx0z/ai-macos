@@ -42,21 +42,21 @@ describe("ai-macos MCP server", () => {
 
     const captureTool = listed.tools.find((tool) => tool.name === "capture_desktop")
     expect(captureTool?._meta).toMatchObject({
-      ui: { resourceUri: "ui://widget/ai-macos-screenshot-v3.html" },
-      "openai/outputTemplate": "ui://widget/ai-macos-screenshot-v3.html",
+      ui: { resourceUri: "ui://widget/ai-macos-screenshot-v4.html" },
+      "openai/outputTemplate": "ui://widget/ai-macos-screenshot-v4.html",
     })
     expect(captureTool?.outputSchema).toBeDefined()
 
     const resources = await client.listResources()
     expect(resources.resources).toContainEqual(expect.objectContaining({
-      uri: "ui://widget/ai-macos-screenshot-v3.html",
+      uri: "ui://widget/ai-macos-screenshot-v4.html",
       mimeType: "text/html;profile=mcp-app",
     }))
-    const resource = await client.readResource({ uri: "ui://widget/ai-macos-screenshot-v3.html" })
+    const resource = await client.readResource({ uri: "ui://widget/ai-macos-screenshot-v4.html" })
     const screenshotResource = resource.contents[0]
     expect(screenshotResource).toBeDefined()
     expect(screenshotResource).toMatchObject({
-      uri: "ui://widget/ai-macos-screenshot-v3.html",
+      uri: "ui://widget/ai-macos-screenshot-v4.html",
       mimeType: "text/html;profile=mcp-app",
     })
     expect(screenshotResource?._meta).toMatchObject({
@@ -69,6 +69,10 @@ describe("ai-macos MCP server", () => {
     expect(html).toContain("ui/notifications/tool-result")
     expect(html).toContain("toolResponseMetadata")
     expect(html).toContain("openai:set_globals")
+    expect(html).toContain("notifyIntrinsicHeight")
+    expect(html).toContain("ui/notifications/size-changed")
+    expect(html).toContain("requestDisplayMode")
+    expect(html).not.toContain("max-height: 70vh")
 
     const originalClipboard = await client.callTool({ name: "clipboard_read", arguments: {} })
     const originalText = String((originalClipboard.structuredContent as { text?: unknown })?.text ?? "")

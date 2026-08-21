@@ -1,4 +1,4 @@
-export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot-v3.html"
+export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot-v4.html"
 
 export const SCREENSHOT_UI_DOMAIN =
   "https://ai-macos-local.zavx0z.app"
@@ -13,10 +13,13 @@ export const screenshotUiHtml = String.raw`<!doctype html>
       * { box-sizing: border-box; }
       body { margin: 0; padding: 8px; background: transparent; color: CanvasText; }
       figure { margin: 0; overflow: hidden; border: 1px solid color-mix(in srgb, CanvasText 16%, transparent); border-radius: 12px; background: Canvas; }
-      img { display: block; width: 100%; max-height: 70vh; object-fit: contain; background: #111; }
+      img { display: block; width: 100%; height: auto; max-height: none; object-fit: contain; background: #111; cursor: zoom-in; }
       figcaption { padding: 8px 10px; display: flex; gap: 8px; justify-content: space-between; align-items: baseline; font-size: 13px; }
       #caption { font-weight: 600; overflow-wrap: anywhere; }
+      #actions { display: flex; gap: 8px; align-items: center; flex: none; }
       #details { opacity: .65; white-space: nowrap; }
+      #expand { appearance: none; border: 1px solid color-mix(in srgb, CanvasText 20%, transparent); border-radius: 999px; padding: 5px 10px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+      #expand:hover { background: color-mix(in srgb, CanvasText 8%, transparent); }
       #empty { padding: 24px; text-align: center; opacity: .7; }
       [hidden] { display: none !important; }
     </style>
@@ -26,7 +29,10 @@ export const screenshotUiHtml = String.raw`<!doctype html>
       <img id="image" alt="macOS screenshot" />
       <figcaption>
         <span id="caption">macOS screenshot</span>
-        <span id="details"></span>
+        <span id="actions">
+          <span id="details"></span>
+          <button id="expand" type="button" title="Open the screenshot at full size">Expand</button>
+        </span>
       </figcaption>
     </figure>
     <div id="empty" role="status">Waiting for screenshot…</div>
@@ -36,7 +42,42 @@ export const screenshotUiHtml = String.raw`<!doctype html>
       const image = document.getElementById("image");
       const caption = document.getElementById("caption");
       const details = document.getElementById("details");
+      const expand = document.getElementById("expand");
       const empty = document.getElementById("empty");
+      let lastReportedHeight = 0;
+      let heightFrame;
+
+      function notifyHeight() {
+        cancelAnimationFrame(heightFrame);
+        heightFrame = requestAnimationFrame(() => {
+          const height = Math.ceil(Math.max(
+            document.body.scrollHeight,
+            document.documentElement.scrollHeight,
+          ));
+          if (!height || height === lastReportedHeight) return;
+          lastReportedHeight = height;
+
+          try {
+            window.openai?.notifyIntrinsicHeight?.(height);
+          } catch {}
+
+          window.parent.postMessage({
+            jsonrpc: "2.0",
+            method: "ui/notifications/size-changed",
+            params: { height },
+          }, "*");
+        });
+      }
+
+      async function expandImage() {
+        if (typeof window.openai?.requestDisplayMode === "function") {
+          await window.openai.requestDisplayMode({ mode: "fullscreen" });
+          return;
+        }
+        if (typeof window.openai?.requestModal === "function") {
+          await window.openai.requestModal({});
+        }
+      }
 
       function render(toolResult) {
         const result = toolResult?.mcp_tool_result ?? toolResult?.call_tool_result ?? toolResult?.result ?? toolResult ?? {};
@@ -55,6 +96,17 @@ export const screenshotUiHtml = String.raw`<!doctype html>
         details.textContent = windowTitle || metadata.target || "";
         empty.hidden = true;
         viewer.hidden = false;
+        notifyHeight();
+      }
+
+      image.addEventListener("load", notifyHeight, { passive: true });
+      image.addEventListener("click", expandImage);
+      expand.addEventListener("click", expandImage);
+
+      if (typeof ResizeObserver === "function") {
+        const observer = new ResizeObserver(notifyHeight);
+        observer.observe(document.documentElement);
+        observer.observe(document.body);
       }
 
       window.addEventListener("message", (event) => {
@@ -71,6 +123,7 @@ export const screenshotUiHtml = String.raw`<!doctype html>
 
       render(window.openai?.toolResponseMetadata);
       render(window.openai?.toolOutput);
+      notifyHeight();
     </script>
   </body>
 </html>`
