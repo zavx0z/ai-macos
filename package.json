@@ -6,7 +6,10 @@
   "workspaces": ["shared", "window", "screen", "chrome", "android", "input", "mcp"],
   "scripts": {
     "dev": "bun run --filter '@meta/window' --filter '@meta/screen' --filter '@meta/chrome' --filter '@meta/android' --filter '@meta/input' dev",
-    "mcp": "bun run --cwd mcp start"
+    "mcp": "bun run --cwd mcp start",
+    "typecheck": "bun run --filter '*' typecheck",
+    "test": "bun test input/tests mcp/tests",
+    "build": "bun run --filter '@meta/window' --filter '@meta/screen' --filter '@meta/chrome' --filter '@meta/android' --filter '@meta/input' --filter '@meta/mcp' build"
   },
   "devDependencies": {
     "@types/bun": "latest"

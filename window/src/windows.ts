@@ -1,4 +1,5 @@
 import { osa, quote } from "@meta/shared";
+import { nativeWindowCommand, windowHelperPath } from "./native.ts";
 
 export type WindowInfo = {
   app: string;
@@ -10,6 +11,9 @@ export type WindowInfo = {
   width: number;
   height: number;
 };
+
+export type ExactWindowInfo = Omit<WindowInfo, "index"> & { windowId: number };
+export type WindowIdentity = { pid: number; windowId: number };
 
 const SEP_FIELD = String.fromCharCode(31);
 const SEP_RECORD = String.fromCharCode(30);
@@ -75,6 +79,24 @@ export async function listWindows(): Promise<WindowInfo[]> {
   return uniqueWindows(windows);
 }
 
+export async function listExactWindows(): Promise<ExactWindowInfo[]> {
+  return JSON.parse(await nativeWindowCommand(["list"])) as ExactWindowInfo[];
+}
+
+export async function focusedWindow(): Promise<WindowIdentity | null> {
+  const parsed = JSON.parse(await nativeWindowCommand(["focused"])) as { focused: WindowIdentity | null };
+  return parsed.focused;
+}
+
+export async function focusExactWindow(identity: WindowIdentity): Promise<WindowIdentity> {
+  const parsed = JSON.parse(await nativeWindowCommand(["focus", String(identity.pid), String(identity.windowId)])) as {
+    focused: WindowIdentity;
+    verified: boolean;
+  };
+  if (!parsed.verified) throw new Error("exact focus was not verified");
+  return parsed.focused;
+}
+
 function uniqueWindows(windows: WindowInfo[]): WindowInfo[] {
   const seen = new Set<string>();
   const out: WindowInfo[] = [];
@@ -133,5 +155,22 @@ export async function checkAccessibility(): Promise<{ granted: boolean; error?: 
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
     return { granted: false, error: msg };
+  }
+}
+
+export async function checkExactWindowAccessibility(): Promise<{ granted: boolean; helper: string; error?: string }> {
+  try {
+    await nativeWindowCommand(["check"]);
+    return { granted: true, helper: windowHelperPath() };
+  } catch (e) {
+    return { granted: false, helper: windowHelperPath(), error: e instanceof Error ? e.message : String(e) };
+  }
+}
+
+export async function requestExactWindowAccessibility(): Promise<void> {
+  try {
+    await nativeWindowCommand(["request"]);
+  } catch {
+    // The helper returns 77 while permission is pending; the prompt side effect already occurred.
   }
 }

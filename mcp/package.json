@@ -5,10 +5,17 @@
   "type": "module",
   "scripts": {
     "start": "bun src/index.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "test:safari-e2e": "AI_MACOS_REAL_SAFARI_E2E=1 bun test tests/safari-reload.e2e.test.ts",
+    "safari:fixture": "bun tests/fixtures/safari-reload-server.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/index.ts --target bun --outdir dist"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "latest",
     "zod": "latest"
+  },
+  "devDependencies": {
+    "ajv": "^8.20.0"
   }
 }
