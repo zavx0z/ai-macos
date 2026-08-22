@@ -297,7 +297,7 @@ Future internal routes are under `/v2/transactions`, `/v2/targets`, and `/v2/art
 | exact focus verification fails | 0 | restore previous | `action_failed` |
 | input backend rejects | unknown delivery is never retried | restore previous | `action_failed` |
 | event delivered, effect unprovable | 1 | restore previous | `delivered_unverified` |
-| effect confirmed, screenshot fails | 1 | restore previous | verified effect; artifact/audit failure; follow-up will use a distinct `verified_without_artifact` state |
+| effect confirmed, screenshot fails | 1 | restore previous | `verified_without_artifact` |
 | previous exact window closed | 1 or 0 | cannot restore | `verified_restoration_failed` or `action_failed`, restoration=`previous_target_gone` |
 | restoration focus verification fails | 1 or 0 | honest current state | restoration=`failed` |
 | deadline/cancellation | never retry uncertain delivery | restoration attempted | typed deadline/cancel outcome |
@@ -404,7 +404,7 @@ Target pyramid:
 6. Chrome/Android E2E: stable target leases across reorder, reload lifecycle proof, transport generation changes.
 7. ChatGPT UI E2E: schemas load without warnings, picker handles ambiguity, PNG is large inline, model cannot call raw input.
 
-The real Safari test is gated by `AI_MACOS_REAL_SAFARI_E2E=1`, `AI_MACOS_MCP_E2E_URL`, and an already-open deterministic fixture. This prevents tests from launching or mutating a user's Safari unexpectedly.
+The real Safari test is gated by `AI_MACOS_REAL_SAFARI_E2E=1` and an already-open deterministic fixture. Run `bun run --cwd mcp safari:fixture`, open its URL in exactly one visible Safari window, then run `bun run --cwd mcp test:safari-e2e`. The product action and test never launch a missing Safari. This prevents the normal suite from mutating a user's browser unexpectedly.
 
 ## 15. Target package structure
 

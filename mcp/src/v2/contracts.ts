@@ -74,6 +74,7 @@ export type DesktopActionResult = {
     | "action_failed"
     | "delivered_unverified"
     | "verified"
+    | "verified_without_artifact"
     | "verified_restoration_failed"
   correlationId: string
   target?: { handle: string; app: string; title: string }

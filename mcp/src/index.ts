@@ -20,7 +20,7 @@ const candidateSchema = z.object({
 })
 
 const actionOutputSchema = {
-  status: z.enum(["target_not_found", "needs_target", "rejected_stale_target", "action_failed", "delivered_unverified", "verified", "verified_restoration_failed"]),
+  status: z.enum(["target_not_found", "needs_target", "rejected_stale_target", "action_failed", "delivered_unverified", "verified", "verified_without_artifact", "verified_restoration_failed"]),
   correlationId: z.string(),
   target: z.object({ handle: z.string(), app: z.string(), title: z.string() }).optional(),
   delivery: z.object({ status: z.enum(["not_attempted", "delivered", "failed", "unknown"]), error: z.string().optional() }),

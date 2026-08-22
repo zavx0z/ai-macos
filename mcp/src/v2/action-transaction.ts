@@ -106,6 +106,10 @@ export class DesktopActionTransaction {
       ...(image ? { _image: image } : {}),
     })
 
+    if (Boolean(request.app?.trim()) === Boolean(request.targetHandle)) {
+      return finish("target_not_found", this.typed("invalid_target", "Provide exactly one of app or targetHandle", "Use app for initial resolution or one returned targetHandle", correlationId))
+    }
+
     let initial
     try {
       initial = await mark("observe", () => this.adapter.observe(request.app))
@@ -229,6 +233,7 @@ export class DesktopActionTransaction {
     }
     if (effect.status !== "confirmed") return finish("delivered_unverified")
     if (restoration.status === "failed" || restoration.status === "previous_target_gone") return finish("verified_restoration_failed")
+    if (!artifact) return finish("verified_without_artifact")
     return finish("verified")
   }
 
