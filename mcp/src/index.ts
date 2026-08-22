@@ -2,380 +2,141 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
 import { SCREENSHOT_UI_DOMAIN, SCREENSHOT_UI_URI, screenshotUiHtml } from "./screenshot-ui.ts"
+import { DesktopActionTransaction } from "./v2/action-transaction.ts"
+import { RestDesktopActionAdapter, requestJson } from "./v2/rest-adapter.ts"
 
 const WINDOW_API = Bun.env.WINDOW_API ?? "http://127.0.0.1:7878"
 const SCREEN_API = Bun.env.SCREEN_API ?? "http://127.0.0.1:7879"
+const CHROME_API = Bun.env.CHROME_API ?? "http://127.0.0.1:7880"
+const ANDROID_API = Bun.env.ANDROID_API ?? "http://127.0.0.1:7881"
 const INPUT_API = Bun.env.INPUT_API ?? "http://127.0.0.1:7882"
 
-type JsonObject = Record<string, unknown>
+const transaction = new DesktopActionTransaction(new RestDesktopActionAdapter(WINDOW_API, SCREEN_API, INPUT_API))
 
-async function requestJson(
-  baseUrl: string,
-  path: string,
-  options: { method?: "GET" | "POST"; body?: JsonObject } = {},
-): Promise<JsonObject> {
-  const response = await fetch(`${baseUrl}${path}`, {
-    method: options.method ?? "GET",
-    headers: options.body ? { "content-type": "application/json" } : undefined,
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  })
-  const text = await response.text()
-  let result: JsonObject
-  try {
-    result = JSON.parse(text) as JsonObject
-  } catch {
-    throw new Error(`${options.method ?? "GET"} ${path} returned non-JSON (${response.status})`)
-  }
-  if (!response.ok) {
-    throw new Error(`${options.method ?? "GET"} ${path} failed (${response.status}): ${text}`)
-  }
-  return result
-}
+const candidateSchema = z.object({
+  handle: z.string(), app: z.string(), title: z.string(),
+  bounds: z.object({ x: z.number(), y: z.number(), width: z.number(), height: z.number() }),
+  expiresAt: z.string(),
+})
 
-function textResult(result: JsonObject, summary: string) {
-  return {
-    structuredContent: result,
-    content: [{ type: "text" as const, text: `${summary}\n${JSON.stringify(result, null, 2)}` }],
-  }
-}
-
-async function capture(path: "/desktop" | "/window", body: JsonObject) {
-  const result = await requestJson(SCREEN_API, path, {
-    method: "POST",
-    body: { ...body, detail: "medium", format: "json" },
-  })
-  const data = result.base64
-  if (typeof data !== "string") throw new Error(`Screenshot response from ${path} did not include base64 data`)
-
-  const { base64: _base64, ...metadata } = result
-  return {
-    structuredContent: { ...metadata, imageIncluded: true, mimeType: "image/png" },
-    content: [
-      { type: "text" as const, text: JSON.stringify(metadata, null, 2) },
-      { type: "image" as const, data, mimeType: "image/png" },
-    ],
-    _meta: {
-      screenshot: { data, mimeType: "image/png" },
-    },
-  }
-}
-
-const screenshotOutputSchema = {
-  ok: z.boolean(),
-  target: z.enum(["desktop", "window"]),
-  mime: z.literal("image/png"),
-  caption: z.string().optional(),
-  imageIncluded: z.literal(true),
-  mimeType: z.literal("image/png"),
-  window: z.object({
-    app: z.string(),
-    pid: z.number().int(),
-    title: z.string(),
-    index: z.number().int(),
-    x: z.number(),
-    y: z.number(),
-    width: z.number(),
-    height: z.number(),
-  }).optional(),
-  restored: z.object({
-    ok: z.boolean(),
-    app: z.string().nullable(),
+const actionOutputSchema = {
+  status: z.enum(["target_not_found", "needs_target", "rejected_stale_target", "action_failed", "delivered_unverified", "verified", "verified_restoration_failed"]),
+  correlationId: z.string(),
+  target: z.object({ handle: z.string(), app: z.string(), title: z.string() }).optional(),
+  delivery: z.object({ status: z.enum(["not_attempted", "delivered", "failed", "unknown"]), error: z.string().optional() }),
+  effect: z.object({
+    status: z.enum(["not_checked", "confirmed", "unconfirmed", "check_failed"]),
+    evidence: z.object({ kind: z.literal("window_title_changed"), before: z.string(), after: z.string() }).optional(),
     error: z.string().optional(),
+  }),
+  verification: z.object({ status: z.enum(["not_run", "confirmed", "unconfirmed", "failed"]) }),
+  restoration: z.object({ status: z.enum(["not_needed", "restored", "previous_target_gone", "failed"]), error: z.string().optional() }),
+  artifact: z.object({ kind: z.literal("screenshot"), mimeType: z.literal("image/png"), imageIncluded: z.literal(true), caption: z.string() }).optional(),
+  error: z.object({
+    code: z.string(), message: z.string(), nextAction: z.string(),
+    candidates: z.array(candidateSchema).optional(), correlationId: z.string(),
   }).optional(),
+  audit: z.array(z.object({
+    stage: z.string(), outcome: z.enum(["ok", "skipped", "failed"]),
+    atMs: z.number(), durationMs: z.number(), detail: z.string().optional(),
+  })),
+  timings: z.object({ totalMs: z.number(), boundedByMs: z.number() }),
 }
 
 const server = new McpServer(
-  { name: "ai-macos", version: "0.2.1" },
-  {
-    instructions:
-      "Control this Mac only for the user's explicit request. Before desktop input, call list_windows, then capture_window or capture_desktop with a precise expectation in caption. Compare the image with that expectation before acting. After every mouse or keyboard action, capture again and verify. Use clipboard_read and clipboard_write instead of Cmd+C/Cmd+V; read clipboard content only when explicitly requested and never expose secrets. Never type secrets or confirm authentication, purchases, account changes, sending, deletion, or other consequential actions without the user's explicit confirmation.",
-  },
+  { name: "ai-macos", version: "0.3.0" },
+  { instructions: "Use desktop_action for desktop input. It binds one exact visible window, verifies focus immediately before dispatch, captures proof, and restores the exact previous window. Never infer effect success from delivery: only status=verified with effect.status=confirmed proves the effect." },
 )
 
-server.registerResource("ai-macos-screenshot", SCREENSHOT_UI_URI, {
-  mimeType: "text/html;profile=mcp-app",
-}, async () => ({
-  contents: [
-    {
-      uri: SCREENSHOT_UI_URI,
-      mimeType: "text/html;profile=mcp-app",
-      text: screenshotUiHtml,
-      _meta: {
-        ui: {
-          prefersBorder: true,
-          domain: SCREENSHOT_UI_DOMAIN,
-          csp: { connectDomains: [], resourceDomains: [] },
-        },
-        "openai/widgetDescription": "Displays the PNG returned by capture_desktop or capture_window.",
-        "openai/widgetPrefersBorder": true,
-        "openai/widgetDomain": SCREENSHOT_UI_DOMAIN,
-        "openai/widgetCSP": { connect_domains: [], resource_domains: [] },
-      },
+server.registerResource("ai-macos-screenshot", SCREENSHOT_UI_URI, { mimeType: "text/html;profile=mcp-app" }, async () => ({
+  contents: [{
+    uri: SCREENSHOT_UI_URI, mimeType: "text/html;profile=mcp-app", text: screenshotUiHtml,
+    _meta: {
+      ui: { prefersBorder: true, domain: SCREENSHOT_UI_DOMAIN, csp: { connectDomains: [], resourceDomains: [] } },
+      "openai/widgetDescription": "Displays exact-target PNG evidence returned by ai-macos.",
+      "openai/widgetPrefersBorder": true,
+      "openai/widgetDomain": SCREENSHOT_UI_DOMAIN,
+      "openai/widgetCSP": { connect_domains: [], resource_domains: [] },
     },
-  ],
+  }],
 }))
 
-server.registerTool(
-  "system_health",
-  {
-    title: "Check ai-macos services",
-    description: "Check whether the local window, screen, and native input services are ready before using them.",
-    inputSchema: {},
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  },
-  async () => {
-    const [window, screen, input] = await Promise.all([
-      requestJson(WINDOW_API, "/health"),
-      requestJson(SCREEN_API, "/health"),
-      requestJson(INPUT_API, "/health"),
-    ])
-    return textResult({ window, screen, input }, "ai-macos service status")
-  },
-)
+async function healthOf(base: string) {
+  try { return { state: "ready", ...(await requestJson(base, "/health")) } }
+  catch (error) { return { state: "unavailable", error: error instanceof Error ? error.message : String(error) } }
+}
 
-server.registerTool(
-  "list_windows",
-  {
-    title: "List visible macOS windows",
-    description: "List visible windows and canonical macOS process names. Always use this before targeting an application.",
-    inputSchema: { app: z.string().min(1).optional().describe("Optional exact canonical macOS process name") },
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  },
-  async ({ app }) => {
-    const query = app ? `?app=${encodeURIComponent(app)}` : ""
-    const result = await requestJson(WINDOW_API, `/windows${query}`)
-    return textResult(result, "Visible macOS windows")
-  },
-)
+server.registerTool("system_health", {
+  title: "Check ai-macos readiness",
+  description: "Read readiness for every desktop, browser, Android, screenshot, and input adapter.",
+  inputSchema: {}, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+}, async () => {
+  const [window, screen, chrome, android, input] = await Promise.all([
+    healthOf(WINDOW_API), healthOf(SCREEN_API), healthOf(CHROME_API), healthOf(ANDROID_API), healthOf(INPUT_API),
+  ])
+  const structuredContent = { window, screen, chrome, android, input }
+  return { structuredContent, content: [{ type: "text" as const, text: JSON.stringify(structuredContent, null, 2) }] }
+})
 
-server.registerTool(
-  "capture_desktop",
-  {
-    title: "Capture the macOS desktop",
-    description: "Take a medium-detail desktop screenshot. State exactly what should be visible in caption before calling.",
-    inputSchema: { caption: z.string().min(1).describe("One sentence describing what should be visible") },
-    outputSchema: screenshotOutputSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-    _meta: {
-      ui: { resourceUri: SCREENSHOT_UI_URI },
-      "openai/outputTemplate": SCREENSHOT_UI_URI,
-      "openai/toolInvocation/invoking": "Capturing desktop…",
-      "openai/toolInvocation/invoked": "Desktop captured.",
-    },
+server.registerTool("desktop_action", {
+  title: "Act on one exact visible macOS window",
+  description: "Resolve one visible window, focus it exactly, dispatch one shortcut, verify its effect when evidence is available, capture post-action PNG proof, and restore the exact previous window. Provide app first; if multiple windows match, repeat with one returned targetHandle. Never launches a missing app.",
+  inputSchema: {
+    app: z.string().min(1).optional().describe("Canonical visible macOS application name for the first call"),
+    targetHandle: z.string().min(1).optional().describe("Opaque short-lived handle returned in needs_target"),
+    shortcut: z.string().min(1).max(80).describe("One shortcut such as cmd+r"),
+    verifyTitlePrefix: z.string().min(1).max(200).optional().describe("Deterministic fixture title prefix; required to prove a reload by title transition"),
+    deadlineMs: z.number().int().min(1_000).max(30_000).optional(),
+    idempotencyKey: z.string().min(1).max(128).optional(),
   },
-  async ({ caption }) => capture("/desktop", { caption }),
-)
+  outputSchema: actionOutputSchema,
+  annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+  _meta: {
+    ui: { resourceUri: SCREENSHOT_UI_URI }, "openai/outputTemplate": SCREENSHOT_UI_URI,
+    "openai/toolInvocation/invoking": "Acting on the exact window…", "openai/toolInvocation/invoked": "Window transaction finished.",
+  },
+}, async (request) => {
+  const result = await transaction.execute(request)
+  const { _image, ...structuredContent } = result
+  const content: Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: "image/png" }> = [
+    { type: "text", text: JSON.stringify(structuredContent, null, 2) },
+  ]
+  if (_image) content.push({ type: "image", data: _image.data, mimeType: _image.mimeType })
+  return { structuredContent, content, ...(_image ? { _meta: { screenshot: { data: _image.data, mimeType: _image.mimeType } } } : {}) }
+})
 
-server.registerTool(
-  "capture_window",
-  {
-    title: "Capture a macOS window",
-    description: "Take a medium-detail screenshot of a specific visible window after list_windows identifies its canonical app name.",
-    inputSchema: {
-      app: z.string().min(1).describe("Canonical macOS process name from list_windows"),
-      index: z.number().int().positive().optional(),
-      title: z.string().min(1).optional().describe("Optional window-title substring"),
-      caption: z.string().min(1).describe("One sentence describing what should be visible"),
-    },
-    outputSchema: screenshotOutputSchema,
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-    _meta: {
-      ui: { resourceUri: SCREENSHOT_UI_URI },
-      "openai/outputTemplate": SCREENSHOT_UI_URI,
-      "openai/toolInvocation/invoking": "Capturing window…",
-      "openai/toolInvocation/invoked": "Window captured.",
-    },
-  },
-  async ({ app, index, title, caption }) => capture("/window", { app, index, title, caption }),
-)
+server.registerTool("capture_desktop", {
+  title: "Capture the desktop", description: "Capture a medium-detail desktop PNG for observation only.",
+  inputSchema: { caption: z.string().min(1).describe("One sentence describing what should be visible") },
+  annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+  _meta: { ui: { resourceUri: SCREENSHOT_UI_URI }, "openai/outputTemplate": SCREENSHOT_UI_URI },
+}, async ({ caption }) => {
+  const result = await requestJson(SCREEN_API, "/desktop", { method: "POST", body: { detail: "medium", format: "json", caption } })
+  const data = result.base64
+  if (typeof data !== "string") throw new Error("desktop screenshot did not include base64")
+  const structuredContent = { target: "desktop", mimeType: "image/png", imageIncluded: true, caption }
+  return {
+    structuredContent,
+    content: [{ type: "text" as const, text: JSON.stringify(structuredContent) }, { type: "image" as const, data, mimeType: "image/png" }],
+    _meta: { screenshot: { data, mimeType: "image/png" } },
+  }
+})
 
-server.registerTool(
-  "clipboard_read",
-  {
-    title: "Read macOS clipboard text",
-    description: "Read plain text directly from the macOS system clipboard using pbpaste. Use only when the user explicitly asks to inspect clipboard content.",
-    inputSchema: {},
-    outputSchema: {
-      text: z.string(),
-      length: z.number().int().nonnegative(),
-      bytes: z.number().int().nonnegative(),
-    },
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  },
-  async () => {
-    const result = await requestJson(INPUT_API, "/clipboard")
-    const text = typeof result.text === "string" ? result.text : ""
-    const structuredContent = {
-      text,
-      length: typeof result.length === "number" ? result.length : text.length,
-      bytes: typeof result.bytes === "number" ? result.bytes : new TextEncoder().encode(text).byteLength,
-    }
-    return {
-      structuredContent,
-      content: [{ type: "text" as const, text: `Clipboard text (${structuredContent.length} characters):\n${text}` }],
-    }
-  },
-)
+server.registerTool("clipboard_read", {
+  title: "Read clipboard text", description: "Read clipboard text only when explicitly requested by the user.",
+  inputSchema: {}, annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+}, async () => {
+  const result = await requestJson(INPUT_API, "/clipboard")
+  return { structuredContent: result, content: [{ type: "text" as const, text: String(result.text ?? "") }] }
+})
 
-server.registerTool(
-  "clipboard_write",
-  {
-    title: "Write macOS clipboard text",
-    description: "Write plain text directly to the macOS system clipboard using pbcopy, without keyboard shortcuts or UI automation.",
-    inputSchema: { text: z.string().max(1_000_000) },
-    outputSchema: {
-      length: z.number().int().nonnegative(),
-      bytes: z.number().int().nonnegative(),
-    },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-  },
-  async ({ text }) => {
-    const result = await requestJson(INPUT_API, "/clipboard", { method: "POST", body: { text } })
-    const structuredContent = {
-      length: typeof result.length === "number" ? result.length : text.length,
-      bytes: typeof result.bytes === "number" ? result.bytes : new TextEncoder().encode(text).byteLength,
-    }
-    return {
-      structuredContent,
-      content: [{ type: "text" as const, text: `Wrote ${structuredContent.length} characters to the macOS clipboard.` }],
-    }
-  },
-)
-
-server.registerTool(
-  "focus_window",
-  {
-    title: "Focus a macOS application",
-    description: "Bring an application to the foreground using the canonical process name returned by list_windows.",
-    inputSchema: { app: z.string().min(1) },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-  },
-  async ({ app }) => textResult(
-    await requestJson(WINDOW_API, "/focus", { method: "POST", body: { app } }),
-    `Focused ${app}`,
-  ),
-)
-
-server.registerTool(
-  "arrange_window",
-  {
-    title: "Arrange a macOS window",
-    description: "Move and resize a visible application window using a named layout preset.",
-    inputSchema: {
-      app: z.string().min(1),
-      index: z.number().int().positive().optional(),
-      preset: z.enum(["left", "right", "top", "bottom", "max", "center"]),
-    },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-  },
-  async ({ app, index, preset }) => textResult(
-    await requestJson(WINDOW_API, "/arrange", { method: "POST", body: { app, index, preset } }),
-    `Arranged ${app}`,
-  ),
-)
-
-server.registerTool(
-  "mouse_position",
-  {
-    title: "Get mouse position",
-    description: "Read the current mouse position in logical screen pixels.",
-    inputSchema: {},
-    annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
-  },
-  async () => textResult(await requestJson(INPUT_API, "/mouse/position"), "Mouse position"),
-)
-
-server.registerTool(
-  "mouse_move",
-  {
-    title: "Move the mouse",
-    description: "Move the pointer to coordinates chosen from the latest verified screenshot. Does not click.",
-    inputSchema: { x: z.number(), y: z.number() },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-  },
-  async ({ x, y }) => textResult(
-    await requestJson(INPUT_API, "/mouse/move", { method: "POST", body: { x, y } }),
-    "Mouse moved",
-  ),
-)
-
-server.registerTool(
-  "mouse_click",
-  {
-    title: "Click the mouse",
-    description: "Click coordinates chosen from the latest verified screenshot. A click may submit forms or change external state, so require confirmation for consequential targets.",
-    inputSchema: {
-      x: z.number(),
-      y: z.number(),
-      button: z.enum(["left", "right", "middle"]).default("left"),
-      count: z.number().int().min(1).max(3).default(1),
-    },
-    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  },
-  async ({ x, y, button, count }) => textResult(
-    await requestJson(INPUT_API, "/mouse/click", { method: "POST", body: { x, y, button, count } }),
-    "Mouse clicked",
-  ),
-)
-
-server.registerTool(
-  "mouse_scroll",
-  {
-    title: "Scroll the mouse",
-    description: "Scroll the current application, then capture the window again before choosing new coordinates.",
-    inputSchema: { dx: z.number().optional(), dy: z.number().optional() },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
-  },
-  async ({ dx, dy }) => textResult(
-    await requestJson(INPUT_API, "/mouse/scroll", { method: "POST", body: { dx, dy } }),
-    "Mouse scrolled",
-  ),
-)
-
-server.registerTool(
-  "keyboard_type",
-  {
-    title: "Type text",
-    description: "Type non-secret text into the currently focused field. This does not press Enter; capture the window afterward.",
-    inputSchema: { text: z.string(), delayMs: z.number().int().min(0).max(1000).default(30) },
-    annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
-  },
-  async ({ text, delayMs }) => textResult(
-    await requestJson(INPUT_API, "/keyboard/type", { method: "POST", body: { text, delayMs } }),
-    `Typed ${text.length} characters`,
-  ),
-)
-
-server.registerTool(
-  "keyboard_key",
-  {
-    title: "Press a keyboard key",
-    description: "Press one key with optional modifiers. Enter can submit forms; destructive or externally visible actions require explicit user confirmation.",
-    inputSchema: {
-      key: z.string().min(1),
-      modifiers: z.array(z.enum(["cmd", "shift", "alt", "ctrl", "fn"])).default([]),
-    },
-    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  },
-  async ({ key, modifiers }) => textResult(
-    await requestJson(INPUT_API, "/keyboard/key", { method: "POST", body: { key, modifiers } }),
-    `Pressed ${[...modifiers, key].join("+")}`,
-  ),
-)
-
-server.registerTool(
-  "keyboard_shortcut",
-  {
-    title: "Press a keyboard shortcut",
-    description: "Press a single macOS keyboard shortcut. Shortcuts may close or change work, so require explicit user confirmation when consequential.",
-    inputSchema: { shortcut: z.string().min(1) },
-    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
-  },
-  async ({ shortcut }) => textResult(
-    await requestJson(INPUT_API, "/keyboard/shortcut", { method: "POST", body: { shortcut } }),
-    `Pressed ${shortcut}`,
-  ),
-)
+server.registerTool("clipboard_write", {
+  title: "Write clipboard text", description: "Write text directly to the clipboard without UI input.",
+  inputSchema: { text: z.string().max(1_000_000) }, annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+}, async ({ text }) => {
+  const result = await requestJson(INPUT_API, "/clipboard", { method: "POST", body: { text } })
+  return { structuredContent: result, content: [{ type: "text" as const, text: `Wrote ${text.length} characters.` }] }
+})
 
 const transport = new StdioServerTransport()
 await server.connect(transport)
