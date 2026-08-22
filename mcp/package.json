@@ -5,7 +5,9 @@
   "type": "module",
   "scripts": {
     "start": "bun src/index.ts",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit",
+    "build": "bun build src/index.ts --target bun --outdir dist"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "latest",

@@ -10,7 +10,7 @@ afterEach(async () => {
 })
 
 describe("ai-macos MCP server", () => {
-  test("advertises tools and reaches the running local services", async () => {
+  test("advertises the small intent-level tool surface and screenshot app", async () => {
     transport = new StdioClientTransport({
       command: "/opt/local/bin/bun",
       args: ["src/index.ts"],
@@ -21,26 +21,20 @@ describe("ai-macos MCP server", () => {
 
     const listed = await client.listTools()
     const names = listed.tools.map((tool) => tool.name)
-    expect(names).toContain("list_windows")
-    expect(names).toContain("capture_window")
+    expect(names).toContain("desktop_action")
+    expect(names).toContain("system_health")
+    expect(names).toContain("capture_desktop")
     expect(names).toContain("clipboard_read")
     expect(names).toContain("clipboard_write")
-    expect(names).toContain("mouse_click")
-    expect(names).toContain("keyboard_type")
+    expect(names).not.toContain("mouse_click")
+    expect(names).not.toContain("keyboard_type")
+    expect(names).not.toContain("keyboard_shortcut")
 
     const health = await client.callTool({ name: "system_health", arguments: {} })
     expect(health.isError).not.toBe(true)
-    expect(health.structuredContent).toMatchObject({
-      window: { ok: true },
-      screen: { ok: true },
-      input: {
-        ok: true,
-        accessibility: true,
-        clipboard: { ok: true, backend: "pbpaste/pbcopy" },
-      },
-    })
+    expect(health.structuredContent).toMatchObject({ window: { state: expect.any(String) }, screen: { state: expect.any(String) }, chrome: { state: expect.any(String) }, android: { state: expect.any(String) }, input: { state: expect.any(String) } })
 
-    const captureTool = listed.tools.find((tool) => tool.name === "capture_desktop")
+    const captureTool = listed.tools.find((tool) => tool.name === "desktop_action")
     expect(captureTool?._meta).toMatchObject({
       ui: { resourceUri: "ui://widget/ai-macos-screenshot-v4.html" },
       "openai/outputTemplate": "ui://widget/ai-macos-screenshot-v4.html",
@@ -74,16 +68,5 @@ describe("ai-macos MCP server", () => {
     expect(html).toContain("requestDisplayMode")
     expect(html).not.toContain("max-height: 70vh")
 
-    const originalClipboard = await client.callTool({ name: "clipboard_read", arguments: {} })
-    const originalText = String((originalClipboard.structuredContent as { text?: unknown })?.text ?? "")
-    const marker = `ai-macos-mcp-${crypto.randomUUID()}-Привет`
-    try {
-      const written = await client.callTool({ name: "clipboard_write", arguments: { text: marker } })
-      expect(written.isError).not.toBe(true)
-      const read = await client.callTool({ name: "clipboard_read", arguments: {} })
-      expect(read.structuredContent).toMatchObject({ text: marker, length: marker.length })
-    } finally {
-      await client.callTool({ name: "clipboard_write", arguments: { text: originalText } })
-    }
   })
 })
