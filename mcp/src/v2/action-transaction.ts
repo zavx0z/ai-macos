@@ -106,39 +106,39 @@ export class DesktopActionTransaction {
       ...(image ? { _image: image } : {}),
     })
 
-    if (Boolean(request.app?.trim()) === Boolean(request.targetHandle)) {
-      return finish("target_not_found", this.typed("invalid_target", "Provide exactly one of app or targetHandle", "Use app for initial resolution or one returned targetHandle", correlationId))
+    const selectorValue = request.target.value.trim()
+    if (!selectorValue) {
+      return finish("target_not_found", this.typed("invalid_target", "Target value must not be empty", "Use target:{kind:\"app\",value:\"Safari\"} or target:{kind:\"handle\",value:\"win_...\"}", correlationId))
     }
 
     let initial
     try {
-      initial = await mark("observe", () => this.adapter.observe(request.app))
+      initial = await mark("observe", () => this.adapter.observe(request.target.kind === "app" ? selectorValue : undefined))
     } catch (error) {
       return finish("action_failed", this.typed("adapter_unavailable", error, "Check system_health and service readiness", correlationId))
     }
 
-    if (request.targetHandle) {
-      const lease = this.leases.get(request.targetHandle)
+    if (request.target.kind === "handle") {
+      const lease = this.leases.get(selectorValue)
       if (!lease || lease.epoch !== initial.epoch) {
-        return finish("rejected_stale_target", this.typed("stale_target", "Target handle is expired or from another service epoch", "Repeat the action with app to obtain fresh candidates", correlationId))
+        return finish("rejected_stale_target", this.typed("stale_target", "Target handle is expired or from another service epoch", "Repeat with target:{kind:\"app\",value:\"<canonical app>\"} to obtain fresh candidates", correlationId))
       }
       target = initial.windows.find((window) => sameIdentity(window, lease.identity))
       targetHandle = lease.handle
       if (!target) {
-        return finish("rejected_stale_target", this.typed("target_closed", "The selected window no longer exists", "Refresh target candidates and select again", correlationId))
+        return finish("rejected_stale_target", this.typed("target_closed", "The selected window no longer exists", "Refresh candidates, then select one with target:{kind:\"handle\",value:\"win_...\"}", correlationId))
       }
     } else {
-      const app = request.app?.trim()
-      if (!app) return finish("target_not_found", this.typed("invalid_target", "Provide app or targetHandle", "Pass the canonical visible application name", correlationId))
+      const app = selectorValue
       if (initial.windows.length === 0) {
-        return finish("target_not_found", this.typed("target_not_found", `No visible window for ${app}`, "Ask the user to open the app or choose another visible target; do not launch it automatically", correlationId))
+        return finish("target_not_found", this.typed("target_not_found", `No visible window for ${app}`, "Ask the user to open the app or choose another visible target, then retry with target:{kind:\"app\",value:\"<canonical app>\"}; do not launch it automatically", correlationId))
       }
       if (initial.windows.length > 1) {
         const candidates = initial.windows.map((window) => this.leases.candidate(initial.epoch, window))
         return finish("needs_target", {
           code: "needs_target",
           message: `Multiple visible windows match ${app}`,
-          nextAction: "Ask the user which candidate to use, then repeat with targetHandle",
+          nextAction: "Ask the user which candidate to use, then repeat with target:{kind:\"handle\",value:\"...\"}",
           candidates,
           correlationId,
         })
@@ -229,7 +229,7 @@ export class DesktopActionTransaction {
 
     if (actionError) {
       const stale = actionError.message.includes("stale") || actionError.message.includes("closed before dispatch")
-      return finish(stale ? "rejected_stale_target" : "action_failed", this.typed(stale ? "stale_target" : "action_failed", actionError, stale ? "Refresh the target and retry" : "Inspect audit stages and service health", correlationId))
+      return finish(stale ? "rejected_stale_target" : "action_failed", this.typed(stale ? "stale_target" : "action_failed", actionError, stale ? "Refresh with target:{kind:\"app\",value:\"<canonical app>\"}, then retry with a fresh selector" : "Inspect audit stages and service health", correlationId))
     }
     if (effect.status !== "confirmed") return finish("delivered_unverified")
     if (restoration.status === "failed" || restoration.status === "previous_target_gone") return finish("verified_restoration_failed")

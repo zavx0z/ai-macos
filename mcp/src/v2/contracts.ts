@@ -34,8 +34,10 @@ export interface DesktopActionAdapter {
 }
 
 export type ActionRequest = {
-  app?: string
-  targetHandle?: string
+  target: {
+    kind: "app" | "handle"
+    value: string
+  }
   shortcut: string
   verifyTitlePrefix?: string
   deadlineMs?: number

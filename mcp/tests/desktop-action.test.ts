@@ -58,9 +58,9 @@ function setup(windows: ExactWindow[], focused: WindowIdentity | null = editor) 
 }
 
 describe("desktop_action fail-closed transaction", () => {
-  test("rejects conflicting app and targetHandle before observation or input", async () => {
+  test("rejects an empty target value before observation or input", async () => {
     const { adapter, transaction } = setup([editor, safari(1)])
-    const result = await transaction.execute({ app: "Safari", targetHandle: "win_invalid", shortcut: "cmd+r" })
+    const result = await transaction.execute({ target: { kind: "app", value: "" }, shortcut: "cmd+r" })
     expect(result.error?.code).toBe("invalid_target")
     expect(adapter.shortcutCalls).toEqual([])
     expect(adapter.focusCalls).toEqual([])
@@ -69,7 +69,7 @@ describe("desktop_action fail-closed transaction", () => {
   test("absent target returns target_not_found with zero focus and zero input", async () => {
     const { adapter, transaction } = setup([editor])
     const before = { ...adapter.focusedIdentity! }
-    const result = await transaction.execute({ app: "Safari", shortcut: "cmd+r" })
+    const result = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r" })
     expect(result.status).toBe("target_not_found")
     expect(result.error?.code).toBe("target_not_found")
     expect(adapter.shortcutCalls).toEqual([])
@@ -79,7 +79,7 @@ describe("desktop_action fail-closed transaction", () => {
 
   test("ambiguous target returns compact handles with zero input", async () => {
     const { adapter, transaction } = setup([editor, safari(1), safari(2)])
-    const result = await transaction.execute({ app: "Safari", shortcut: "cmd+r" })
+    const result = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r" })
     expect(result.status).toBe("needs_target")
     expect(result.error?.candidates).toHaveLength(2)
     expect(result.error?.candidates?.[0]).toEqual(expect.objectContaining({ handle: expect.stringMatching(/^win_/), app: "Safari" }))
@@ -89,10 +89,10 @@ describe("desktop_action fail-closed transaction", () => {
 
   test("a candidate handle selects the exact window among multiple", async () => {
     const { adapter, transaction } = setup([editor, safari(1, "fixture:1"), safari(2, "other")])
-    const ambiguous = await transaction.execute({ app: "Safari", shortcut: "cmd+r" })
+    const ambiguous = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r" })
     const selected = ambiguous.error!.candidates!.find((candidate) => candidate.title === "fixture:1")!
     adapter.onShortcut = () => { adapter.windows.find((window) => window.windowId === 1)!.title = "fixture:2" }
-    const result = await transaction.execute({ targetHandle: selected.handle, shortcut: "cmd+r", verifyTitlePrefix: "fixture:" })
+    const result = await transaction.execute({ target: { kind: "handle", value: selected.handle }, shortcut: "cmd+r", verifyTitlePrefix: "fixture:" })
     expect(result.status).toBe("verified")
     expect(adapter.shortcutCalls).toEqual(["cmd+r"])
     expect(adapter.focusCalls[0]).toEqual({ pid: 50, windowId: 1 })
@@ -103,7 +103,7 @@ describe("desktop_action fail-closed transaction", () => {
     const previous = { ...editor, windowId: 10, title: "second editor" }
     const { adapter, transaction } = setup([editor, previous, safari(1)], previous)
     adapter.onShortcut = () => { adapter.windows.find((window) => window.windowId === 1)!.title = "reloaded" }
-    const result = await transaction.execute({ app: "Safari", shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
+    const result = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
     expect(result.restoration.status).toBe("restored")
     expect(adapter.focusedIdentity).toEqual({ pid: previous.pid, windowId: previous.windowId })
     expect(adapter.focusCalls.at(-1)).toEqual({ pid: previous.pid, windowId: previous.windowId })
@@ -112,7 +112,7 @@ describe("desktop_action fail-closed transaction", () => {
   test("restoration runs after an action exception", async () => {
     const { adapter, transaction } = setup([editor, safari(1)])
     adapter.onShortcut = () => { throw new Error("input backend failed") }
-    const result = await transaction.execute({ app: "Safari", shortcut: "cmd+r" })
+    const result = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r" })
     expect(result.status).toBe("action_failed")
     expect(result.delivery.status).toBe("unknown")
     expect(result.restoration.status).toBe("restored")
@@ -121,7 +121,7 @@ describe("desktop_action fail-closed transaction", () => {
 
   test("delivery is not effect and no unverified action is verified", async () => {
     const { adapter, transaction } = setup([editor, safari(1)])
-    const result = await transaction.execute({ app: "Safari", shortcut: "cmd+l" })
+    const result = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+l" })
     expect(result.delivery.status).toBe("delivered")
     expect(result.effect.status).toBe("not_checked")
     expect(result.status).toBe("delivered_unverified")
@@ -132,7 +132,7 @@ describe("desktop_action fail-closed transaction", () => {
     adapter.onFocus = (identity) => {
       if (identity.windowId === 1) adapter.epoch = "epoch-2"
     }
-    const result = await transaction.execute({ app: "Safari", shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
+    const result = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
     expect(result.status).toBe("rejected_stale_target")
     expect(adapter.shortcutCalls).toEqual([])
     expect(result.restoration.status).toBe("restored")
@@ -143,7 +143,7 @@ describe("desktop_action fail-closed transaction", () => {
     adapter.onFocus = (identity) => {
       if (identity.windowId === 1) adapter.windows = adapter.windows.filter((window) => window.windowId !== 1)
     }
-    const result = await transaction.execute({ app: "Safari", shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
+    const result = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
     expect(result.status).toBe("rejected_stale_target")
     expect(adapter.shortcutCalls).toEqual([])
   })
@@ -154,7 +154,7 @@ describe("desktop_action fail-closed transaction", () => {
       adapter.windows.find((window) => window.windowId === 1)!.title = "Safari reloaded"
       adapter.windows = adapter.windows.filter((window) => window.windowId !== editor.windowId)
     }
-    const result = await transaction.execute({ app: "Safari", shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
+    const result = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
     expect(result.status).toBe("verified_restoration_failed")
     expect(result.restoration.status).toBe("previous_target_gone")
   })
@@ -162,7 +162,7 @@ describe("desktop_action fail-closed transaction", () => {
   test("returns screenshot artifact metadata separately from private image bytes", async () => {
     const { adapter, transaction } = setup([editor, safari(1)])
     adapter.onShortcut = () => { adapter.windows.find((window) => window.windowId === 1)!.title = "reloaded" }
-    const result = await transaction.execute({ app: "Safari", shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
+    const result = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
     expect(result.artifact).toEqual(expect.objectContaining({ kind: "screenshot", mimeType: "image/png", imageIncluded: true }))
     expect(result._image).toEqual(expect.objectContaining({ data: "iVBORw0KGgo=", mimeType: "image/png" }))
     expect(adapter.captureCalls).toEqual([{ pid: 50, windowId: 1 }])
@@ -172,7 +172,7 @@ describe("desktop_action fail-closed transaction", () => {
     const { adapter, transaction } = setup([editor, safari(1)])
     adapter.onShortcut = () => { adapter.windows.find((window) => window.windowId === 1)!.title = "Safari reloaded" }
     adapter.captureError = new Error("screen recording unavailable")
-    const result = await transaction.execute({ app: "Safari", shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
+    const result = await transaction.execute({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r", verifyTitlePrefix: "Safari" })
     expect(result.effect.status).toBe("confirmed")
     expect(result.status).toBe("verified_without_artifact")
     expect(result.artifact).toBeUndefined()

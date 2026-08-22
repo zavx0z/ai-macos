@@ -80,15 +80,17 @@ server.registerTool("system_health", {
 
 server.registerTool("desktop_action", {
   title: "Act on one exact visible macOS window",
-  description: "Resolve one visible window, focus it exactly, dispatch one shortcut, verify its effect when evidence is available, capture post-action PNG proof, and restore the exact previous window. Provide app first; if multiple windows match, repeat with one returned targetHandle. Never launches a missing app.",
-  inputSchema: {
-    app: z.string().min(1).optional().describe("Canonical visible macOS application name for the first call"),
-    targetHandle: z.string().min(1).optional().describe("Opaque short-lived handle returned in needs_target"),
+  description: "Resolve one exact visible macOS window from required target {kind,value}, focus it exactly, dispatch one shortcut, verify its effect when evidence is available, capture post-action PNG proof, and restore the exact previous window. Start with target kind app; if multiple windows match, repeat with target kind handle and one returned candidate handle. Never launches a missing app.",
+  inputSchema: z.strictObject({
+    target: z.strictObject({
+      kind: z.enum(["app", "handle"]).describe("Use app for initial resolution or handle for a returned candidate"),
+      value: z.string().min(1).describe("Canonical app name or opaque candidate handle, according to kind"),
+    }),
     shortcut: z.string().min(1).max(80).describe("One shortcut such as cmd+r"),
     verifyTitlePrefix: z.string().min(1).max(200).optional().describe("Deterministic fixture title prefix; required to prove a reload by title transition"),
     deadlineMs: z.number().int().min(1_000).max(30_000).optional(),
     idempotencyKey: z.string().min(1).max(128).optional(),
-  },
+  }),
   outputSchema: actionOutputSchema,
   annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   _meta: {

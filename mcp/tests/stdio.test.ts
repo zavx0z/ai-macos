@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, test } from "bun:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
+import Ajv from "ajv"
 
 let transport: StdioClientTransport | undefined
 
@@ -10,7 +11,7 @@ afterEach(async () => {
 })
 
 describe("ai-macos MCP server", () => {
-  test("advertises the small intent-level tool surface and screenshot app", async () => {
+  test("advertises the small intent-level tool surface, schema-total target selector, and screenshot app", async () => {
     transport = new StdioClientTransport({
       command: "/opt/local/bin/bun",
       args: ["src/index.ts"],
@@ -34,12 +35,38 @@ describe("ai-macos MCP server", () => {
     expect(health.isError).not.toBe(true)
     expect(health.structuredContent).toMatchObject({ window: { state: expect.any(String) }, screen: { state: expect.any(String) }, chrome: { state: expect.any(String) }, android: { state: expect.any(String) }, input: { state: expect.any(String) } })
 
-    const captureTool = listed.tools.find((tool) => tool.name === "desktop_action")
-    expect(captureTool?._meta).toMatchObject({
+    const desktopActionTool = listed.tools.find((tool) => tool.name === "desktop_action")
+    expect(desktopActionTool?._meta).toMatchObject({
       ui: { resourceUri: "ui://widget/ai-macos-screenshot-v4.html" },
       "openai/outputTemplate": "ui://widget/ai-macos-screenshot-v4.html",
     })
-    expect(captureTool?.outputSchema).toBeDefined()
+    expect(desktopActionTool?.outputSchema).toBeDefined()
+    const validateDesktopAction = new Ajv({ strict: false }).compile(desktopActionTool!.inputSchema)
+    expect(desktopActionTool?.inputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        target: {
+          type: "object",
+          properties: {
+            kind: { type: "string", enum: ["app", "handle"] },
+            value: { type: "string", minLength: 1 },
+          },
+          required: ["kind", "value"],
+          additionalProperties: false,
+        },
+      },
+      required: ["target", "shortcut"],
+      additionalProperties: false,
+    })
+    expect(desktopActionTool?.inputSchema.properties).not.toHaveProperty("app")
+    expect(desktopActionTool?.inputSchema.properties).not.toHaveProperty("targetHandle")
+
+    expect(validateDesktopAction({ target: { kind: "app", value: "Safari" }, shortcut: "cmd+r" })).toBe(true)
+    expect(validateDesktopAction({ target: { kind: "handle", value: "win_example" }, shortcut: "cmd+r" })).toBe(true)
+    expect(validateDesktopAction({ app: "Safari", shortcut: "cmd+r" })).toBe(false)
+    expect(validateDesktopAction({ targetHandle: "win_example", shortcut: "cmd+r" })).toBe(false)
+    expect(validateDesktopAction({ app: "Safari", targetHandle: "win_example", shortcut: "cmd+r" })).toBe(false)
+    expect(validateDesktopAction({ shortcut: "cmd+r" })).toBe(false)
 
     const resources = await client.listResources()
     expect(resources.resources).toContainEqual(expect.objectContaining({

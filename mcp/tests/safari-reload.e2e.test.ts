@@ -38,7 +38,7 @@ test.skipIf(!enabled)("one desktop_action reloads the exact Safari fixture and r
   const called = await client.callTool({
     name: "desktop_action",
     arguments: {
-      app: "Safari",
+      target: { kind: "app", value: "Safari" },
       shortcut: "cmd+r",
       verifyTitlePrefix: fixtureTitlePrefix,
       deadlineMs: 12_000,

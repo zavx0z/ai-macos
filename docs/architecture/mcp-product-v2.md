@@ -49,7 +49,7 @@ Only `system_health`, `desktop_action`, `capture_desktop`, `clipboard_read`, and
 
 From the agent's point of view, each of these is one call:
 
-- “Reload the exact running Safari window and show proof”: `desktop_action(app:"Safari", shortcut:"cmd+r")`. Zero matches fails without launching; multiple matches returns handles; a selected handle finishes focus, dispatch, verification, screenshot, and restoration.
+- “Reload the exact running Safari window and show proof”: `desktop_action(target:{kind:"app",value:"Safari"}, shortcut:"cmd+r")`. Zero matches fails without launching; multiple matches returns handles; a selected handle finishes focus, dispatch, verification, screenshot, and restoration.
 - “Click/type/shortcut/scroll in this exact window”: one `desktop_action` call. A click uses target-local coordinates bound to a fresh snapshot ID.
 - “Navigate/reload this exact Chrome tab”: one `browser_action` call bound to desktop Chrome window identity and CDP target ID.
 - “Navigate/reload this exact Android tab”: one `android_action` call bound to device serial, transport generation, and CDP target ID.
@@ -129,7 +129,7 @@ Future click input is:
 
 ```json
 {
-  "targetHandle": "win_opaque",
+  "target": { "kind": "handle", "value": "win_opaque" },
   "action": {
     "kind": "click",
     "snapshotId": "snap_opaque",
@@ -221,7 +221,7 @@ Typed failure:
   "error": {
     "code": "needs_target",
     "message": "Multiple visible windows match Safari",
-    "nextAction": "Ask the user which candidate to use, then repeat with targetHandle",
+    "nextAction": "Ask the user which candidate to use, then repeat with target:{kind:\"handle\",value:\"...\"}",
     "candidates": [
       { "handle": "win_opaque", "app": "Safari", "title": "Docs", "bounds": { "x": 0, "y": 25, "width": 900, "height": 700 }, "expiresAt": "..." }
     ],
@@ -234,25 +234,32 @@ This contract physically prevents a conforming client from equating event delive
 
 ## 6. Public input schema
 
-The implemented schema is intentionally flat to avoid deeply nested unions and ChatGPT schema warnings:
+The implemented schema is schema-total and uses no `oneOf` or `anyOf`, avoiding ChatGPT schema warnings:
 
 ```json
 {
   "type": "object",
   "properties": {
-    "app": { "type": "string", "minLength": 1 },
-    "targetHandle": { "type": "string", "minLength": 1 },
+    "target": {
+      "type": "object",
+      "properties": {
+        "kind": { "type": "string", "enum": ["app", "handle"] },
+        "value": { "type": "string", "minLength": 1 }
+      },
+      "required": ["kind", "value"],
+      "additionalProperties": false
+    },
     "shortcut": { "type": "string", "minLength": 1, "maxLength": 80 },
     "verifyTitlePrefix": { "type": "string", "minLength": 1, "maxLength": 200 },
     "deadlineMs": { "type": "integer", "minimum": 1000, "maximum": 30000 },
     "idempotencyKey": { "type": "string", "minLength": 1, "maxLength": 128 }
   },
-  "required": ["shortcut"],
+  "required": ["target", "shortcut"],
   "additionalProperties": false
 }
 ```
 
-Runtime validation requires exactly one of `app` and `targetHandle`; the first slice currently rejects missing target and gives `targetHandle` precedence if both are sent. A follow-up makes “both” an explicit `invalid_target` without introducing a JSON Schema union.
+The schema and runtime require one total selector object. `target.kind="app"` resolves a canonical visible application name from `target.value`; `target.kind="handle"` resolves the opaque candidate handle from `target.value`. The public tool has no `app` or `targetHandle` input aliases.
 
 `verifyTitlePrefix` opts into deterministic title-transition verification. It is intended for a controlled fixture such as `ai-macos-reload-count:`; an unrelated title change is not accepted as reload proof. Without a supported verifier, delivery remains `delivered_unverified`. If dispatch throws after it begins, delivery is `unknown`, not falsely `not_attempted` or `failed`.
 
