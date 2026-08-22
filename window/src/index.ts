@@ -1,8 +1,10 @@
-import { checkAccessibility, focusApp, getScreen, listWindows, moveWindow, raiseWindow, resizeWindow } from "./windows.ts";
+import { checkAccessibility, checkExactWindowAccessibility, focusedWindow, focusExactWindow, focusApp, getScreen, listExactWindows, listWindows, moveWindow, raiseWindow, requestExactWindowAccessibility, resizeWindow } from "./windows.ts";
+import { NativeWindowError } from "./native.ts";
 import { listPins, startPin, stopAllPins, stopPin } from "./pin.ts";
 import { err, json, logRequest, printBanner } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? 7878);
+const EPOCH = crypto.randomUUID();
 
 const server = Bun.serve({
   port: PORT,
@@ -15,7 +17,25 @@ const server = Bun.serve({
 
     const res = await (async () => {
     try {
-      if (path === "/health") return json({ ok: true });
+      if (path === "/health") return json({ ok: true, epoch: EPOCH });
+
+      if (path === "/v2/windows" && method === "GET") {
+        const all = await listExactWindows();
+        const app = url.searchParams.get("app");
+        const windows = app ? all.filter((w) => w.app.toLowerCase() === app.toLowerCase()) : all;
+        return json({ epoch: EPOCH, observedAt: new Date().toISOString(), windows });
+      }
+
+      if (path === "/v2/focus" && method === "GET") {
+        return json({ epoch: EPOCH, focused: await focusedWindow() });
+      }
+
+      if (path === "/v2/focus" && method === "POST") {
+        const body = (await req.json()) as { pid?: number; windowId?: number };
+        if (!Number.isInteger(body.pid) || !Number.isInteger(body.windowId)) return err(400, "need exact {pid, windowId}");
+        const focused = await focusExactWindow({ pid: body.pid!, windowId: body.windowId! });
+        return json({ epoch: EPOCH, focused, verified: true });
+      }
 
       if (path === "/screen" && method === "GET") {
         return json(await getScreen());
@@ -112,18 +132,23 @@ const server = Bun.serve({
       }
 
       if (path === "/permissions/accessibility" && method === "GET") {
-        return json(await checkAccessibility());
+        const [legacy, exact] = await Promise.all([checkAccessibility(), checkExactWindowAccessibility()]);
+        return json({ granted: legacy.granted && exact.granted, legacy, exact });
       }
 
       if (path === "/permissions/accessibility" && method === "POST") {
+        await requestExactWindowAccessibility();
         const proc = Bun.spawn(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]);
         await proc.exited;
         return json({ ...(await checkAccessibility()), opened: true });
       }
 
-      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /screen /windows /pin, POST /focus /move /resize /arrange /raise /pin, DELETE /pin /pin/:id");
+      return err(404, `${method} ${path} not found`, "Routes include GET /v2/windows /v2/focus and POST /v2/focus");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
+      if (e instanceof NativeWindowError && e.code === 78) return err(404, msg, "Refresh GET /v2/windows; the exact target is gone");
+      if (e instanceof NativeWindowError && e.code === 79) return err(409, msg, "Exact focused-window verification failed");
+      if (e instanceof NativeWindowError && e.code === 77) return err(503, msg, "Grant Accessibility to meta-window-helper");
       const isAccessibility = msg.includes("-25211") || msg.includes("osascript failed (1)");
       return err(500, msg, isAccessibility ? "Нет разрешения Accessibility. Выдайте его в POST http://localhost:7878/permissions/accessibility" : undefined);
     }
