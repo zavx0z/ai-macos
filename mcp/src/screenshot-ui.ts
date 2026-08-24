@@ -1,4 +1,4 @@
-export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot-v4.html"
+export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot-v5.html"
 
 export const SCREENSHOT_UI_DOMAIN =
   "https://ai-macos-local.zavx0z.app"
@@ -45,7 +45,10 @@ export const screenshotUiHtml = String.raw`<!doctype html>
       const expand = document.getElementById("expand");
       const empty = document.getElementById("empty");
       let lastReportedHeight = 0;
+      let lastVersion = 0;
       let heightFrame;
+      let pipRequested = false;
+      let refreshInFlight = false;
 
       function notifyHeight() {
         cancelAnimationFrame(heightFrame);
@@ -79,12 +82,21 @@ export const screenshotUiHtml = String.raw`<!doctype html>
         }
       }
 
+      async function enterPip() {
+        if (pipRequested || typeof window.openai?.requestDisplayMode !== "function") return;
+        try {
+          await window.openai.requestDisplayMode({ mode: "pip" });
+          pipRequested = true;
+        } catch {}
+      }
+
       function render(toolResult) {
         const result = toolResult?.mcp_tool_result ?? toolResult?.call_tool_result ?? toolResult?.result ?? toolResult ?? {};
         const content = Array.isArray(result.content) ? result.content : [];
         const imageBlock = content.find((item) => item?.type === "image" && typeof item?.data === "string");
         const privateImage = result._meta?.screenshot;
         const metadata = result.structuredContent ?? {};
+        if (typeof metadata.version === "number") lastVersion = metadata.version;
         const imageData = imageBlock?.data ?? privateImage?.data;
         if (typeof imageData !== "string") return;
 
@@ -97,6 +109,17 @@ export const screenshotUiHtml = String.raw`<!doctype html>
         empty.hidden = true;
         viewer.hidden = false;
         notifyHeight();
+      }
+
+      async function refreshLatest() {
+        if (refreshInFlight || typeof window.openai?.callTool !== "function") return;
+        refreshInFlight = true;
+        try {
+          const result = await window.openai.callTool("latest_capture", { after: lastVersion });
+          render(result);
+        } catch {} finally {
+          refreshInFlight = false;
+        }
       }
 
       image.addEventListener("load", notifyHeight, { passive: true });
@@ -119,10 +142,15 @@ export const screenshotUiHtml = String.raw`<!doctype html>
       window.addEventListener("openai:set_globals", (event) => {
         const globals = event.detail?.globals;
         render(globals?.toolResponseMetadata);
+        void enterPip();
+        void refreshLatest();
       }, { passive: true });
 
       render(window.openai?.toolResponseMetadata);
       render(window.openai?.toolOutput);
+      void enterPip();
+      void refreshLatest();
+      window.setInterval(refreshLatest, 1000);
       notifyHeight();
     </script>
   </body>

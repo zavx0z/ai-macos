@@ -33,6 +33,21 @@ bun run start  # обычный запуск
 { "ok": true, "running": true }
 ```
 
+### `GET /profiles`
+
+Возвращает только безопасные метаданные доступных профилей Chrome — `directory` и отображаемое `name`. Email, GAIA ID и другие поля `Local State` наружу не выдаются.
+
+### `POST /session`
+
+Единый precondition перед browser-agent операциями:
+
+- если Chrome уже запущен — возвращает `{"status":"ready","running":true,"launched":false}` и не перезапускает его;
+- если Chrome закрыт и `profileDirectory` не передан — **ничего не запускает**, а возвращает `status: "choice_required"` и список `profiles`; вызывающая сторона должна спросить пользователя, какой профиль запускать;
+- после явного выбора принимает `{"profileDirectory":"Profile 2"}` и запускает ровно этот профиль;
+- неизвестный профиль даёт `400 status: "invalid_profile"`; автоматического fallback нет.
+
+Даже если найден только один профиль, выбор остаётся обязательным. Обычный профиль запускается через `--profile-directory`; `--user-data-dir` и CDP-флаги здесь не используются. Специальная CDP-сессия `bun run cdp` остаётся отдельным механизмом.
+
 ### `GET /windows`
 
 Список всех окон Chrome со вложенными вкладками.
@@ -235,6 +250,8 @@ Window-mode требует, чтобы окно было в состоянии `
 
 ```
 chrome health
+chrome profiles
+chrome session [--profile <directory>]
 chrome windows
 chrome tabs [--window <id>]
 chrome active

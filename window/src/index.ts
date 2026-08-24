@@ -1,4 +1,4 @@
-import { checkAccessibility, focusApp, getScreen, listWindows, moveWindow, raiseWindow, resizeWindow } from "./windows.ts";
+import { checkAccessibility, focusApp, getFocusedWindow, getFrontmostApp, getScreen, listWindows, moveWindow, raiseWindow, resizeWindow } from "./windows.ts";
 import { listPins, startPin, stopAllPins, stopPin } from "./pin.ts";
 import { err, json, logRequest, printBanner } from "@meta/shared";
 
@@ -28,11 +28,103 @@ const server = Bun.serve({
         return json({ count: filtered.length, windows: filtered });
       }
 
+      if (path === "/frontmost" && method === "GET") {
+        return json({ ...(await getFrontmostApp()), window: await getFocusedWindow() });
+      }
+
       if (path === "/focus" && method === "POST") {
-        const body = (await req.json()) as { app?: string };
+        const body = (await req.json()) as {
+          app?: string;
+          pid?: number;
+          index?: number;
+          title?: string;
+          x?: number;
+          y?: number;
+          width?: number;
+          height?: number;
+        };
         if (!body.app) return err(400, "missing 'app'", "Укажите имя процесса macOS: {\"app\": \"Google Chrome\"}");
-        await focusApp(body.app);
-        return json({ ok: true });
+        const previousFrontmost = await getFrontmostApp();
+        const previousWindow = await getFocusedWindow();
+        const windows = (await listWindows()).filter((window) =>
+          window.app.toLowerCase() === body.app!.toLowerCase()
+          && (body.pid === undefined || window.pid === body.pid)
+          && (body.index === undefined || window.index === body.index)
+          && (body.title === undefined || window.title.toLowerCase().includes(body.title.toLowerCase()))
+          && (body.x === undefined || window.x === body.x)
+          && (body.y === undefined || window.y === body.y)
+          && (body.width === undefined || window.width === body.width)
+          && (body.height === undefined || window.height === body.height)
+        );
+        if (windows.length === 0) {
+          return err(
+            404,
+            `visible window not found: app=${body.app}${body.pid ? ` pid=${body.pid}` : ""}${body.index ? ` index=${body.index}` : ""}${body.title ? ` title=${body.title}` : ""}`,
+            "Сначала вызовите GET /windows и используйте точные app/pid/index. Никакое приложение не было запущено и фокус не менялся.",
+          );
+        }
+        if (windows.length > 1) {
+          const candidates = windows.map(({ app, pid, index, title }) => ({ app, pid, index, title }));
+          return err(
+            409,
+            `ambiguous window target: ${windows.length} windows match ${body.app}`,
+            `Укажите pid и index ровно одного окна из GET /windows: ${JSON.stringify(candidates)}`,
+          );
+        }
+        const target = windows[0]!;
+
+        await raiseWindow(target.app, target.index);
+        await focusApp(target.app);
+
+        let frontmost = await getFrontmostApp();
+        for (let attempt = 0; attempt < 5 && frontmost.app.toLowerCase() !== target.app.toLowerCase(); attempt += 1) {
+          await Bun.sleep(40);
+          frontmost = await getFrontmostApp();
+        }
+        if (frontmost.app.toLowerCase() !== target.app.toLowerCase()) {
+          return err(
+            409,
+            `focus verification failed: expected ${target.app}, got ${frontmost.app}`,
+            "Клавиатурный или мышиный ввод после этого ответа выполнять нельзя.",
+          );
+        }
+        const focusedWindow = await getFocusedWindow();
+        const targetMatchesFocusedWindow = focusedWindow
+          && focusedWindow.pid === target.pid
+          && focusedWindow.title === target.title
+          && focusedWindow.x === target.x
+          && focusedWindow.y === target.y
+          && focusedWindow.width === target.width
+          && focusedWindow.height === target.height;
+        if (!targetMatchesFocusedWindow) {
+          if (previousWindow) {
+            const previousNow = (await listWindows()).find((window) =>
+              window.pid === previousWindow.pid
+              && window.title === previousWindow.title
+              && window.x === previousWindow.x
+              && window.y === previousWindow.y
+              && window.width === previousWindow.width
+              && window.height === previousWindow.height
+            );
+            if (previousNow) {
+              await raiseWindow(previousNow.app, previousNow.index);
+              await focusApp(previousNow.app);
+            }
+          } else {
+            await focusApp(previousFrontmost.app);
+          }
+          return err(
+            409,
+            `focused-window verification failed for ${target.app} pid=${target.pid} index=${target.index}`,
+            "Фокус предыдущего окна восстановлен; ввод выполнять нельзя.",
+          );
+        }
+        return json({
+          ok: true,
+          target: focusedWindow,
+          frontmost: { ...frontmost, window: focusedWindow },
+          previous: { ...previousFrontmost, window: previousWindow },
+        });
       }
 
       if (path === "/move" && method === "POST") {
@@ -121,7 +213,7 @@ const server = Bun.serve({
         return json({ ...(await checkAccessibility()), opened: true });
       }
 
-      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /screen /windows /pin, POST /focus /move /resize /arrange /raise /pin, DELETE /pin /pin/:id");
+      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /screen /windows /frontmost /pin, POST /focus /move /resize /arrange /raise /pin, DELETE /pin /pin/:id");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       const isAccessibility = msg.includes("-25211") || msg.includes("osascript failed (1)");
@@ -140,7 +232,8 @@ printBanner("@meta/window", PORT, [
   { title: "Экран и окна", routes: [
     { method: "GET",  path: "/screen",       description: "размер дисплея" },
     { method: "GET",  path: "/windows",      description: "список окон" },
-    { method: "POST", path: "/focus",        description: "переключить фокус" },
+    { method: "GET",  path: "/frontmost",    description: "проверить активное приложение" },
+    { method: "POST", path: "/focus",        description: "переключить фокус только на видимое окно и проверить" },
     { method: "POST", path: "/move",         description: "переместить окно" },
     { method: "POST", path: "/resize",       description: "изменить размер" },
     { method: "POST", path: "/arrange",      description: "расположить  (left|right|top|bottom|max|center)" },

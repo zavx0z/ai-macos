@@ -59,6 +59,8 @@ function help(): never {
 
 usage:
   chrome health
+  chrome profiles
+  chrome session [--profile <directory>]
   chrome windows
   chrome tabs [--window <id>]
   chrome active
@@ -101,6 +103,14 @@ try {
 
     case "health":
       console.log(pretty(await get("/health")));
+      break;
+
+    case "profiles":
+      console.log(pretty(await get("/profiles")));
+      break;
+
+    case "session":
+      console.log(pretty(await send("POST", "/session", args.profile ? {profileDirectory: args.profile} : {})));
       break;
 
     case "windows":

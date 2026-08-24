@@ -24,6 +24,7 @@ import {
 import { err, json, logRequest, num, parseBool, printBanner } from "@meta/shared";
 import { detectCdp, type ViewportMode, type ViewportOverride } from "./cdp-mode.ts";
 import type { WaitReadyOptions } from "./wait-ready.ts";
+import {ensureChromeSession, listChromeProfiles} from "./session.ts";
 
 const PORT = Number(Bun.env.PORT ?? 7880);
 
@@ -45,6 +46,18 @@ const server = Bun.serve({
 
       if (path === "/cdp" && method === "GET") {
         return json(await detectCdp(true));
+      }
+
+      if (path === "/profiles" && method === "GET") {
+        const profiles = await listChromeProfiles();
+        return json({ count: profiles.length, profiles });
+      }
+
+      if (path === "/session" && method === "POST") {
+        const body = (await req.json().catch(() => ({}))) as { profileDirectory?: string };
+        const result = await ensureChromeSession({profileDirectory: body.profileDirectory});
+        const status = result.status === "invalid_profile" ? 400 : result.status === "unavailable" ? 503 : 200;
+        return json(result, {status});
       }
 
       if (path === "/windows" && method === "GET") {
@@ -238,7 +251,7 @@ const server = Bun.serve({
         return new Response(result.body, { headers });
       }
 
-      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /windows /tabs /tabs/active /source /text /screenshot, POST /windows /tabs /navigate /activate /reload /back /forward /eval /screenshot /wait-ready /viewport, DELETE /windows/:id /tabs/:wid/:idx /viewport");
+      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /cdp /profiles /windows /tabs /tabs/active /source /text /screenshot, POST /session /windows /tabs /navigate /activate /reload /back /forward /eval /screenshot /wait-ready /viewport, DELETE /windows/:id /tabs/:wid/:idx /viewport");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       let hint: string | undefined;
@@ -261,6 +274,8 @@ printBanner("@meta/chrome", PORT, [
   { routes: [
     { method: "GET", path: "/health", description: "состояние Chrome, CDP и сервиса" },
     { method: "GET", path: "/cdp",    description: "проверить CDP (--remote-debugging-port)" },
+    { method: "GET", path: "/profiles", description: "профили Chrome, доступные для явного запуска" },
+    { method: "POST", path: "/session", description: "использовать открытый Chrome или запросить/применить явный выбор профиля" },
   ]},
   { title: "Окна и вкладки", routes: [
     { method: "GET",    path: "/windows",        description: "список окон с вкладками" },
