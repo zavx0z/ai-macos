@@ -58,7 +58,7 @@ describe("Chrome session profile selection", () => {
       launchProfile: async (profile) => { launched.push(profile) },
     })
     expect(launched).toEqual([{directory: "Profile 2", name: "Work"}])
-    expect(result).toEqual({status: "ready", running: true, launched: true, profile: PROFILES[1]})
+    expect(result).toEqual({status: "ready", running: true, launched: true, profile: PROFILES[1]!})
   })
 
   test("never falls back when the selected profile is invalid", async () => {

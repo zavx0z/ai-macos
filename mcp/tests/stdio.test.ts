@@ -21,7 +21,7 @@ afterEach(async () => {
 describe("ai-macos MCP server", () => {
   test("advertises tools and reaches the running local services", async () => {
     transport = new StdioClientTransport({
-      command: "/opt/local/bin/bun",
+      command: process.execPath,
       args: ["src/index.ts"],
       cwd: new URL("..", import.meta.url).pathname,
     })
