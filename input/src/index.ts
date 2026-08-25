@@ -1,6 +1,7 @@
 import { err, json, logRequest, num, printBanner } from "@meta/shared"
 import {
   bootstrap,
+  preflightAccessibilityNow,
   probeAccessibilityNow,
   requestAccessibilityNow,
   type InputBootstrapStatus,
@@ -22,7 +23,7 @@ import {
 } from "./keyboard.ts"
 
 const PORT = Number(Bun.env.PORT ?? 7882)
-const AUTO_REQUEST_ACCESSIBILITY = Bun.env.INPUT_AUTO_REQUEST_ACCESSIBILITY !== "false"
+const AUTO_REQUEST_ACCESSIBILITY = Bun.env.INPUT_AUTO_REQUEST_ACCESSIBILITY === "true"
 
 let bootStatus: InputBootstrapStatus = await bootstrap(AUTO_REQUEST_ACCESSIBILITY)
 setNativeHelper(bootStatus.helper)
@@ -36,9 +37,11 @@ async function requireAccessibility(): Promise<Response | null> {
   return err(503, "Accessibility не выдан meta-input-helper", bootStatus.hint)
 }
 
-async function refreshAccessibility(): Promise<void> {
+async function refreshAccessibility(active: boolean): Promise<void> {
   if (!bootStatus.helper) return
-  const accessibility = await probeAccessibilityNow(bootStatus.helper)
+  const accessibility = active
+    ? await probeAccessibilityNow(bootStatus.helper)
+    : await preflightAccessibilityNow(bootStatus.helper)
   bootStatus = {
     ...bootStatus,
     accessibility,
@@ -59,15 +62,37 @@ Bun.serve({
 
     const res = await (async () => {
       try {
-        if (path === "/health") {
-          await refreshAccessibility()
+        if (path === "/status") {
+          await refreshAccessibility(false)
           const clipboard = await clipboardHealth()
           return json({
-            ok: bootStatus.accessibility && clipboard.ok,
+            ok: true,
+            service: "@meta/input",
             backend: bootStatus.backend,
             helper: bootStatus.helper,
             accessibility: bootStatus.accessibility,
+            inputReady: bootStatus.accessibility,
             clipboard,
+            clipboardReady: clipboard.ok,
+            probe: "passive-preflight",
+            hint: bootStatus.hint,
+          })
+        }
+
+        if (path === "/health") {
+          const active = url.searchParams.get("active") !== "false"
+          await refreshAccessibility(active)
+          const clipboard = await clipboardHealth()
+          return json({
+            ok: bootStatus.accessibility && clipboard.ok,
+            service: "@meta/input",
+            backend: bootStatus.backend,
+            helper: bootStatus.helper,
+            accessibility: bootStatus.accessibility,
+            inputReady: bootStatus.accessibility,
+            clipboard,
+            clipboardReady: clipboard.ok,
+            probe: active ? "active-event" : "passive-preflight",
             hint: bootStatus.hint,
           })
         }
@@ -83,7 +108,7 @@ Bun.serve({
           if (!bootStatus.helper) {
             return json({ granted: false, helper: null, hint: bootStatus.hint })
           }
-          const granted = await probeAccessibilityNow(bootStatus.helper)
+          const granted = await preflightAccessibilityNow(bootStatus.helper)
           bootStatus = { ...bootStatus, accessibility: granted, hint: granted ? undefined : bootStatus.hint }
           return json({ granted, helper: bootStatus.helper })
         }
@@ -217,11 +242,11 @@ Bun.serve({
         }
 
         return err(404, `${method} ${path} not found`,
-          "Маршруты: GET /health /clipboard /mouse/position; POST /clipboard /mouse/{move,click,drag,scroll} /keyboard/{type,key,shortcut} /bootstrap")
+          "Маршруты: GET /status /health /clipboard /mouse/position; POST /clipboard /mouse/{move,click,drag,scroll} /keyboard/{type,key,shortcut} /bootstrap")
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         if (e instanceof NativeInputError && e.code === 77) {
-          await refreshAccessibility()
+          await refreshAccessibility(false)
           return err(503, msg, bootStatus.hint)
         }
         let hint: string | undefined
@@ -238,7 +263,8 @@ Bun.serve({
 
 printBanner("@meta/input", PORT, [
   { routes: [
-    { method: "GET",  path: "/health",    description: "состояние и доступные инструменты" },
+    { method: "GET",  path: "/status",    description: "пассивный preflight без input event" },
+    { method: "GET",  path: "/health",    description: "состояние и активная проверка input event" },
     { method: "POST", path: "/bootstrap", description: "собрать helper + проверить Accessibility" },
   ]},
   { title: "Мышь", routes: [

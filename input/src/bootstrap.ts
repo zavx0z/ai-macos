@@ -1,5 +1,6 @@
 import {
   ensureNativeHelper,
+  preflightNativeAccessibility,
   probeNativeAccessibility,
   requestNativeAccessibility,
 } from "./native.ts"
@@ -24,13 +25,17 @@ export async function probeAccessibilityNow(helper: string): Promise<boolean> {
   return await probeNativeAccessibility(helper)
 }
 
+export async function preflightAccessibilityNow(helper: string): Promise<boolean> {
+  return await preflightNativeAccessibility(helper)
+}
+
 export async function requestAccessibilityNow(
   helper: string,
 ): Promise<{ accessibility: boolean; postEvents: boolean }> {
   return await requestNativeAccessibility(helper)
 }
 
-export async function bootstrap(autoRequest = true): Promise<InputBootstrapStatus> {
+export async function bootstrap(autoRequest = false): Promise<InputBootstrapStatus> {
   console.log()
   console.log(`  ${C}@meta/input bootstrap${RESET}`)
 
@@ -50,7 +55,7 @@ export async function bootstrap(autoRequest = true): Promise<InputBootstrapStatu
     }
   }
 
-  let accessibility = await probeAccessibilityNow(helper)
+  let accessibility = await preflightAccessibilityNow(helper)
   if (!accessibility && autoRequest) {
     await requestAccessibilityNow(helper)
     accessibility = await probeAccessibilityNow(helper)

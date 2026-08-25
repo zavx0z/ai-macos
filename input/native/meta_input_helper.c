@@ -16,7 +16,7 @@ enum {
 
 static void usage(void) {
   fprintf(stderr,
-          "usage: meta-input-helper <check|request|position|move|click|drag|scroll|key|type> ...\n");
+          "usage: meta-input-helper <preflight|check|request|position|move|click|drag|scroll|key|type> ...\n");
 }
 
 static bool parse_double(const char *value, double *out) {
@@ -301,6 +301,16 @@ int main(int argc, char **argv) {
     printf("{\"accessibility\":%s,\"postEvents\":%s,\"effective\":%s}\n",
            AXIsProcessTrusted() ? "true" : "false",
            CGPreflightPostEventAccess() ? "true" : "false",
+           effective ? "true" : "false");
+    return effective ? 0 : EXIT_PERMISSION;
+  }
+  if (strcmp(argv[1], "preflight") == 0) {
+    const bool accessibility = AXIsProcessTrusted();
+    const bool post_events = CGPreflightPostEventAccess();
+    const bool effective = accessibility && post_events;
+    printf("{\"accessibility\":%s,\"postEvents\":%s,\"effective\":%s}\n",
+           accessibility ? "true" : "false",
+           post_events ? "true" : "false",
            effective ? "true" : "false");
     return effective ? 0 : EXIT_PERMISSION;
   }

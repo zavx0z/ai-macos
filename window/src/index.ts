@@ -16,7 +16,7 @@ const server = Bun.serve({
 
     const res = await (async () => {
     try {
-      if (path === "/health") return json({ ok: true });
+      if (path === "/health") return json({ ok: true, service: "@meta/window" });
 
       if (path === "/screen" && method === "GET") {
         return json(await getScreen());

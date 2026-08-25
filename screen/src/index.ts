@@ -158,10 +158,10 @@ console.log(`  WINDOW_API  ${windowApi.baseUrl}`);
 async function health(): Promise<Response> {
   try {
     const upstream = await windowApi.health();
-    return json({ ok: true, windowApi: windowApi.baseUrl, window: upstream });
+    return json({ ok: true, service: "@meta/screen", windowApi: windowApi.baseUrl, window: upstream });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
-    return json({ ok: true, windowApi: windowApi.baseUrl, window: { ok: false, error: msg } });
+    return json({ ok: true, service: "@meta/screen", windowApi: windowApi.baseUrl, window: { ok: false, error: msg } });
   }
 }
 

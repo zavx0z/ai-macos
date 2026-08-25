@@ -101,6 +101,10 @@ export async function probeNativeAccessibility(helper: string): Promise<boolean>
   return (await nativeResult(helper, ["check"])).code === 0
 }
 
+export async function preflightNativeAccessibility(helper: string): Promise<boolean> {
+  return (await nativeResult(helper, ["preflight"])).code === 0
+}
+
 export async function requestNativeAccessibility(
   helper: string,
 ): Promise<{ accessibility: boolean; postEvents: boolean }> {

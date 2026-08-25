@@ -1,8 +1,196 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import {afterEach, beforeEach, describe, expect, test} from "bun:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
+import { hostname } from "node:os"
 
 let transport: StdioClientTransport | undefined
+let fakeClipboard = ""
+let fakeClickCount = 0
+let fakeClickStatus = 200
+let fakeClickDelayMs = 0
+let fakeScreenFailure = false
+let fakeFocusApps: string[] = []
+let fakeRequestCount = 0
+let fakeClickEntered: Promise<void> = Promise.resolve()
+let resolveFakeClickEntered: () => void = () => {}
+let fakeServers: Array<{stop(closeActiveConnections?: boolean): void}> = []
+let serviceEnv: Record<string, string> = {}
+
+const ONE_PIXEL_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+
+function jsonResponse(value: unknown, status = 200): Response {
+  return Response.json(value, {status})
+}
+
+beforeEach(() => {
+  fakeClipboard = ""
+  fakeClickCount = 0
+  fakeClickStatus = 200
+  fakeClickDelayMs = 0
+  fakeScreenFailure = false
+  fakeFocusApps = []
+  fakeRequestCount = 0
+  fakeClickEntered = new Promise<void>((resolve) => { resolveFakeClickEntered = resolve })
+  const targetWindow = {
+    app: "TestApp",
+    pid: 101,
+    title: "Test window",
+    index: 1,
+    x: 100,
+    y: 80,
+    width: 640,
+    height: 480,
+  }
+  const previousWindow = {
+    app: "PreviousApp",
+    pid: 202,
+    title: "Previous window",
+    index: 1,
+    x: 20,
+    y: 30,
+    width: 500,
+    height: 400,
+  }
+  const windowServer = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      fakeRequestCount += 1
+      const url = new URL(req.url)
+      const path = url.pathname
+      if (path === "/health") return jsonResponse({ok: true, service: "@meta/window"})
+      if (path === "/windows") {
+        const app = url.searchParams.get("app")
+        const windows = app === previousWindow.app ? [previousWindow] : [targetWindow]
+        return jsonResponse({count: windows.length, windows})
+      }
+      if (path === "/frontmost") {
+        return jsonResponse({app: targetWindow.app, pid: targetWindow.pid, window: targetWindow})
+      }
+      if (path === "/focus" && req.method === "POST") {
+        const body = await req.json() as {app?: string}
+        fakeFocusApps.push(body.app ?? "")
+        const target = body.app === previousWindow.app ? previousWindow : targetWindow
+        return jsonResponse({
+          ok: true,
+          target,
+          frontmost: {app: targetWindow.app, pid: targetWindow.pid},
+          previous: {app: previousWindow.app, window: previousWindow},
+        })
+      }
+      return jsonResponse({error: "not implemented"}, 404)
+    },
+  })
+  const screenServer = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      fakeRequestCount += 1
+      const url = new URL(req.url)
+      if (url.pathname === "/health") {
+        return jsonResponse({
+          ok: true,
+          service: "@meta/screen",
+          windowApi: windowServer.url.origin,
+          window: {ok: true, service: "@meta/window"},
+        })
+      }
+      if (url.pathname === "/desktop" && req.method === "POST") {
+        const body = await req.json() as {caption?: string}
+        return jsonResponse({
+          ok: true,
+          target: "desktop",
+          mime: "image/png",
+          caption: body.caption,
+          base64: ONE_PIXEL_PNG,
+        })
+      }
+      if (url.pathname === "/window" && req.method === "POST") {
+        if (fakeScreenFailure) return jsonResponse({error: "capture failed"}, 500)
+        const body = await req.json() as {caption?: string}
+        return jsonResponse({
+          ok: true,
+          target: "window",
+          mime: "image/png",
+          caption: body.caption,
+          window: targetWindow,
+          restored: {ok: true, app: previousWindow.app},
+          base64: ONE_PIXEL_PNG,
+        })
+      }
+      return jsonResponse({error: "not implemented"}, 404)
+    },
+  })
+  const chromeServer = Bun.serve({
+    port: 0,
+    fetch(req) {
+      fakeRequestCount += 1
+      if (new URL(req.url).pathname === "/health") {
+        return jsonResponse({
+          ok: true,
+          service: "@meta/chrome",
+          running: false,
+          cdp: {available: false},
+          browserProcesses: [],
+          appleScriptAmbiguous: false,
+        })
+      }
+      return jsonResponse({error: "not implemented"}, 404)
+    },
+  })
+  const inputServer = Bun.serve({
+    port: 0,
+    async fetch(req) {
+      fakeRequestCount += 1
+      const path = new URL(req.url).pathname
+      if (path === "/status" || path === "/health") {
+        return jsonResponse({
+          ok: true,
+          service: "@meta/input",
+          backend: "native-helper",
+          helper: "/test/meta-input-helper",
+          accessibility: true,
+          inputReady: true,
+          clipboardReady: true,
+          clipboard: {ok: true, backend: "pbpaste/pbcopy"},
+          probe: path === "/status" ? "passive-preflight" : "active-event",
+        })
+      }
+      if (path === "/clipboard" && req.method === "GET") {
+        return jsonResponse({
+          ok: true,
+          backend: "pbpaste/pbcopy",
+          text: fakeClipboard,
+          length: fakeClipboard.length,
+          bytes: new TextEncoder().encode(fakeClipboard).byteLength,
+        })
+      }
+      if (path === "/clipboard" && req.method === "POST") {
+        const body = await req.json() as {text?: string}
+        fakeClipboard = body.text ?? ""
+        return jsonResponse({
+          ok: true,
+          backend: "pbpaste/pbcopy",
+          length: fakeClipboard.length,
+          bytes: new TextEncoder().encode(fakeClipboard).byteLength,
+        })
+      }
+      if (path === "/mouse/click" && req.method === "POST") {
+        resolveFakeClickEntered()
+        if (fakeClickDelayMs > 0) await Bun.sleep(fakeClickDelayMs)
+        if (fakeClickStatus !== 200) return jsonResponse({error: "click rejected"}, fakeClickStatus)
+        fakeClickCount += 1
+        return jsonResponse({ok: true})
+      }
+      return jsonResponse({error: "not implemented"}, 404)
+    },
+  })
+  fakeServers = [windowServer, screenServer, chromeServer, inputServer]
+  serviceEnv = {
+    WINDOW_API: windowServer.url.origin.replace("localhost", "127.0.0.1"),
+    SCREEN_API: screenServer.url.origin,
+    CHROME_API: chromeServer.url.origin,
+    INPUT_API: inputServer.url.origin,
+  }
+})
 
 function hasImageContent(content: unknown): boolean {
   if (!Array.isArray(content)) return false
@@ -13,24 +201,33 @@ function hasImageContent(content: unknown): boolean {
   )
 }
 
+async function connectDirectClient(name: string): Promise<Client> {
+  transport = new StdioClientTransport({
+    command: process.execPath,
+    args: ["src/index.ts"],
+    cwd: new URL("..", import.meta.url).pathname,
+    env: {...process.env, ...serviceEnv, AI_MACOS_EXPECTED_HOSTNAME: hostname()},
+  })
+  const client = new Client({name, version: "0.1.0"})
+  await client.connect(transport)
+  return client
+}
+
 afterEach(async () => {
   await transport?.close()
   transport = undefined
+  for (const server of fakeServers) server.stop(true)
+  fakeServers = []
 })
 
 describe("ai-macos MCP server", () => {
   test("advertises tools and reaches the running local services", async () => {
-    transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ["src/launcher.ts"],
-      cwd: new URL("..", import.meta.url).pathname,
-    })
-    const client = new Client({ name: "ai-macos-test", version: "0.1.0" })
-    await client.connect(transport)
+    const client = await connectDirectClient("ai-macos-test")
 
     const listed = await client.listTools()
     const names = listed.tools.map((tool) => tool.name)
     expect(names).toContain("list_windows")
+    expect(names).toContain("input_readiness")
     expect(names).toContain("capture_window")
     expect(names).toContain("latest_capture")
     expect(names).toContain("open_screenshot_pip")
@@ -50,13 +247,27 @@ describe("ai-macos MCP server", () => {
     const health = await client.callTool({ name: "system_health", arguments: {} })
     expect(health.isError).not.toBe(true)
     expect(health.structuredContent).toMatchObject({
+      machine: {
+        hostname: expect.any(String),
+        expectedHostname: hostname(),
+        matchesExpected: true,
+        platform: "darwin",
+        arch: expect.any(String),
+        projectRoot: new URL("../..", import.meta.url).pathname.replace(/\/$/, ""),
+      },
       window: { ok: true },
       screen: { ok: true },
-      input: {
-        ok: true,
-        accessibility: true,
-        clipboard: { ok: true, backend: "pbpaste/pbcopy" },
-      },
+      chrome: { ok: true },
+      input: {ok: true, inputReady: true, clipboardReady: true},
+    })
+
+    const readiness = await client.callTool({name: "input_readiness", arguments: {}})
+    expect(readiness.isError).not.toBe(true)
+    expect(readiness.structuredContent).toMatchObject({
+      ok: true,
+      serviceReady: true,
+      inputReady: true,
+      probe: "active-event",
     })
 
     const captureTool = listed.tools.find((tool) => tool.name === "capture_desktop")
@@ -144,5 +355,119 @@ describe("ai-macos MCP server", () => {
     } finally {
       await client.callTool({ name: "clipboard_write", arguments: { text: originalText } })
     }
+  })
+
+  test("launcher reuses all compatible desktop listeners on the expected Mac", async () => {
+    fakeRequestCount = 0
+    transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["src/launcher.ts"],
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {...process.env, ...serviceEnv, AI_MACOS_EXPECTED_HOSTNAME: hostname()},
+    })
+    const client = new Client({name: "ai-macos-launcher-test", version: "0.1.0"})
+    await client.connect(transport)
+
+    const health = await client.callTool({name: "system_health", arguments: {}})
+    expect(health.structuredContent).toMatchObject({
+      servicesProbed: true,
+      window: {ok: true, service: "@meta/window"},
+      screen: {ok: true, service: "@meta/screen"},
+      chrome: {ok: true, service: "@meta/chrome"},
+      input: {ok: true, service: "@meta/input"},
+    })
+    expect(fakeRequestCount).toBeGreaterThanOrEqual(8)
+  })
+
+  test("reports a delivered click without retry when post-action capture fails", async () => {
+    const client = await connectDirectClient("ai-macos-click-verification-test")
+    fakeScreenFailure = true
+
+    const result = await client.callTool({
+      name: "mouse_click",
+      arguments: {app: "TestApp", x: 20, y: 30, button: "left", count: 1},
+    })
+
+    expect(result.isError).not.toBe(true)
+    expect(result.structuredContent).toMatchObject({
+      ok: false,
+      delivered: true,
+      verificationComplete: false,
+      restorationComplete: true,
+    })
+    expect(fakeClickCount).toBe(1)
+    expect(fakeFocusApps).toEqual(["TestApp", "PreviousApp"])
+  })
+
+  test("distinguishes rejected and unknown click delivery", async () => {
+    const client = await connectDirectClient("ai-macos-click-delivery-test")
+    fakeClickStatus = 503
+    const rejected = await client.callTool({
+      name: "mouse_click",
+      arguments: {app: "TestApp", x: 20, y: 30, button: "left", count: 1},
+    })
+    expect(rejected.structuredContent).toMatchObject({
+      ok: false,
+      delivered: false,
+      delivery: "not-delivered",
+    })
+    expect(fakeClickCount).toBe(0)
+
+    fakeClickStatus = 500
+    const unknown = await client.callTool({
+      name: "mouse_click",
+      arguments: {app: "TestApp", x: 20, y: 30, button: "left", count: 1},
+    })
+    expect(unknown.structuredContent).toMatchObject({
+      ok: false,
+      delivered: null,
+      delivery: "unknown",
+    })
+    expect(fakeClickCount).toBe(0)
+  })
+
+  test("fails fast instead of queueing a stale concurrent desktop mutation", async () => {
+    const client = await connectDirectClient("ai-macos-mutation-guard-test")
+    fakeClickDelayMs = 100
+    const click = client.callTool({
+      name: "mouse_click",
+      arguments: {app: "TestApp", x: 20, y: 30, button: "left", count: 1},
+    })
+    await fakeClickEntered
+    const focus = await client.callTool({
+      name: "focus_window",
+      arguments: {app: "TestApp"},
+    })
+    expect(focus.isError).toBe(true)
+    expect(JSON.stringify(focus.content)).toContain("refusing queued stale action")
+    expect((await click).structuredContent).toMatchObject({delivered: true})
+  })
+
+  test("does not probe or start REST services before physical machine identity matches", async () => {
+    fakeRequestCount = 0
+    const expectedHostname = `not-${hostname()}`
+    transport = new StdioClientTransport({
+      command: process.execPath,
+      args: ["src/launcher.ts"],
+      cwd: new URL("..", import.meta.url).pathname,
+      env: {...process.env, ...serviceEnv, AI_MACOS_EXPECTED_HOSTNAME: expectedHostname},
+    })
+    const client = new Client({name: "ai-macos-machine-gate-test", version: "0.1.0"})
+    await client.connect(transport)
+
+    const health = await client.callTool({name: "system_health", arguments: {}})
+    expect(health.isError).not.toBe(true)
+    expect(health.structuredContent).toEqual({
+      machine: {
+        hostname: hostname(),
+        expectedHostname,
+        matchesExpected: false,
+        platform: "darwin",
+        arch: expect.any(String),
+        projectRoot: new URL("../..", import.meta.url).pathname.replace(/\/$/, ""),
+      },
+      servicesProbed: false,
+    })
+    expect(fakeRequestCount).toBe(0)
   })
 })

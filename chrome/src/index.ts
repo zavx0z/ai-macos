@@ -65,6 +65,7 @@ const server = Bun.serve({
         ]);
         return json({
           ok: true,
+          service: "@meta/chrome",
           running: browserProcesses.length > 0 || await isRunning(),
           cdp,
           browserProcesses,

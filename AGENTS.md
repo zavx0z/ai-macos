@@ -16,13 +16,15 @@ Bun monorepo. Пять пакетов:
 ## Запуск сервисов
 
 ```bash
-cd /Users/vladimirfilipenko/meta/macos
+cd /Users/zavx0z/repozitarium/ai-macos
 bun run dev      # все сервисы параллельно с --hot
 ```
 
 ## Разрешения macOS
 
-Каждый сервис проверяет и **сам открывает** нужный раздел System Settings.
+Каждый сервис умеет проверять разрешение. Только отдельный документированный
+`POST /permissions/*` открывает System Settings, и агент вызывает его лишь по
+отдельной явной просьбе пользователя.
 
 ```bash
 # Accessibility — нужно для window: move/resize/arrange/list/raise/pin
@@ -34,7 +36,9 @@ curl http://localhost:7879/permissions/screen-recording
 curl -X POST http://localhost:7879/permissions/screen-recording
 ```
 
-При `granted: false` → вызвать `POST /permissions/*`, сообщить пользователю. **Не ретраить операцию.**
+При `granted: false` сообщить пользователю и остановить операцию. `POST
+/permissions/*` разрешён только после отдельной явной просьбы пользователя
+открыть соответствующий раздел System Settings.
 
 ## @meta/window — порт 7878
 
@@ -351,9 +355,13 @@ curl -s -X POST http://localhost:7881/screenshot \
 Клавиатура и мышь. HTTP API и вся логика реализованы на **Bun + TypeScript**. Единственный backend ввода — собираемый локально `input/bin/meta-input-helper`, который вызывает официальные CoreGraphics/Accessibility API. Python, `cliclick` и AppleScript не используются. Нужно один раз выдать **Accessibility** именно `meta-input-helper`; при отсутствии разрешения API закрывается с `503` и не сообщает ложный успех.
 
 ```bash
+curl http://localhost:7882/status
+# → { ok:true, service:"@meta/input", inputReady, clipboardReady, probe:"passive-preflight" }
+# passive: не отправляет CoreGraphics event
+
 curl http://localhost:7882/health
-# → { ok, backend:"native-helper", helper, accessibility, hint? }
-# ok: true = helper собран И тестовое CoreGraphics-событие фактически прошло
+# → { ok:true, service:"@meta/input", inputReady, clipboardReady, probe:"active-event" }
+# inputReady: true = активное CoreGraphics-событие прошло и курсор восстановлен
 
 curl -X POST http://localhost:7882/permissions/accessibility
 # регистрирует запрос TCC и открывает System Settings
@@ -391,18 +399,40 @@ curl -X POST http://localhost:7882/clipboard \
 ## Правила для агентов
 
 1. **Перед каждым скриншотом** — сформулировать одним предложением, что ожидается увидеть, и передать это в поле `caption`. После получения изображения — сравнить ожидание с реальностью и сообщить о расхождении.
-2. Перед первой операцией с сервисом вызвать `GET /health`. Для `@meta/input` это активная проба события, а не только TCC preflight. При ошибке — сообщить пользователю, не ретраить.
-3. При `granted: false` от `/permissions/*` — вызвать `POST /permissions/*` (откроет Settings), сообщить пользователю, не ретраить.
+2. Агентский путь — direct MCP server `ai-macos`: перед первой операцией вызвать
+   пассивный `system_health` и продолжать только при
+   `machine.matchesExpected: true`. Перед первым pointer/keyboard input после
+   проверки машины вызвать отдельный `input_readiness`, который активно
+   проверяет post-event delivery с возвратом курсора; pointer/keyboard работа
+   продолжается только при `inputReady: true`. Clipboard использует отдельный
+   `clipboardReady` и активной проверки не требует. Прямые `GET /health`
+   используются только при разработке или диагностике самого MCP/REST контура.
+3. При отсутствии разрешения сообщить пользователю и остановиться. Не вызывать
+   `POST /permissions/*` и не открывать System Settings без отдельной явной
+   просьбы пользователя.
 4. Для скриншотов передавать `detail="medium"` если пользователь не указал иное.
-5. Использовать только REST API — никакого прямого `osascript`, `screencapture` или AppleScript.
+5. Для пользовательских desktop-операций использовать только direct
+   `mcp__ai_macos__*`. REST API является внутренней границей MCP и не служит
+   fallback при отсутствующем или ошибочном MCP tool. Deprecated connector
+   `ai-macos-local`, ожидающий внешнего архивирования, не использовать.
 6. Имя приложения (`app`) — каноническое имя процесса macOS, строго по системному.
-7. Для разработки страницы сначала вызвать `GET /cdp/targets`, выбрать точный `targetId` и использовать его во всех дальнейших CDP-операциях. Не полагаться на URL как identity. `GET /windows` использовать только для системного окна/Chrome UI.
-8. Для screenshot страницы/canvas использовать `POST /cdp/screenshot {targetId,...}`: он снимает compositor напрямую, не требует фокуса или `@meta/screen`. Обычный `POST /screenshot {windowId,tabIndex,...}` нужен только когда в кадре требуется сам Chrome UI.
+7. Следующие Chrome REST-правила применяются только при разработке или тесте
+   самого `@meta/chrome` либо нового direct Chrome MCP adapter. Они не
+   разрешают обходить отсутствующий MCP tool в обычной пользовательской
+   desktop-операции. В этом контуре сначала вызвать `GET /cdp/targets`, выбрать
+   точный `targetId` и использовать его во всех дальнейших CDP-операциях. Не
+   полагаться на URL как identity. `GET /windows` использовать только для
+   системного окна/Chrome UI.
+8. В том же внутреннем Chrome-контуре для screenshot страницы/canvas
+   использовать `POST /cdp/screenshot {targetId,...}`: он снимает compositor
+   напрямую, не требует фокуса или `@meta/screen`. Обычный `POST /screenshot
+   {windowId,tabIndex,...}` нужен только когда в кадре требуется сам Chrome UI.
 9. Окна `kind:"appWindow"` из `GET /windows` — это Chrome app-mode (`Google Chrome --app=<url>`). Они нужны для видимости/диагностики Chrome app окон, но не имеют вкладок; не использовать их с `/activate`, `/navigate`, `/reload`, `/eval`, `/source`, `/text`, `/viewport`, `/console`, `/wait-ready` и не придумывать `tabIndex`.
 10. После `POST /reload` страница гарантированно загружена (сервис ждёт до 10 с) — можно сразу делать скриншот без `sleep`. `hard: true` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
 11. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
 12. При ошибке `osascript failed (-1743)` — нет разрешения Automation.
-13. При `503` от `@meta/input` — нет разрешения Accessibility для пути из `/health.helper`; вызвать `POST /permissions/accessibility`, сообщить пользователю и не ретраить.
+13. При недоступном input/Accessibility сообщить точный helper path и не
+    ретраить. Открывать настройки можно только по отдельной явной просьбе.
 14. **Canvas/WebGPU-приложения:** основной proof — `POST /cdp/screenshot` после `/wait-ready`. Если нужен ровно один canvas без остального viewport, использовать `POST /eval {targetId,js:"return document.querySelector('canvas').toDataURL('image/png')"}` и декодировать data URL. При нескольких canvas выбирать точный индекс.
 
 
