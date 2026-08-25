@@ -1,6 +1,6 @@
 # ai-macos MCP tool map
 
-The repository at `/Users/zavx0z/repozitarium/ai-macos` is authoritative for
+The repository at `~/repozitarium/ai-macos` on the current Mac is authoritative for
 implementation details. This reference describes the direct MCP surface exposed
 to agents. It contains no REST fallback.
 

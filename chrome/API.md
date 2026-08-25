@@ -12,7 +12,7 @@ AppleScript остаётся отдельным системным контур�
 ## Запуск
 
 ```bash
-cd /Users/zavx0z/repozitarium/ai-macos/chrome
+cd ~/repozitarium/ai-macos/chrome
 bun run dev    # с hot reload
 bun run start  # обычный запуск
 bun run cdp    # Chrome с отдельным CDP-профилем

@@ -16,7 +16,7 @@ Bun monorepo. Пять пакетов:
 ## Запуск сервисов
 
 ```bash
-cd /Users/zavx0z/repozitarium/ai-macos
+cd ~/repozitarium/ai-macos
 bun run dev      # все сервисы параллельно с --hot
 ```
 

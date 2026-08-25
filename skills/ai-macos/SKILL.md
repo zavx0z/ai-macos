@@ -9,7 +9,7 @@ Use the direct `ai-macos` MCP server for local macOS observation and input.
 
 ## Identity
 
-- The canonical source is `/Users/zavx0z/repozitarium/ai-macos`.
+- The canonical source is `~/repozitarium/ai-macos` on the current Mac.
 - Before changing the MCP implementation or diagnosing a missing tool, read the
   repository `AGENTS.md` completely.
 - Invoke only direct tools whose names begin `mcp__ai_macos__`.
