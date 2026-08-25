@@ -3,8 +3,29 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "bun";
 import { logCaption, osa, quote } from "@meta/shared";
-import { cdpClearViewport, cdpConsoleListen, cdpEval, cdpNavigate, cdpReload, cdpSetViewport, cdpWaitReady, findTargetByUrl, isCdpAvailable, type ConsoleEntry, type ViewportOverride, type ViewportMode } from "./cdp-mode.ts";
+import {
+  CdpTargetSelectionError,
+  cdpClearViewport,
+  cdpConsoleListen,
+  cdpEval,
+  cdpHistory,
+  cdpNavigate,
+  cdpReload,
+  cdpSetViewport,
+  cdpWaitReady,
+  findTargetById,
+  findTargetByUrl,
+  isCdpAvailable,
+  type ConsoleEntry,
+  type ViewportOverride,
+  type ViewportMode,
+} from "./cdp-mode.ts";
+import type { CdpTarget } from "@meta/shared";
 import type { WaitReadyOptions, WaitReadyResult } from "./wait-ready.ts";
+import {
+  assertUnambiguousChromeProcess,
+  listChromeBrowserProcesses,
+} from "./browser-processes.ts";
 
 export type TabInfo = {
   id: number;
@@ -184,7 +205,13 @@ JSON.stringify((function() {
 `)
 }
 
+async function chromeJxaValue<T>(body: string): Promise<T> {
+  await assertUnambiguousChromeProcess()
+  return await jxaValue<T>(body)
+}
+
 async function runJxa(body: string): Promise<void> {
+  await assertUnambiguousChromeProcess()
   await jxa(`
 ${JXA_CHROME_HELPERS}
 (function() {
@@ -195,7 +222,7 @@ ${JXA_CHROME_HELPERS}
 }
 
 export async function listWindows(): Promise<WindowInfo[]> {
-  const browserWindows = await jxaValue<WindowInfo[]>(`
+  const browserWindows = await chromeJxaValue<WindowInfo[]>(`
     if (!app.running()) return [];
     return app.windows().map(function(w, i) {
       return chromeWindowPayload(w, i + 1);
@@ -303,7 +330,7 @@ export type NewWindowOptions = {
 };
 
 export async function newWindow(options: NewWindowOptions = {}): Promise<{ id: number }> {
-  const id = await jxaValue<number>(`
+  const id = await chromeJxaValue<number>(`
     var before = app.windows().map(function(w) { return Number(w.id()); });
     try {
       app.windows.push(app.Window(${options.incognito ? `{mode: "incognito"}` : ""}));
@@ -331,7 +358,7 @@ export type NewTabOptions = {
 };
 
 export async function newTab(options: NewTabOptions = {}): Promise<{ id: number; index: number }> {
-  return await jxaValue<{ id: number; index: number }>(`
+  return await chromeJxaValue<{ id: number; index: number }>(`
     var w = chromeWindow(app, ${jxaArg(options.windowId)});
     var t = app.Tab({url: ${options.url ? jsString(options.url) : jsString("about:blank")}});
     w.tabs.push(t);
@@ -362,10 +389,35 @@ export async function activateTab(windowId: number, tabIndex: number): Promise<v
 }
 
 async function tabUrl(windowId?: number, tabIndex?: number): Promise<string> {
-  return await jxaValue<string>(`
+  return await chromeJxaValue<string>(`
     var w = chromeWindow(app, ${jxaArg(windowId)});
     return String(chromeTab(w, ${jxaArg(tabIndex)}).url() || "");
   `)
+}
+
+async function resolveCdpTarget(
+  targetId?: string,
+  windowId?: number,
+  tabIndex?: number,
+): Promise<CdpTarget | null> {
+  if (!(await isCdpAvailable())) {
+    if (targetId) {
+      throw new CdpTargetSelectionError(
+        "CDP not available — start Chrome with --remote-debugging-port=9222 (bun run cdp)",
+        503,
+      )
+    }
+    return null
+  }
+  if (targetId) return await findTargetById(targetId)
+  const url = await tabUrl(windowId, tabIndex).catch(() => "")
+  if (!url) return null
+  try {
+    return await findTargetByUrl(url)
+  } catch (error) {
+    if (error instanceof CdpTargetSelectionError && error.status === 503) return null
+    throw error
+  }
 }
 
 export async function navigate(
@@ -374,14 +426,12 @@ export async function navigate(
   tabIndex?: number,
   wait = true,
   waitOpts: WaitReadyOptions = {},
+  targetId?: string,
 ): Promise<{ via: "cdp" | "applescript"; waitMs?: number; ready?: WaitReadyResult }> {
-  if (await isCdpAvailable()) {
-    const currentUrl = await tabUrl(windowId, tabIndex).catch(() => "")
-    const target = currentUrl ? await findTargetByUrl(currentUrl) : null
-    if (target) {
-      const r = await cdpNavigate(target, url, wait, waitOpts)
-      return { via: "cdp", ...r }
-    }
+  const target = await resolveCdpTarget(targetId, windowId, tabIndex)
+  if (target) {
+    const r = await cdpNavigate(target, url, wait, waitOpts)
+    return { via: "cdp", ...r }
   }
   await runJxa(`
     var w = chromeWindow(app, ${jxaArg(windowId)});
@@ -396,14 +446,12 @@ export async function reload(
   tabIndex?: number,
   wait = true,
   waitOpts: WaitReadyOptions = {},
+  targetId?: string,
 ): Promise<{ waitMs: number; via: "cdp" | "applescript"; ready?: WaitReadyResult }> {
-  if (await isCdpAvailable()) {
-    const url = await tabUrl(windowId, tabIndex).catch(() => "")
-    const target = url ? await findTargetByUrl(url) : null
-    if (target) {
-      const r = await cdpReload(target, false, wait, waitOpts)
-      return { via: "cdp", ...r }
-    }
+  const target = await resolveCdpTarget(targetId, windowId, tabIndex)
+  if (target) {
+    const r = await cdpReload(target, false, wait, waitOpts)
+    return { via: "cdp", ...r }
   }
   await runJxa(`
     var w = chromeWindow(app, ${jxaArg(windowId)});
@@ -418,15 +466,13 @@ export async function hardReload(
   tabIndex?: number,
   wait = true,
   waitOpts: WaitReadyOptions = {},
+  targetId?: string,
 ): Promise<{ waitMs: number; via: "cdp" | "applescript"; ready?: WaitReadyResult }> {
   // CDP path: ignoreCache:true is the equivalent of Cmd+Shift+R, без воровства фокуса
-  if (await isCdpAvailable()) {
-    const url = await tabUrl(windowId, tabIndex).catch(() => "")
-    const target = url ? await findTargetByUrl(url) : null
-    if (target) {
-      const r = await cdpReload(target, true, wait, waitOpts)
-      return { via: "cdp", ...r }
-    }
+  const target = await resolveCdpTarget(targetId, windowId, tabIndex)
+  if (target) {
+    const r = await cdpReload(target, true, wait, waitOpts)
+    return { via: "cdp", ...r }
   }
   await runJxa(`
     var w = chromeWindow(app, ${jxaArg(windowId)});
@@ -452,7 +498,7 @@ async function waitForTabLoad(windowId?: number, tabIndex?: number, timeoutMs = 
   // brief initial delay so loading=true has time to register
   await new Promise((r) => setTimeout(r, 150))
   while (Date.now() - t0 < timeoutMs) {
-    const loading = await jxaValue<boolean>(`
+    const loading = await chromeJxaValue<boolean>(`
       var w = chromeWindow(app, ${jxaArg(windowId)});
       return Boolean(chromeTab(w, ${jxaArg(tabIndex)}).loading());
     `).catch(() => false)
@@ -462,32 +508,48 @@ async function waitForTabLoad(windowId?: number, tabIndex?: number, timeoutMs = 
   return Date.now() - t0
 }
 
-export async function goBack(windowId?: number, tabIndex?: number): Promise<void> {
+export async function goBack(
+  windowId?: number,
+  tabIndex?: number,
+  targetId?: string,
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+): Promise<{ via: "cdp" | "applescript"; navigated?: boolean; waitMs?: number; ready?: WaitReadyResult }> {
+  const target = await resolveCdpTarget(targetId, windowId, tabIndex)
+  if (target) return { via: "cdp", ...await cdpHistory(target, -1, wait, waitOpts) }
   await runJxa(`
     var w = chromeWindow(app, ${jxaArg(windowId)});
     chromeTab(w, ${jxaArg(tabIndex)}).goBack();
   `)
+  return { via: "applescript" }
 }
 
-export async function goForward(windowId?: number, tabIndex?: number): Promise<void> {
+export async function goForward(
+  windowId?: number,
+  tabIndex?: number,
+  targetId?: string,
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+): Promise<{ via: "cdp" | "applescript"; navigated?: boolean; waitMs?: number; ready?: WaitReadyResult }> {
+  const target = await resolveCdpTarget(targetId, windowId, tabIndex)
+  if (target) return { via: "cdp", ...await cdpHistory(target, 1, wait, waitOpts) }
   await runJxa(`
     var w = chromeWindow(app, ${jxaArg(windowId)});
     chromeTab(w, ${jxaArg(tabIndex)}).goForward();
   `)
+  return { via: "applescript" }
 }
 
 export async function evalJs(
   js: string,
   windowId?: number,
   tabIndex?: number,
+  targetId?: string,
 ): Promise<string> {
-  if (await isCdpAvailable()) {
-    const url = await tabUrl(windowId, tabIndex).catch(() => "")
-    const target = url ? await findTargetByUrl(url) : null
-    if (target) return await cdpEval(target, js)
-  }
+  const target = await resolveCdpTarget(targetId, windowId, tabIndex)
+  if (target) return await cdpEval(target, js)
   const wrapped = `(function(){try{var __r=(function(){${js}})();return (typeof __r==='undefined')?'':(typeof __r==='string'?__r:JSON.stringify(__r));}catch(e){throw e;}})()`
-  return await jxaValue<string>(`
+  return await chromeJxaValue<string>(`
     var w = chromeWindow(app, ${jxaArg(windowId)});
     return String(chromeTab(w, ${jxaArg(tabIndex)}).execute({javascript: ${jsString(wrapped)}}) || "");
   `)
@@ -497,29 +559,29 @@ export async function consoleListen(
   windowId?: number,
   tabIndex?: number,
   durationMs = 1000,
+  targetId?: string,
 ): Promise<{ entries: ConsoleEntry[]; via: "cdp" } | { entries: []; via: "unavailable"; error: string }> {
   if (!(await isCdpAvailable())) {
     return { entries: [], via: "unavailable", error: "CDP not available — bun run cdp" }
   }
-  const url = await tabUrl(windowId, tabIndex).catch(() => "")
-  const target = url ? await findTargetByUrl(url) : null
+  const target = await resolveCdpTarget(targetId, windowId, tabIndex)
   if (!target) {
-    return { entries: [], via: "unavailable", error: `CDP target not found for URL: ${url || "(unknown)"}` }
+    return { entries: [], via: "unavailable", error: "CDP target not found for selected Chrome tab" }
   }
   const entries = await cdpConsoleListen(target, Math.max(50, Math.min(durationMs, 60_000)))
   return { entries, via: "cdp" }
 }
 
-export async function getSource(windowId?: number, tabIndex?: number): Promise<string> {
-  return await evalJs("return document.documentElement.outerHTML;", windowId, tabIndex)
+export async function getSource(windowId?: number, tabIndex?: number, targetId?: string): Promise<string> {
+  return await evalJs("return document.documentElement.outerHTML;", windowId, tabIndex, targetId)
 }
 
-export async function getText(windowId?: number, tabIndex?: number): Promise<string> {
-  return await evalJs("return document.body && document.body.innerText || '';", windowId, tabIndex)
+export async function getText(windowId?: number, tabIndex?: number, targetId?: string): Promise<string> {
+  return await evalJs("return document.body && document.body.innerText || '';", windowId, tabIndex, targetId)
 }
 
 export async function isRunning(): Promise<boolean> {
-  return await jxaValue<boolean>(`return Boolean(app.running());`).catch(() => false)
+  return (await listChromeBrowserProcesses().catch(() => [])).length > 0
 }
 
 const SCREEN_API = Bun.env.SCREEN_API ?? "http://localhost:7879"
@@ -542,14 +604,14 @@ export async function waitReady(
   windowId?: number,
   tabIndex?: number,
   opts: WaitReadyOptions = {},
+  targetId?: string,
 ): Promise<{ via: "cdp"; result: WaitReadyResult } | { via: "unavailable"; error: string }> {
   if (!(await isCdpAvailable())) {
     return { via: "unavailable", error: "CDP not available — start Chrome with --remote-debugging-port=9222 (bun run cdp)" }
   }
-  const url = await tabUrl(windowId, tabIndex).catch(() => "")
-  const target = url ? await findTargetByUrl(url) : null
+  const target = await resolveCdpTarget(targetId, windowId, tabIndex)
   if (!target) {
-    return { via: "unavailable", error: `CDP target not found for URL: ${url || "(unknown)"}` }
+    return { via: "unavailable", error: "CDP target not found for selected Chrome tab" }
   }
   const result = await cdpWaitReady(target, opts)
   return { via: "cdp", result }
@@ -562,14 +624,14 @@ export async function setViewport(
   wait = true,
   waitOpts: WaitReadyOptions = {},
   reload = true,
+  targetId?: string,
 ): Promise<{ via: "cdp"; applied: { width: number; height: number; deviceScaleFactor: number; mobile: boolean; mode: ViewportMode; innerSize: boolean }; bounds?: { before: unknown; after: unknown }; inner?: { width: number; height: number }; reloaded: boolean; ready?: WaitReadyResult } | { via: "unavailable"; error: string }> {
   if (!(await isCdpAvailable())) {
     return { via: "unavailable", error: "CDP not available — start Chrome with --remote-debugging-port=9222 (bun run cdp)" }
   }
-  const url = await tabUrl(windowId, tabIndex).catch(() => "")
-  const target = url ? await findTargetByUrl(url) : null
+  const target = await resolveCdpTarget(targetId, windowId, tabIndex)
   if (!target) {
-    return { via: "unavailable", error: `CDP target not found for URL: ${url || "(unknown)"}` }
+    return { via: "unavailable", error: "CDP target not found for selected Chrome tab" }
   }
   const r = await cdpSetViewport(target, override, wait, waitOpts, reload)
   return { via: "cdp", ...r }
@@ -581,14 +643,14 @@ export async function clearViewport(
   wait = true,
   waitOpts: WaitReadyOptions = {},
   reload = true,
+  targetId?: string,
 ): Promise<{ via: "cdp"; reloaded: boolean; ready?: WaitReadyResult } | { via: "unavailable"; error: string }> {
   if (!(await isCdpAvailable())) {
     return { via: "unavailable", error: "CDP not available — start Chrome with --remote-debugging-port=9222 (bun run cdp)" }
   }
-  const url = await tabUrl(windowId, tabIndex).catch(() => "")
-  const target = url ? await findTargetByUrl(url) : null
+  const target = await resolveCdpTarget(targetId, windowId, tabIndex)
   if (!target) {
-    return { via: "unavailable", error: `CDP target not found for URL: ${url || "(unknown)"}` }
+    return { via: "unavailable", error: "CDP target not found for selected Chrome tab" }
   }
   const r = await cdpClearViewport(target, wait, waitOpts, reload)
   return { via: "cdp", ...r }

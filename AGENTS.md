@@ -4,14 +4,14 @@
 
 Bun monorepo. Пять пакетов:
 
-| Пакет | Порт | Назначение |
-|---|---|---|
-| `@meta/shared` | — | Общие утилиты |
-| `@meta/window` | 7878 | Окна macOS (Accessibility) |
-| `@meta/screen` | 7879 | Скриншоты (`screencapture`) |
-| `@meta/chrome` | 7880 | Десктопный Chrome (AppleScript) |
-| `@meta/android` | 7881 | Chrome на Android (ADB + CDP) |
-| `@meta/input`  | 7882 | Клавиатура, мышь и системный clipboard (CoreGraphics + pbpaste/pbcopy) |
+| Пакет           | Порт | Назначение                                                      |
+| --------------- | ---- | --------------------------------------------------------------- |
+| `@meta/shared`  | —    | Общие утилиты                                                   |
+| `@meta/window`  | 7878 | Окна macOS (Accessibility)                                      |
+| `@meta/screen`  | 7879 | Скриншоты (`screencapture`)                                     |
+| `@meta/chrome`  | 7880 | Десктопный Chrome (CDP-native agent API + системные окна macOS) |
+| `@meta/android` | 7881 | Chrome на Android (ADB + CDP)                                   |
+| `@meta/input`   | 7882 | Клавиатура, мышь и clipboard (native CoreGraphics + pbpaste/pbcopy) |
 
 ## Запуск сервисов
 
@@ -121,12 +121,12 @@ curl -s -X POST http://localhost:7879/rect \
 ```
 
 Параметр `detail`:
-| Значение | Масштаб | Размер |
-|---|---|---|
-| `low` | 25 % | ~200 КБ |
-| `medium` | 50 % | ~400 КБ |
-| `high` | 75 % | ~600 КБ |
-| `full` | 100 % | ~900 КБ |
+| Значение | Масштаб | Размер  |
+| -------- | ------- | ------- |
+| `low`    | 25 %    | ~200 КБ |
+| `medium` | 50 %    | ~400 КБ |
+| `high`   | 75 %    | ~600 КБ |
+| `full`   | 100 %   | ~900 КБ |
 
 Формат `json` вместо `png` → `{ ok, target, mime, base64 }`.
 
@@ -134,7 +134,23 @@ curl -s -X POST http://localhost:7879/rect \
 
 Health: `{ ok, running, cdp }` — `running: false` Chrome не запущен; `cdp.available: true` если Chrome запущен с `--remote-debugging-port=9222`.
 
-**Гибрид CDP / AppleScript:** при доступном CDP `evalJs`/`navigate`/`reload` идут через CDP — не нужны "Allow JavaScript from Apple Events" и Automation. Без флага debug-port — обычный AppleScript-путь. Ответы `/navigate` и `/reload` содержат `via: "cdp" | "applescript"`.
+**Основной агентский контракт — CDP `targetId`.** Сначала вызвать
+`GET /cdp/targets`, затем передавать выбранный `targetId` в `/navigate`,
+`/reload`, `/wait-ready`, `/viewport`, `/eval`, `/console`, `/source` и `/text`.
+`targetId` сохраняется при navigate/reload. Не связывать CDP-вкладки с
+AppleScript-окнами по URL: отдельный CDP-профиль и обычный Chrome имеют разные
+window identity даже при одинаковом URL и геометрии.
+
+`windowId/tabIndex` относятся к системному AppleScript-контуру и нужны только
+для физического окна/Chrome UI. Без `targetId` часть старых операций может
+использовать AppleScript fallback, но это не основной путь разработки.
+
+Если одновременно запущены обычный Chrome и отдельный CDP Chrome, macOS
+AppleScript не умеет адресовать профиль по PID. Поэтому `/windows`, `/tabs` и
+изменяющие AppleScript-операции отвечают `409`, а не возвращают неполный список
+и не выбирают произвольный профиль. В этом состоянии использовать только
+`GET /cdp/targets` и точный `targetId`; нельзя трактовать прежнее `windows: []`
+как отсутствие уже открытого CDP target и нельзя вызывать `POST /windows`.
 
 Чтобы поднять Chrome с CDP:
 ```bash
@@ -144,6 +160,28 @@ cd chrome && bun run cdp:check    # проверка
 ```
 
 Chrome 137+ запрещает `--remote-debugging-port` на дефолтном профиле, поэтому скрипт открывает экземпляр с `--user-data-dir=~/Library/Application Support/Google/Chrome-CDP` — это **отдельный** Chrome рядом с основным.
+
+```bash
+# Stable target inventory без debugger WebSocket URL
+curl http://localhost:7880/cdp/targets
+
+# Создать target сразу в CDP Chrome
+curl -X POST http://localhost:7880/cdp/targets \
+  -H 'content-type: application/json' \
+  -d '{"url":"http://127.0.0.1:4214/"}'
+
+# Прямой viewport screenshot без фокуса и Chrome UI
+curl -s -X POST http://localhost:7880/cdp/screenshot \
+  -H 'content-type: application/json' \
+  -d '{"targetId":"TARGET","format":"png","caption":"Ожидаю увидеть visual scene"}' \
+  -o visual.png
+
+# Диагностика
+curl -X POST http://localhost:7880/cdp/performance -d '{"targetId":"TARGET"}'
+curl -X POST http://localhost:7880/cdp/trace -d '{"targetId":"TARGET","durationMs":1000}' -o trace.json
+curl -X POST http://localhost:7880/cdp/command \
+  -d '{"targetId":"TARGET","method":"Runtime.getHeapUsage","params":{}}'
+```
 
 `GET /windows` возвращает смешанный список Chrome-окон:
 
@@ -358,12 +396,27 @@ curl -X POST http://localhost:7882/clipboard \
 4. Для скриншотов передавать `detail="medium"` если пользователь не указал иное.
 5. Использовать только REST API — никакого прямого `osascript`, `screencapture` или AppleScript.
 6. Имя приложения (`app`) — каноническое имя процесса macOS, строго по системному.
-7. Для Chrome сначала вызвать `GET /windows`. Для операций с вкладкой выбирать только окно `kind:"browser"` и конкретную вкладку из `tabs`, затем во всех tab-операциях передавать **оба** поля `windowId` и `tabIndex`. Не полагаться на `front window`, активное окно, `/tabs/active` или отсутствующий `windowId`: при нескольких окнах/профилях это легко попадает не туда.
-8. Для скриншота Chrome использовать `POST /screenshot` у `@meta/chrome`, **не** напрямую в `@meta/screen` (`/window` или `/rect` не видят Chrome без Accessibility).
-   Сценарий: `GET /windows` → выбрать нужные `windowId` и `tabIndex` → `POST /activate {windowId, tabIndex}` → `POST /screenshot {windowId, tabIndex, detail, caption}`.
+7. Для разработки страницы сначала вызвать `GET /cdp/targets`, выбрать точный `targetId` и использовать его во всех дальнейших CDP-операциях. Не полагаться на URL как identity. `GET /windows` использовать только для системного окна/Chrome UI.
+8. Для screenshot страницы/canvas использовать `POST /cdp/screenshot {targetId,...}`: он снимает compositor напрямую, не требует фокуса или `@meta/screen`. Обычный `POST /screenshot {windowId,tabIndex,...}` нужен только когда в кадре требуется сам Chrome UI.
 9. Окна `kind:"appWindow"` из `GET /windows` — это Chrome app-mode (`Google Chrome --app=<url>`). Они нужны для видимости/диагностики Chrome app окон, но не имеют вкладок; не использовать их с `/activate`, `/navigate`, `/reload`, `/eval`, `/source`, `/text`, `/viewport`, `/console`, `/wait-ready` и не придумывать `tabIndex`.
 10. После `POST /reload` страница гарантированно загружена (сервис ждёт до 10 с) — можно сразу делать скриншот без `sleep`. `hard: true` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
 11. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
 12. При ошибке `osascript failed (-1743)` — нет разрешения Automation.
 13. При `503` от `@meta/input` — нет разрешения Accessibility для пути из `/health.helper`; вызвать `POST /permissions/accessibility`, сообщить пользователю и не ретраить.
-14. **Canvas-приложения** (графики, редакторы, кастомные рендереры): `POST /screenshot` снимает окно Chrome целиком, но canvas-пиксели могут не совпасть из-за DPR-масштабирования или тайминга. Вместо этого использовать `POST /eval` с JS `return document.querySelector('canvas').toDataURL('image/png')` — получить base64-строку, отрезать префикс `data:image/png;base64,`, декодировать через `base64 -d` в PNG-файл. При нескольких canvas — `document.querySelectorAll('canvas')[N]`.
+14. **Canvas/WebGPU-приложения:** основной proof — `POST /cdp/screenshot` после `/wait-ready`. Если нужен ровно один canvas без остального viewport, использовать `POST /eval {targetId,js:"return document.querySelector('canvas').toDataURL('image/png')"}` и декодировать data URL. При нескольких canvas выбирать точный индекс.
+
+
+## Ветки Git и рабочие каталоги
+
+- Агент работает в том каноническом каталоге и в той ветке Git, где начата
+  задача. Текущая ветка является веткой выполнения задачи.
+- Без прямого указания пользователя нельзя создавать, подключать, переключать,
+  переименовывать или удалять ветки Git, дополнительные рабочие каталоги Git и
+  копии репозитория.
+- Аудит, параллельная работа, изоляция задачи, наличие чужих изменений и
+  временный каталог, созданный средой агента, не являются разрешением на новое
+  ответвление. Если продолжать в текущем состоянии нельзя, агент
+  останавливается и сообщает пользователю точную причину.
+- Слияние, перенос отдельных коммитов, изменение основания, принудительный
+  сброс и отправка изменений на сервер выполняются только по отдельному прямому
+  указанию пользователя.

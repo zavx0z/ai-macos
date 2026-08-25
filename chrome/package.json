@@ -12,7 +12,7 @@
     "start": "bun src/index.ts",
     "cli": "bun src/cli.ts",
     "build": "bun build src/index.ts --target bun --outdir dist",
-    "test": "bun test src/session.test.ts",
+    "test": "bun test",
     "typecheck": "tsc --noEmit",
     "cdp": "bash scripts/cdp.sh",
     "cdp:check": "curl -sf http://localhost:9222/json/version | python3 -m json.tool || echo 'CDP недоступен — запустите: bun run cdp'"

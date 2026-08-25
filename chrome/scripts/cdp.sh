@@ -22,13 +22,11 @@ mkdir -p "${DATA_DIR}"
 # Запускаем отдельный экземпляр Chrome с CDP-флагами и своим профилем,
 # не трогая основной Chrome пользователя.
 printf "${D}запуск Chrome с --remote-debugging-port=${PORT}...${X}\n"
-"/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" \
+open -na "Google Chrome" --args \
   --remote-debugging-port="${PORT}" \
   --user-data-dir="${DATA_DIR}" \
   --no-first-run \
-  --no-default-browser-check \
-  > /dev/null 2>&1 &
-disown
+  --no-default-browser-check
 
 # Ждём пока CDP поднимется (до ~9 с)
 for i in $(seq 1 30); do

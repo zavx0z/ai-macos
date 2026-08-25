@@ -1,36 +1,197 @@
 # @meta/chrome
 
-Локальный REST‑сервис для управления Google Chrome на macOS через AppleScript.
+Локальный REST-сервис для agent-driven управления Google Chrome через CDP.
+AppleScript остаётся отдельным системным контуром для окон обычного Chrome, но
+не участвует в адресации CDP-вкладок.
 
 - База: `$CHROME_API` или `http://localhost:7880`.
-- JSON in / JSON out (кроме `/source` и `/text` — они возвращают `text/html` и `text/plain`).
-- Все операции выполняются через `osascript` поверх AppleScript‑словаря Google Chrome.
-- Идентификаторы окон (`id`) и индексы вкладок (`index`) возвращаются эндпоинтом `GET /windows`.
+- Основной идентификатор вкладки — стабильный `targetId` из `GET /cdp/targets`.
+- `targetId` сохраняется при navigate/reload и исчезает только после закрытия target.
+- JSON in / JSON out, кроме HTML/text, screenshot и trace responses.
 
 ## Запуск
 
 ```bash
-cd macos/chrome
+cd /Users/zavx0z/repozitarium/ai-macos/chrome
 bun run dev    # с hot reload
 bun run start  # обычный запуск
+bun run cdp    # Chrome с отдельным CDP-профилем
 ```
 
 Переменные окружения:
 
 - `PORT` — порт сервера (по умолчанию `7880`).
 - `CHROME_API` — база для CLI (по умолчанию `http://localhost:7880`).
+- `CHROME_CDP_HOST` / `CHROME_CDP_PORT` — CDP endpoint (по умолчанию `localhost:9222`).
 
-## Разрешения
+## Основной agent workflow
 
-- AppleScript‑автоматизация: при первом обращении macOS попросит разрешить процессу управление Google Chrome.
-- Для `/eval`, `/source`, `/text` нужно включить в Chrome: **View → Developer → Allow JavaScript from Apple Events**. Без этого `execute javascript` возвращает ошибку.
+```bash
+# 1. Получить точные targets. URL не используется как identity.
+curl -s http://localhost:7880/cdp/targets
+
+# 2. Либо создать отдельную вкладку сразу в CDP Chrome.
+curl -s -X POST http://localhost:7880/cdp/targets \
+  -H 'content-type: application/json' \
+  -d '{"url":"http://127.0.0.1:4214/"}'
+
+# 3. Все дальнейшие операции адресовать по targetId.
+curl -s -X POST http://localhost:7880/eval \
+  -H 'content-type: application/json' \
+  -d '{"targetId":"TARGET","js":"return {url:location.href,title:document.title}"}'
+```
+
+Один target не нужно повторно искать после навигации. Не смешивать CDP `targetId`,
+AppleScript `windowId` и `tabIndex`: это идентификаторы разных контуров.
+
+## CDP targets
+
+### `GET /cdp/targets[?type=page|all]`
+
+Возвращает безопасный inventory без `webSocketDebuggerUrl`:
+
+```json
+{
+  "ok": true,
+  "count": 1,
+  "targets": [{
+    "targetId": "92312DE4989B4D5CEAE84B49BC5B12C0",
+    "type": "page",
+    "title": "MetaFor Visual",
+    "url": "http://127.0.0.1:4214/"
+  }]
+}
+```
+
+### `POST /cdp/targets`
+
+Создаёт target в CDP Chrome и сразу возвращает `targetId`.
+
+```json
+{ "url": "http://127.0.0.1:4214/" }
+```
+
+### `POST /cdp/targets/:targetId/activate`
+
+Активирует target без AppleScript.
+
+### `DELETE /cdp/targets/:targetId`
+
+Закрывает точный target.
+
+## CDP diagnostics
+
+### `POST /cdp/screenshot`
+
+Снимает пиксели viewport напрямую через `Page.captureScreenshot`, без фокуса,
+Screen Recording и Chrome UI. Для canvas/WebGPU это основной screenshot path.
+
+```json
+{
+  "targetId": "TARGET",
+  "format": "png",
+  "fullPage": false,
+  "waitReady": true,
+  "waitOpts": {"reflowStable": false},
+  "caption": "Ожидаю увидеть сцену MetaFor"
+}
+```
+
+Ответ — `image/png`, `image/jpeg` или `image/webp`. Заголовки содержат
+`x-meta-via: cdp` и `x-meta-target-id`.
+
+### `POST /cdp/performance`
+
+```json
+{ "targetId": "TARGET" }
+```
+
+Возвращает `Performance.getMetrics`, DOM counters и page/viewport identity одним
+компактным JSON snapshot.
+
+### `POST /cdp/trace`
+
+```json
+{
+  "targetId": "TARGET",
+  "durationMs": 1000,
+  "maxBytes": 50000000
+}
+```
+
+Продолжительность ограничена 30 секундами, payload — 100 MB. Ответом приходит
+необёрнутый browser-level DevTools trace JSON, пригодный для записи в файл и
+загрузки в trace viewer. По умолчанию записываются все категории (`["*"]`): на
+Chrome 150 узкие категории могут вернуть только metadata. `targetId` фиксирует
+контекст запроса и гарантирует существование требуемой страницы, но сам trace
+охватывает процессы CDP Chrome целиком.
+
+### `POST /cdp/command`
+
+One-shot escape hatch для CDP-метода, которого ещё нет в удобном REST endpoint:
+
+```json
+{
+  "targetId": "TARGET",
+  "method": "Runtime.getHeapUsage",
+  "params": {},
+  "timeoutMs": 10000
+}
+```
+
+Session-bound и streaming workflows выполняются специализированными endpoints
+(`/cdp/trace`), потому что one-shot session закрывается после ответа.
+
+## Общие операции по targetId
+
+Следующие существующие endpoints принимают `targetId` без `windowId/tabIndex`:
+
+- `POST /navigate`
+- `POST /reload`
+- `POST /back`, `POST /forward`
+- `POST /wait-ready`
+- `POST /viewport`, `DELETE /viewport`
+- `POST /eval`
+- `GET|POST /console`
+- `GET /source`, `GET /text`
+
+Пример:
+
+```json
+{ "targetId": "TARGET", "url": "http://127.0.0.1:4204/", "waitReady": true }
+```
+
+## AppleScript/system UI
+
+`GET /windows`, `/tabs`, `/activate` и обычный `/screenshot` обслуживают окна
+macOS и Chrome UI. Они нужны, когда требуется физически показать окно или снять
+панель вкладок. Для разработки страницы предпочтителен CDP-native API выше.
+
+Когда одновременно работают обычный Chrome и отдельный CDP Chrome, AppleScript
+не может выбрать точный профиль по PID. В этом состоянии все операции данного
+раздела fail-closed с `409`: сервис не возвращает неполный `windows: []` и не
+создаёт окно в произвольном профиле. Для CDP Chrome нужно получить существующий
+`targetId` через `GET /cdp/targets` и продолжить через CDP-native endpoints.
+
+AppleScript-автоматизация требует разрешения macOS. AppleScript fallback для
+`/eval`, `/source`, `/text` дополнительно требует Chrome setting
+**View → Developer → Allow JavaScript from Apple Events**.
 
 ## Эндпоинты
 
 ### `GET /health`
 
 ```json
-{ "ok": true, "running": true }
+{
+  "ok": true,
+  "running": true,
+  "cdp": {"available": true, "browser": "Chrome/151.0.7922.76"},
+  "browserProcesses": [
+    {"pid": 564, "profile": "default", "remoteDebugging": false, "userDataDir": null},
+    {"pid": 96181, "profile": "cdp", "remoteDebugging": true, "userDataDir": "/path/to/Chrome-CDP"}
+  ],
+  "appleScriptAmbiguous": true
+}
 ```
 
 ### `GET /profiles`
@@ -163,18 +324,18 @@ bun run start  # обычный запуск
 
 Опции `options` (все опциональные):
 
-| Поле | По умолчанию | Что делает |
-|---|---|---|
-| `readyState` | `true` | дождаться `document.readyState === 'complete'` |
-| `fonts` | `true` | `await document.fonts.ready` |
-| `networkIdle` | `true` | нет inflight HTTP за `idleMs`. Счётчик ведётся снаружи через `Network.requestWillBeSent/loadingFinished/loadingFailed` |
-| `images` | `true` | принудительный `loading='eager'` + `Promise.all(load)` + `decode()` для всех `<img>` |
-| `reflowStable` | `true` | дождаться двух подряд rAF, между которыми `documentElement.scrollWidth/scrollHeight` не изменились (internal deadline 2.5 с) |
-| `animations` | `true` | дождаться завершения всех конечных `getAnimations()` |
-| `finalCommit` | `true` | финальный двойной rAF — коммит в композитор |
-| `idleMs` | `700` | окно тишины network для шага `networkIdle` |
-| `stepMs` | `8000` | таймаут одного шага (защита от зависшего шрифта/img) |
-| `maxMs` | `15000` | общий таймаут |
+| Поле           | По умолчанию | Что делает                                                                                                                   |
+| -------------- | ------------ | ---------------------------------------------------------------------------------------------------------------------------- |
+| `readyState`   | `true`       | дождаться `document.readyState === 'complete'`                                                                               |
+| `fonts`        | `true`       | `await document.fonts.ready`                                                                                                 |
+| `networkIdle`  | `true`       | нет inflight HTTP за `idleMs`. Счётчик ведётся снаружи через `Network.requestWillBeSent/loadingFinished/loadingFailed`       |
+| `images`       | `true`       | принудительный `loading='eager'` + `Promise.all(load)` + `decode()` для всех `<img>`                                         |
+| `reflowStable` | `true`       | дождаться двух подряд rAF, между которыми `documentElement.scrollWidth/scrollHeight` не изменились (internal deadline 2.5 с) |
+| `animations`   | `true`       | дождаться завершения всех конечных `getAnimations()`                                                                         |
+| `finalCommit`  | `true`       | финальный двойной rAF — коммит в композитор                                                                                  |
+| `idleMs`       | `700`        | окно тишины network для шага `networkIdle`                                                                                   |
+| `stepMs`       | `8000`       | таймаут одного шага (защита от зависшего шрифта/img)                                                                         |
+| `maxMs`        | `15000`      | общий таймаут                                                                                                                |
 
 Требует CDP (порт 9222). Без CDP — `503` с подсказкой запустить `bun run cdp`. Сервис сам вызывает `Emulation.setFocusEmulationEnabled` чтобы Chrome не тротлил `rAF`/`setTimeout` в фоновой вкладке (без отнятия OS-уровневого фокуса).
 
@@ -228,6 +389,9 @@ Window-mode требует, чтобы окно было в состоянии `
 { "ok": true, "result": "{\"iw\":1024,\"ih\":768}", "parsed": {"iw":1024,"ih":768} }
 ```
 
+В CDP-native path тело `js` выполняется в async wrapper, поэтому внутри можно
+использовать `await`. Для точной адресации передавать `targetId`.
+
 ### `GET /source[?windowId=N&tabIndex=N]`
 
 Возвращает `document.documentElement.outerHTML` как `text/html`.
@@ -252,6 +416,23 @@ Window-mode требует, чтобы окно было в состоянии `
 chrome health
 chrome profiles
 chrome session [--profile <directory>]
+chrome targets
+chrome new-target      [--url <url>]
+chrome activate-target --target <id>
+chrome close-target    --target <id>
+chrome navigate        --target <id> --url <url>
+chrome reload          --target <id> [--hard]
+chrome back            --target <id>
+chrome forward         --target <id>
+chrome eval            --target <id> --js "<code>"
+chrome source          --target <id>
+chrome text            --target <id>
+chrome capture         --target <id> [--out <path>] [--full-page] [--caption <text>]
+chrome performance     --target <id>
+chrome trace           --target <id> [--duration <ms>] [--out <path>]
+chrome command         --target <id> --method <Domain.method> [--params <json>]
+
+# system UI / AppleScript
 chrome windows
 chrome tabs [--window <id>]
 chrome active

@@ -22,7 +22,7 @@ describe("ai-macos MCP server", () => {
   test("advertises tools and reaches the running local services", async () => {
     transport = new StdioClientTransport({
       command: process.execPath,
-      args: ["src/index.ts"],
+      args: ["src/launcher.ts"],
       cwd: new URL("..", import.meta.url).pathname,
     })
     const client = new Client({ name: "ai-macos-test", version: "0.1.0" })

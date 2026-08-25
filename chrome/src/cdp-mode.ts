@@ -27,22 +27,323 @@ export async function isCdpAvailable(): Promise<boolean> {
   return (await detectCdp()).available
 }
 
-/**
- * Find a CDP target matching a tab from AppleScript listWindows.
- * Match by exact URL — most reliable cross-window.
- */
-export async function findTargetByUrl(url: string): Promise<CdpTarget | null> {
-  try {
-    const targets = await cdp.list()
-    return targets.find((t) => t.type === "page" && t.url === url) ?? null
-  } catch {
-    return null
+export type CdpTargetSummary = Omit<CdpTarget, "id" | "webSocketDebuggerUrl"> & {
+  targetId: string
+}
+
+export class CdpTargetSelectionError extends Error {
+  constructor(
+    message: string,
+    readonly status: 404 | 409 | 503,
+  ) {
+    super(message)
+    this.name = "CdpTargetSelectionError"
   }
+}
+
+export function summarizeCdpTarget(target: CdpTarget): CdpTargetSummary {
+  return {
+    targetId: target.id,
+    type: target.type,
+    title: target.title,
+    url: target.url,
+    ...(target.description === undefined ? {} : { description: target.description }),
+    ...(target.faviconUrl === undefined ? {} : { faviconUrl: target.faviconUrl }),
+  }
+}
+
+export function selectCdpTarget(
+  targets: readonly CdpTarget[],
+  selector: { targetId?: string; url?: string },
+): CdpTarget | null {
+  if (selector.targetId) {
+    const target = targets.find((candidate) => candidate.id === selector.targetId)
+    if (!target) {
+      throw new CdpTargetSelectionError(`CDP target not found: ${selector.targetId}`, 404)
+    }
+    return target
+  }
+  if (!selector.url) return null
+  const matches = targets.filter((target) => target.type === "page" && target.url === selector.url)
+  if (matches.length > 1) {
+    throw new CdpTargetSelectionError(
+      `CDP target is ambiguous for URL: ${selector.url}; pass targetId from GET /cdp/targets`,
+      409,
+    )
+  }
+  return matches[0] ?? null
+}
+
+async function cdpTargets(): Promise<CdpTarget[]> {
+  try {
+    return await cdp.list()
+  } catch (error) {
+    throw new CdpTargetSelectionError(
+      `CDP unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      503,
+    )
+  }
+}
+
+export async function listCdpTargets(type: string | null = "page"): Promise<CdpTargetSummary[]> {
+  const targets = await cdpTargets()
+  return targets
+    .filter((target) => type === null || target.type === type)
+    .map(summarizeCdpTarget)
+}
+
+export async function findTargetById(targetId: string): Promise<CdpTarget> {
+  return selectCdpTarget(await cdpTargets(), { targetId })!
+}
+
+export async function newCdpTarget(url = "about:blank"): Promise<CdpTargetSummary> {
+  try {
+    return summarizeCdpTarget(await cdp.newTab(url))
+  } catch (error) {
+    throw new CdpTargetSelectionError(
+      `Could not create CDP target: ${error instanceof Error ? error.message : String(error)}`,
+      503,
+    )
+  }
+}
+
+export async function activateCdpTarget(targetId: string): Promise<void> {
+  await findTargetById(targetId)
+  await cdp.activateTab(targetId)
+}
+
+export async function closeCdpTarget(targetId: string): Promise<void> {
+  await findTargetById(targetId)
+  await cdp.closeTab(targetId)
+}
+
+/** URL matching exists only for the AppleScript fallback surface. Agent workflows use targetId. */
+export async function findTargetByUrl(url: string): Promise<CdpTarget | null> {
+  return selectCdpTarget(await cdpTargets(), { url })
+}
+
+export async function cdpCommand(
+  target: CdpTarget,
+  method: string,
+  params: Record<string, unknown> = {},
+  timeoutMs = 10_000,
+): Promise<unknown> {
+  if (!/^[A-Za-z][A-Za-z0-9]*\.[A-Za-z][A-Za-z0-9]*$/.test(method)) {
+    throw new Error(`Invalid CDP method: ${method}`)
+  }
+  const boundedTimeout = Math.max(100, Math.min(Math.round(timeoutMs), 30_000))
+  return await withSession(target, async (session) => {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    try {
+      return await Promise.race([
+        session.send(method, params),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`CDP ${method} timed out after ${boundedTimeout}ms`)), boundedTimeout)
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  })
+}
+
+export type CdpPerformanceSnapshot = {
+  targetId: string
+  capturedAt: string
+  metrics: Record<string, number>
+  domCounters: { documents: number; nodes: number; jsEventListeners: number } | null
+  page: {
+    url: string
+    title: string
+    visibilityState: string
+    devicePixelRatio: number
+    viewport: { width: number; height: number }
+  } | null
+}
+
+export async function cdpPerformanceSnapshot(target: CdpTarget): Promise<CdpPerformanceSnapshot> {
+  return await withSession(target, async (session) => {
+    await session.send("Performance.enable")
+    const raw = await session.send<{ metrics: Array<{ name: string; value: number }> }>("Performance.getMetrics")
+    const domCounters = await session.send<{ documents: number; nodes: number; jsEventListeners: number }>(
+      "Memory.getDOMCounters",
+    ).catch(() => null)
+    const evaluated = await session.send<{
+      result: { value?: CdpPerformanceSnapshot["page"] }
+    }>("Runtime.evaluate", {
+      expression: `({
+        url: location.href,
+        title: document.title,
+        visibilityState: document.visibilityState,
+        devicePixelRatio,
+        viewport: {width: innerWidth, height: innerHeight}
+      })`,
+      returnByValue: true,
+    }).catch(() => null)
+    return {
+      targetId: target.id,
+      capturedAt: new Date().toISOString(),
+      metrics: Object.fromEntries(raw.metrics.map((metric) => [metric.name, metric.value])),
+      domCounters,
+      page: evaluated?.result.value ?? null,
+    }
+  })
+}
+
+export type CdpScreenshotOptions = {
+  format?: "png" | "jpeg" | "webp"
+  quality?: number
+  fullPage?: boolean
+}
+
+export async function cdpCaptureScreenshot(
+  target: CdpTarget,
+  options: CdpScreenshotOptions = {},
+): Promise<{ data: string; contentType: string }> {
+  return await withSession(target, async (session) => {
+    await session.send("Page.enable")
+    const format = options.format ?? "png"
+    const params: Record<string, unknown> = {
+      format,
+      fromSurface: true,
+      captureBeyondViewport: options.fullPage === true,
+    }
+    if (format !== "png" && options.quality !== undefined) {
+      params.quality = Math.max(0, Math.min(Math.round(options.quality), 100))
+    }
+    if (options.fullPage) {
+      const metrics = await session.send<{
+        cssContentSize?: { x: number; y: number; width: number; height: number }
+        contentSize?: { x: number; y: number; width: number; height: number }
+      }>("Page.getLayoutMetrics")
+      const size = metrics.cssContentSize ?? metrics.contentSize
+      if (size) {
+        params.clip = {
+          x: size.x,
+          y: size.y,
+          width: Math.max(1, Math.ceil(size.width)),
+          height: Math.max(1, Math.ceil(size.height)),
+          scale: 1,
+        }
+      }
+    }
+    const result = await session.send<{ data: string }>("Page.captureScreenshot", params)
+    return { data: result.data, contentType: `image/${format}` }
+  })
+}
+
+export type CdpTraceOptions = {
+  durationMs?: number
+  categories?: string[]
+  maxBytes?: number
+}
+
+export type CdpTraceResult = {
+  targetId: string
+  durationMs: number
+  categories: string[]
+  bytes: number
+  data: string
+}
+
+const DEFAULT_TRACE_CATEGORIES = ["*"]
+
+export async function cdpTrace(target: CdpTarget, options: CdpTraceOptions = {}): Promise<CdpTraceResult> {
+  const durationMs = Math.max(100, Math.min(Math.round(options.durationMs ?? 1_000), 30_000))
+  const categories = (options.categories?.length ? options.categories : DEFAULT_TRACE_CATEGORIES)
+    .map((category) => category.trim())
+    .filter(Boolean)
+    .slice(0, 64)
+  const maxBytes = Math.max(1_000_000, Math.min(Math.round(options.maxBytes ?? 50_000_000), 100_000_000))
+
+  const browser = await cdp.version().catch((error) => {
+    throw new CdpTargetSelectionError(
+      `CDP browser endpoint unavailable: ${error instanceof Error ? error.message : String(error)}`,
+      503,
+    )
+  })
+  if (!browser.webSocketDebuggerUrl) {
+    throw new CdpTargetSelectionError("CDP browser WebSocket endpoint is unavailable", 503)
+  }
+  const tracingTarget: CdpTarget = {
+    ...target,
+    webSocketDebuggerUrl: browser.webSocketDebuggerUrl,
+  }
+
+  return await withSession(tracingTarget, async (session) => {
+    const ws = (session as unknown as { ws: WebSocket }).ws
+    let resolveComplete!: (stream: string) => void
+    let rejectComplete!: (error: Error) => void
+    const complete = new Promise<string>((resolve, reject) => {
+      resolveComplete = resolve
+      rejectComplete = reject
+    })
+    const onMessage = (event: MessageEvent) => {
+      try {
+        const message = JSON.parse(String(event.data)) as {
+          method?: string
+          params?: { stream?: string }
+        }
+        if (message.method !== "Tracing.tracingComplete") return
+        const stream = message.params?.stream
+        if (stream) resolveComplete(stream)
+        else rejectComplete(new Error("CDP trace completed without a stream"))
+      } catch {}
+    }
+    ws.addEventListener("message", onMessage)
+    let started = false
+    try {
+      await session.send("Tracing.start", {
+        transferMode: "ReturnAsStream",
+        traceConfig: {
+          recordMode: "recordContinuously",
+          includedCategories: categories,
+        },
+      })
+      started = true
+      await new Promise((resolve) => setTimeout(resolve, durationMs))
+      let completionTimer: ReturnType<typeof setTimeout> | null = null
+      const streamPromise = Promise.race([
+        complete,
+        new Promise<never>((_, reject) => {
+          completionTimer = setTimeout(() => reject(new Error("CDP trace completion timed out")), 10_000)
+        }),
+      ]).finally(() => {
+        if (completionTimer) clearTimeout(completionTimer)
+      })
+      await session.send("Tracing.end")
+      started = false
+      const stream = await streamPromise
+      const chunks: string[] = []
+      let bytes = 0
+      try {
+        while (true) {
+          const chunk = await session.send<{ data: string; base64Encoded?: boolean; eof?: boolean }>("IO.read", {
+            handle: stream,
+            size: 1_000_000,
+          })
+          const text = chunk.base64Encoded
+            ? Buffer.from(chunk.data, "base64").toString("utf8")
+            : chunk.data
+          bytes += Buffer.byteLength(text)
+          if (bytes > maxBytes) throw new Error(`CDP trace exceeds maxBytes=${maxBytes}`)
+          chunks.push(text)
+          if (chunk.eof) break
+        }
+      } finally {
+        await session.send("IO.close", { handle: stream }).catch(() => {})
+      }
+      return { targetId: target.id, durationMs, categories, bytes, data: chunks.join("") }
+    } finally {
+      ws.removeEventListener("message", onMessage)
+      if (started) await session.send("Tracing.end").catch(() => {})
+    }
+  })
 }
 
 export async function cdpEval(target: CdpTarget, js: string): Promise<string> {
   return await withSession(target, async (s) => {
-    const wrapped = `(function(){try{var __r=(function(){${js}})();return (typeof __r==='undefined')?'':(typeof __r==='string'?__r:JSON.stringify(__r));}catch(e){throw e;}})()`
+    const wrapped = `(async function(){try{var __r=await (async function(){${js}})();return (typeof __r==='undefined')?'':(typeof __r==='string'?__r:JSON.stringify(__r));}catch(e){throw e;}})()`
     const result = await s.send<{
       result: { value?: string }
       exceptionDetails?: { text?: string; exception?: { description?: string } }
@@ -173,6 +474,29 @@ export async function cdpReload(
     await loaded!
     const ready = await waitOnSession(s, waitOpts)
     return { waitMs: Date.now() - t0, ready }
+  })
+}
+
+export async function cdpHistory(
+  target: CdpTarget,
+  direction: -1 | 1,
+  wait = true,
+  waitOpts: WaitReadyOptions = {},
+): Promise<{ navigated: boolean; waitMs: number; ready?: WaitReadyResult }> {
+  return await withSession(target, async (session) => {
+    await session.send("Page.enable")
+    const history = await session.send<{
+      currentIndex: number
+      entries: Array<{ id: number }>
+    }>("Page.getNavigationHistory")
+    const entry = history.entries[history.currentIndex + direction]
+    if (!entry) return { navigated: false, waitMs: 0 }
+    const startedAt = Date.now()
+    await session.send("Page.navigateToHistoryEntry", { entryId: entry.id })
+    if (!wait) return { navigated: true, waitMs: 0 }
+    await new Promise((resolve) => setTimeout(resolve, 100))
+    const ready = await waitOnSession(session, waitOpts)
+    return { navigated: true, waitMs: Date.now() - startedAt, ready }
   })
 }
 
