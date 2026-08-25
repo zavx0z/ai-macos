@@ -3,6 +3,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod"
 import { installProcessDiagnostics } from "./process-diagnostics.ts"
 import { SCREENSHOT_UI_DOMAIN, SCREENSHOT_UI_URI, screenshotUiHtml } from "./screenshot-ui.ts"
+import { windowLocalPointToScreen } from "./window-coordinates.ts"
 
 const diagnostics = installProcessDiagnostics("ai-macos-mcp")
 const WINDOW_API = Bun.env.WINDOW_API ?? "http://127.0.0.1:7878"
@@ -241,6 +242,16 @@ async function capture(path: "/desktop" | "/window", body: JsonObject) {
   if (typeof data !== "string") throw new Error(`Screenshot response from ${path} did not include base64 data`)
 
   const { base64: _base64, ...metadata } = result
+  if (path === "/window") {
+    const window = parseWindowInfo(result.window, "Window capture")
+    metadata.coordinateSpace = {
+      type: "window-local",
+      origin: "top-left",
+      width: window.width,
+      height: window.height,
+      screenOffset: {x: window.x, y: window.y},
+    }
+  }
   latestScreenshot = {
     version: ++latestScreenshotVersion,
     data,
@@ -306,6 +317,13 @@ const screenshotOutputSchema = {
     ok: z.boolean(),
     app: z.string().nullable(),
     error: z.string().optional(),
+  }).optional(),
+  coordinateSpace: z.object({
+    type: z.literal("window-local"),
+    origin: z.literal("top-left"),
+    width: z.number(),
+    height: z.number(),
+    screenOffset: z.object({x: z.number(), y: z.number()}),
   }).optional(),
 }
 
@@ -560,11 +578,11 @@ server.registerTool(
   "mouse_click",
   {
     title: "Click the mouse",
-    description: "Focus a verified visible target and click coordinates inside that target window. Rejects missing targets and out-of-window coordinates.",
+    description: "Focus a verified visible target and click window-local logical coordinates measured from that window's top-left corner. Converts them to screen coordinates and rejects missing targets or out-of-window points.",
     inputSchema: {
       ...windowTargetInputSchema,
-      x: z.number(),
-      y: z.number(),
+      x: z.number().describe("Window-local logical x coordinate measured from the target window's left edge"),
+      y: z.number().describe("Window-local logical y coordinate measured from the target window's top edge"),
       button: z.enum(["left", "right", "middle"]).default("left"),
       count: z.number().int().min(1).max(3).default(1),
     },
@@ -573,16 +591,18 @@ server.registerTool(
   async ({ app, index, title, x, y, button, count }) => {
     const focused = await focusVisibleWindow(app, index, title)
     const target = focused.target
-    if (x < target.x || y < target.y || x >= target.x + target.width || y >= target.y + target.height) {
-      throw new Error(`Refusing click outside verified ${target.app} window bounds (${target.x},${target.y})–(${target.x + target.width},${target.y + target.height})`)
-    }
-    const input = await requestJson(INPUT_API, "/mouse/click", { method: "POST", body: { x, y, button, count } })
+    const screenPoint = windowLocalPointToScreen(target, {x, y})
+    const input = await requestJson(INPUT_API, "/mouse/click", {
+      method: "POST",
+      body: {...screenPoint, button, count},
+    })
     const frontmostAfterInput = await requestJson(WINDOW_API, "/frontmost")
     return textResult({
       ok: true,
       delivered: true,
       effectVerified: false,
-      action: `Clicked ${button} at (${x}, ${y})`,
+      action: `Clicked ${button} at window-local (${x}, ${y})`,
+      coordinates: {windowLocal: {x, y}, screen: screenPoint},
       target,
       frontmostBeforeInput: focused.result.frontmost,
       frontmostAfterInput,

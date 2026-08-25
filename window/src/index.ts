@@ -1,4 +1,5 @@
 import { checkAccessibility, focusApp, getFocusedWindow, getFrontmostApp, getScreen, listWindows, moveWindow, raiseWindow, resizeWindow } from "./windows.ts";
+import { isFocusedSheet } from "./focus.ts"
 import { listPins, startPin, stopAllPins, stopPin } from "./pin.ts";
 import { err, json, logRequest, printBanner } from "@meta/shared";
 
@@ -96,7 +97,13 @@ const server = Bun.serve({
           && focusedWindow.y === target.y
           && focusedWindow.width === target.width
           && focusedWindow.height === target.height;
-        if (!targetMatchesFocusedWindow) {
+        const targetOwnsFocusedSheet = focusedWindow && isFocusedSheet(target, focusedWindow)
+        const targetHasUnreportedModal = !focusedWindow
+          && previousFrontmost.app.toLowerCase() === target.app.toLowerCase()
+          && previousFrontmost.pid === target.pid
+          && frontmost.app.toLowerCase() === target.app.toLowerCase()
+          && frontmost.pid === target.pid
+        if (!targetMatchesFocusedWindow && !targetOwnsFocusedSheet && !targetHasUnreportedModal) {
           if (previousWindow) {
             const previousNow = (await listWindows()).find((window) =>
               window.pid === previousWindow.pid
@@ -121,8 +128,10 @@ const server = Bun.serve({
         }
         return json({
           ok: true,
-          target: focusedWindow,
+          target,
           frontmost: { ...frontmost, window: focusedWindow },
+          focusedSheet: targetOwnsFocusedSheet ? focusedWindow : null,
+          unreportedModal: targetHasUnreportedModal,
           previous: { ...previousFrontmost, window: previousWindow },
         });
       }
