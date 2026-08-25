@@ -1,4 +1,12 @@
 interface:
   display_name: "ai-macos"
-  short_description: "Control local macOS apps through REST APIs"
-  default_prompt: "Use $ai-macos to inspect the current desktop and complete the requested UI action safely."
+  short_description: "Control visible macOS apps through direct MCP"
+  default_prompt: "Use $ai-macos to inspect the visible target through direct MCP and complete the requested UI action safely."
+dependencies:
+  tools:
+    - type: "mcp"
+      value: "ai-macos"
+      description: "Direct local ai-macos MCP server configured in Codex"
+      transport: "stdio"
+policy:
+  allow_implicit_invocation: true
