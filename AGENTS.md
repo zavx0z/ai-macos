@@ -7,7 +7,7 @@ Bun monorepo. Пять пакетов:
 | Пакет           | Порт | Назначение                                                      |
 | --------------- | ---- | --------------------------------------------------------------- |
 | `@meta/shared`  | —    | Общие утилиты                                                   |
-| `@meta/window`  | 7878 | Окна macOS (Accessibility)                                      |
+| `@meta/window`  | 7878 | Окна macOS через PID-aware native Accessibility helper          |
 | `@meta/screen`  | 7879 | Скриншоты (`screencapture`)                                     |
 | `@meta/chrome`  | 7880 | Десктопный Chrome (CDP-native agent API + системные окна macOS) |
 | `@meta/android` | 7881 | Chrome на Android (ADB + CDP)                                   |
@@ -27,7 +27,7 @@ bun run dev      # все сервисы параллельно с --hot
 отдельной явной просьбе пользователя.
 
 ```bash
-# Accessibility — нужно для window: move/resize/arrange/list/raise/pin
+# Accessibility — один grant meta-input-helper для window и input
 curl http://localhost:7878/permissions/accessibility          # GET: { granted: true|false }
 curl -X POST http://localhost:7878/permissions/accessibility  # POST: { granted, opened: true }
 
@@ -52,9 +52,11 @@ curl "http://localhost:7878/windows"
 curl "http://localhost:7878/windows?app=Google%20Chrome"
 # → { count: N, windows: [{ app, pid, index, title, x, y, width, height }] }
 
-# Фокус (не требует Accessibility)
+# pid — часть identity; передавайте его при одноимённых процессах
+
+# Фокус уже видимого окна через exact PID native helper
 curl -X POST http://localhost:7878/focus \
-  -H 'content-type: application/json' -d '{"app":"Google Chrome"}'
+  -H 'content-type: application/json' -d '{"app":"Google Chrome","pid":85565,"index":1}'
 
 # Переместить / изменить размер
 curl -X POST http://localhost:7878/move   -H 'content-type: application/json' -d '{"app":"iTerm2","x":960,"y":600}'
@@ -352,7 +354,7 @@ curl -s -X POST http://localhost:7881/screenshot \
 
 ## @meta/input — порт 7882
 
-Клавиатура и мышь. HTTP API и вся логика реализованы на **Bun + TypeScript**. Единственный backend ввода — собираемый локально `input/bin/meta-input-helper`, который вызывает официальные CoreGraphics/Accessibility API. Python, `cliclick` и AppleScript не используются. Нужно один раз выдать **Accessibility** именно `meta-input-helper`; при отсутствии разрешения API закрывается с `503` и не сообщает ложный успех.
+Клавиатура, мышь и низкоуровневый PID-aware window backend. HTTP API и вся логика реализованы на **Bun + TypeScript**. Единственный native backend — собираемый локально `input/bin/meta-input-helper`, который вызывает официальные CoreGraphics/Accessibility/AppKit API. Python, `cliclick` и AppleScript не используются. Нужно один раз выдать **Accessibility** именно `meta-input-helper`; при отсутствии разрешения window/input API закрываются с ошибкой и не возвращают неполную инвентаризацию как успех.
 
 ```bash
 curl http://localhost:7882/status

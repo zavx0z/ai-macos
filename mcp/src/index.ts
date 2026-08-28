@@ -149,10 +149,14 @@ async function requireWindowCaptureServices(): Promise<void> {
   const nestedService = nestedWindow && typeof nestedWindow === "object"
     ? (nestedWindow as JsonObject)["service"]
     : undefined
+  const nestedOk = nestedWindow && typeof nestedWindow === "object"
+    ? (nestedWindow as JsonObject)["ok"]
+    : undefined
   if (
     screen["ok"] !== true
     || apiOrigin(screen["windowApi"]) !== apiOrigin(WINDOW_API)
     || nestedService !== "@meta/window"
+    || nestedOk !== true
   ) {
     throw new Error(`@meta/screen window adapter is incompatible: ${JSON.stringify(screen)}`)
   }
@@ -209,12 +213,12 @@ function windowFromResult(result: JsonObject): WindowInfo {
   return parseWindowInfo(result.target, "Verified focus response")
 }
 
-async function focusVisibleWindow(app: string, index?: number, title?: string) {
+async function focusVisibleWindow(app: string, pid?: number, index?: number, title?: string) {
   requireExpectedMachine()
   await requireCompatibleService(WINDOW_API, "/health", "@meta/window")
   const result = await requestJson(WINDOW_API, "/focus", {
     method: "POST",
-    body: { app, index, title },
+    body: { app, pid, index, title },
   })
   return { result, target: windowFromResult(result) }
 }
@@ -269,6 +273,7 @@ async function captureWindowData(target: WindowInfo, caption: string) {
     method: "POST",
     body: {
       app: target.app,
+      pid: target.pid,
       index: target.index,
       title: target.title || undefined,
       caption,
@@ -283,7 +288,7 @@ async function captureWindowData(target: WindowInfo, caption: string) {
   return { data, metadata }
 }
 
-type TargetedInputTarget = {app: string; index?: number; title?: string}
+type TargetedInputTarget = {app: string; pid?: number; index?: number; title?: string}
 type TargetedInputBody = JsonObject | ((target: WindowInfo) => JsonObject)
 
 let desktopMutationActive = false
@@ -332,7 +337,12 @@ async function runTargetedInput(
   requireExpectedMachine()
   await requireCompatibleService(INPUT_API, "/status", "@meta/input")
   await requireWindowCaptureServices()
-  const focused = await focusVisibleWindow(targetInput.app, targetInput.index, targetInput.title)
+  const focused = await focusVisibleWindow(
+    targetInput.app,
+    targetInput.pid,
+    targetInput.index,
+    targetInput.title,
+  )
   let dispatchStarted = false
   let input: JsonObject | undefined
   let frontmostAfterInput: JsonObject | undefined
@@ -450,6 +460,7 @@ async function runTargetedInput(
 
 const windowTargetInputSchema = {
   app: z.string().min(1).describe("Canonical process name. A sole visible window is selected automatically; a missing or ambiguous target is rejected before input"),
+  pid: z.number().int().positive().optional().describe("Exact process ID returned by list_windows; use it when multiple processes share one app name"),
   index: z.number().int().positive().optional().describe("Only needed to disambiguate multiple visible windows; use the index returned in the rejection or list_windows"),
   title: z.string().min(1).optional().describe("Optional title substring to disambiguate multiple visible windows"),
 }
@@ -684,6 +695,7 @@ server.registerTool(
     description: "Take a medium-detail screenshot of a specific visible window for model vision and update the latest frame consumed by the separate PiP viewer. The screen adapter may temporarily raise the exact target and restores the previous focus afterward. Use list_windows first to identify the canonical app name.",
     inputSchema: {
       app: z.string().min(1).describe("Canonical macOS process name from list_windows"),
+      pid: z.number().int().positive().optional().describe("Exact process ID from list_windows"),
       index: z.number().int().positive().optional(),
       title: z.string().min(1).optional().describe("Optional window-title substring"),
       caption: z.string().min(1).describe("One sentence describing what should be visible"),
@@ -695,9 +707,9 @@ server.registerTool(
       "openai/toolInvocation/invoked": "Window captured.",
     },
   },
-  async ({ app, index, title, caption }) => await withDesktopMutation(
+  async ({ app, pid, index, title, caption }) => await withDesktopMutation(
     "capture_window",
-    async () => await capture("/window", {app, index, title, caption}),
+    async () => await capture("/window", {app, pid, index, title, caption}),
   ),
 )
 
@@ -805,10 +817,10 @@ server.registerTool(
     inputSchema: windowTargetInputSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
-  async ({ app, index, title }) => await withDesktopMutation(
+  async ({ app, pid, index, title }) => await withDesktopMutation(
     "focus_window",
     async () => textResult(
-      (await focusVisibleWindow(app, index, title)).result,
+      (await focusVisibleWindow(app, pid, index, title)).result,
       `Focused and verified visible target ${app}`,
     ),
   ),
@@ -821,16 +833,17 @@ server.registerTool(
     description: "Move and resize a visible application window using a named layout preset.",
     inputSchema: {
       app: z.string().min(1),
+      pid: z.number().int().positive().optional(),
       index: z.number().int().positive().optional(),
       preset: z.enum(["left", "right", "top", "bottom", "max", "center"]),
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
-  async ({ app, index, preset }) => await withDesktopMutation("arrange_window", async () => {
+  async ({ app, pid, index, preset }) => await withDesktopMutation("arrange_window", async () => {
     requireExpectedMachine()
     await requireCompatibleService(WINDOW_API, "/health", "@meta/window")
     return textResult(
-      await requestJson(WINDOW_API, "/arrange", { method: "POST", body: { app, index, preset } }),
+      await requestJson(WINDOW_API, "/arrange", { method: "POST", body: { app, pid, index, preset } }),
       `Arranged ${app}`,
     )
   }),
@@ -883,8 +896,8 @@ server.registerTool(
     },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
-  async ({ app, index, title, x, y, button, count }) => targetedInput(
-    {app, index, title},
+  async ({ app, pid, index, title, x, y, button, count }) => targetedInput(
+    {app, pid, index, title},
     "/mouse/click",
     (target) => ({...windowLocalPointToScreen(target, {x, y}), button, count}),
     `Clicked ${button} at window-local (${x}, ${y})`,
@@ -900,10 +913,15 @@ server.registerTool(
     inputSchema: { ...windowTargetInputSchema, dx: z.number().optional(), dy: z.number().optional() },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
-  async ({ app, index, title, dx, dy }) => targetedInput(
-    { app, index, title },
+  async ({ app, pid, index, title, dx, dy }) => targetedInput(
+    { app, pid, index, title },
     "/mouse/scroll",
-    { dx, dy },
+    (target) => ({
+      dx,
+      dy,
+      x: target.x + target.width / 2,
+      y: target.y + target.height / 2,
+    }),
     `Scrolled dx=${dx ?? 0}, dy=${dy ?? 0}`,
   ),
 )
@@ -920,10 +938,10 @@ server.registerTool(
     },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: true },
   },
-  async ({ app, index, title, text, delayMs }) => {
+  async ({ app, pid, index, title, text, delayMs }) => {
     validateTypingRequest(text, delayMs)
     return await targetedInput(
-      {app, index, title},
+      {app, pid, index, title},
       "/keyboard/type",
       {text, delayMs},
       `Typed ${text.length} characters`,
@@ -945,8 +963,8 @@ server.registerTool(
     },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
-  async ({ app, index, title, key, modifiers }) => targetedInput(
-    { app, index, title },
+  async ({ app, pid, index, title, key, modifiers }) => targetedInput(
+    { app, pid, index, title },
     "/keyboard/key",
     { key, modifiers },
     `Pressed ${[...modifiers, key].join("+")}`,
@@ -961,8 +979,8 @@ server.registerTool(
     inputSchema: { ...windowTargetInputSchema, shortcut: z.string().min(1) },
     annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
   },
-  async ({ app, index, title, shortcut }) => targetedInput(
-    { app, index, title },
+  async ({ app, pid, index, title, shortcut }) => targetedInput(
+    { app, pid, index, title },
     "/keyboard/shortcut",
     { shortcut },
     `Pressed ${shortcut}`,

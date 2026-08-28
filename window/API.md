@@ -81,7 +81,7 @@ Activity Monitor). Голосовой слой должен подставлят
 Проверка живости.
 
 - Параметры: нет
-- Ответ: `{ "ok": true }`
+- Ответ: `{ "ok": true, "service": "@meta/window", "backend": "meta-input-helper", "accessibility": { "granted": true } }`
 
 ```bash
 curl -s http://localhost:7878/health
@@ -135,18 +135,20 @@ curl -s "http://localhost:7878/windows?app=Safari" | jq '.windows[].title'
 
 Голос: «какие окна открыты», «покажи окна Safari».
 
-> Требует Accessibility-разрешения у процесса, запустившего `bun`.
-> Без него `count` всегда `0`.
+> Использует подписанный `input/bin/meta-input-helper`. Без его Accessibility
+> endpoint закрывается с ошибкой: неполный список больше не возвращается как
+> успех. `pid` является частью identity и нужен для точного выбора между
+> одноимёнными процессами, например обычным и CDP Chrome.
 
 ---
 
 ### 4.4 `POST /focus`
 
-Активация приложения (выводит в фронт). **Не требует Accessibility.**
+Активация уже видимого точного окна через native helper.
 
-- Body: `{ "app": string }`
-- Ответ: `{ "ok": true }`
-- Ошибки: `400 missing 'app'`, `500` если приложение не запущено
+- Body: `{ "app": string, "pid"?: number, "index"?: number, "title"?: string }`
+- Ответ: `{ "ok": true, "target": {...}, "frontmost": {...}, "previous": {...} }`
+- Ошибки: `400 missing 'app'`, `404` если видимого окна нет, `409` при неоднозначном target или неуспешной проверке фокуса
 
 ```bash
 curl -s -X POST -H 'content-type: application/json' \

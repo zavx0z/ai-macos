@@ -69,11 +69,17 @@ export async function drag(opts: {
 export async function scroll(opts: {
   dx?: number
   dy?: number
+  x?: number
+  y?: number
 }): Promise<{ via: "native-helper" }> {
-  await nativeCommand(helper(), [
+  const args = [
     "scroll",
     String(opts.dx ?? 0),
     String(opts.dy ?? 0),
-  ])
+  ]
+  if (opts.x !== undefined && opts.y !== undefined) {
+    args.push(String(opts.x), String(opts.y))
+  }
+  await nativeCommand(helper(), args)
   return { via: "native-helper" }
 }

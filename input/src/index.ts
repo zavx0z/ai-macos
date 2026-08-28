@@ -21,6 +21,16 @@ import {
   setKeyboardNativeHelper,
   typeText,
 } from "./keyboard.ts"
+import {
+  focusNativeApplication,
+  focusNativeWindow,
+  getNativeFrontmost,
+  listNativeWindows,
+  moveNativeWindow,
+  raiseNativeWindow,
+  resizeNativeWindow,
+  setWindowNativeHelper,
+} from "./windows.ts"
 
 const PORT = Number(Bun.env.PORT ?? 7882)
 const AUTO_REQUEST_ACCESSIBILITY = Bun.env.INPUT_AUTO_REQUEST_ACCESSIBILITY === "true"
@@ -28,6 +38,7 @@ const AUTO_REQUEST_ACCESSIBILITY = Bun.env.INPUT_AUTO_REQUEST_ACCESSIBILITY === 
 let bootStatus: InputBootstrapStatus = await bootstrap(AUTO_REQUEST_ACCESSIBILITY)
 setNativeHelper(bootStatus.helper)
 setKeyboardNativeHelper(bootStatus.helper)
+setWindowNativeHelper(bootStatus.helper)
 
 async function requireAccessibility(): Promise<Response | null> {
   if (!bootStatus.helper) {
@@ -101,6 +112,7 @@ Bun.serve({
           bootStatus = await bootstrap(AUTO_REQUEST_ACCESSIBILITY)
           setNativeHelper(bootStatus.helper)
           setKeyboardNativeHelper(bootStatus.helper)
+          setWindowNativeHelper(bootStatus.helper)
           return json({ ok: bootStatus.accessibility, ...bootStatus })
         }
 
@@ -118,6 +130,7 @@ Bun.serve({
             bootStatus = await bootstrap(false)
             setNativeHelper(bootStatus.helper)
             setKeyboardNativeHelper(bootStatus.helper)
+            setWindowNativeHelper(bootStatus.helper)
           }
           const requested = bootStatus.helper
             ? await requestAccessibilityNow(bootStatus.helper)
@@ -157,6 +170,80 @@ Bun.serve({
           })
         }
 
+        // ─── Native window inventory and exact PID targeting ───────────
+        if (path === "/window/windows" && method === "GET") {
+          const denied = await requireAccessibility()
+          if (denied) return denied
+          const windows = await listNativeWindows()
+          return json({ ok: true, backend: "native-helper", count: windows.length, windows })
+        }
+
+        if (path === "/window/frontmost" && method === "GET") {
+          const denied = await requireAccessibility()
+          if (denied) return denied
+          return json({ ok: true, backend: "native-helper", ...(await getNativeFrontmost()) })
+        }
+
+        if (path === "/window/focus" && method === "POST") {
+          const denied = await requireAccessibility()
+          if (denied) return denied
+          const body = (await req.json()) as { pid?: number; index?: number }
+          if (!Number.isInteger(body.pid) || body.pid! <= 0 || !Number.isInteger(body.index) || body.index! <= 0) {
+            return err(400, "need positive integer {pid, index}")
+          }
+          await focusNativeWindow(body.pid!, body.index!)
+          return json({ ok: true, backend: "native-helper", pid: body.pid, index: body.index })
+        }
+
+        if (path === "/window/focus-app" && method === "POST") {
+          const denied = await requireAccessibility()
+          if (denied) return denied
+          const body = (await req.json()) as { pid?: number }
+          if (!Number.isInteger(body.pid) || body.pid! <= 0) {
+            return err(400, "need positive integer {pid}")
+          }
+          await focusNativeApplication(body.pid!)
+          return json({ ok: true, backend: "native-helper", pid: body.pid })
+        }
+
+        if (path === "/window/raise" && method === "POST") {
+          const denied = await requireAccessibility()
+          if (denied) return denied
+          const body = (await req.json()) as { pid?: number; index?: number }
+          if (!Number.isInteger(body.pid) || body.pid! <= 0 || !Number.isInteger(body.index) || body.index! <= 0) {
+            return err(400, "need positive integer {pid, index}")
+          }
+          await raiseNativeWindow(body.pid!, body.index!)
+          return json({ ok: true, backend: "native-helper", pid: body.pid, index: body.index })
+        }
+
+        if (path === "/window/move" && method === "POST") {
+          const denied = await requireAccessibility()
+          if (denied) return denied
+          const body = (await req.json()) as { pid?: number; index?: number; x?: number; y?: number }
+          if (
+            !Number.isInteger(body.pid) || body.pid! <= 0
+            || !Number.isInteger(body.index) || body.index! <= 0
+            || !Number.isFinite(body.x) || !Number.isFinite(body.y)
+          ) return err(400, "need {pid, index, x, y}")
+          await moveNativeWindow(body.pid!, body.index!, body.x!, body.y!)
+          return json({ ok: true, backend: "native-helper", pid: body.pid, index: body.index })
+        }
+
+        if (path === "/window/resize" && method === "POST") {
+          const denied = await requireAccessibility()
+          if (denied) return denied
+          const body = (await req.json()) as { pid?: number; index?: number; width?: number; height?: number }
+          if (
+            !Number.isInteger(body.pid) || body.pid! <= 0
+            || !Number.isInteger(body.index) || body.index! <= 0
+            || !Number.isFinite(body.width) || body.width! <= 0
+            || !Number.isFinite(body.height) || body.height! <= 0
+          ) return err(400, "need positive {pid, index, width, height}")
+          await resizeNativeWindow(body.pid!, body.index!, body.width!, body.height!)
+          return json({ ok: true, backend: "native-helper", pid: body.pid, index: body.index })
+        }
+
         // ─── Mouse ───────────────────────────────────────────────────────
         if (path === "/mouse/position" && method === "GET") {
           const denied = await requireAccessibility()
@@ -193,7 +280,7 @@ Bun.serve({
         if (path === "/mouse/scroll" && method === "POST") {
           const denied = await requireAccessibility()
           if (denied) return denied
-          const body = (await req.json()) as { dx?: number; dy?: number }
+          const body = (await req.json()) as { dx?: number; dy?: number; x?: number; y?: number }
           const r = await scroll(body)
           return json({ ok: true, ...r })
         }
@@ -242,7 +329,7 @@ Bun.serve({
         }
 
         return err(404, `${method} ${path} not found`,
-          "Маршруты: GET /status /health /clipboard /mouse/position; POST /clipboard /mouse/{move,click,drag,scroll} /keyboard/{type,key,shortcut} /bootstrap")
+          "Маршруты: GET /status /health /clipboard /window/{windows,frontmost} /mouse/position; POST /clipboard /window/{focus,focus-app,raise,move,resize} /mouse/{move,click,drag,scroll} /keyboard/{type,key,shortcut} /bootstrap")
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
         if (e instanceof NativeInputError && e.code === 77) {
@@ -273,6 +360,15 @@ printBanner("@meta/input", PORT, [
     { method: "POST", path: "/mouse/click",    description: "клик  ({x?,y?,button?,count?})" },
     { method: "POST", path: "/mouse/drag",     description: "drag  ({from,to,durationMs?})" },
     { method: "POST", path: "/mouse/scroll",   description: "прокрутка  ({dx?,dy?})" },
+  ]},
+  { title: "Окна через native helper", routes: [
+    { method: "GET",  path: "/window/windows",   description: "видимые окна с точным PID" },
+    { method: "GET",  path: "/window/frontmost", description: "активное приложение и окно" },
+    { method: "POST", path: "/window/focus",     description: "фокус точного окна ({pid,index})" },
+    { method: "POST", path: "/window/focus-app", description: "фокус приложения ({pid})" },
+    { method: "POST", path: "/window/raise",     description: "поднять точное окно ({pid,index})" },
+    { method: "POST", path: "/window/move",      description: "переместить ({pid,index,x,y})" },
+    { method: "POST", path: "/window/resize",    description: "изменить размер ({pid,index,width,height})" },
   ]},
   { title: "Системный буфер обмена", routes: [
     { method: "GET",  path: "/clipboard", description: "прочитать текст через pbpaste" },

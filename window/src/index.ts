@@ -1,4 +1,4 @@
-import { checkAccessibility, focusApp, getFocusedWindow, getFrontmostApp, getScreen, listWindows, moveWindow, raiseWindow, resizeWindow } from "./windows.ts";
+import { checkAccessibility, focusApplication, focusWindow, getFrontmostState, getScreen, listWindows, moveWindow, raiseWindow, requestAccessibility, resizeWindow } from "./windows.ts"
 import { isFocusedSheet } from "./focus.ts"
 import { listPins, startPin, stopAllPins, stopPin } from "./pin.ts";
 import { err, json, logRequest, printBanner } from "@meta/shared";
@@ -16,7 +16,15 @@ const server = Bun.serve({
 
     const res = await (async () => {
     try {
-      if (path === "/health") return json({ ok: true, service: "@meta/window" });
+      if (path === "/health") {
+        const accessibility = await checkAccessibility()
+        return json({
+          ok: accessibility.granted,
+          service: "@meta/window",
+          backend: "meta-input-helper",
+          accessibility,
+        })
+      }
 
       if (path === "/screen" && method === "GET") {
         return json(await getScreen());
@@ -30,7 +38,7 @@ const server = Bun.serve({
       }
 
       if (path === "/frontmost" && method === "GET") {
-        return json({ ...(await getFrontmostApp()), window: await getFocusedWindow() });
+        return json(await getFrontmostState())
       }
 
       if (path === "/focus" && method === "POST") {
@@ -45,8 +53,8 @@ const server = Bun.serve({
           height?: number;
         };
         if (!body.app) return err(400, "missing 'app'", "Укажите имя процесса macOS: {\"app\": \"Google Chrome\"}");
-        const previousFrontmost = await getFrontmostApp();
-        const previousWindow = await getFocusedWindow();
+        const previousFrontmost = await getFrontmostState()
+        const previousWindow = previousFrontmost.window
         const windows = (await listWindows()).filter((window) =>
           window.app.toLowerCase() === body.app!.toLowerCase()
           && (body.pid === undefined || window.pid === body.pid)
@@ -74,22 +82,22 @@ const server = Bun.serve({
         }
         const target = windows[0]!;
 
-        await raiseWindow(target.app, target.index);
-        await focusApp(target.app);
+        await raiseWindow(target.app, target.index, target.pid)
+        await focusWindow(target)
 
-        let frontmost = await getFrontmostApp();
-        for (let attempt = 0; attempt < 5 && frontmost.app.toLowerCase() !== target.app.toLowerCase(); attempt += 1) {
-          await Bun.sleep(40);
-          frontmost = await getFrontmostApp();
+        let frontmost = await getFrontmostState()
+        for (let attempt = 0; attempt < 5 && frontmost.pid !== target.pid; attempt += 1) {
+          await Bun.sleep(40)
+          frontmost = await getFrontmostState()
         }
-        if (frontmost.app.toLowerCase() !== target.app.toLowerCase()) {
+        if (frontmost.pid !== target.pid) {
           return err(
             409,
-            `focus verification failed: expected ${target.app}, got ${frontmost.app}`,
+            `focus verification failed: expected ${target.app} pid=${target.pid}, got ${frontmost.app} pid=${frontmost.pid}`,
             "Клавиатурный или мышиный ввод после этого ответа выполнять нельзя.",
           );
         }
-        const focusedWindow = await getFocusedWindow();
+        const focusedWindow = frontmost.window
         const targetMatchesFocusedWindow = focusedWindow
           && focusedWindow.pid === target.pid
           && focusedWindow.title === target.title
@@ -114,11 +122,11 @@ const server = Bun.serve({
               && window.height === previousWindow.height
             );
             if (previousNow) {
-              await raiseWindow(previousNow.app, previousNow.index);
-              await focusApp(previousNow.app);
+              await raiseWindow(previousNow.app, previousNow.index, previousNow.pid)
+              await focusWindow(previousNow)
             }
           } else {
-            await focusApp(previousFrontmost.app);
+            await focusApplication(previousFrontmost.pid)
           }
           return err(
             409,
@@ -137,24 +145,25 @@ const server = Bun.serve({
       }
 
       if (path === "/move" && method === "POST") {
-        const body = (await req.json()) as { app?: string; index?: number; x?: number; y?: number };
+        const body = (await req.json()) as { app?: string, pid?: number, index?: number, x?: number, y?: number }
         if (!body.app || body.x == null || body.y == null)
           return err(400, "need {app, x, y, index?}", "Пример: {\"app\":\"iTerm2\",\"x\":0,\"y\":0}");
-        await moveWindow(body.app, body.index ?? 1, body.x, body.y);
+        await moveWindow(body.app, body.index ?? 1, body.x, body.y, body.pid)
         return json({ ok: true });
       }
 
       if (path === "/resize" && method === "POST") {
-        const body = (await req.json()) as { app?: string; index?: number; width?: number; height?: number };
+        const body = (await req.json()) as { app?: string, pid?: number, index?: number, width?: number, height?: number }
         if (!body.app || body.width == null || body.height == null)
           return err(400, "need {app, width, height, index?}", "Пример: {\"app\":\"iTerm2\",\"width\":960,\"height\":600}");
-        await resizeWindow(body.app, body.index ?? 1, body.width, body.height);
+        await resizeWindow(body.app, body.index ?? 1, body.width, body.height, body.pid)
         return json({ ok: true });
       }
 
       if (path === "/arrange" && method === "POST") {
         const body = (await req.json()) as {
           app?: string;
+          pid?: number
           index?: number;
           preset?: "left" | "right" | "top" | "bottom" | "max" | "center";
         };
@@ -176,15 +185,15 @@ const server = Bun.serve({
         };
         const p = presets[body.preset];
         if (!p) return err(400, `unknown preset '${body.preset}'`, "Доступные пресеты: left | right | top | bottom | max | center");
-        await moveWindow(body.app, idx, p[0], p[1]);
-        await resizeWindow(body.app, idx, p[2], p[3]);
+        await moveWindow(body.app, idx, p[0], p[1], body.pid)
+        await resizeWindow(body.app, idx, p[2], p[3], body.pid)
         return json({ ok: true, applied: { x: p[0], y: p[1], width: p[2], height: p[3] } });
       }
 
       if (path === "/raise" && method === "POST") {
-        const body = (await req.json()) as { app?: string; index?: number };
+        const body = (await req.json()) as { app?: string, pid?: number, index?: number }
         if (!body.app) return err(400, "missing 'app'", "Укажите имя процесса macOS: {\"app\": \"Google Chrome\"}");
-        await raiseWindow(body.app, body.index ?? 1);
+        await raiseWindow(body.app, body.index ?? 1, body.pid)
         return json({ ok: true });
       }
 
@@ -217,9 +226,7 @@ const server = Bun.serve({
       }
 
       if (path === "/permissions/accessibility" && method === "POST") {
-        const proc = Bun.spawn(["open", "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"]);
-        await proc.exited;
-        return json({ ...(await checkAccessibility()), opened: true });
+        return json(await requestAccessibility())
       }
 
       return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /screen /windows /frontmost /pin, POST /focus /move /resize /arrange /raise /pin, DELETE /pin /pin/:id");

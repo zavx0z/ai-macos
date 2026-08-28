@@ -28,6 +28,12 @@ so a Codex MCP reconnect does not stop them. Service output is appended to
 
 Android remains opt-in and is not started by the desktop MCP launcher.
 
+Window discovery and targeting use the same signed native helper as input.
+`list_windows` returns exact process IDs, and every window-targeted MCP tool
+accepts optional `pid` in addition to the existing `app`/`index`/`title`
+selectors. Existing calls remain compatible; same-name processes fail closed
+until the caller selects an exact visible target.
+
 Typing requests are accepted only when their estimated duration is at most 30
 seconds. This is not a hard native-helper deadline. An accepted typing dispatch
 has no client-side REST timeout: MCP keeps the verified target focused and holds

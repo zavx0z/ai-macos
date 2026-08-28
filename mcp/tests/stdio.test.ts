@@ -8,6 +8,7 @@ let fakeClipboard = ""
 let fakeClickCount = 0
 let fakeClickStatus = 200
 let fakeClickDelayMs = 0
+let fakeScrollBody: Record<string, unknown> | null = null
 let fakeScreenFailure = false
 let fakeFocusApps: string[] = []
 let fakeRequestCount = 0
@@ -27,6 +28,7 @@ beforeEach(() => {
   fakeClickCount = 0
   fakeClickStatus = 200
   fakeClickDelayMs = 0
+  fakeScrollBody = null
   fakeScreenFailure = false
   fakeFocusApps = []
   fakeRequestCount = 0
@@ -180,6 +182,10 @@ beforeEach(() => {
         fakeClickCount += 1
         return jsonResponse({ok: true})
       }
+      if (path === "/mouse/scroll" && req.method === "POST") {
+        fakeScrollBody = await req.json() as Record<string, unknown>
+        return jsonResponse({ok: true})
+      }
       return jsonResponse({error: "not implemented"}, 404)
     },
   })
@@ -240,7 +246,10 @@ describe("ai-macos MCP server", () => {
       const tool = listed.tools.find((candidate) => candidate.name === name)
       expect(tool?.inputSchema.required).toContain("app")
       expect(tool?.inputSchema.properties).toHaveProperty("app")
+      expect(tool?.inputSchema.properties).toHaveProperty("pid")
     }
+    expect(listed.tools.find((tool) => tool.name === "capture_window")?.inputSchema.properties).toHaveProperty("pid")
+    expect(listed.tools.find((tool) => tool.name === "arrange_window")?.inputSchema.properties).toHaveProperty("pid")
     const missingTarget = await client.callTool({name: "keyboard_type", arguments: {text: "not delivered"}})
     expect(missingTarget.isError).toBe(true)
 
@@ -396,6 +405,24 @@ describe("ai-macos MCP server", () => {
       restorationComplete: true,
     })
     expect(fakeClickCount).toBe(1)
+    expect(fakeFocusApps).toEqual(["TestApp", "PreviousApp"])
+  })
+
+  test("anchors scrolling inside the verified target without moving the pointer", async () => {
+    const client = await connectDirectClient("ai-macos-scroll-target-test")
+
+    const result = await client.callTool({
+      name: "mouse_scroll",
+      arguments: {app: "TestApp", dx: 2, dy: 6},
+    })
+
+    expect(result.structuredContent).toMatchObject({
+      ok: true,
+      delivered: true,
+      verificationComplete: true,
+      restorationComplete: true,
+    })
+    expect(fakeScrollBody).toEqual({dx: 2, dy: 6, x: 420, y: 320})
     expect(fakeFocusApps).toEqual(["TestApp", "PreviousApp"])
   })
 

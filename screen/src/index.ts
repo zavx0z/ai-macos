@@ -1,5 +1,4 @@
 import { captureDesktop, captureRect, parseDetail, type CaptureOptions } from "./capture.ts";
-import { frontmostApp } from "./restore.ts";
 import { createWindowApi, type WindowApi, type WindowInfo } from "./window-api.ts";
 import { clamp, err, json, logCaption, logRequest, nonNegativeInt, osa, parseBoolean, png, positiveInt, printBanner, quote, sleep } from "@meta/shared";
 
@@ -9,6 +8,7 @@ const windowApi = createWindowApi();
 
 type WindowCaptureRequest = {
   app?: string;
+  pid?: number
   index?: number;
   title?: string;
   restore?: boolean;
@@ -72,6 +72,7 @@ const server = Bun.serve({
       if (path === "/window" && method === "GET") {
         const request: WindowCaptureRequest = {
           app: url.searchParams.get("app") ?? undefined,
+          pid: positiveInt(url.searchParams.get("pid"), undefined),
           index: positiveInt(url.searchParams.get("index"), undefined),
           title: url.searchParams.get("title") ?? undefined,
           restore: parseBoolean(url.searchParams.get("restore"), true),
@@ -210,23 +211,23 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
   const delayMs = clamp(nonNegativeInt(input.delayMs, 150) ?? 150, 0, 2_000);
   const restore = input.restore !== false;
   const scale = parseDetail(input.detail ?? (input.scale != null ? String(input.scale) : null));
-  const beforeFrontmost = restore ? await frontmostApp() : null;
+  const beforeFrontmost = restore ? await windowApi.frontmost() : null
 
   if (input.caption) logCaption(input.caption)
 
   let target: WindowInfo | undefined;
   try {
     const windows = await windowApi.listWindows(app);
-    target = selectWindow(windows, index, input.title);
+    target = selectWindow(windows, index, input.title, input.pid)
     if (target === undefined) {
-      if (app.toLowerCase().includes("chrome")) {
+      if (app.toLowerCase().includes("chrome") && input.pid === undefined) {
         return await proxyChromeScreenshot(input);
       }
       return err(404, `window not found: app=${app} index=${index}${input.title ? ` title=${input.title}` : ""}`,
         `Проверьте: 1) приложение открыто, 2) разрешение Accessibility выдано (GET http://localhost:7878/permissions/accessibility)`);
     }
 
-    await windowApi.raise(app, target.index);
+    await windowApi.raise(target)
     if (delayMs > 0) await sleep(delayMs);
 
     const image = await captureRect(target, { shadow: input.shadow, scale });
@@ -258,23 +259,33 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
   }
 }
 
-function selectWindow(windows: WindowInfo[], index: number, title: string | undefined): WindowInfo | undefined {
+function selectWindow(
+  windows: WindowInfo[],
+  index: number,
+  title: string | undefined,
+  pid: number | undefined,
+): WindowInfo | undefined {
+  const candidates = pid === undefined ? windows : windows.filter((window) => window.pid === pid)
   if (title !== undefined && title.length > 0) {
-    const needle = title.toLowerCase();
-    const byTitle = windows.find((w) => w.title.toLowerCase().includes(needle));
-    if (byTitle !== undefined) return byTitle;
+    const needle = title.toLowerCase()
+    const byTitle = candidates.find((w) => w.title.toLowerCase().includes(needle))
+    if (byTitle !== undefined) return byTitle
   }
-  return windows.find((w) => w.index === index);
+  return candidates.find((w) => w.index === index)
 }
 
-async function restoreFocus(api: WindowApi, app: string | null, enabled: boolean): Promise<{ ok: boolean; app: string | null; error?: string }> {
-  if (!enabled || app === null) return { ok: true, app };
+async function restoreFocus(
+  api: WindowApi,
+  state: { app: string; pid: number; window: WindowInfo | null } | null,
+  enabled: boolean,
+): Promise<{ ok: boolean; app: string | null; error?: string }> {
+  if (!enabled || state === null) return { ok: true, app: state?.app ?? null }
   try {
-    await api.focus(app);
-    return { ok: true, app };
+    await api.focus(state.window ?? { app: state.app, pid: state.pid })
+    return { ok: true, app: state.app }
   } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    return { ok: false, app, error: msg };
+    const msg = e instanceof Error ? e.message : String(e)
+    return { ok: false, app: state.app, error: msg }
   }
 }
 
@@ -297,7 +308,7 @@ async function rectResponse(input: RectCaptureRequest): Promise<Response> {
   const delayMs = clamp(nonNegativeInt(input.delayMs, 150) ?? 150, 0, 2_000);
   const restore = input.restore !== false;
   const scale = parseDetail(input.detail ?? (input.scale != null ? String(input.scale) : null));
-  const beforeFrontmost = restore ? await frontmostApp() : null;
+  const beforeFrontmost = restore ? await windowApi.frontmost() : null
 
   if (input.caption) logCaption(input.caption)
 
