@@ -1,7 +1,7 @@
 import { checkAccessibility, focusApplication, focusWindow, getFrontmostState, getScreen, listWindows, moveWindow, raiseWindow, requestAccessibility, resizeWindow } from "./windows.ts"
 import { isFocusedSheet } from "./focus.ts"
 import { listPins, startPin, stopAllPins, stopPin } from "./pin.ts";
-import { err, json, logRequest, printBanner } from "@meta/shared";
+import { err, json, logRequest, printBanner, selectUniqueWindow, matchesWindow, sameWindowIdentity, stableWindowTarget, validWindowId } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? 7878);
 
@@ -22,6 +22,7 @@ const server = Bun.serve({
           ok: accessibility.granted,
           service: "@meta/window",
           backend: "meta-input-helper",
+          capabilities: { stableWindowId: true },
           accessibility,
         })
       }
@@ -45,6 +46,7 @@ const server = Bun.serve({
         const body = (await req.json()) as {
           app?: string;
           pid?: number;
+          windowId?: number;
           index?: number;
           title?: string;
           x?: number;
@@ -55,25 +57,17 @@ const server = Bun.serve({
         if (!body.app) return err(400, "missing 'app'", "Укажите имя процесса macOS: {\"app\": \"Google Chrome\"}");
         const previousFrontmost = await getFrontmostState()
         const previousWindow = previousFrontmost.window
-        const windows = (await listWindows()).filter((window) =>
-          window.app.toLowerCase() === body.app!.toLowerCase()
-          && (body.pid === undefined || window.pid === body.pid)
-          && (body.index === undefined || window.index === body.index)
-          && (body.title === undefined || window.title.toLowerCase().includes(body.title.toLowerCase()))
-          && (body.x === undefined || window.x === body.x)
-          && (body.y === undefined || window.y === body.y)
-          && (body.width === undefined || window.width === body.width)
-          && (body.height === undefined || window.height === body.height)
-        );
+        if (body.windowId !== undefined && !validWindowId(body.windowId)) return err(400, "invalid windowId")
+        const windows = (await listWindows()).filter(window => matchesWindow(window, body));
         if (windows.length === 0) {
           return err(
             404,
-            `visible window not found: app=${body.app}${body.pid ? ` pid=${body.pid}` : ""}${body.index ? ` index=${body.index}` : ""}${body.title ? ` title=${body.title}` : ""}`,
+            `visible window not found: app=${body.app}${body.pid ? ` pid=${body.pid}` : ""}${body.windowId ? ` windowId=${body.windowId}` : ""}${body.index ? ` index=${body.index}` : ""}${body.title ? ` title=${body.title}` : ""}`,
             "Сначала вызовите GET /windows и используйте точные app/pid/index. Никакое приложение не было запущено и фокус не менялся.",
           );
         }
         if (windows.length > 1) {
-          const candidates = windows.map(({ app, pid, index, title }) => ({ app, pid, index, title }));
+          const candidates = windows.map(({ app, pid, windowId, index, title }) => ({ app, pid, windowId, index, title }));
           return err(
             409,
             `ambiguous window target: ${windows.length} windows match ${body.app}`,
@@ -82,10 +76,20 @@ const server = Bun.serve({
         }
         const target = windows[0]!;
 
-        await raiseWindow(target.app, target.index, target.pid)
-        await focusWindow(target)
-
+        const alreadyFocused = previousWindow
+          && (sameWindowIdentity(target, previousWindow) || isFocusedSheet(target, previousWindow))
+        if (!alreadyFocused) {
+          await raiseWindow(target.app, target.index, target.pid, target.windowId)
+          await focusWindow(target)
+        }
         let frontmost = await getFrontmostState()
+        // Preserve an existing menu/field focus. If another application took
+        // focus after the passive snapshot, explicitly activate the target once.
+        if (alreadyFocused && frontmost.pid !== target.pid) {
+          await raiseWindow(target.app, target.index, target.pid, target.windowId)
+          await focusWindow(target)
+          frontmost = await getFrontmostState()
+        }
         for (let attempt = 0; attempt < 5 && frontmost.pid !== target.pid; attempt += 1) {
           await Bun.sleep(40)
           frontmost = await getFrontmostState()
@@ -98,31 +102,21 @@ const server = Bun.serve({
           );
         }
         const focusedWindow = frontmost.window
-        const targetMatchesFocusedWindow = focusedWindow
-          && focusedWindow.pid === target.pid
-          && focusedWindow.title === target.title
-          && focusedWindow.x === target.x
-          && focusedWindow.y === target.y
-          && focusedWindow.width === target.width
-          && focusedWindow.height === target.height;
+        const targetMatchesFocusedWindow = focusedWindow && sameWindowIdentity(target, focusedWindow)
         const targetOwnsFocusedSheet = focusedWindow && isFocusedSheet(target, focusedWindow)
-        const targetHasUnreportedModal = !focusedWindow
+        const targetHasUnreportedModal = !validWindowId(target.windowId) && !focusedWindow
           && previousFrontmost.app.toLowerCase() === target.app.toLowerCase()
           && previousFrontmost.pid === target.pid
           && frontmost.app.toLowerCase() === target.app.toLowerCase()
           && frontmost.pid === target.pid
         if (!targetMatchesFocusedWindow && !targetOwnsFocusedSheet && !targetHasUnreportedModal) {
           if (previousWindow) {
-            const previousNow = (await listWindows()).find((window) =>
-              window.pid === previousWindow.pid
-              && window.title === previousWindow.title
-              && window.x === previousWindow.x
-              && window.y === previousWindow.y
-              && window.width === previousWindow.width
-              && window.height === previousWindow.height
-            );
+            const previousSelector = validWindowId(previousWindow.ownerWindowId)
+              ? { app: previousWindow.app, pid: previousWindow.pid, windowId: previousWindow.ownerWindowId }
+              : stableWindowTarget(previousWindow)
+            const previousNow = (await listWindows()).find(window => matchesWindow(window, previousSelector));
             if (previousNow) {
-              await raiseWindow(previousNow.app, previousNow.index, previousNow.pid)
+              await raiseWindow(previousNow.app, previousNow.index, previousNow.pid, previousNow.windowId)
               await focusWindow(previousNow)
             }
           } else {
@@ -134,9 +128,13 @@ const server = Bun.serve({
             "Фокус предыдущего окна восстановлен; ввод выполнять нельзя.",
           );
         }
+        const verifiedTarget = validWindowId(target.windowId)
+          ? selectUniqueWindow(await listWindows(), stableWindowTarget(target))
+          : target
+        if (!verifiedTarget) return err(409, "target window disappeared before input; rediscover windows")
         return json({
           ok: true,
-          target,
+          target: verifiedTarget,
           frontmost: { ...frontmost, window: focusedWindow },
           focusedSheet: targetOwnsFocusedSheet ? focusedWindow : null,
           unreportedModal: targetHasUnreportedModal,
@@ -145,18 +143,18 @@ const server = Bun.serve({
       }
 
       if (path === "/move" && method === "POST") {
-        const body = (await req.json()) as { app?: string, pid?: number, index?: number, x?: number, y?: number }
+        const body = (await req.json()) as { app?: string, pid?: number, windowId?: number, index?: number, x?: number, y?: number }
         if (!body.app || body.x == null || body.y == null)
           return err(400, "need {app, x, y, index?}", "Пример: {\"app\":\"iTerm2\",\"x\":0,\"y\":0}");
-        await moveWindow(body.app, body.index ?? 1, body.x, body.y, body.pid)
+        await moveWindow(body.app, body.index ?? 1, body.x, body.y, body.pid, body.windowId)
         return json({ ok: true });
       }
 
       if (path === "/resize" && method === "POST") {
-        const body = (await req.json()) as { app?: string, pid?: number, index?: number, width?: number, height?: number }
+        const body = (await req.json()) as { app?: string, pid?: number, windowId?: number, index?: number, width?: number, height?: number }
         if (!body.app || body.width == null || body.height == null)
           return err(400, "need {app, width, height, index?}", "Пример: {\"app\":\"iTerm2\",\"width\":960,\"height\":600}");
-        await resizeWindow(body.app, body.index ?? 1, body.width, body.height, body.pid)
+        await resizeWindow(body.app, body.index ?? 1, body.width, body.height, body.pid, body.windowId)
         return json({ ok: true });
       }
 
@@ -164,13 +162,16 @@ const server = Bun.serve({
         const body = (await req.json()) as {
           app?: string;
           pid?: number
+          windowId?: number
           index?: number;
           preset?: "left" | "right" | "top" | "bottom" | "max" | "center";
         };
         if (!body.app || !body.preset)
           return err(400, "need {app, preset}", "Пресеты: left | right | top | bottom | max | center");
+        const target = selectUniqueWindow(await listWindows(), { app: body.app, pid: body.pid, windowId: body.windowId, index: body.index ?? 1 })
+        if (!target) return err(404, "visible arrange target not found")
         const screen = await getScreen();
-        const idx = body.index ?? 1;
+        const idx = target.index;
         const W = screen.width;
         const H = screen.height;
         const half = Math.floor(W / 2);
@@ -185,15 +186,15 @@ const server = Bun.serve({
         };
         const p = presets[body.preset];
         if (!p) return err(400, `unknown preset '${body.preset}'`, "Доступные пресеты: left | right | top | bottom | max | center");
-        await moveWindow(body.app, idx, p[0], p[1], body.pid)
-        await resizeWindow(body.app, idx, p[2], p[3], body.pid)
+        await moveWindow(target.app, idx, p[0], p[1], target.pid, target.windowId)
+        await resizeWindow(target.app, idx, p[2], p[3], target.pid, target.windowId)
         return json({ ok: true, applied: { x: p[0], y: p[1], width: p[2], height: p[3] } });
       }
 
       if (path === "/raise" && method === "POST") {
-        const body = (await req.json()) as { app?: string, pid?: number, index?: number }
+        const body = (await req.json()) as { app?: string, pid?: number, windowId?: number, index?: number }
         if (!body.app) return err(400, "missing 'app'", "Укажите имя процесса macOS: {\"app\": \"Google Chrome\"}");
-        await raiseWindow(body.app, body.index ?? 1, body.pid)
+        await raiseWindow(body.app, body.index ?? 1, body.pid, body.windowId)
         return json({ ok: true });
       }
 
@@ -202,11 +203,11 @@ const server = Bun.serve({
       }
 
       if (path === "/pin" && method === "POST") {
-        const body = (await req.json()) as { app?: string; index?: number; intervalMs?: number };
+        const body = (await req.json()) as { app?: string; pid?: number; windowId?: number; index?: number; intervalMs?: number };
         if (!body.app) return err(400, "missing 'app'", "Пример: {\"app\":\"iTerm2\",\"intervalMs\":500}");
         const interval = body.intervalMs ?? 500;
         if (interval < 100) return err(400, "intervalMs must be >= 100", "Минимальный интервал 100 мс чтобы не перегружать систему");
-        const pin = startPin(body.app, body.index ?? 1, interval);
+        const pin = await startPin(body.app, body.index ?? 1, interval, body.pid, body.windowId);
         return json({ ok: true, pin });
       }
 

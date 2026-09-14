@@ -240,12 +240,118 @@ static bool same_frame(CGRect cg_frame, CGPoint ax_position, CGSize ax_size) {
          fabs(cg_frame.size.height - ax_size.height) <= tolerance;
 }
 
+static CGWindowID cg_window_id(CFDictionaryRef info) {
+  CGWindowID value = 0;
+  CFNumberRef number = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowNumber);
+  if (number != NULL) CFNumberGetValue(number, kCFNumberSInt32Type, &value);
+  return value;
+}
+
+static bool cg_window_pid(CFDictionaryRef info, pid_t pid) {
+  pid_t owner = 0;
+  CFNumberRef value = (CFNumberRef)CFDictionaryGetValue(info, kCGWindowOwnerPID);
+  return value != NULL && CFNumberGetValue(value, kCFNumberIntType, &owner) && owner == pid;
+}
+
+static bool cg_window_frame(CFDictionaryRef info, CGRect *frame) {
+  CFDictionaryRef bounds = (CFDictionaryRef)CFDictionaryGetValue(info, kCGWindowBounds);
+  return bounds != NULL && CGRectMakeWithDictionaryRepresentation(bounds, frame);
+}
+
+// A CGWindowID survives AXWindows reordering, title changes, move and resize.
+// Mapping into Accessibility is allowed only when current geometry/title yield
+// a unique element. Identical overlapping windows fail closed, never first-match.
+static AXUIElementRef match_ax_window(CFArrayRef windows, CFDictionaryRef info,
+                                     CFIndex *index_out) {
+  CGRect frame = CGRectZero;
+  if (!cg_window_frame(info, &frame)) return NULL;
+  CFStringRef cg_title = (CFStringRef)CFDictionaryGetValue(info, kCGWindowName);
+  AXUIElementRef only_frame = NULL, only_title = NULL;
+  CFIndex frame_index = 0, title_index = 0, frame_count = 0, title_count = 0;
+  for (CFIndex i = 0; i < CFArrayGetCount(windows); i++) {
+    AXUIElementRef candidate = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+    CGPoint position; CGSize size;
+    if (!copy_ax_frame(candidate, &position, &size) || !same_frame(frame, position, size)) continue;
+    only_frame = candidate; frame_index = i + 1; frame_count++;
+    CFStringRef title = copy_ax_title(candidate);
+    if (title && cg_title && CFGetTypeID(cg_title) == CFStringGetTypeID()
+        && CFStringGetLength(title) > 0 && CFEqual(title, cg_title)) {
+      only_title = candidate; title_index = i + 1; title_count++;
+    }
+    if (title) CFRelease(title);
+  }
+  if (frame_count == 1) { *index_out = frame_index; return only_frame; }
+  if (title_count == 1) { *index_out = title_index; return only_title; }
+  return NULL;
+}
+
+static CGWindowID window_id_for_ax(pid_t pid, AXUIElementRef window) {
+  CGPoint position; CGSize size;
+  if (!copy_ax_frame(window, &position, &size)) return kCGNullWindowID;
+  CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly |
+                                             kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+  if (!list) return kCGNullWindowID;
+  CFStringRef title = copy_ax_title(window);
+  CGWindowID frame_id = 0, title_id = 0;
+  int frame_count = 0, title_count = 0;
+  for (CFIndex i = 0; i < CFArrayGetCount(list); i++) {
+    CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(list, i);
+    CGRect frame;
+    if (!cg_window_pid(info, pid) || !cg_window_frame(info, &frame)
+        || !same_frame(frame, position, size)) continue;
+    frame_id = cg_window_id(info); frame_count++;
+    CFStringRef cg_title = (CFStringRef)CFDictionaryGetValue(info, kCGWindowName);
+    if (title && cg_title && CFGetTypeID(cg_title) == CFStringGetTypeID()
+        && CFStringGetLength(title) > 0 && CFEqual(title, cg_title)) {
+      title_id = frame_id; title_count++;
+    }
+  }
+  if (title) CFRelease(title);
+  CFRelease(list);
+  return frame_count == 1 ? frame_id : title_count == 1 ? title_id : kCGNullWindowID;
+}
+
+static CGWindowID sheet_owner_id(pid_t pid, AXUIElementRef focused, CFArrayRef windows) {
+  AXUIElementRef cursor = (AXUIElementRef)CFRetain(focused);
+  for (int depth = 0; cursor && depth < 16; depth++) {
+    for (CFIndex i = 0; i < CFArrayGetCount(windows); i++) {
+      AXUIElementRef owner = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+      if (!CFEqual(owner, focused) && CFEqual(owner, cursor)) {
+        CGWindowID id = window_id_for_ax(pid, owner); CFRelease(cursor); return id;
+      }
+    }
+    CFTypeRef parent = NULL;
+    AXUIElementCopyAttributeValue(cursor, kAXParentAttribute, &parent);
+    CFRelease(cursor);
+    cursor = parent && CFGetTypeID(parent) == AXUIElementGetTypeID() ? (AXUIElementRef)parent : NULL;
+    if (parent && !cursor) CFRelease(parent);
+  }
+  if (cursor) CFRelease(cursor);
+  for (CFIndex i = 0; i < CFArrayGetCount(windows); i++) {
+    AXUIElementRef owner = (AXUIElementRef)CFArrayGetValueAtIndex(windows, i);
+    CFTypeRef sheets = NULL;
+    AXUIElementCopyAttributeValue(owner, CFSTR("AXSheets"), &sheets);
+    if (sheets && CFGetTypeID(sheets) == CFArrayGetTypeID()) {
+      CFArrayRef array = (CFArrayRef)sheets;
+      for (CFIndex j = 0; j < CFArrayGetCount(array); j++) {
+        if (CFEqual(focused, CFArrayGetValueAtIndex(array, j))) {
+          CGWindowID id = window_id_for_ax(pid, owner); CFRelease(sheets); return id;
+        }
+      }
+    }
+    if (sheets) CFRelease(sheets);
+  }
+  return kCGNullWindowID;
+}
+
 static void print_window_json(CFStringRef app, pid_t pid, CFStringRef title,
-                              CFIndex index, CGPoint position, CGSize size) {
+                              CFIndex index, CGPoint position, CGSize size,
+                              CGWindowID window_id, CGWindowID owner_id) {
   fputs("{\"app\":", stdout);
   print_json_cfstring(app);
   fprintf(stdout, ",\"pid\":%d,\"title\":", pid);
   print_json_cfstring(title);
+  fprintf(stdout, ",\"windowId\":%u,\"ownerWindowId\":%u", window_id, owner_id);
   fprintf(stdout,
           ",\"index\":%ld,\"x\":%.0f,\"y\":%.0f,\"width\":%.0f,\"height\":%.0f}",
           (long)index, position.x, position.y, size.width, size.height);
@@ -320,7 +426,11 @@ static int command_windows(void) {
           (AXUIElementRef)CFArrayGetValueAtIndex(ax_windows, ax_index);
       CGPoint position = CGPointZero;
       CGSize size = CGSizeZero;
-      if (!copy_ax_frame(window, &position, &size) ||
+      CFIndex matched_index = 0;
+      AXUIElementRef matched = match_ax_window(ax_windows, info, &matched_index);
+      if (matched == NULL || matched_index != ax_index + 1 ||
+          window_id_for_ax(pid, matched) != cg_window_id(info) ||
+          !copy_ax_frame(window, &position, &size) ||
           !same_frame(cg_frame, position, size) ||
           already_seen(seen, seen_count, pid, ax_index + 1))
         continue;
@@ -333,14 +443,18 @@ static int command_windows(void) {
         app = fallback_app;
       }
       CFStringRef title = copy_ax_title(window);
-      if (title == NULL) {
+      // During a sheet transition Chromium can report an empty AX title for
+      // the parent. Keep the CG title of this PID/frame instead of exposing a
+      // transient empty selector that makes consumers fall back to an index.
+      if (title == NULL || CFStringGetLength(title) == 0) {
         CFTypeRef cg_title = CFDictionaryGetValue(info, kCGWindowName);
         if (cg_title != NULL && CFGetTypeID(cg_title) == CFStringGetTypeID()) {
+          if (title != NULL) CFRelease(title);
           title = (CFStringRef)CFRetain(cg_title);
         }
       }
       if (!first) putchar(',');
-      print_window_json(app, pid, title, ax_index + 1, position, size);
+      print_window_json(app, pid, title, ax_index + 1, position, size, cg_window_id(info), 0);
       first = false;
       seen[seen_count++] = (SeenWindow){.pid = pid, .index = ax_index + 1};
       if (title != NULL) CFRelease(title);
@@ -431,9 +545,12 @@ static int command_frontmost(void) {
       CFGetTypeID(windows_value) == CFArrayGetTypeID()) {
     index = index_of_ax_window((CFArrayRef)windows_value, window, position, size);
   }
+  CGWindowID owner_id = 0;
+  if (windows_value && CFGetTypeID(windows_value) == CFArrayGetTypeID())
+    owner_id = sheet_owner_id(pid, window, (CFArrayRef)windows_value);
   if (windows_value != NULL) CFRelease(windows_value);
   CFStringRef title = copy_ax_title(window);
-  print_window_json(app, pid, title, index, position, size);
+  print_window_json(app, pid, title, index, position, size, window_id_for_ax(pid, window), owner_id);
   fputs("}\n", stdout);
   if (title != NULL) CFRelease(title);
   CFRelease(window);
@@ -442,33 +559,51 @@ static int command_frontmost(void) {
   return 0;
 }
 
+typedef struct { CFIndex index; CGWindowID window_id; } WindowSelector;
+
 static bool parse_window_target(int argc, char **argv, int expected_argc,
-                                pid_t *pid, CFIndex *index) {
+                                pid_t *pid, WindowSelector *selector) {
   if (argc != expected_argc) return false;
-  long pid_value = 0;
-  long index_value = 0;
-  if (!parse_long(argv[2], &pid_value) ||
-      !parse_long(argv[3], &index_value) || pid_value <= 0 ||
-      index_value <= 0)
-    return false;
+  long pid_value = 0, index_value = 0;
+  if (!parse_long(argv[2], &pid_value) || pid_value <= 0 || pid_value > INT32_MAX) return false;
   *pid = (pid_t)pid_value;
-  *index = (CFIndex)index_value;
+  *selector = (WindowSelector){0};
+  if (strncmp(argv[3], "id:", 3) == 0) {
+    uint64_t id = 0;
+    if (!parse_u64(argv[3] + 3, &id) || id == 0 || id > UINT32_MAX) return false;
+    selector->window_id = (CGWindowID)id;
+  } else {
+    if (!parse_long(argv[3], &index_value) || index_value <= 0) return false;
+    selector->index = (CFIndex)index_value;
+  }
   return true;
 }
 
-static bool copy_target_window(pid_t pid, CFIndex index,
+static bool copy_target_window(pid_t pid, WindowSelector selector,
                                AXUIElementRef *application_out,
                                AXUIElementRef *window_out) {
   AXUIElementRef application = NULL;
   CFArrayRef windows = NULL;
   if (!copy_ax_windows(pid, &application, &windows)) return false;
-  if (index < 1 || index > CFArrayGetCount(windows)) {
-    CFRelease(windows);
-    CFRelease(application);
-    return false;
+  AXUIElementRef window = NULL;
+  if (selector.window_id) {
+    CFArrayRef list = CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly |
+                                               kCGWindowListExcludeDesktopElements, kCGNullWindowID);
+    if (list) {
+      for (CFIndex i = 0; i < CFArrayGetCount(list); i++) {
+        CFDictionaryRef info = (CFDictionaryRef)CFArrayGetValueAtIndex(list, i);
+        if (cg_window_id(info) != selector.window_id || !cg_window_pid(info, pid)) continue;
+        CFIndex current_index = 0;
+        window = match_ax_window(windows, info, &current_index);
+        if (window && window_id_for_ax(pid, window) != selector.window_id) window = NULL;
+        break;
+      }
+      CFRelease(list);
+    }
+  } else if (selector.index >= 1 && selector.index <= CFArrayGetCount(windows)) {
+    window = (AXUIElementRef)CFArrayGetValueAtIndex(windows, selector.index - 1);
   }
-  AXUIElementRef window =
-      (AXUIElementRef)CFArrayGetValueAtIndex(windows, index - 1);
+  if (!window) { CFRelease(windows); CFRelease(application); return false; }
   CFRetain(window);
   CFRelease(windows);
   *application_out = application;
@@ -478,12 +613,12 @@ static bool copy_target_window(pid_t pid, CFIndex index,
 
 static int command_window_focus(int argc, char **argv) {
   pid_t pid = 0;
-  CFIndex index = 0;
-  if (!parse_window_target(argc, argv, 4, &pid, &index)) return EXIT_USAGE;
+  WindowSelector selector = {0};
+  if (!parse_window_target(argc, argv, 4, &pid, &selector)) return EXIT_USAGE;
   AXUIElementRef application = NULL;
   AXUIElementRef window = NULL;
-  if (!copy_target_window(pid, index, &application, &window)) {
-    fprintf(stderr, "window not found: pid=%d index=%ld\n", pid, (long)index);
+  if (!copy_target_window(pid, selector, &application, &window)) {
+    fprintf(stderr, "window not found or ambiguous: pid=%d index=%ld windowId=%u\n", pid, (long)selector.index, selector.window_id);
     return 1;
   }
 
@@ -537,12 +672,12 @@ static int command_application_focus(int argc, char **argv) {
 
 static int command_window_raise(int argc, char **argv) {
   pid_t pid = 0;
-  CFIndex index = 0;
-  if (!parse_window_target(argc, argv, 4, &pid, &index)) return EXIT_USAGE;
+  WindowSelector selector = {0};
+  if (!parse_window_target(argc, argv, 4, &pid, &selector)) return EXIT_USAGE;
   AXUIElementRef application = NULL;
   AXUIElementRef window = NULL;
-  if (!copy_target_window(pid, index, &application, &window)) {
-    fprintf(stderr, "window not found: pid=%d index=%ld\n", pid, (long)index);
+  if (!copy_target_window(pid, selector, &application, &window)) {
+    fprintf(stderr, "window not found or ambiguous: pid=%d index=%ld windowId=%u\n", pid, (long)selector.index, selector.window_id);
     return 1;
   }
   const AXError error = AXUIElementPerformAction(window, kAXRaiseAction);
@@ -557,15 +692,15 @@ static int command_window_raise(int argc, char **argv) {
 
 static int command_window_move(int argc, char **argv) {
   pid_t pid = 0;
-  CFIndex index = 0;
-  if (!parse_window_target(argc, argv, 6, &pid, &index)) return EXIT_USAGE;
+  WindowSelector selector = {0};
+  if (!parse_window_target(argc, argv, 6, &pid, &selector)) return EXIT_USAGE;
   double x = 0;
   double y = 0;
   if (!parse_double(argv[4], &x) || !parse_double(argv[5], &y))
     return EXIT_USAGE;
   AXUIElementRef application = NULL;
   AXUIElementRef window = NULL;
-  if (!copy_target_window(pid, index, &application, &window)) return 1;
+  if (!copy_target_window(pid, selector, &application, &window)) return 1;
   const CGPoint point = CGPointMake(x, y);
   AXValueRef value = AXValueCreate(kAXValueCGPointType, &point);
   const AXError error = value == NULL
@@ -584,8 +719,8 @@ static int command_window_move(int argc, char **argv) {
 
 static int command_window_resize(int argc, char **argv) {
   pid_t pid = 0;
-  CFIndex index = 0;
-  if (!parse_window_target(argc, argv, 6, &pid, &index)) return EXIT_USAGE;
+  WindowSelector selector = {0};
+  if (!parse_window_target(argc, argv, 6, &pid, &selector)) return EXIT_USAGE;
   double width = 0;
   double height = 0;
   if (!parse_double(argv[4], &width) || !parse_double(argv[5], &height) ||
@@ -593,7 +728,7 @@ static int command_window_resize(int argc, char **argv) {
     return EXIT_USAGE;
   AXUIElementRef application = NULL;
   AXUIElementRef window = NULL;
-  if (!copy_target_window(pid, index, &application, &window)) return 1;
+  if (!copy_target_window(pid, selector, &application, &window)) return 1;
   const CGSize size = CGSizeMake(width, height);
   AXValueRef value = AXValueCreate(kAXValueCGSizeType, &size);
   const AXError error = value == NULL

@@ -1,3 +1,4 @@
+import { validWindowId } from "@meta/shared"
 import { nativeCommand } from "./native.ts"
 
 export type NativeWindowInfo = {
@@ -5,6 +6,8 @@ export type NativeWindowInfo = {
   pid: number
   title: string
   index: number
+  windowId?: number
+  ownerWindowId?: number
   x: number
   y: number
   width: number
@@ -87,16 +90,25 @@ export async function getNativeFrontmost(): Promise<NativeFrontmost> {
   }
 }
 
-export async function focusNativeWindow(pid: number, index: number): Promise<void> {
-  await nativeCommand(helper(), ["window-focus", String(pid), String(index)])
+export function nativeWindowSelector(index: number, windowId?: number): string {
+  if (windowId !== undefined) {
+    if (!validWindowId(windowId)) throw new Error("invalid windowId")
+    return `id:${windowId}`
+  }
+  if (!Number.isInteger(index) || index <= 0) throw new Error("invalid window index")
+  return String(index)
+}
+
+export async function focusNativeWindow(pid: number, index: number, windowId?: number): Promise<void> {
+  await nativeCommand(helper(), ["window-focus", String(pid), nativeWindowSelector(index, windowId)])
 }
 
 export async function focusNativeApplication(pid: number): Promise<void> {
   await nativeCommand(helper(), ["application-focus", String(pid)])
 }
 
-export async function raiseNativeWindow(pid: number, index: number): Promise<void> {
-  await nativeCommand(helper(), ["window-raise", String(pid), String(index)])
+export async function raiseNativeWindow(pid: number, index: number, windowId?: number): Promise<void> {
+  await nativeCommand(helper(), ["window-raise", String(pid), nativeWindowSelector(index, windowId)])
 }
 
 export async function moveNativeWindow(
@@ -104,11 +116,12 @@ export async function moveNativeWindow(
   index: number,
   x: number,
   y: number,
+  windowId?: number,
 ): Promise<void> {
   await nativeCommand(helper(), [
     "window-move",
     String(pid),
-    String(index),
+    nativeWindowSelector(index, windowId),
     String(x),
     String(y),
   ])
@@ -119,11 +132,12 @@ export async function resizeNativeWindow(
   index: number,
   width: number,
   height: number,
+  windowId?: number,
 ): Promise<void> {
   await nativeCommand(helper(), [
     "window-resize",
     String(pid),
-    String(index),
+    nativeWindowSelector(index, windowId),
     String(width),
     String(height),
   ])

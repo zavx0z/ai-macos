@@ -11,6 +11,11 @@ let fakeClickDelayMs = 0
 let fakeScrollBody: Record<string, unknown> | null = null
 let fakeScreenFailure = false
 let fakeFocusApps: string[] = []
+let fakeTransition: "none" | "change" | "close" = "none"
+let fakeTransitionApplied = false
+let fakeCaptureBodies: Record<string, unknown>[] = []
+let fakeFocusBodies: Record<string, unknown>[] = []
+let fakeOwnedSheet: "none" | "open" | "closed" = "none"
 let fakeRequestCount = 0
 let fakeClickEntered: Promise<void> = Promise.resolve()
 let resolveFakeClickEntered: () => void = () => {}
@@ -32,10 +37,16 @@ beforeEach(() => {
   fakeScreenFailure = false
   fakeFocusApps = []
   fakeRequestCount = 0
+  fakeTransition = "none"
+  fakeTransitionApplied = false
+  fakeCaptureBodies = []
+  fakeFocusBodies = []
+  fakeOwnedSheet = "none"
   fakeClickEntered = new Promise<void>((resolve) => { resolveFakeClickEntered = resolve })
   const targetWindow = {
     app: "TestApp",
     pid: 101,
+    windowId: 1001,
     title: "Test window",
     index: 1,
     x: 100,
@@ -46,6 +57,7 @@ beforeEach(() => {
   const previousWindow = {
     app: "PreviousApp",
     pid: 202,
+    windowId: 2001,
     title: "Previous window",
     index: 1,
     x: 20,
@@ -53,6 +65,8 @@ beforeEach(() => {
     width: 500,
     height: 400,
   }
+  const decoyWindow = { ...targetWindow, windowId: 9001 }
+  const sheet = { ...targetWindow, windowId: 1002, ownerWindowId: 1001, index: 0, title: "Save", width: 400, height: 250 }
   const windowServer = Bun.serve({
     port: 0,
     async fetch(req) {
@@ -62,21 +76,23 @@ beforeEach(() => {
       if (path === "/health") return jsonResponse({ok: true, service: "@meta/window"})
       if (path === "/windows") {
         const app = url.searchParams.get("app")
-        const windows = app === previousWindow.app ? [previousWindow] : [targetWindow]
+        const windows = app === previousWindow.app ? [previousWindow] : fakeTransitionApplied ? fakeTransition === "close" ? [decoyWindow] : [decoyWindow, targetWindow] : [targetWindow]
         return jsonResponse({count: windows.length, windows})
       }
       if (path === "/frontmost") {
-        return jsonResponse({app: targetWindow.app, pid: targetWindow.pid, window: targetWindow})
+        return jsonResponse({app: targetWindow.app, pid: targetWindow.pid, window: fakeOwnedSheet === "open" ? sheet : targetWindow})
       }
       if (path === "/focus" && req.method === "POST") {
-        const body = await req.json() as {app?: string}
+        const body = await req.json() as {app?: string; windowId?: number}
+        fakeFocusBodies.push(body)
+        if (body.windowId !== undefined && ![1001, 2001].includes(body.windowId)) return jsonResponse({error: "windowId not found"}, 404)
         fakeFocusApps.push(body.app ?? "")
         const target = body.app === previousWindow.app ? previousWindow : targetWindow
         return jsonResponse({
           ok: true,
           target,
           frontmost: {app: targetWindow.app, pid: targetWindow.pid},
-          previous: {app: previousWindow.app, window: previousWindow},
+          previous: fakeOwnedSheet === "none" ? {app: previousWindow.app, window: previousWindow} : {app: targetWindow.app, pid: targetWindow.pid, window: sheet},
         })
       }
       return jsonResponse({error: "not implemented"}, 404)
@@ -108,6 +124,7 @@ beforeEach(() => {
       if (url.pathname === "/window" && req.method === "POST") {
         if (fakeScreenFailure) return jsonResponse({error: "capture failed"}, 500)
         const body = await req.json() as {caption?: string}
+        fakeCaptureBodies.push(body)
         return jsonResponse({
           ok: true,
           target: "window",
@@ -180,6 +197,10 @@ beforeEach(() => {
         if (fakeClickDelayMs > 0) await Bun.sleep(fakeClickDelayMs)
         if (fakeClickStatus !== 200) return jsonResponse({error: "click rejected"}, fakeClickStatus)
         fakeClickCount += 1
+        if (fakeTransition !== "none") {
+          fakeTransitionApplied = true
+          if (fakeTransition === "change") Object.assign(targetWindow, {index: 3, title: "Changed article title", x: 500, width: 800})
+        }
         return jsonResponse({ok: true})
       }
       if (path === "/mouse/scroll" && req.method === "POST") {
@@ -227,6 +248,45 @@ afterEach(async () => {
 })
 
 describe("ai-macos MCP server", () => {
+  for (const state of ["open", "closed"] as const) {
+    test(`does not refocus an owned ${state} sheet and dismiss its popup`, async () => {
+      fakeOwnedSheet = state
+      const client = await connectDirectClient(`owned-sheet-${state}`)
+      const result = await client.callTool({name: "mouse_click", arguments: {app: "TestApp", pid: 101, windowId: 1001, x: 10, y: 10}})
+      expect(result.structuredContent).toMatchObject({ok: true, delivered: true, restorationComplete: true})
+      expect(fakeFocusBodies).toHaveLength(1)
+      expect(fakeFocusBodies[0]).toMatchObject({windowId: 1001})
+    })
+  }
+
+  test("keeps the stable ID through a title/index/frame change and a same-frame decoy", async () => {
+    fakeTransition = "change"
+    const client = await connectDirectClient("stable-window-id")
+    const result = await client.callTool({name: "mouse_click", arguments: {app: "TestApp", pid: 101, windowId: 1001, index: 99, title: "stale title", x: 10, y: 10}})
+    expect(result.isError).not.toBe(true)
+    expect(result.structuredContent).toMatchObject({delivered: true, verificationComplete: true, verificationCapture: {window: {windowId: 1001, index: 3, title: "Changed article title"}}})
+    expect(fakeClickCount).toBe(1)
+    expect(fakeCaptureBodies[0]).toMatchObject({windowId: 1001})
+    expect(fakeFocusBodies.at(-1)).toEqual({app: "PreviousApp", pid: 202, windowId: 2001})
+  })
+
+  test("closed target is not replaced by another window with the same title and frame", async () => {
+    fakeTransition = "close"
+    const client = await connectDirectClient("closed-window-id")
+    const result = await client.callTool({name: "mouse_click", arguments: {app: "TestApp", windowId: 1001, x: 10, y: 10}})
+    expect(result.structuredContent).toMatchObject({ok: false, delivered: true, verificationComplete: false})
+    expect(fakeClickCount).toBe(1)
+    expect(fakeCaptureBodies).toEqual([])
+  })
+
+  test("unknown stable ID fails before input even with a valid legacy index", async () => {
+    const client = await connectDirectClient("unknown-window-id")
+    const result = await client.callTool({name: "mouse_click", arguments: {app: "TestApp", windowId: 9999, index: 1, x: 10, y: 10}})
+    expect(result.isError).toBe(true)
+    expect(fakeClickCount).toBe(0)
+    expect(fakeCaptureBodies).toEqual([])
+  })
+
   test("advertises tools and reaches the running local services", async () => {
     const client = await connectDirectClient("ai-macos-test")
 
@@ -247,6 +307,7 @@ describe("ai-macos MCP server", () => {
       expect(tool?.inputSchema.required).toContain("app")
       expect(tool?.inputSchema.properties).toHaveProperty("app")
       expect(tool?.inputSchema.properties).toHaveProperty("pid")
+      expect(tool?.inputSchema.properties).toHaveProperty("windowId")
     }
     expect(listed.tools.find((tool) => tool.name === "capture_window")?.inputSchema.properties).toHaveProperty("pid")
     expect(listed.tools.find((tool) => tool.name === "arrange_window")?.inputSchema.properties).toHaveProperty("pid")

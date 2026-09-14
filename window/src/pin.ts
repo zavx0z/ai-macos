@@ -1,9 +1,12 @@
-import { raiseWindow } from "./windows.ts";
+import { selectUniqueWindow } from "@meta/shared"
+import { raiseWindow, listWindows } from "./windows.ts";
 
 type Pin = {
   id: string;
   app: string;
   index: number;
+  pid: number;
+  windowId?: number;
   intervalMs: number;
   timer: ReturnType<typeof setInterval>;
   startedAt: number;
@@ -16,16 +19,20 @@ let nextId = 1;
 
 export type PinPublic = Omit<Pin, "timer">;
 
-export function startPin(app: string, index = 1, intervalMs = 500): PinPublic {
+export async function startPin(app: string, index = 1, intervalMs = 500, pid?: number, windowId?: number): Promise<PinPublic> {
+  const target = selectUniqueWindow(await listWindows(), { app, index, pid, windowId })
+  if (!target) throw new Error("visible pin target not found")
   const id = String(nextId++);
   const pin: Pin = {
     id,
     app,
-    index,
+    index: target.index,
+    pid: target.pid,
+    windowId: target.windowId,
     intervalMs,
     timer: setInterval(async () => {
       try {
-        await raiseWindow(pin.app, pin.index);
+        await raiseWindow(pin.app, pin.index, pin.pid, pin.windowId);
         pin.raises++;
       } catch {
         pin.errors++;

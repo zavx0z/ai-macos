@@ -3,6 +3,8 @@ export type WindowInfo = {
   pid: number
   title: string
   index: number
+  windowId?: number
+  ownerWindowId?: number
   x: number
   y: number
   width: number
@@ -13,6 +15,7 @@ export type WindowTarget = {
   app: string
   pid?: number
   index?: number
+  windowId?: number
   title?: string
   x?: number
   y?: number
@@ -66,6 +69,7 @@ export function createWindowApi(
         app: target.app,
         pid: target.pid,
         index: target.index,
+        windowId: target.windowId,
       })
     },
   }

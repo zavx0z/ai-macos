@@ -1,4 +1,4 @@
-import { err, json, logRequest, num, printBanner } from "@meta/shared"
+import { err, json, logRequest, num, printBanner, validWindowId } from "@meta/shared"
 import {
   bootstrap,
   preflightAccessibilityNow,
@@ -187,12 +187,12 @@ Bun.serve({
         if (path === "/window/focus" && method === "POST") {
           const denied = await requireAccessibility()
           if (denied) return denied
-          const body = (await req.json()) as { pid?: number; index?: number }
-          if (!Number.isInteger(body.pid) || body.pid! <= 0 || !Number.isInteger(body.index) || body.index! <= 0) {
-            return err(400, "need positive integer {pid, index}")
+          const body = (await req.json()) as { pid?: number; windowId?: number; index?: number }
+          if (!Number.isInteger(body.pid) || body.pid! <= 0 || (body.windowId !== undefined ? !validWindowId(body.windowId) : !Number.isInteger(body.index) || body.index! <= 0)) {
+            return err(400, "need positive pid and windowId (or legacy index)")
           }
-          await focusNativeWindow(body.pid!, body.index!)
-          return json({ ok: true, backend: "native-helper", pid: body.pid, index: body.index })
+          await focusNativeWindow(body.pid!, body.index ?? 1, body.windowId)
+          return json({ ok: true, backend: "native-helper", pid: body.pid, windowId: body.windowId, index: body.index })
         }
 
         if (path === "/window/focus-app" && method === "POST") {
@@ -209,39 +209,39 @@ Bun.serve({
         if (path === "/window/raise" && method === "POST") {
           const denied = await requireAccessibility()
           if (denied) return denied
-          const body = (await req.json()) as { pid?: number; index?: number }
-          if (!Number.isInteger(body.pid) || body.pid! <= 0 || !Number.isInteger(body.index) || body.index! <= 0) {
-            return err(400, "need positive integer {pid, index}")
+          const body = (await req.json()) as { pid?: number; windowId?: number; index?: number }
+          if (!Number.isInteger(body.pid) || body.pid! <= 0 || (body.windowId !== undefined ? !validWindowId(body.windowId) : !Number.isInteger(body.index) || body.index! <= 0)) {
+            return err(400, "need positive pid and windowId (or legacy index)")
           }
-          await raiseNativeWindow(body.pid!, body.index!)
-          return json({ ok: true, backend: "native-helper", pid: body.pid, index: body.index })
+          await raiseNativeWindow(body.pid!, body.index ?? 1, body.windowId)
+          return json({ ok: true, backend: "native-helper", pid: body.pid, windowId: body.windowId, index: body.index })
         }
 
         if (path === "/window/move" && method === "POST") {
           const denied = await requireAccessibility()
           if (denied) return denied
-          const body = (await req.json()) as { pid?: number; index?: number; x?: number; y?: number }
+          const body = (await req.json()) as { pid?: number; windowId?: number; index?: number; x?: number; y?: number }
           if (
             !Number.isInteger(body.pid) || body.pid! <= 0
-            || !Number.isInteger(body.index) || body.index! <= 0
+            || (body.windowId !== undefined ? !validWindowId(body.windowId) : !Number.isInteger(body.index) || body.index! <= 0)
             || !Number.isFinite(body.x) || !Number.isFinite(body.y)
           ) return err(400, "need {pid, index, x, y}")
-          await moveNativeWindow(body.pid!, body.index!, body.x!, body.y!)
-          return json({ ok: true, backend: "native-helper", pid: body.pid, index: body.index })
+          await moveNativeWindow(body.pid!, body.index ?? 1, body.x!, body.y!, body.windowId)
+          return json({ ok: true, backend: "native-helper", pid: body.pid, windowId: body.windowId, index: body.index })
         }
 
         if (path === "/window/resize" && method === "POST") {
           const denied = await requireAccessibility()
           if (denied) return denied
-          const body = (await req.json()) as { pid?: number; index?: number; width?: number; height?: number }
+          const body = (await req.json()) as { pid?: number; windowId?: number; index?: number; width?: number; height?: number }
           if (
             !Number.isInteger(body.pid) || body.pid! <= 0
-            || !Number.isInteger(body.index) || body.index! <= 0
+            || (body.windowId !== undefined ? !validWindowId(body.windowId) : !Number.isInteger(body.index) || body.index! <= 0)
             || !Number.isFinite(body.width) || body.width! <= 0
             || !Number.isFinite(body.height) || body.height! <= 0
           ) return err(400, "need positive {pid, index, width, height}")
-          await resizeNativeWindow(body.pid!, body.index!, body.width!, body.height!)
-          return json({ ok: true, backend: "native-helper", pid: body.pid, index: body.index })
+          await resizeNativeWindow(body.pid!, body.index ?? 1, body.width!, body.height!, body.windowId)
+          return json({ ok: true, backend: "native-helper", pid: body.pid, windowId: body.windowId, index: body.index })
         }
 
         // ─── Mouse ───────────────────────────────────────────────────────

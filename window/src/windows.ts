@@ -1,10 +1,12 @@
-import { osa } from "@meta/shared"
+import { osa, selectUniqueWindow } from "@meta/shared"
 
 export type WindowInfo = {
   app: string
   pid: number
   title: string
   index: number
+  windowId?: number
+  ownerWindowId?: number
   x: number
   y: number
   width: number
@@ -120,7 +122,7 @@ export async function getFocusedWindow(): Promise<WindowInfo | null> {
 export async function focusWindow(window: WindowInfo): Promise<void> {
   await requestJson("/window/focus", {
     method: "POST",
-    body: { pid: window.pid, index: window.index },
+    body: { pid: window.pid, index: window.index, windowId: window.windowId },
   })
 }
 
@@ -135,28 +137,18 @@ async function resolveExactWindow(
   app: string,
   index: number,
   pid?: number,
+  windowId?: number,
 ): Promise<WindowInfo> {
-  const matches = (await listWindows()).filter((window) =>
-    window.app.toLowerCase() === app.toLowerCase()
-    && window.index === index
-    && (pid === undefined || window.pid === pid)
-  )
-  if (matches.length === 0) {
-    throw new Error(`visible window not found: app=${app} index=${index}${pid ? ` pid=${pid}` : ""}`)
-  }
-  if (matches.length > 1) {
-    throw new Error(
-      `ambiguous window target: app=${app} index=${index}; pass exact pid from GET /windows`,
-    )
-  }
-  return matches[0]!
+  const match = selectUniqueWindow(await listWindows(), { app, pid, index, windowId })
+  if (!match) throw new Error(`visible window not found: app=${app} pid=${pid} windowId=${windowId} index=${index}`)
+  return match
 }
 
-export async function raiseWindow(app: string, index: number, pid?: number): Promise<void> {
-  const window = await resolveExactWindow(app, index, pid)
+export async function raiseWindow(app: string, index: number, pid?: number, windowId?: number): Promise<void> {
+  const window = await resolveExactWindow(app, index, pid, windowId)
   await requestJson("/window/raise", {
     method: "POST",
-    body: { pid: window.pid, index: window.index },
+    body: { pid: window.pid, index: window.index, windowId: window.windowId },
   })
 }
 
@@ -166,11 +158,12 @@ export async function moveWindow(
   x: number,
   y: number,
   pid?: number,
+  windowId?: number,
 ): Promise<void> {
-  const window = await resolveExactWindow(app, index, pid)
+  const window = await resolveExactWindow(app, index, pid, windowId)
   await requestJson("/window/move", {
     method: "POST",
-    body: { pid: window.pid, index: window.index, x, y },
+    body: { pid: window.pid, index: window.index, windowId: window.windowId, x, y },
   })
 }
 
@@ -180,11 +173,12 @@ export async function resizeWindow(
   width: number,
   height: number,
   pid?: number,
+  windowId?: number,
 ): Promise<void> {
-  const window = await resolveExactWindow(app, index, pid)
+  const window = await resolveExactWindow(app, index, pid, windowId)
   await requestJson("/window/resize", {
     method: "POST",
-    body: { pid: window.pid, index: window.index, width, height },
+    body: { pid: window.pid, index: window.index, windowId: window.windowId, width, height },
   })
 }
 

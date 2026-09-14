@@ -1,6 +1,7 @@
 import { captureDesktop, captureRect, parseDetail, type CaptureOptions } from "./capture.ts";
-import { createWindowApi, type WindowApi, type WindowInfo } from "./window-api.ts";
-import { clamp, err, json, logCaption, logRequest, nonNegativeInt, osa, parseBoolean, png, positiveInt, printBanner, quote, sleep } from "@meta/shared";
+import { createWindowApi, type WindowInfo } from "./window-api.ts";
+import { restoreFocus } from "./restore-focus.ts";
+import { clamp, err, json, logCaption, logRequest, nonNegativeInt, osa, parseBoolean, png, positiveInt, printBanner, quote, sleep, selectUniqueWindow, validWindowId, sameWindowIdentity } from "@meta/shared";
 
 const PORT = Number(Bun.env.PORT ?? Bun.env.SCREEN_PORT ?? 7879);
 const CHROME_API = Bun.env.CHROME_API ?? "http://localhost:7880";
@@ -9,6 +10,7 @@ const windowApi = createWindowApi();
 type WindowCaptureRequest = {
   app?: string;
   pid?: number
+  windowId?: number
   index?: number;
   title?: string;
   restore?: boolean;
@@ -73,6 +75,7 @@ const server = Bun.serve({
         const request: WindowCaptureRequest = {
           app: url.searchParams.get("app") ?? undefined,
           pid: positiveInt(url.searchParams.get("pid"), undefined),
+          windowId: url.searchParams.has("windowId") ? Number(url.searchParams.get("windowId")) : undefined,
           index: positiveInt(url.searchParams.get("index"), undefined),
           title: url.searchParams.get("title") ?? undefined,
           restore: parseBoolean(url.searchParams.get("restore"), true),
@@ -206,6 +209,7 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
   if (input.app === undefined || input.app.trim().length === 0)
     return err(400, "missing 'app'", "Укажите имя приложения: {\"app\": \"Google Chrome\"}");
 
+  if (input.windowId !== undefined && !validWindowId(input.windowId)) return err(400, "invalid windowId");
   const app = input.app;
   const index = positiveInt(input.index, 1) ?? 1;
   const delayMs = clamp(nonNegativeInt(input.delayMs, 150) ?? 150, 0, 2_000);
@@ -217,10 +221,13 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
 
   let target: WindowInfo | undefined;
   try {
+    // Closing a native sheet can briefly reorder AXWindows. Settle before
+    // selecting an index, rather than selecting a transient index then waiting.
+    if (delayMs > 0) await sleep(delayMs);
     const windows = await windowApi.listWindows(app);
-    target = selectWindow(windows, index, input.title, input.pid)
+    target = selectUniqueWindow(windows, { app, pid: input.pid, windowId: input.windowId, title: input.title, index: input.title || input.windowId !== undefined ? undefined : index })
     if (target === undefined) {
-      if (app.toLowerCase().includes("chrome") && input.pid === undefined) {
+      if (app.toLowerCase().includes("chrome") && input.pid === undefined && input.windowId === undefined) {
         return await proxyChromeScreenshot(input);
       }
       return err(404, `window not found: app=${app} index=${index}${input.title ? ` title=${input.title}` : ""}`,
@@ -230,7 +237,18 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
     await windowApi.raise(target)
     if (delayMs > 0) await sleep(delayMs);
 
+    // Menus are separate compositor surfaces and are absent from -l captures.
+    // Resolve the owner by stable ID, capture its visible composite, then verify
+    // its identity/frame again before publishing window-local coordinates.
     const image = await captureRect(target, { shadow: input.shadow, scale });
+    if (validWindowId(target.windowId)) {
+      const after = selectUniqueWindow(await windowApi.listWindows(app), { app: target.app, pid: target.pid, windowId: target.windowId })
+      if (!after || !sameWindowIdentity(target, after)
+          || after.x !== target.x || after.y !== target.y
+          || after.width !== target.width || after.height !== target.height) {
+        throw new Error("window moved, resized or closed during capture; capture again before input")
+      }
+    }
     const restored = await restoreFocus(windowApi, beforeFrontmost, restore);
     if (input.format === "json") {
       return json({
@@ -256,36 +274,6 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
   } catch (e) {
     await restoreFocus(windowApi, beforeFrontmost, restore);
     throw e;
-  }
-}
-
-function selectWindow(
-  windows: WindowInfo[],
-  index: number,
-  title: string | undefined,
-  pid: number | undefined,
-): WindowInfo | undefined {
-  const candidates = pid === undefined ? windows : windows.filter((window) => window.pid === pid)
-  if (title !== undefined && title.length > 0) {
-    const needle = title.toLowerCase()
-    const byTitle = candidates.find((w) => w.title.toLowerCase().includes(needle))
-    if (byTitle !== undefined) return byTitle
-  }
-  return candidates.find((w) => w.index === index)
-}
-
-async function restoreFocus(
-  api: WindowApi,
-  state: { app: string; pid: number; window: WindowInfo | null } | null,
-  enabled: boolean,
-): Promise<{ ok: boolean; app: string | null; error?: string }> {
-  if (!enabled || state === null) return { ok: true, app: state?.app ?? null }
-  try {
-    await api.focus(state.window ?? { app: state.app, pid: state.pid })
-    return { ok: true, app: state.app }
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e)
-    return { ok: false, app: state.app, error: msg }
   }
 }
 
