@@ -42,6 +42,13 @@ curl -X POST http://localhost:7879/permissions/screen-recording
 
 ## @meta/window — порт 7878
 
+Основной selector окна — `{app,pid,windowId}` из `list_windows`/`GET /windows`.
+`windowId` — CGWindowID живого окна; index/title/геометрия не являются identity.
+После закрытия окна старый ID не переиспользовать. При явном ID нельзя делать
+fallback по заголовку, геометрии или индексу. Для sheet сохранять ownerWindowId.
+Подробности — `window/API.md` и `skills/ai-macos/references/incidents.md`.
+
+
 ```bash
 # Размер экрана (логические пиксели)
 curl http://localhost:7878/screen

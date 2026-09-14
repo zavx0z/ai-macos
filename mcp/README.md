@@ -49,3 +49,23 @@ bun run --cwd mcp start
 
 Set `AI_MACOS_REST_STARTUP_TIMEOUT_MS` to override the default 15-second REST
 startup deadline.
+
+## Stable windows (0.3.0)
+
+Use `app`, `pid` and `windowId` returned by `list_windows`. Every targeted input
+and capture tool accepts the CGWindowID; stale title/index/frame hints never
+retarget an explicit ID. Closed IDs fail without replaying input. Native sheets
+expose `ownerWindowId`; post-input restoration targets their owner even when
+Save/Open was deliberately closed. Legacy app/index/title calls remain accepted.
+
+`system_health.mcp` identifies the connected protocol version and process.
+Already-connected MCP clients keep their old schemas until reconnected; updating
+REST listeners alone does not refresh the client tool catalog.
+
+Regression suite: `bun test shared/src/window-identity.test.ts window/tests screen/tests input/tests/window-selector.test.ts mcp/tests`.
+The explicit `mcp/tests/live-window-id.ts` integration test requires
+`AI_MACOS_LIVE_TEST=1`, a configured expected hostname, and
+`tmp/live-window-target.json` populated from a verified inventory. Inspect the
+window before each `capture`, `cancel` or `open` phase; saved screenshots/proofs
+are under `tmp/stable-window-*`. This is an opt-in implementation test, not an
+alternate application-automation interface. It never submits a publication.

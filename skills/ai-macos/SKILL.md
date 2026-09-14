@@ -24,6 +24,13 @@ Use the direct `ai-macos` MCP server for local macOS observation and input.
 Read [references/api.md](references/api.md) when the task needs a concrete tool
 sequence or when MCP capability boundaries are unclear.
 
+Track nonstandard failures and verified workarounds in
+[references/incidents.md](references/incidents.md). Record expected and actual
+effects, delivery status, evidence, cause versus hypothesis, recovery, and its
+limits. Promote a workaround into the workflow only after verification; add a
+regression test when fixing implementation behavior. Keep application-specific
+cases in that application's project and cross-reference shared input issues.
+
 ## Workflow
 
 1. Call `mcp__ai_macos__system_health` before the first desktop operation.
@@ -50,6 +57,62 @@ sequence or when MCP capability boundaries are unclear.
 8. After input, inspect the verification capture returned by the tool or take a
    new captioned capture. A delivered event is not proof of the requested app
    effect.
+
+## Stable window identity (MCP 0.3.0+)
+
+- After discovery, prefer `{app, pid, windowId}` from `list_windows` for focus,
+  capture, click, scroll and keyboard tools. `windowId` is the Core Graphics
+  window number; `index`, title and frame are mutable observations.
+- When `windowId` is supplied it is authoritative; stale title/index/frame
+  hints cannot retarget the call. A missing/closed ID must fail without a
+  fallback to a similar window. Never reuse IDs after a window or app closes.
+- A focused native sheet has its own `windowId` and an `ownerWindowId` obtained
+  through Accessibility relationships. Target the listed owning window and
+  use its window-local coordinates for Save/Open operations.
+- `0` in observed ID fields means unavailable, never a valid input selector.
+  Ambiguous CG-to-AX mapping fails closed. IDs are scoped to the live macOS
+  user session, not durable identifiers across logout/restart.
+- Only send `windowId` when the current tool schema advertises it. Updated
+  source/REST services do not replace an already-connected MCP process. New
+  connections report `system_health.mcp.version`; reconnect the MCP client to
+  refresh older schemas. Do not use a CLI/REST route as an application fallback.
+
+## Native Save/Open dialogs and focused sheets
+
+- Before a multi-step browser sequence such as `cmd+l`, typing a URL, and
+  Enter, call `focus_window` on the verified target. Input tools restore the
+  previously focused application after each action. If that is ChatGPT,
+  Yandex can dismiss its address-bar popup between calls and lose the field
+  focus. Keeping the intended browser frontmost preserves the sequence; still
+  inspect every result and preserve unrelated tabs.
+- A macOS Save/Open dialog may appear as `frontmost.window.index: 0` while
+  `list_windows` still lists only the browser's owning window. This is a nested
+  sheet, not a missing browser and not automatically a permissions problem.
+- Top-level AX indices can also change after closing dialogs or status windows.
+  When a unique stable title substring identifies the intended window, prefer
+  `app` plus `title` without a cached `index`. Otherwise rediscover the index.
+  After `list_windows` reports a changed index, use the new result immediately;
+  never take the recovery screenshot with the previous index.
+- Keep targeting the exact owning window returned by `list_windows` (including
+  `pid` and `windowId` when the advertised tool supports them). Do not pass sheet index `0` as
+  a top-level window selector. Measure clicks relative to the captured owning
+  window; the native adapter verifies the sheet belongs to that process and
+  lies within the target window.
+- For an ordinary Save/Open dialog, use the visible fields or `cmd+shift+g`
+  to enter a user-authorized absolute directory, then inspect the capture before
+  confirming. A system dialog alone is no reason to ask the user to click it.
+- A `POST /focus failed (409)` before dispatch means **no input was sent**.
+  Capture and inspect the target again. Do not repeat blind clicks, disable
+  focus verification, or substitute raw input/REST for the direct MCP tool.
+- When the user authorizes updating or fixing ai-macos, inspect the current
+  checkout and running service versions: updating source files does not update
+  already-running `bun ... start` processes. Verify each affected listener's
+  cwd is the canonical repository before a controlled restart, preserve other
+  listeners, then repeat `system_health`, `input_readiness`, window discovery,
+  and the failed dialog operation. Report a fix only after visual verification.
+- If repair/update has not been authorized and the direct MCP still cannot
+  verify the dialog owner, report the exact rejected tool and error. Ask for
+  the smallest manual step only when available supported actions are exhausted.
 
 ## Safety boundary
 
