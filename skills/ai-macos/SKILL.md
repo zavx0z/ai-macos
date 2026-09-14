@@ -31,6 +31,19 @@ limits. Promote a workaround into the workflow only after verification; add a
 regression test when fixing implementation behavior. Keep application-specific
 cases in that application's project and cross-reference shared input issues.
 
+## Обновление репозитория и навыка
+
+После разрешённого обновления репозитория проверить изменения `package.json`
+и `bun.lock`. Если зависимости изменились, выполнить `bun install --frozen-lockfile`
+в корне канонического checkout: новые workspace dependencies требуют обновления
+локальных связей пакетов. Проверить путь установленного навыка; если это symlink
+на `skills/ai-macos`, отдельное копирование не нужно.
+
+При диагностике запуска проверить MCP `initialize` и `tools/list` с командой,
+cwd и env из конфигурации клиента, затем пассивный `system_health`. Такой тест
+не разрешает desktop-действия через отдельный диагностический клиент и не
+подтверждает появление инструментов в уже открытой задаче Codex.
+
 ## Workflow
 
 1. Call `mcp__ai_macos__system_health` before the first desktop operation.
