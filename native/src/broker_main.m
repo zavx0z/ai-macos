@@ -5,6 +5,7 @@
 #include "meta_serialization.h"
 #include "meta_input_executor.h"
 #include "meta_macos_input.h"
+#include "meta_session_identity.h"
 #include "clipboard/meta_clipboard.h"
 #include <ApplicationServices/ApplicationServices.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -56,6 +57,17 @@
 - (NSDictionary *)permissions {
   return @{@"accessibility": @(AXIsProcessTrusted()), @"postEvents": @(CGPreflightPostEventAccess()),
            @"screenRecording": @(meta_capture_preflight_screen_recording())};
+}
+
+- (NSDictionary *)sessionIdentity {
+  MetaSessionIdentity session = meta_session_identity_read();
+  NSMutableDictionary *value = [@{@"source": @"darwin-audit", @"uid": @(session.uid),
+    @"effectiveUid": @(session.effective_uid), @"verified": session.verified ? @YES : @NO} mutableCopy];
+  if (session.verified) {
+    value[@"auditUserId"] = @(session.audit_user_id);
+    value[@"auditSessionId"] = @(session.audit_session_id);
+  } else value[@"reason"] = [NSString stringWithFormat:@"Darwin audit identity недоступна: errno=%d", session.error_number];
+  return value;
 }
 
 - (NSDictionary *)inventory {
@@ -175,6 +187,7 @@ int main(int argc, const char **argv) {
       NSMutableDictionary *metadata = [@{@"protocolVersion": @"1", @"nativeBuildId": @META_NATIVE_BUILD_ID,
         @"installRoot": @META_NATIVE_INSTALL_ROOT, @"nativeGeneration": generation,
         @"pid": @(getpid()), @"capabilitySchemaVersion": @"1"} mutableCopy];
+      metadata[@"session"] = [backend sessionIdentity];
       if (strcmp(argv[1], "--doctor") == 0) metadata[@"permissions"] = [backend permissions];
       NSData *data = [NSJSONSerialization dataWithJSONObject:metadata options:0 error:NULL];
       fwrite(data.bytes, 1, data.length, stdout);

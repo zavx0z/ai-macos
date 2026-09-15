@@ -14,10 +14,18 @@ static bool fixtureText(void *context, const uint16_t *text, size_t length, uint
 static bool fixtureFlags(void *context, uint64_t flags) { (void)context; (void)flags; return true; }
 @implementation FixtureCommandBackend {
   MetaInputExecutor *_input;
+  NSString *_clipboardValue;
+  NSUInteger _clipboardVersion;
+}
+- (NSDictionary *)sessionIdentity {
+  return @{@"verified": @NO, @"source": @"darwin-audit", @"uid": @501, @"effectiveUid": @501,
+    @"reason": @"Injected fixture не вызывает системный audit syscall"};
 }
 - (instancetype)init {
   self = [super init];
   if (self) {
+    _clipboardValue = @"";
+    _clipboardVersion = 7;
     MetaExecutorBackend sink = {.post_held_event = fixturePost, .post_text_cluster = fixtureText, .set_event_flags = fixtureFlags};
     _input = [[MetaInputExecutor alloc] initWithGeneration:@"native-command-fixture" sink:sink verify:^BOOL(NSString *target) {
       return [target isEqual:focusedSheet ? @"sheet-fixture" : @"window-fixture"];
@@ -32,7 +40,21 @@ static bool fixtureFlags(void *context, uint64_t flags) { (void)context; (void)f
 }
 - (NSDictionary *)clipboard:(NSDictionary *)command {
   if ([command[@"method"] isEqual:@"clipboard.version"]) {
-    return @{@"method": @"clipboard.version", @"value": @{@"status": @"ok", @"changeCount": @7}};
+    return @{@"method": @"clipboard.version", @"value": @{@"status": @"ok", @"changeCount": @(_clipboardVersion)}};
+  }
+  if ([command[@"method"] isEqual:@"clipboard.write"]) {
+    NSUInteger before = _clipboardVersion;
+    _clipboardValue = command[@"payload"][@"text"];
+    _clipboardVersion += 1;
+    return @{@"method": @"clipboard.write", @"value": @{@"status": @"written", @"beforeChangeCount": @(before),
+      @"declaredChangeCount": @(_clipboardVersion), @"afterChangeCount": @(_clipboardVersion), @"mutationAttempted": @YES,
+      @"setStringSucceeded": @YES, @"ownershipStableAfterWrite": @YES, @"atomicPrecondition": @NO,
+      @"utf8Bytes": @([_clipboardValue lengthOfBytesUsingEncoding:NSUTF8StringEncoding])}};
+  }
+  if ([command[@"method"] isEqual:@"clipboard.read"]) {
+    return @{@"method": @"clipboard.read", @"value": @{@"status": @"ok", @"beforeChangeCount": @(_clipboardVersion),
+      @"afterChangeCount": @(_clipboardVersion), @"text": _clipboardValue,
+      @"utf8Bytes": @([_clipboardValue lengthOfBytesUsingEncoding:NSUTF8StringEncoding])}};
   }
   return nil;
 }

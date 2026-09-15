@@ -31,6 +31,7 @@ mkdir -p "$(dirname -- "$CANDIDATE_OUTPUT")"
   native/src/capture/meta_capture.m native/src/clipboard/meta_clipboard.m \
   native/src/command_loop.m native/src/broker_transport.m native/src/broker_main.m \
   native/src/input_job.m native/src/input_executor.m \
+  native/src/session_identity.c -lbsm \
   -framework Foundation -framework AppKit -framework ApplicationServices \
   -framework CoreGraphics -framework CoreImage -framework CoreMedia \
   -framework CoreVideo -framework ImageIO -framework ScreenCaptureKit \

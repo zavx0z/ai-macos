@@ -39,6 +39,7 @@ import {
 } from "./protocol.ts"
 import {
   clipboardResponseMatches, nativeClipboardRequestSchema, nativeClipboardResponseSchema,
+  NATIVE_CLIPBOARD_WIRE_BYTES,
   type NativeClipboardRequest, type NativeClipboardResponse,
 } from "./clipboard-protocol.ts"
 
@@ -232,12 +233,12 @@ export class NativeBrokerAdapter implements NativeAdapter {
 
   async clipboard(request: NativeClipboardRequest, control: AdapterControl): Promise<NativeClipboardResponse> {
     control.signal.throwIfAborted()
-    const parsed = parseWireValue(nativeClipboardRequestSchema, request)
+    const parsed = parseWireValue(nativeClipboardRequestSchema, request, { maxBytes: NATIVE_CLIPBOARD_WIRE_BYTES, maxDepth: 32 })
     this.#assertGeneration(parsed)
     await control.checkpoint("native-before-clipboard")
     const response = await this.#exchange("clipboard", { channel: "clipboard", payload: parsed }, parsed.requestId, control.signal, parsed.deadlineAt)
     if (response.channel !== "clipboard") throw new Error("Native clipboard response channel mismatch")
-    const value = parseWireValue(nativeClipboardResponseSchema, response.payload)
+    const value = parseWireValue(nativeClipboardResponseSchema, response.payload, { maxBytes: NATIVE_CLIPBOARD_WIRE_BYTES, maxDepth: 32 })
     if (!clipboardResponseMatches(parsed, value)) throw new Error("Native clipboard response identity mismatch")
     return value
   }

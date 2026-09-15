@@ -143,6 +143,11 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     _runtimeEpoch = payload[@"runtimeEpoch"];
     _loginSessionId = payload[@"loginSessionId"];
     _admitted = [payload[@"protocolVersion"] isEqual:@"1"] && [payload[@"capabilitySchemaVersion"] isEqual:@"1"] && [payload[@"expectedNativeBuildId"] isEqual:_buildId];
+    NSDictionary *session = [_backend sessionIdentity];
+    if ([session[@"verified"] isEqual:@YES]) {
+      NSString *actualLogin = [NSString stringWithFormat:@"audit:%@:%@", session[@"uid"], session[@"auditSessionId"]];
+      _admitted = _admitted && [actualLogin isEqual:_loginSessionId];
+    }
     NSDictionary *capabilities = @{@"schemaVersion": @"1", @"scope": @"adapter", @"producerRef": _generation,
       @"capabilities": @[@{@"id": @"runtime.identity", @"state": @"ready"},
                           @{@"id": @"input.pointer", @"state": @"unavailable", @"reason": @"Broker input dispatch integration pending"},
@@ -152,6 +157,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
       @"runtimeEpoch": _runtimeEpoch, @"loginSessionId": _loginSessionId, @"nativeGeneration": _generation,
       @"nativeBuildId": _buildId, @"capabilitySchemaVersion": @"1", @"installRoot": _installRoot,
       @"process": @{@"pid": @(getpid()), @"startedAt": _startedAt, @"nonce": _nonce}, @"capabilities": capabilities,
+      @"session": session,
     }];
     return;
   }

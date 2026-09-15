@@ -33,10 +33,20 @@ import {
   windowTransitionRequestSchema,
   z,
 } from "@meta/shared/contracts"
-import { nativeClipboardRequestSchema, nativeClipboardResponseSchema } from "./clipboard-protocol.ts"
+import { nativeClipboardRequestSchema, nativeClipboardResponseSchema, NATIVE_CLIPBOARD_WIRE_BYTES } from "./clipboard-protocol.ts"
 export * from "./clipboard-protocol.ts"
 
 export const NATIVE_FRAME_HEADER_BYTES = 4
+export const NATIVE_CLIPBOARD_FRAME_FLAG = 0x80000000
+
+function decodeMessage(bytes: Uint8Array, clipboardProfile: boolean): NativeTransportResponseFrame {
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+  const frame = parseWireJson(nativeTransportResponseFrameSchema, text, {
+    maxBytes: clipboardProfile ? NATIVE_CLIPBOARD_WIRE_BYTES : MAX_NATIVE_ENVELOPE_BYTES, maxDepth: 32,
+  })
+  if (clipboardProfile && frame.channel !== "clipboard") throw new Error("Clipboard frame profile содержит другой channel")
+  return frame
+}
 
 const nativeRectSchema = z.strictObject({
   x: z.number().finite(),
@@ -741,12 +751,14 @@ export type NativeCapturePollResult = z.infer<typeof nativeCapturePollResultSche
 export type NativeCaptureTaskStatus = z.infer<typeof nativeCaptureTaskStatusSchema>
 
 export function encodeNativeFrame(value: unknown): Uint8Array {
+  const clipboardProfile = typeof value === "object" && value !== null && "channel" in value && value.channel === "clipboard"
   const payload = new TextEncoder().encode(JSON.stringify(value))
-  if (payload.byteLength > MAX_NATIVE_ENVELOPE_BYTES) {
-    throw new Error(`native frame превышает ${MAX_NATIVE_ENVELOPE_BYTES} байт`)
+  const maximum = clipboardProfile ? NATIVE_CLIPBOARD_WIRE_BYTES : MAX_NATIVE_ENVELOPE_BYTES
+  if (payload.byteLength > maximum) {
+    throw new Error(`native frame превышает ${maximum} байт`)
   }
   const frame = new Uint8Array(NATIVE_FRAME_HEADER_BYTES + payload.byteLength)
-  new DataView(frame.buffer).setUint32(0, payload.byteLength, false)
+  new DataView(frame.buffer).setUint32(0, (payload.byteLength | (clipboardProfile ? NATIVE_CLIPBOARD_FRAME_FLAG : 0)) >>> 0, false)
   frame.set(payload, NATIVE_FRAME_HEADER_BYTES)
   return frame
 }
@@ -756,6 +768,7 @@ export function parseNativeRequestFrame(text: string): NativeTransportRequestFra
 }
 
 export class NativeFrameDecoder {
+  #clipboardProfile = false
   readonly #header = new Uint8Array(NATIVE_FRAME_HEADER_BYTES)
   #headerLength = 0
   #payload: Uint8Array | undefined
@@ -771,8 +784,11 @@ export class NativeFrameDecoder {
         this.#headerLength += copied
         offset += copied
         if (this.#headerLength < NATIVE_FRAME_HEADER_BYTES) continue
-        const length = new DataView(this.#header.buffer).getUint32(0, false)
-        if (length === 0 || length > MAX_NATIVE_ENVELOPE_BYTES) {
+        const encodedLength = new DataView(this.#header.buffer).getUint32(0, false)
+        this.#clipboardProfile = (encodedLength & NATIVE_CLIPBOARD_FRAME_FLAG) !== 0
+        const length = encodedLength & 0x7fffffff
+        const maximum = this.#clipboardProfile ? NATIVE_CLIPBOARD_WIRE_BYTES : MAX_NATIVE_ENVELOPE_BYTES
+        if (length === 0 || length > maximum) {
           throw new Error("native frame length превышает предел или пуст")
         }
         this.#payload = new Uint8Array(length)
@@ -783,8 +799,7 @@ export class NativeFrameDecoder {
       this.#payloadLength += copied
       offset += copied
       if (this.#payloadLength !== this.#payload.byteLength) continue
-      const text = new TextDecoder("utf-8", { fatal: true }).decode(this.#payload)
-      frames.push(parseWireJson(nativeTransportResponseFrameSchema, text))
+      frames.push(decodeMessage(this.#payload, this.#clipboardProfile))
       this.#headerLength = 0
       this.#payload = undefined
       this.#payloadLength = 0
@@ -804,6 +819,7 @@ export type NativeTransportPacket =
   | { kind: "binary", binaryToken: string, bytes: Uint8Array }
 
 export class NativeTransportStreamDecoder {
+  #clipboardProfile = false
   readonly #header = new Uint8Array(NATIVE_FRAME_HEADER_BYTES)
   #headerLength = 0
   #message: Uint8Array | undefined
@@ -842,8 +858,11 @@ export class NativeTransportStreamDecoder {
         this.#headerLength += copied
         offset += copied
         if (this.#headerLength < NATIVE_FRAME_HEADER_BYTES) continue
-        const length = new DataView(this.#header.buffer).getUint32(0, false)
-        if (length === 0 || length > MAX_NATIVE_ENVELOPE_BYTES) {
+        const encodedLength = new DataView(this.#header.buffer).getUint32(0, false)
+        this.#clipboardProfile = (encodedLength & NATIVE_CLIPBOARD_FRAME_FLAG) !== 0
+        const length = encodedLength & 0x7fffffff
+        const maximum = this.#clipboardProfile ? NATIVE_CLIPBOARD_WIRE_BYTES : MAX_NATIVE_ENVELOPE_BYTES
+        if (length === 0 || length > maximum) {
           throw new Error("native frame length превышает предел или пуст")
         }
         this.#message = new Uint8Array(length)
@@ -855,8 +874,7 @@ export class NativeTransportStreamDecoder {
       offset += copied
       if (this.#messageLength !== this.#message.byteLength) continue
       const messageBytes = this.#message
-      const text = new TextDecoder("utf-8", { fatal: true }).decode(messageBytes)
-      const frame = parseWireJson(nativeTransportResponseFrameSchema, text)
+      const frame = decodeMessage(messageBytes, this.#clipboardProfile)
       this.#headerLength = 0
       this.#message = undefined
       this.#messageLength = 0

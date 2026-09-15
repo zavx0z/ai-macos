@@ -6,6 +6,7 @@ import { NativeBrokerAdapter, NativeProcessTransport } from "../src/adapter.ts"
 import { nativeInventoryRequestSchema, nativeInventoryResponseSchema } from "../src/protocol.ts"
 import { nativeInputExecutionRequestSchema, nativeInputExecutionResponseSchema, type NativeInputExecutionPayload } from "../src/protocol.ts"
 import { heldInputLedgerDigest, type HeldInputLedgerSink } from "@meta/shared/contracts"
+import { nativeClipboardRequestSchema } from "../src/clipboard-protocol.ts"
 
 let directory = ""
 let binary = ""
@@ -39,8 +40,10 @@ function createAdapter(ledgerSink: HeldInputLedgerSink = { persist: async () => 
 test("production command loop: verified handshake → coherent clipboard method → sealed drain", async () => {
   const adapter = createAdapter()
   try {
-    await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "handshake", runtimeEpoch: "runtime", loginSessionId: "login",
+    const handshake = await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "handshake", runtimeEpoch: "runtime", loginSessionId: "login",
       runtimeBuildId: "runtime-build", expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" })
+    expect(handshake.session).toEqual({ verified: false, source: "darwin-audit", uid: 501, effectiveUid: 501,
+      reason: "Injected fixture не вызывает системный audit syscall" })
     const deadlineAt = new Date(Date.now() + 1_000).toISOString()
     const generation = adapter.generation!
     const response = await adapter.clipboard({
@@ -188,6 +191,35 @@ test("production command loop reports loaded build and rejects incompatible hand
     expect(adapter.generation).toBeUndefined()
   } finally { await adapter.close() }
 })
+
+test("clipboard-only 8MiB profile round-trips 1M NUL plaintext через actual framed loop", async () => {
+  const adapter = createAdapter()
+  try {
+    await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "handshake", runtimeEpoch: "runtime", loginSessionId: "login",
+      runtimeBuildId: "runtime-build", expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" })
+    const deadlineAt = new Date(Date.now() + 10_000).toISOString()
+    const base = {
+      kind: "request" as const, protocolVersion: "1" as const, ...adapter.generation!, deadlineAt,
+      operation: {
+        kind: "clipboard" as const, operationId: "clipboard-operation", clientRequestId: "client-request", clientSessionId: "client", principalId: "principal",
+        runtimeEpoch: "runtime", loginSessionId: "login", deadlineAt, inventoryId: "inventory", inventoryRevision: 0,
+        target: { kind: "clipboard" as const, ref: { runtimeEpoch: "runtime", loginSessionId: "login", clipboardRef: "system" as const } },
+      },
+    }
+    const control = { signal: new AbortController().signal, checkpoint: () => undefined }
+    const text = "\0".repeat(1_000_000)
+    const written = await adapter.clipboard(nativeClipboardRequestSchema.parse({ ...base, requestId: "large-write",
+      command: { method: "clipboard.write", payload: { text, expectedChangeCount: 7 } } }), control)
+    expect(written.ok).toBe(true)
+    const read = await adapter.clipboard(nativeClipboardRequestSchema.parse({ ...base, requestId: "large-read",
+      command: { method: "clipboard.read", payload: { maxBytes: 1_000_000 } } }), control)
+    if (!read.ok || read.result.method !== "clipboard.read" || read.result.value.status !== "ok") throw new Error("clipboard read failed")
+    expect(read.result.value.text).toBe(text)
+    expect(read.result.value.utf8Bytes).toBe(1_000_000)
+    expect(() => nativeClipboardRequestSchema.parse({ ...base, requestId: "too-large",
+      command: { method: "clipboard.write", payload: { text: `${text}x` } } })).toThrow()
+  } finally { await adapter.close() }
+}, 20_000)
 
 test("slow inventory не блокирует control heartbeat; drain sealed-pending не разрешает replacement", async () => {
   const adapter = createAdapter()

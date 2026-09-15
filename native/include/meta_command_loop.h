@@ -5,6 +5,7 @@
 #include "meta_input_job.h"
 
 @protocol MetaCommandBackend <NSObject>
+- (NSDictionary *)sessionIdentity;
 - (NSDictionary *)permissions;
 - (NSDictionary *)inventory;
 - (NSDictionary *)clipboard:(NSDictionary *)command;

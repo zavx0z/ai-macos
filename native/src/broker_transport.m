@@ -6,6 +6,8 @@
 #include <time.h>
 
 static const NSUInteger messageLimit = 1024 * 1024;
+static const NSUInteger clipboardMessageLimit = 8 * 1024 * 1024;
+static const uint32_t clipboardFrameFlag = 0x80000000u;
 static const NSUInteger queuedByteLimit = 4 * 1024 * 1024;
 static const NSUInteger queuedMessageLimit = 128;
 
@@ -32,11 +34,15 @@ static uint64_t monotonic_millis(void) {
   NSUInteger _headerLength;
   NSMutableData *_payload;
   NSUInteger _payloadLength;
+  BOOL _clipboardProfile;
   NSMutableArray<NSData *> *_writes;
+  NSMutableArray<NSNumber *> *_writeProfiles;
   NSUInteger _writeOffset;
   NSUInteger _queuedBytes;
+  NSUInteger _queuedClipboardBytes;
   NSUInteger _pendingMessages;
   NSUInteger _pendingBytes;
+  NSUInteger _pendingClipboardBytes;
   uint64_t _partialSince;
   uint64_t _lastWriteProgress;
 }
@@ -67,6 +73,7 @@ static uint64_t monotonic_millis(void) {
     _onMessage = [onMessage copy];
     _onFailure = [onFailure copy];
     _writes = [NSMutableArray array];
+    _writeProfiles = [NSMutableArray array];
   }
   return self;
 }
@@ -92,8 +99,10 @@ static uint64_t monotonic_millis(void) {
     dispatch_source_cancel(_writer);
   } else close(_output);
   [_writes removeAllObjects];
+  [_writeProfiles removeAllObjects];
   _payload = nil;
   _queuedBytes = 0;
+  _queuedClipboardBytes = 0;
 }
 
 - (void)start {
@@ -146,9 +155,14 @@ static uint64_t monotonic_millis(void) {
       if (_headerLength < 4) continue;
       uint32_t encoded;
       memcpy(&encoded, _header, sizeof(encoded));
-      NSUInteger length = ntohl(encoded);
-      if (length == 0 || length > messageLimit) { [self fail:@"Native frame length вне budget"]; return; }
-      if (length > queuedByteLimit - _pendingBytes) { [self fail:@"Native control byte budget исчерпан"]; return; }
+      uint32_t header = ntohl(encoded);
+      _clipboardProfile = (header & clipboardFrameFlag) != 0;
+      NSUInteger length = header & 0x7fffffffu;
+      NSUInteger limit = _clipboardProfile ? clipboardMessageLimit : messageLimit;
+      if (length == 0 || length > limit) { [self fail:@"Native frame length вне budget"]; return; }
+      NSUInteger pending = _clipboardProfile ? _pendingClipboardBytes : _pendingBytes - _pendingClipboardBytes;
+      NSUInteger queueLimit = _clipboardProfile ? clipboardMessageLimit : queuedByteLimit;
+      if (pending > queueLimit || length > queueLimit - pending) { [self fail:@"Native control byte budget исчерпан"]; return; }
       _payload = [NSMutableData dataWithLength:length];
       _payloadLength = 0;
     } else {
@@ -161,9 +175,12 @@ static uint64_t monotonic_millis(void) {
       _headerLength = 0;
       _partialSince = 0;
       if (![value isKindOfClass:NSDictionary.class]) { [self fail:@"Native frame должен быть JSON object"]; return; }
+      if (_clipboardProfile && ![value[@"channel"] isEqual:@"clipboard"]) { [self fail:@"Clipboard frame profile содержит другой channel"]; return; }
       if (_pendingMessages >= queuedMessageLimit) { [self fail:@"Native control queue overflow"]; return; }
       _pendingMessages += 1;
       _pendingBytes += messageBytes;
+      BOOL clipboard = _clipboardProfile;
+      if (clipboard) _pendingClipboardBytes += messageBytes;
       NSDictionary *message = value;
       dispatch_async(_callbacks, ^{
         __block BOOL admitted = NO;
@@ -174,6 +191,7 @@ static uint64_t monotonic_millis(void) {
           dispatch_async(self->_io, ^{
             self->_pendingMessages -= 1;
             self->_pendingBytes -= messageBytes;
+            if (clipboard) self->_pendingClipboardBytes -= messageBytes;
           });
         }
       });
@@ -182,23 +200,29 @@ static uint64_t monotonic_millis(void) {
 }
 
 - (BOOL)enqueueFrame:(NSDictionary *)frame {
+  BOOL clipboard = [frame[@"channel"] isEqual:@"clipboard"];
+  NSUInteger limit = clipboard ? clipboardMessageLimit : messageLimit;
   NSData *payload = [NSJSONSerialization dataWithJSONObject:frame options:0 error:NULL];
-  if (payload == nil || payload.length == 0 || payload.length > messageLimit) return NO;
+  if (payload == nil || payload.length == 0 || payload.length > limit) return NO;
   __block BOOL accepted = NO;
   dispatch_sync(_io, ^{
     if (self->_closed) return;
     NSUInteger length = payload.length + 4;
-    if (self->_writes.count >= queuedMessageLimit || length > queuedByteLimit - self->_queuedBytes) {
+    NSUInteger queued = clipboard ? self->_queuedClipboardBytes : self->_queuedBytes - self->_queuedClipboardBytes;
+    NSUInteger queueLimit = clipboard ? clipboardMessageLimit + 4 : queuedByteLimit;
+    if (self->_writes.count >= queuedMessageLimit || queued > queueLimit || length > queueLimit - queued) {
       [self fail:@"Native writer queue overflow"];
       return;
     }
     NSMutableData *encoded = [NSMutableData dataWithLength:4];
-    uint32_t header = htonl((uint32_t)payload.length);
+    uint32_t header = htonl((uint32_t)payload.length | (clipboard ? clipboardFrameFlag : 0));
     memcpy(encoded.mutableBytes, &header, sizeof(header));
     [encoded appendData:payload];
     if (self->_writes.count == 0) self->_lastWriteProgress = monotonic_millis();
     [self->_writes addObject:encoded];
+    [self->_writeProfiles addObject:clipboard ? @YES : @NO];
     self->_queuedBytes += length;
+    if (clipboard) self->_queuedClipboardBytes += length;
     accepted = YES;
     if (self->_started && self->_writerSuspended) {
       self->_writerSuspended = NO;
@@ -220,9 +244,11 @@ static uint64_t monotonic_millis(void) {
     _writeOffset += (NSUInteger)sent;
     _lastWriteProgress = monotonic_millis();
     _queuedBytes -= (NSUInteger)sent;
+    if ([_writeProfiles[0] boolValue]) _queuedClipboardBytes -= (NSUInteger)sent;
     writeBudget -= (NSUInteger)sent;
     if (_writeOffset == data.length) {
       [_writes removeObjectAtIndex:0];
+      [_writeProfiles removeObjectAtIndex:0];
       _writeOffset = 0;
     }
   }

@@ -8,6 +8,7 @@ import {
 } from "@meta/shared/contracts"
 
 export const NATIVE_CLIPBOARD_MAX_UTF8_BYTES = 1_000_000
+export const NATIVE_CLIPBOARD_WIRE_BYTES = 8 * 1024 * 1024
 const count = z.number().int().safe().min(0)
 const bytes = z.number().int().min(0).max(NATIVE_CLIPBOARD_MAX_UTF8_BYTES)
 const text = z.string().refine(value => new TextEncoder().encode(value).byteLength <= NATIVE_CLIPBOARD_MAX_UTF8_BYTES,

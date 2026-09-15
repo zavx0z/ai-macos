@@ -237,6 +237,21 @@ sh native/scripts/build.sh /tmp/meta-native-build.*/libmeta-native.dylib
 
 ## Следующий шаг
 
+### Audit session metadata checkpoint
+
+Production `--metadata`, `--doctor` и framed handshake теперь содержат `session`
+из `getaudit_addr`, `getuid`, `geteuid` в исполняемом helper. При syscall failure
+или unassigned audit session возвращается `verified:false` с reason; caller
+environment не подставляется. При verified identity native admission сравнивает
+login label с `audit:<uid>:<auditSessionId>`. RuntimeHost отдельно проверяет
+actual handshake session перед readiness; parent-process audit comparison пока
+не заявлен.
+
+`build-broker.sh` связывает `session_identity.c` и `libbsm`. Временный production
+candidate с ID `native-audit-metadata-check` собран, не запускался. Command-loop
+fixture возвращает явно unverified mock session, не вызывает audit syscall:
+8 tests / 33 assertions pass. `git diff --check` проходит.
+
 ### Async command loop и keyboard checkpoint
 
 `command_loop.m` теперь использует `MetaBrokerTransport`: control queue отдельно
