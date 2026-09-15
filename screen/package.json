@@ -4,6 +4,11 @@
   "version": "0.0.0",
   "type": "module",
   "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./adapter": "./src/adapter.ts",
+    "./native-driver": "./src/native-driver.ts"
+  },
   "bin": {
     "screen": "src/cli.ts"
   },
@@ -12,9 +17,14 @@
     "start": "bun src/index.ts",
     "cli": "bun src/cli.ts",
     "build": "bun build src/index.ts --target bun --outdir dist",
+    "test": "bun test tests",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "@meta/native": "workspace:*",
     "@meta/shared": "workspace:*"
+  },
+  "devDependencies": {
+    "@meta/runtime": "workspace:*"
   }
 }

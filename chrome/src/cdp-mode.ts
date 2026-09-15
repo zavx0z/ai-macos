@@ -1,5 +1,10 @@
 import { CdpHttp, withSession, type CdpSession, type CdpTarget } from "@meta/shared"
-import { waitOnSession, type WaitReadyOptions, type WaitReadyResult } from "./wait-ready.ts"
+import {
+  armReadiness,
+  waitOnSession,
+  type WaitReadyOptions,
+  type WaitReadyResult,
+} from "./wait-ready.ts"
 
 const CDP_HOST = Bun.env.CHROME_CDP_HOST ?? "localhost"
 const CDP_PORT = Number(Bun.env.CHROME_CDP_PORT ?? 9222)
@@ -64,14 +69,10 @@ export function selectCdpTarget(
     return target
   }
   if (!selector.url) return null
-  const matches = targets.filter((target) => target.type === "page" && target.url === selector.url)
-  if (matches.length > 1) {
-    throw new CdpTargetSelectionError(
-      `CDP target is ambiguous for URL: ${selector.url}; pass targetId from GET /cdp/targets`,
-      409,
-    )
-  }
-  return matches[0] ?? null
+  throw new CdpTargetSelectionError(
+    `CDP target selection by URL is disabled: ${selector.url}; pass targetId from GET /cdp/targets`,
+    409,
+  )
 }
 
 async function cdpTargets(): Promise<CdpTarget[]> {
@@ -117,11 +118,6 @@ export async function closeCdpTarget(targetId: string): Promise<void> {
   await cdp.closeTab(targetId)
 }
 
-/** URL matching exists only for the AppleScript fallback surface. Agent workflows use targetId. */
-export async function findTargetByUrl(url: string): Promise<CdpTarget | null> {
-  return selectCdpTarget(await cdpTargets(), { url })
-}
-
 export async function cdpCommand(
   target: CdpTarget,
   method: string,
@@ -133,17 +129,7 @@ export async function cdpCommand(
   }
   const boundedTimeout = Math.max(100, Math.min(Math.round(timeoutMs), 30_000))
   return await withSession(target, async (session) => {
-    let timer: ReturnType<typeof setTimeout> | null = null
-    try {
-      return await Promise.race([
-        session.send(method, params),
-        new Promise<never>((_, reject) => {
-          timer = setTimeout(() => reject(new Error(`CDP ${method} timed out after ${boundedTimeout}ms`)), boundedTimeout)
-        }),
-      ])
-    } finally {
-      if (timer) clearTimeout(timer)
-    }
+    return await session.send(method, params, { timeoutMs: boundedTimeout })
   })
 }
 
@@ -194,15 +180,42 @@ export type CdpScreenshotOptions = {
   format?: "png" | "jpeg" | "webp"
   quality?: number
   fullPage?: boolean
+  maxDimension?: number
+  maxPixels?: number
+  maxBytes?: number
+  maxWidth?: number
+  maxHeight?: number
+  scale?: number
+  clip?: { x: number; y: number; width: number; height: number }
 }
+
+export class CdpCaptureLimitError extends Error {
+  constructor(
+    message: string,
+    readonly limit: "dimension" | "pixels" | "bytes",
+  ) {
+    super(message)
+    this.name = "CdpCaptureLimitError"
+  }
+}
+
+const DEFAULT_CAPTURE_MAX_DIMENSION = 16_384
+const DEFAULT_CAPTURE_MAX_PIXELS = 32_000_000
+const DEFAULT_CAPTURE_MAX_BYTES = 64 * 1024 * 1024
 
 export async function cdpCaptureScreenshot(
   target: CdpTarget,
   options: CdpScreenshotOptions = {},
-): Promise<{ data: string; contentType: string }> {
+  signal?: AbortSignal,
+): Promise<{ data: string; contentType: string; width: number; height: number; bytes: number }> {
   return await withSession(target, async (session) => {
     await session.send("Page.enable")
     const format = options.format ?? "png"
+    const maxDimension = Math.max(1, Math.round(options.maxDimension ?? DEFAULT_CAPTURE_MAX_DIMENSION))
+    const maxWidth = Math.min(maxDimension, Math.max(1, Math.round(options.maxWidth ?? maxDimension)))
+    const maxHeight = Math.min(maxDimension, Math.max(1, Math.round(options.maxHeight ?? maxDimension)))
+    const maxPixels = Math.max(1, Math.round(options.maxPixels ?? DEFAULT_CAPTURE_MAX_PIXELS))
+    const maxBytes = Math.max(1, Math.round(options.maxBytes ?? DEFAULT_CAPTURE_MAX_BYTES))
     const params: Record<string, unknown> = {
       format,
       fromSurface: true,
@@ -211,25 +224,77 @@ export async function cdpCaptureScreenshot(
     if (format !== "png" && options.quality !== undefined) {
       params.quality = Math.max(0, Math.min(Math.round(options.quality), 100))
     }
-    if (options.fullPage) {
-      const metrics = await session.send<{
-        cssContentSize?: { x: number; y: number; width: number; height: number }
-        contentSize?: { x: number; y: number; width: number; height: number }
-      }>("Page.getLayoutMetrics")
-      const size = metrics.cssContentSize ?? metrics.contentSize
-      if (size) {
-        params.clip = {
-          x: size.x,
-          y: size.y,
-          width: Math.max(1, Math.ceil(size.width)),
-          height: Math.max(1, Math.ceil(size.height)),
-          scale: 1,
-        }
+    const metrics = await session.send<{
+      cssContentSize?: { x: number; y: number; width: number; height: number }
+      contentSize?: { x: number; y: number; width: number; height: number }
+      cssVisualViewport?: { clientWidth: number; clientHeight: number }
+      visualViewport?: { clientWidth: number; clientHeight: number }
+    }>("Page.getLayoutMetrics")
+    const fullSize = metrics.cssContentSize ?? metrics.contentSize
+    const viewport = metrics.cssVisualViewport ?? metrics.visualViewport
+    const selected = options.clip ?? (options.fullPage ? fullSize : viewport)
+    if (!selected) throw new Error("CDP did not return measured capture dimensions")
+    const sourceWidth = Math.max(1, Math.ceil("width" in selected ? selected.width : selected.clientWidth))
+    const sourceHeight = Math.max(1, Math.ceil("height" in selected ? selected.height : selected.clientHeight))
+    const scale = options.scale ?? 1
+    const width = Math.max(1, Math.ceil(sourceWidth * scale))
+    const height = Math.max(1, Math.ceil(sourceHeight * scale))
+    assertCaptureDimensions(width, height, maxDimension, maxPixels)
+    if (width > maxWidth || height > maxHeight) {
+      throw new CdpCaptureLimitError(`CDP capture exceeds output extent: ${width}x${height}`, "dimension")
+    }
+    if (options.fullPage || options.clip || scale !== 1) {
+      const origin = options.clip ?? fullSize ?? { x: 0, y: 0 }
+      params.clip = {
+        x: origin.x,
+        y: origin.y,
+        width: sourceWidth,
+        height: sourceHeight,
+        scale,
       }
     }
     const result = await session.send<{ data: string }>("Page.captureScreenshot", params)
-    return { data: result.data, contentType: `image/${format}` }
+    const bytes = decodedBase64Bytes(result.data)
+    if (bytes > maxBytes) {
+      throw new CdpCaptureLimitError(
+        `CDP capture exceeds byte limit: ${bytes} > ${maxBytes}`,
+        "bytes",
+      )
+    }
+    return { data: result.data, contentType: `image/${format}`, width, height, bytes }
+  }, {
+    signal,
+    maxIncomingMessageBytes: Math.ceil((options.maxBytes ?? DEFAULT_CAPTURE_MAX_BYTES) * 4 / 3) + 64 * 1024,
   })
+}
+
+export function assertCaptureDimensions(
+  width: number,
+  height: number,
+  maxDimension = DEFAULT_CAPTURE_MAX_DIMENSION,
+  maxPixels = DEFAULT_CAPTURE_MAX_PIXELS,
+): void {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    throw new CdpCaptureLimitError(`Invalid CDP capture dimensions: ${width}x${height}`, "dimension")
+  }
+  if (width > maxDimension || height > maxDimension) {
+    throw new CdpCaptureLimitError(
+      `CDP capture dimensions exceed limit: ${width}x${height}, maxDimension=${maxDimension}`,
+      "dimension",
+    )
+  }
+  if (width * height > maxPixels) {
+    throw new CdpCaptureLimitError(
+      `CDP capture pixel count exceeds limit: ${width * height} > ${maxPixels}`,
+      "pixels",
+    )
+  }
+}
+
+function decodedBase64Bytes(value: string): number {
+  if (value.length === 0) return 0
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0
+  return Math.floor(value.length * 3 / 4) - padding
 }
 
 export type CdpTraceOptions = {
@@ -271,26 +336,17 @@ export async function cdpTrace(target: CdpTarget, options: CdpTraceOptions = {})
   }
 
   return await withSession(tracingTarget, async (session) => {
-    const ws = (session as unknown as { ws: WebSocket }).ws
     let resolveComplete!: (stream: string) => void
     let rejectComplete!: (error: Error) => void
     const complete = new Promise<string>((resolve, reject) => {
       resolveComplete = resolve
       rejectComplete = reject
     })
-    const onMessage = (event: MessageEvent) => {
-      try {
-        const message = JSON.parse(String(event.data)) as {
-          method?: string
-          params?: { stream?: string }
-        }
-        if (message.method !== "Tracing.tracingComplete") return
-        const stream = message.params?.stream
-        if (stream) resolveComplete(stream)
-        else rejectComplete(new Error("CDP trace completed without a stream"))
-      } catch {}
-    }
-    ws.addEventListener("message", onMessage)
+    const unsubscribe = session.subscribe<{ stream?: string }>("Tracing.tracingComplete", (params) => {
+      const stream = params.stream
+      if (stream) resolveComplete(stream)
+      else rejectComplete(new Error("CDP trace completed without a stream"))
+    })
     let started = false
     try {
       await session.send("Tracing.start", {
@@ -335,13 +391,13 @@ export async function cdpTrace(target: CdpTarget, options: CdpTraceOptions = {})
       }
       return { targetId: target.id, durationMs, categories, bytes, data: chunks.join("") }
     } finally {
-      ws.removeEventListener("message", onMessage)
+      unsubscribe()
       if (started) await session.send("Tracing.end").catch(() => {})
     }
   })
 }
 
-export async function cdpEval(target: CdpTarget, js: string): Promise<string> {
+export async function cdpEval(target: CdpTarget, js: string, signal?: AbortSignal): Promise<string> {
   return await withSession(target, async (s) => {
     const wrapped = `(async function(){try{var __r=await (async function(){${js}})();return (typeof __r==='undefined')?'':(typeof __r==='string'?__r:JSON.stringify(__r));}catch(e){throw e;}})()`
     const result = await s.send<{
@@ -353,7 +409,7 @@ export async function cdpEval(target: CdpTarget, js: string): Promise<string> {
       throw new Error(msg)
     }
     return result.result.value ?? ""
-  })
+  }, { signal })
 }
 
 export async function cdpNavigate(
@@ -361,17 +417,25 @@ export async function cdpNavigate(
   url: string,
   wait = true,
   waitOpts: WaitReadyOptions = {},
+  signal?: AbortSignal,
+  onDispatched?: () => void,
 ): Promise<{ waitMs: number; ready?: WaitReadyResult }> {
   return await withSession(target, async (s) => {
     await s.send("Page.enable")
     const t0 = Date.now()
-    const loaded = wait ? armLoadEvent(s, 8_000) : null
-    await s.send("Page.navigate", { url })
-    if (!wait) return { waitMs: 0 }
-    await loaded!
-    const ready = await waitOnSession(s, waitOpts)
-    return { waitMs: Date.now() - t0, ready }
-  })
+    const tracker = wait ? await armReadiness(s, waitOpts) : null
+    try {
+      const loaded = wait ? armLoadEvent(s, 8_000) : null
+      await s.send("Page.navigate", { url })
+      onDispatched?.()
+      if (!wait) return { waitMs: 0 }
+      await loaded!
+      const ready = await waitOnSession(s, waitOpts, tracker)
+      return { waitMs: Date.now() - t0, ready }
+    } finally {
+      tracker?.close()
+    }
+  }, { signal, commandTimeoutMs: Math.min(waitOpts.maxMs ?? 15_000, 30_000) })
 }
 
 export type ConsoleEntry = {
@@ -387,9 +451,21 @@ export async function cdpConsoleListen(
   target: CdpTarget,
   durationMs: number,
   collectExisting = true,
+  signal?: AbortSignal,
+  limits: { maxEvents?: number; maxBytes?: number; onDrop?: () => void } = {},
 ): Promise<ConsoleEntry[]> {
   return await withSession(target, async (s) => {
     const entries: ConsoleEntry[] = []
+    let serializedBytes = 2
+    const push = (entry: ConsoleEntry) => {
+      const bytes = Buffer.byteLength(JSON.stringify(entry)) + (entries.length === 0 ? 0 : 1)
+      if (entries.length >= (limits.maxEvents ?? 1_000) || serializedBytes + bytes > (limits.maxBytes ?? 1024 * 1024)) {
+        limits.onDrop?.()
+        return
+      }
+      entries.push(entry)
+      serializedBytes += bytes
+    }
 
     if (collectExisting) {
       // Enable Log domain to also catch network errors / browser warnings logged to console
@@ -397,28 +473,16 @@ export async function cdpConsoleListen(
     }
     await s.send("Runtime.enable")
 
-    // Listen via raw WebSocket events
-    const ws = (s as unknown as { ws: WebSocket }).ws
-    const handler = (ev: MessageEvent) => {
-      try {
-        const m = JSON.parse(ev.data as string) as {
-          method?: string
-          params?: {
-            type?: string
-            args?: { value?: unknown; description?: string }[]
-            stackTrace?: { callFrames: { url: string; lineNumber: number }[] }
-            timestamp?: number
-            entry?: { source: string; level: string; text: string; url?: string; lineNumber?: number; timestamp?: number }
-          }
-        }
-        if (m.method === "Runtime.consoleAPICalled" && m.params) {
-          const args = (m.params.args ?? []).map((a) => {
-            if (a.value !== undefined) return typeof a.value === "string" ? a.value : JSON.stringify(a.value)
-            return a.description ?? ""
-          })
-          const frame = m.params.stackTrace?.callFrames?.[0]
-          const rawType = String(m.params.type ?? "log")
-          // CDP типы: log, info, warning, error, debug, dir, ...
+    const unsubscribeConsole = s.subscribe<{
+      type?: string
+      args?: { value?: unknown; description?: string }[]
+      stackTrace?: { callFrames: { url: string; lineNumber: number }[] }
+      timestamp?: number
+    }>("Runtime.consoleAPICalled", (params) => {
+          const argumentBudget = Math.max(64, Math.floor((limits.maxBytes ?? 1024 * 1024) / Math.max(1, params.args?.length ?? 1)))
+          const args = (params.args ?? []).map(argument => materializeConsoleArgument(argument, argumentBudget))
+          const frame = params.stackTrace?.callFrames?.[0]
+          const rawType = String(params.type ?? "log")
           const lvl: ConsoleEntry["level"] =
             rawType === "warning" ? "warn"
             : rawType === "error" ? "error"
@@ -426,17 +490,21 @@ export async function cdpConsoleListen(
             : rawType === "debug" ? "debug"
             : rawType === "verbose" ? "verbose"
             : "log"
-          entries.push({
+          push({
             type: "console",
             level: lvl,
             text: args.join(" "),
             url: frame?.url,
             line: frame?.lineNumber,
-            timestamp: m.params.timestamp ?? Date.now(),
+            timestamp: params.timestamp ?? Date.now(),
           })
-        } else if (m.method === "Log.entryAdded" && m.params?.entry) {
-          const e = m.params.entry
-          entries.push({
+    })
+    const unsubscribeLog = s.subscribe<{
+      entry?: { source: string; level: string; text: string; url?: string; lineNumber?: number; timestamp?: number }
+    }>("Log.entryAdded", (params) => {
+          const e = params.entry
+          if (!e) return
+          push({
             type: e.source ?? "browser",
             level: (["error", "warning", "info", "verbose"].includes(e.level) ? (e.level === "warning" ? "warn" : e.level) : "log") as ConsoleEntry["level"],
             text: e.text,
@@ -444,19 +512,36 @@ export async function cdpConsoleListen(
             line: e.lineNumber,
             timestamp: e.timestamp ?? Date.now(),
           })
-        }
-      } catch {
-        /* ignore parse errors */
-      }
-    }
-    ws.addEventListener("message", handler)
+    })
     try {
       await new Promise((r) => setTimeout(r, durationMs))
     } finally {
-      ws.removeEventListener("message", handler)
+      unsubscribeConsole()
+      unsubscribeLog()
     }
     return entries
+  }, {
+    signal,
+    maxIncomingMessageBytes: Math.min(8 * 1024 * 1024, (limits.maxBytes ?? 1024 * 1024) * 2 + 64 * 1024),
   })
+}
+
+export function materializeConsoleArgument(
+  argument: { value?: unknown; description?: string },
+  maxBytes: number,
+): string {
+  const value = argument.value !== undefined
+    ? typeof argument.value === "string" ? argument.value : JSON.stringify(argument.value)
+    : argument.description ?? ""
+  if (Buffer.byteLength(value) <= maxBytes) return value
+  let low = 0
+  let high = value.length
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2)
+    if (Buffer.byteLength(value.slice(0, middle)) <= maxBytes) low = middle
+    else high = middle - 1
+  }
+  return value.slice(0, low)
 }
 
 export async function cdpReload(
@@ -464,17 +549,25 @@ export async function cdpReload(
   ignoreCache = false,
   wait = true,
   waitOpts: WaitReadyOptions = {},
+  signal?: AbortSignal,
+  onDispatched?: () => void,
 ): Promise<{ waitMs: number; ready?: WaitReadyResult }> {
   return await withSession(target, async (s) => {
     await s.send("Page.enable")
     const t0 = Date.now()
-    const loaded = wait ? armLoadEvent(s, 8_000) : null
-    await s.send("Page.reload", { ignoreCache })
-    if (!wait) return { waitMs: 0 }
-    await loaded!
-    const ready = await waitOnSession(s, waitOpts)
-    return { waitMs: Date.now() - t0, ready }
-  })
+    const tracker = wait ? await armReadiness(s, waitOpts) : null
+    try {
+      const loaded = wait ? armLoadEvent(s, 8_000) : null
+      await s.send("Page.reload", { ignoreCache })
+      onDispatched?.()
+      if (!wait) return { waitMs: 0 }
+      await loaded!
+      const ready = await waitOnSession(s, waitOpts, tracker)
+      return { waitMs: Date.now() - t0, ready }
+    } finally {
+      tracker?.close()
+    }
+  }, { signal, commandTimeoutMs: Math.min(waitOpts.maxMs ?? 15_000, 30_000) })
 }
 
 export async function cdpHistory(
@@ -492,11 +585,17 @@ export async function cdpHistory(
     const entry = history.entries[history.currentIndex + direction]
     if (!entry) return { navigated: false, waitMs: 0 }
     const startedAt = Date.now()
-    await session.send("Page.navigateToHistoryEntry", { entryId: entry.id })
-    if (!wait) return { navigated: true, waitMs: 0 }
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    const ready = await waitOnSession(session, waitOpts)
-    return { navigated: true, waitMs: Date.now() - startedAt, ready }
+    const tracker = wait ? await armReadiness(session, waitOpts) : null
+    try {
+      const loaded = wait ? armLoadEvent(session, 8_000) : null
+      await session.send("Page.navigateToHistoryEntry", { entryId: entry.id })
+      if (!wait) return { navigated: true, waitMs: 0 }
+      await loaded!
+      const ready = await waitOnSession(session, waitOpts, tracker)
+      return { navigated: true, waitMs: Date.now() - startedAt, ready }
+    } finally {
+      tracker?.close()
+    }
   })
 }
 
@@ -528,44 +627,33 @@ async function forceClearMetrics(s: CdpSession): Promise<void> {
  * for builds where the event arrives before our subscription.
  */
 function armLoadEvent(s: CdpSession, timeoutMs: number): Promise<void> {
-  const ws = (s as unknown as { ws: WebSocket }).ws
-  return new Promise<void>((resolve) => {
-    let loaded = false
-    let contextReady = false
-    let timer: ReturnType<typeof setTimeout> | null = null
-    const settle = () => {
-      if (timer) clearTimeout(timer)
-      ws.removeEventListener("message", onMsg)
-      resolve()
+  const controller = new AbortController()
+  const eventOptions = { timeoutMs, signal: controller.signal }
+  const loaded = Promise.any([
+    s.waitForEvent("Page.loadEventFired", eventOptions),
+    s.waitForEvent("Page.frameStoppedLoading", eventOptions),
+  ])
+  const contextReady = s.waitForEvent("Runtime.executionContextCreated", eventOptions)
+  s.send("Runtime.enable", {}, { timeoutMs, signal: controller.signal }).catch(() => {})
+  return (async () => {
+    try {
+      await loaded
+      await Promise.race([
+        contextReady,
+        new Promise<void>((resolve) => setTimeout(resolve, 200)),
+      ])
+    } finally {
+      controller.abort()
+      await contextReady.catch(() => {})
     }
-    const maybeDone = () => {
-      if (loaded && contextReady) settle()
-    }
-    timer = setTimeout(settle, timeoutMs)
-    const onMsg = (ev: MessageEvent) => {
-      try {
-        const m = JSON.parse(ev.data as string) as { method?: string }
-        if (m.method === "Page.loadEventFired" || m.method === "Page.frameStoppedLoading") {
-          loaded = true
-          // Fallback: if the new context already arrived before we subscribed (or this
-          // build does not surface executionContextCreated), give it 200 ms and move on.
-          setTimeout(() => { contextReady = true; maybeDone() }, 200)
-          maybeDone()
-        } else if (m.method === "Runtime.executionContextCreated") {
-          contextReady = true
-          maybeDone()
-        }
-      } catch {}
-    }
-    ws.addEventListener("message", onMsg)
-    // Enable Runtime to receive executionContextCreated events. Fire-and-forget —
-    // we don't await because we want the subscription armed before Page.reload.
-    s.send("Runtime.enable").catch(() => {})
-  })
+  })()
 }
 
-export async function cdpWaitReady(target: CdpTarget, waitOpts: WaitReadyOptions = {}): Promise<WaitReadyResult> {
-  return await withSession(target, async (s) => waitOnSession(s, waitOpts))
+export async function cdpWaitReady(target: CdpTarget, waitOpts: WaitReadyOptions = {}, signal?: AbortSignal): Promise<WaitReadyResult> {
+  return await withSession(target, async (s) => waitOnSession(s, waitOpts), {
+    signal,
+    commandTimeoutMs: Math.min(waitOpts.maxMs ?? 15_000, 30_000),
+  })
 }
 
 export type ViewportMode = "window" | "emulation"

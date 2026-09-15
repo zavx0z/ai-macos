@@ -4,7 +4,6 @@ import {
   closeTab,
   closeWindow,
   consoleListen,
-  evalJs,
   getActiveTab,
   getSource,
   getText,
@@ -26,7 +25,6 @@ import {
   CdpTargetSelectionError,
   activateCdpTarget,
   cdpCaptureScreenshot,
-  cdpCommand,
   cdpPerformanceSnapshot,
   cdpTrace,
   cdpWaitReady,
@@ -38,7 +36,7 @@ import {
   type ViewportMode,
   type ViewportOverride,
 } from "./cdp-mode.ts";
-import type { WaitReadyOptions } from "./wait-ready.ts";
+import type { WaitReadyOptions, WaitReadyResult } from "./wait-ready.ts";
 import {ensureChromeSession, listChromeProfiles} from "./session.ts";
 import {
   ChromeProcessAmbiguityError,
@@ -46,6 +44,17 @@ import {
 } from "./browser-processes.ts";
 
 const PORT = Number(Bun.env.PORT ?? 7880);
+
+function jsonWithReadiness(value: Record<string, unknown> & { ready?: WaitReadyResult }): Response {
+  if (value.ready && !value.ready.ok) {
+    return json({
+      ok: false,
+      error: "browser-readiness-incomplete",
+      ...value,
+    }, { status: value.ready.timedOut ? 504 : 409 })
+  }
+  return json({ ok: true, ...value })
+}
 
 const server = Bun.serve({
   port: PORT,
@@ -114,28 +123,6 @@ const server = Bun.serve({
         return json({ ok: true, targetId: cdpTargetMatch[1] });
       }
 
-      if (path === "/cdp/command" && method === "POST") {
-        const body = (await req.json()) as {
-          targetId?: string;
-          method?: string;
-          params?: unknown;
-          timeoutMs?: number;
-        };
-        if (!body.targetId?.trim()) return err(400, "missing 'targetId'", "Получите targetId из GET /cdp/targets");
-        if (!body.method?.trim()) return err(400, "missing 'method'", "Пример: {\"targetId\":\"...\",\"method\":\"Runtime.getHeapUsage\"}");
-        if (body.params !== undefined && (!body.params || typeof body.params !== "object" || Array.isArray(body.params))) {
-          return err(400, "'params' must be a JSON object");
-        }
-        const target = await findTargetById(body.targetId);
-        const result = await cdpCommand(
-          target,
-          body.method,
-          (body.params ?? {}) as Record<string, unknown>,
-          body.timeoutMs,
-        );
-        return json({ ok: true, targetId: target.id, method: body.method, result });
-      }
-
       if (path === "/cdp/performance" && method === "POST") {
         const body = (await req.json()) as { targetId?: string };
         if (!body.targetId?.trim()) return err(400, "missing 'targetId'", "Получите targetId из GET /cdp/targets");
@@ -186,7 +173,15 @@ const server = Bun.serve({
         }
         const target = await findTargetById(body.targetId);
         if (body.caption) logCaption(body.caption);
-        if (body.waitReady !== false) await cdpWaitReady(target, body.waitOpts ?? {});
+        const ready = body.waitReady === false ? undefined : await cdpWaitReady(target, body.waitOpts ?? {});
+        if (ready && !ready.ok) {
+          return json({
+            ok: false,
+            error: "browser-readiness-incomplete",
+            targetId: target.id,
+            readiness: ready,
+          }, { status: ready.timedOut ? 504 : 409 });
+        }
         const capture = await cdpCaptureScreenshot(target, {
           format: body.format,
           quality: body.quality,
@@ -251,7 +246,7 @@ const server = Bun.serve({
         if (!body.url) return err(400, "missing 'url'", "Пример: {\"url\":\"https://example.com\"}");
         const wait = body.waitReady !== false
         const result = await navigate(body.url, body.windowId, body.tabIndex, wait, body.waitOpts, body.targetId);
-        return json({ ok: true, ...result });
+        return jsonWithReadiness(result);
       }
 
       if (path === "/activate" && method === "POST") {
@@ -269,7 +264,7 @@ const server = Bun.serve({
         const result = body.hard
           ? await hardReload(body.windowId, body.tabIndex, wait, body.waitOpts, body.targetId)
           : await reload(body.windowId, body.tabIndex, wait, body.waitOpts, body.targetId);
-        return json({ ok: true, hard: body.hard === true, waited: wait, ...result });
+        return jsonWithReadiness({ hard: body.hard === true, waited: wait, ...result });
       }
 
       if (path === "/wait-ready" && method === "POST") {
@@ -278,7 +273,12 @@ const server = Bun.serve({
         if (r.via === "unavailable") {
           return err(503, r.error, "Запустите Chrome с CDP: bun run cdp (в директории chrome/)");
         }
-        return json({ via: r.via, ...r.result });
+        if (!r.result.ok) {
+          return json({ error: "browser-readiness-incomplete", via: r.via, ...r.result, ok: false }, {
+            status: r.result.timedOut ? 504 : 409,
+          });
+        }
+        return json({ via: r.via, ...r.result, ok: true });
       }
 
       if (path === "/viewport" && method === "POST") {
@@ -303,7 +303,7 @@ const server = Bun.serve({
         if (r.via === "unavailable") {
           return err(503, r.error, "Запустите Chrome с CDP: bun run cdp (в директории chrome/)");
         }
-        return json({ ok: true, ...r });
+        return jsonWithReadiness(r);
       }
 
       if (path === "/viewport" && method === "DELETE") {
@@ -314,35 +314,19 @@ const server = Bun.serve({
         if (r.via === "unavailable") {
           return err(503, r.error, "Запустите Chrome с CDP: bun run cdp (в директории chrome/)");
         }
-        return json({ ok: true, ...r });
+        return jsonWithReadiness(r);
       }
 
       if (path === "/back" && method === "POST") {
         const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; targetId?: string; wait?: boolean; waitOpts?: WaitReadyOptions };
         const result = await goBack(body.windowId, body.tabIndex, body.targetId, body.wait !== false, body.waitOpts);
-        return json({ ok: true, ...result });
+        return jsonWithReadiness(result);
       }
 
       if (path === "/forward" && method === "POST") {
         const body = (await req.json().catch(() => ({}))) as { windowId?: number; tabIndex?: number; targetId?: string; wait?: boolean; waitOpts?: WaitReadyOptions };
         const result = await goForward(body.windowId, body.tabIndex, body.targetId, body.wait !== false, body.waitOpts);
-        return json({ ok: true, ...result });
-      }
-
-      if (path === "/eval" && method === "POST") {
-        const body = (await req.json()) as { js?: string; windowId?: number; tabIndex?: number; targetId?: string };
-        if (!body.js) return err(400, "missing 'js'", "Пример: {\"js\":\"return document.title\"}");
-        const result = await evalJs(body.js, body.windowId, body.tabIndex, body.targetId);
-        // The eval wrapper always JSON.stringify-s non-string return values, so `result`
-        // is a string like '{"foo":42}'. Surface a pre-parsed copy as `parsed` so clients
-        // don't need to JSON.parse(result) themselves. Strings that don't look like JSON
-        // get parsed:null.
-        let parsed: unknown = null;
-        const trimmed = typeof result === "string" ? result.trim() : "";
-        if (trimmed && (trimmed[0] === "{" || trimmed[0] === "[" || trimmed === "true" || trimmed === "false" || trimmed === "null" || /^-?\d/.test(trimmed) || (trimmed[0] === '"' && trimmed[trimmed.length - 1] === '"'))) {
-          try { parsed = JSON.parse(trimmed); } catch { parsed = null; }
-        }
-        return json({ ok: true, result, parsed });
+        return jsonWithReadiness(result);
       }
 
       if (path === "/console" && (method === "GET" || method === "POST")) {
@@ -396,7 +380,7 @@ const server = Bun.serve({
         return new Response(result.body, { headers });
       }
 
-      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /cdp /profiles /cdp/targets /windows /tabs /tabs/active /source /text /screenshot, POST /session /cdp/targets /cdp/command /cdp/performance /cdp/trace /cdp/screenshot /windows /tabs /navigate /activate /reload /back /forward /eval /screenshot /wait-ready /viewport, DELETE /cdp/targets/:id /windows/:id /tabs/:wid/:idx /viewport");
+      return err(404, `${method} ${path} not found`, "Доступные маршруты: GET /health /cdp /profiles /cdp/targets /windows /tabs /tabs/active /source /text /screenshot, POST /session /cdp/targets /cdp/performance /cdp/trace /cdp/screenshot /windows /tabs /navigate /activate /reload /back /forward /screenshot /wait-ready /viewport, DELETE /cdp/targets/:id /windows/:id /tabs/:wid/:idx /viewport");
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       if (e instanceof CdpTargetSelectionError) {
@@ -436,7 +420,6 @@ printBanner("@meta/chrome", PORT, [
     { method: "POST",   path: "/cdp/screenshot",                 description: "viewport/full-page screenshot по targetId" },
     { method: "POST",   path: "/cdp/performance",                description: "Performance + DOM snapshot по targetId" },
     { method: "POST",   path: "/cdp/trace",                      description: "bounded DevTools trace по targetId" },
-    { method: "POST",   path: "/cdp/command",                    description: "one-shot CDP method по targetId" },
   ]},
   { title: "Окна и вкладки", routes: [
     { method: "GET",    path: "/windows",        description: "список окон с вкладками" },
@@ -458,7 +441,6 @@ printBanner("@meta/chrome", PORT, [
     { method: "POST",   path: "/forward",    description: "вперёд" },
   ]},
   { title: "Контент", routes: [
-    { method: "POST", path: "/eval",    description: "выполнить JS в вкладке" },
     { method: "GET",  path: "/source",  description: "HTML страницы" },
     { method: "GET",  path: "/text",    description: "текст страницы" },
     { method: "POST", path: "/console", description: "слушать console (CDP) ({durationMs?})" },

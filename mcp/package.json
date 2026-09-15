@@ -6,11 +6,13 @@
   "scripts": {
     "start": "bun src/launcher.ts",
     "server": "bun src/index.ts",
+    "runtime-server": "bun src/runtime-mcp.ts",
     "test": "bun test"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "latest",
     "zod": "latest",
+    "@meta/runtime": "workspace:*",
     "@meta/shared": "workspace:*"
   }
 }

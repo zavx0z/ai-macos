@@ -3,9 +3,10 @@
   "module": "index.ts",
   "type": "module",
   "private": true,
-  "workspaces": ["shared", "window", "screen", "chrome", "android", "input", "mcp"],
+  "workspaces": ["shared", "window", "screen", "chrome", "android", "input", "mcp", "runtime", "native"],
   "scripts": {
-    "dev": "bun run --filter '@meta/window' --filter '@meta/screen' --filter '@meta/chrome' --filter '@meta/android' --filter '@meta/input' dev",
+    "dev": "bun run --filter '@meta/window' --filter '@meta/screen' --filter '@meta/chrome' --filter '@meta/input' dev",
+    "dev:android": "ANDROID_AUTO_INSTALL=false bun run --cwd android dev",
     "mcp": "bun run --cwd mcp start"
   },
   "devDependencies": {

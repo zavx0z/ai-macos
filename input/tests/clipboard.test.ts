@@ -4,9 +4,12 @@ import {
   readClipboardText,
   writeClipboardText,
 } from "../src/clipboard.ts"
+import { LIVE_CLIPBOARD_ENV, liveClipboardEnabled } from "./clipboard-live-gate.ts"
+
+const liveTest = liveClipboardEnabled() ? test : test.skip
 
 describe("system clipboard", () => {
-  test("uses native macOS pbpaste/pbcopy and round-trips UTF-8 text", async () => {
+  liveTest(`uses native macOS pbpaste/pbcopy and round-trips UTF-8 text (${LIVE_CLIPBOARD_ENV}=true)`, async () => {
     const health = await clipboardHealth()
     expect(health).toMatchObject({ ok: true, backend: "pbpaste/pbcopy" })
 

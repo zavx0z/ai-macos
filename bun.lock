@@ -15,6 +15,7 @@
       "name": "@meta/android",
       "version": "0.0.0",
       "dependencies": {
+        "@meta/chrome": "workspace:*",
         "@meta/shared": "workspace:*",
       },
     },
@@ -32,6 +33,7 @@
       "name": "@meta/input",
       "version": "0.0.0",
       "dependencies": {
+        "@meta/native": "workspace:*",
         "@meta/shared": "workspace:*",
       },
     },
@@ -39,9 +41,27 @@
       "name": "@meta/mcp",
       "version": "0.3.0",
       "dependencies": {
+        "@meta/runtime": "workspace:*",
         "@meta/shared": "workspace:*",
         "@modelcontextprotocol/sdk": "latest",
         "zod": "latest",
+      },
+    },
+    "native": {
+      "name": "@meta/native",
+      "version": "0.0.0",
+      "dependencies": {
+        "@meta/shared": "workspace:*",
+      },
+    },
+    "runtime": {
+      "name": "@meta/runtime",
+      "version": "0.0.0",
+      "dependencies": {
+        "@meta/android": "workspace:*",
+        "@meta/chrome": "workspace:*",
+        "@meta/native": "workspace:*",
+        "@meta/shared": "workspace:*",
       },
     },
     "screen": {
@@ -51,12 +71,19 @@
         "screen": "src/cli.ts",
       },
       "dependencies": {
+        "@meta/native": "workspace:*",
         "@meta/shared": "workspace:*",
+      },
+      "devDependencies": {
+        "@meta/runtime": "workspace:*",
       },
     },
     "shared": {
       "name": "@meta/shared",
       "version": "0.0.0",
+      "dependencies": {
+        "zod": "4.4.3",
+      },
     },
     "window": {
       "name": "@meta/window",
@@ -65,6 +92,7 @@
         "window": "src/cli.ts",
       },
       "dependencies": {
+        "@meta/native": "workspace:*",
         "@meta/shared": "workspace:*",
       },
     },
@@ -79,6 +107,10 @@
     "@meta/input": ["@meta/input@workspace:input"],
 
     "@meta/mcp": ["@meta/mcp@workspace:mcp"],
+
+    "@meta/native": ["@meta/native@workspace:native"],
+
+    "@meta/runtime": ["@meta/runtime@workspace:runtime"],
 
     "@meta/screen": ["@meta/screen@workspace:screen"],
 
@@ -272,9 +304,11 @@
 
     "wrappy": ["wrappy@1.0.2", "", {}, "sha512-l4Sp/DRseor9wL6EvV2+TuQn63dMkPjZ/sp9XkghTEbV9KlPS1xUsZ3u7/IQO4wxtcFB4bgpQPRcR3QCvezPcQ=="],
 
-    "zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
+    "zod": ["zod@4.6.5", "", {}, "sha512-v5l/aFXZQeai4awLbOpSoHecE9UiMrnfx75tEXLjNonXVARxQ5mOeipTjROUchszUNCqnE+hqAMujRsRHsut2Q=="],
 
     "zod-to-json-schema": ["zod-to-json-schema@3.25.2", "", { "peerDependencies": { "zod": "^3.25.28 || ^4" } }, "sha512-O/PgfnpT1xKSDeQYSCfRI5Gy3hPf91mKVDuYLUHZJMiDFptvP41MSnWofm8dnCm0256ZNfZIM7DSzuSMAFnjHA=="],
+
+    "@meta/shared/zod": ["zod@4.4.3", "", {}, "sha512-ytENFjIJFl2UwYglde2jchW2Hwm4GJFLDiSXWdTrJQBIN9Fcyp7n4DhxJEiWNAJMV1/BqWfW/kkg71UDcHJyTQ=="],
 
     "body-parser/content-type": ["content-type@2.1.0", "", {}, "sha512-mj7UPXE0jaqaOsukNZRUEfEi2AcL7C/vwmwcHV0O97eO1E1pxBZuyjlZrx5seTaNBg1U6+o35wpa35Qfcc+7ag=="],
 

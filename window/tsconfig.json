@@ -1,4 +1,9 @@
 {
   "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "paths": {
+      "@meta/native/window-adapter": ["../native/src/window-adapter.ts"]
+    }
+  },
   "include": ["src/**/*.ts"]
 }

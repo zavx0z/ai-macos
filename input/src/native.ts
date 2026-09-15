@@ -1,10 +1,10 @@
-import { mkdir, stat } from "node:fs/promises"
+import { access, stat } from "node:fs/promises"
+import { constants } from "node:fs"
 import { join } from "node:path"
 
 const INPUT_ROOT = join(import.meta.dir, "..")
 const NATIVE_SOURCE = join(INPUT_ROOT, "native", "meta_input_helper.c")
-const NATIVE_DIR = join(INPUT_ROOT, "bin")
-const NATIVE_HELPER = join(NATIVE_DIR, "meta-input-helper")
+const NATIVE_HELPER = join(INPUT_ROOT, "bin", "meta-input-helper")
 const ACCESSIBILITY_EXIT = 77
 
 export class NativeInputError extends Error {
@@ -33,7 +33,7 @@ async function run(
   return { stdout: stdout.trim(), stderr: stderr.trim(), code }
 }
 
-async function needsBuild(): Promise<boolean> {
+async function sourceIsNewerThanInstalledHelper(): Promise<boolean> {
   try {
     const [source, helper] = await Promise.all([stat(NATIVE_SOURCE), stat(NATIVE_HELPER)])
     return source.mtimeMs > helper.mtimeMs
@@ -46,40 +46,17 @@ export async function ensureNativeHelper(): Promise<string> {
   if (process.platform !== "darwin") {
     throw new Error("@meta/input native helper поддерживается только на macOS")
   }
-  if (!(await needsBuild())) return NATIVE_HELPER
-
-  await mkdir(NATIVE_DIR, { recursive: true })
-  const compile = await run("/usr/bin/clang", [
-    "-O2",
-    "-Wall",
-    "-Wextra",
-    "-mmacosx-version-min=12.0",
-    "-framework",
-    "ApplicationServices",
-    "-framework",
-    "CoreGraphics",
-    "-framework",
-    "AppKit",
-    "-x",
-    "objective-c",
-    "-o",
-    NATIVE_HELPER,
-    NATIVE_SOURCE,
-  ])
-  if (compile.code !== 0) {
-    throw new Error(`не удалось собрать meta-input-helper: ${compile.stderr}`)
+  try {
+    await access(NATIVE_HELPER, constants.X_OK)
+  } catch {
+    throw new Error(
+      `установленный meta-input-helper отсутствует или не исполняем: ${NATIVE_HELPER}; требуется явный apply-update`,
+    )
   }
-
-  const sign = await run("/usr/bin/codesign", [
-    "--force",
-    "--sign",
-    "-",
-    "--identifier",
-    "com.meta.input.helper",
-    NATIVE_HELPER,
-  ])
-  if (sign.code !== 0) {
-    throw new Error(`не удалось подписать meta-input-helper: ${sign.stderr}`)
+  if (await sourceIsNewerThanInstalledHelper()) {
+    throw new Error(
+      `исходник native helper новее установленного ${NATIVE_HELPER}; автоматическая пересборка запрещена, требуется согласованный apply-update`,
+    )
   }
   return NATIVE_HELPER
 }

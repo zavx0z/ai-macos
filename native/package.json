@@ -1,0 +1,23 @@
+{
+  "name": "@meta/native",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "exports": {
+    "./session-lifecycle": "./src/session-lifecycle.ts",
+    ".": "./src/index.ts",
+    "./protocol": "./src/protocol.ts",
+    "./adapter": "./src/adapter.ts",
+    "./capture-client": "./src/capture-client.ts",
+    "./evidence-extractor": "./src/evidence-extractor.ts",
+    "./window-adapter": "./src/window-adapter.ts"
+  },
+  "scripts": {
+    "build": "sh scripts/build.sh",
+    "test": "sh scripts/check.sh && bun test tests/*.test.ts",
+    "typecheck": "sh scripts/check.sh --compile-only && tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@meta/shared": "workspace:*"
+  }
+}

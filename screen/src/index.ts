@@ -1,4 +1,4 @@
-import { captureDesktop, captureRect, parseDetail, type CaptureOptions } from "./capture.ts";
+import { captureDesktop, captureRect, finiteNumber, legacyCaptureMetadata, parseDetail, type CaptureOptions } from "./capture.ts";
 import { createWindowApi, type WindowInfo } from "./window-api.ts";
 import { restoreFocus } from "./restore-focus.ts";
 import { clamp, err, json, logCaption, logRequest, nonNegativeInt, osa, parseBoolean, png, positiveInt, printBanner, quote, sleep, selectUniqueWindow, validWindowId, sameWindowIdentity } from "@meta/shared";
@@ -56,13 +56,18 @@ const server = Bun.serve({
         const display = positiveInt(url.searchParams.get("display"), undefined);
         const format = parseFormat(url.searchParams.get("format"));
         const scale = parseDetail(url.searchParams.get("detail") ?? url.searchParams.get("scale"));
-        return await desktopResponse({ display, scale }, format);
+        const caption = url.searchParams.get("caption") ?? undefined
+        return await desktopResponse({ display, scale }, format, caption)
       }
 
       if (path === "/desktop" && method === "POST") {
-        const body = await readJson<{ display?: number; format?: "png" | "json"; detail?: string; scale?: number }>(req);
-        const scale = parseDetail(body.detail ?? String(body.scale ?? ""), 1.0);
-        return await desktopResponse({ display: positiveInt(body.display, undefined), scale }, body.format ?? "png");
+        const body = await readJson<{ display?: number; format?: "png" | "json"; detail?: string; scale?: number; caption?: string }>(req)
+        const scale = parseDetail(body.detail ?? body.scale, 1.0)
+        return await desktopResponse(
+          { display: positiveInt(body.display, undefined), scale },
+          body.format ?? "png",
+          body.caption,
+        )
       }
 
       if (path === "/windows" && method === "GET") {
@@ -83,7 +88,7 @@ const server = Bun.serve({
           shadow: parseBoolean(url.searchParams.get("shadow"), true),
           format: parseFormat(url.searchParams.get("format")),
           detail: url.searchParams.get("detail") ?? undefined,
-          scale: positiveInt(url.searchParams.get("scale"), undefined),
+          scale: finiteNumber(url.searchParams.get("scale")),
           caption: url.searchParams.get("caption") ?? undefined,
         };
         return await windowResponse(request);
@@ -97,8 +102,8 @@ const server = Bun.serve({
         const input: RectCaptureRequest = method === "POST"
           ? await readJson<RectCaptureRequest>(req)
           : {
-              x: nonNegativeInt(url.searchParams.get("x"), undefined),
-              y: nonNegativeInt(url.searchParams.get("y"), undefined),
+              x: finiteNumber(url.searchParams.get("x")),
+              y: finiteNumber(url.searchParams.get("y")),
               width: positiveInt(url.searchParams.get("width"), undefined),
               height: positiveInt(url.searchParams.get("height"), undefined),
               app: url.searchParams.get("app") ?? undefined,
@@ -107,7 +112,7 @@ const server = Bun.serve({
               restore: parseBoolean(url.searchParams.get("restore"), true),
               format: parseFormat(url.searchParams.get("format")),
               detail: url.searchParams.get("detail") ?? undefined,
-              scale: positiveInt(url.searchParams.get("scale"), undefined),
+              scale: finiteNumber(url.searchParams.get("scale")),
               caption: url.searchParams.get("caption") ?? undefined,
             };
         return await rectResponse(input);
@@ -169,17 +174,30 @@ async function health(): Promise<Response> {
   }
 }
 
-async function desktopResponse(options: CaptureOptions, format: "png" | "json"): Promise<Response> {
-  const image = await captureDesktop(options);
+async function desktopResponse(
+  options: CaptureOptions,
+  format: "png" | "json",
+  caption?: string,
+): Promise<Response> {
+  if (caption) logCaption(caption)
+  const image = await captureDesktop(options)
+  const metadata = legacyCaptureMetadata(image, caption)
   if (format === "json") {
     return json({
       ok: true,
       target: "desktop",
       mime: "image/png",
+      ...metadata,
       base64: Buffer.from(image).toString("base64"),
-    });
+    })
   }
-  return png(image, { "x-meta-screen-target": "desktop" });
+  return png(image, {
+    "x-meta-screen-target": "desktop",
+    "x-meta-image-width": String(metadata.widthPx),
+    "x-meta-image-height": String(metadata.heightPx),
+    "x-meta-encoded-bytes": String(metadata.encodedBytes),
+    ...(caption ? { "x-meta-caption": encodeURIComponent(caption) } : {}),
+  })
 }
 
 async function proxyChromeScreenshot(input: WindowCaptureRequest): Promise<Response> {
@@ -240,7 +258,8 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
     // Menus are separate compositor surfaces and are absent from -l captures.
     // Resolve the owner by stable ID, capture its visible composite, then verify
     // its identity/frame again before publishing window-local coordinates.
-    const image = await captureRect(target, { shadow: input.shadow, scale });
+    const image = await captureRect(target, { shadow: input.shadow, scale })
+    const imageMetadata = legacyCaptureMetadata(image, input.caption)
     if (validWindowId(target.windowId)) {
       const after = selectUniqueWindow(await windowApi.listWindows(app), { app: target.app, pid: target.pid, windowId: target.windowId })
       if (!after || !sameWindowIdentity(target, after)
@@ -255,9 +274,9 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
         ok: true,
         target: "window",
         mime: "image/png",
+        ...imageMetadata,
         window: target,
         restored,
-        ...(input.caption ? { caption: input.caption } : {}),
         base64: Buffer.from(image).toString("base64"),
       });
     }
@@ -269,6 +288,9 @@ async function windowResponse(input: WindowCaptureRequest): Promise<Response> {
       "x-meta-window-index": String(target.index),
       "x-meta-window-title": encodeURIComponent(target.title),
       "x-meta-window-restored": restored.ok ? "true" : "false",
+      "x-meta-image-width": String(imageMetadata.widthPx),
+      "x-meta-image-height": String(imageMetadata.heightPx),
+      "x-meta-encoded-bytes": String(imageMetadata.encodedBytes),
       ...extraHeaders,
     });
   } catch (e) {
@@ -304,7 +326,8 @@ async function rectResponse(input: RectCaptureRequest): Promise<Response> {
     if (input.app) await osa(`tell application ${quote(input.app)} to activate`);
     if (delayMs > 0) await sleep(delayMs);
 
-    const image = await captureRect({ x, y, width, height }, { shadow: input.shadow, scale });
+    const image = await captureRect({ x, y, width, height }, { shadow: input.shadow, scale })
+    const imageMetadata = legacyCaptureMetadata(image, input.caption)
     const restored = await restoreFocus(windowApi, beforeFrontmost, restore);
 
     if (input.format === "json") {
@@ -312,9 +335,9 @@ async function rectResponse(input: RectCaptureRequest): Promise<Response> {
         ok: true,
         target: "rect",
         mime: "image/png",
+        ...imageMetadata,
         rect: { x, y, width, height },
         restored,
-        ...(input.caption ? { caption: input.caption } : {}),
         base64: Buffer.from(image).toString("base64"),
       });
     }
@@ -324,6 +347,9 @@ async function rectResponse(input: RectCaptureRequest): Promise<Response> {
       "x-meta-screen-target": "rect",
       "x-meta-rect": `${x},${y},${width},${height}`,
       "x-meta-window-restored": restored.ok ? "true" : "false",
+      "x-meta-image-width": String(imageMetadata.widthPx),
+      "x-meta-image-height": String(imageMetadata.heightPx),
+      "x-meta-encoded-bytes": String(imageMetadata.encodedBytes),
       ...extraHeaders,
     });
   } catch (e) {
