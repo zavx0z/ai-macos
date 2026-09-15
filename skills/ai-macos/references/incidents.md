@@ -77,3 +77,11 @@
 ## 2026-09-15 — scroll deltas mistaken for pixels
 
 Yandex editor navigation alternated dy650, -900, 350, -600 and250 while seeking a nearby paragraph. Native command_scroll uses kCGScrollEventUnitLine, so these values represent wheel lines, not pixels. The MCP schema did not state the units. Clarified tool description, dx/dy field descriptions and API reference without changing native behavior. Start with a small step and verify the resulting viewport; do not claim a fixed pixel distance. The large-step tool arguments are retained in the publisher task history and local operation evidence in canonical dzen.
+
+## 2026-09-15 — Cyrillic mojibake after plain clipboard paste
+
+A known approved two-paragraph string was written through clipboard_write and inserted using the visible Paste menu in the Dzen editor. The write reported 796 input bytes, but screenshot06 in canonical dzen's week-live-2026-09-15/05-covered-market-glazing/create/publisher/screens shows mojibake. This differs from the earlier three punctuation errors during native keyboard typing.
+
+The implementation spawned pbcopy/pbpaste with inherited locale. The installed macOS pbcopy manual states that these utilities choose input/output encoding from locale and recommends UTF-8; a headless service need not inherit Terminal's UTF-8 locale. Both child processes now explicitly receive LANG, LC_CTYPE and LC_ALL=en_US.UTF-8. No global shell or macOS setting is changed.
+
+Regression tests mock the subprocess boundary, cover missing/C/non-UTF-8 parent locales and multilingual text, and do not read or replace the user's general clipboard. The previous automatic real-clipboard round trip was removed from the default tests. TypeScript and four unit tests passed. Live verification is performed only through the assigned operator's direct MCP write and visible Paste/readback in the existing draft. A successful byte-count response alone is not application-level verification. Evidence remains in the local Dzen incident archive; the draft is not duplicated.
