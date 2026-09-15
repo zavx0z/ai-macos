@@ -2,11 +2,13 @@ import {
   NATIVE_PROTOCOL_VERSION,
   structurallyEqual,
   type AdapterControl,
+  type ContractError,
   type NativeAdapter,
   type NativeCancelAck,
   type NativeContinuationIssuer,
   type NativeContinuationRegistrar,
   type NativeExecutionContext,
+  type NativeOperationStatus,
   type NativeTargetMapping,
   type RuntimeOperationContext,
   type ScreenCaptureRequest,
@@ -32,6 +34,17 @@ export type NativeCapturePoll = {
   evidenceReceipt?: VerifiedNativeEvidenceReceipt
   terminalEvidenceReceipt?: VerifiedNativeEvidenceReceipt
 }
+
+export class NativeCaptureStartError extends Error {
+  constructor(
+    readonly nativeError: ContractError,
+    readonly nativeStatus?: NativeOperationStatus,
+  ) {
+    super(nativeError.message)
+  }
+}
+
+export class NativeCaptureRejectedBeforeStartError extends NativeCaptureStartError {}
 
 type BinaryNativeAdapter = NativeAdapter & {
   takeBinary(binaryToken: string, expectedLength: number, signal?: AbortSignal): Promise<Uint8Array>
@@ -78,7 +91,12 @@ export class NativeCaptureClient {
       nativeCaptureStartResponseSchema,
       context.control,
     )
-    if (!response.ok) throw new Error(response.error.message)
+    if (!response.ok) {
+      if (response.startDisposition === "rejected-before-start") {
+        throw new NativeCaptureRejectedBeforeStartError(response.error)
+      }
+      throw new NativeCaptureStartError(response.error, response.nativeStatus)
+    }
     if (
       response.result.operationId !== context.wire.operationId
       || !structurallyEqual(response.result.acceptedFence, context.wire.fence)

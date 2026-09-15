@@ -1,5 +1,7 @@
 import {
   NativeCaptureClient,
+  NativeCaptureRejectedBeforeStartError,
+  NativeCaptureStartError,
   type NativeCaptureTask as ProtocolCaptureTask,
 } from "@meta/native/capture-client"
 import {
@@ -15,6 +17,7 @@ import {
   type NativeCaptureSuccess,
   type NativeCaptureTask,
   type NativeCaptureTaskStatus,
+  NativeCaptureDriverStartError,
 } from "./adapter.ts"
 
 type TrackedTask = {
@@ -45,15 +48,27 @@ export class ProtocolNativeCaptureDriver implements NativeCaptureDriver {
     context: Parameters<NativeCaptureDriver["start"]>[0],
     input: NativeCaptureDriverRequest,
   ): Promise<NativeCaptureTask> {
-    const protocol = await this.#client.start(
-      context,
-      input.request,
-      input.nativeMapping,
-      {
-        captureTimeoutMs: input.captureTimeoutMs,
-        stopTimeoutMs: input.stopTimeoutMs,
-      },
-    )
+    let protocol: ProtocolCaptureTask
+    try {
+      protocol = await this.#client.start(
+        context,
+        input.request,
+        input.nativeMapping,
+        {
+          captureTimeoutMs: input.captureTimeoutMs,
+          stopTimeoutMs: input.stopTimeoutMs,
+        },
+      )
+    } catch (error) {
+      if (error instanceof NativeCaptureStartError) {
+        throw new NativeCaptureDriverStartError(
+          error.nativeError,
+          error.nativeStatus,
+          error instanceof NativeCaptureRejectedBeforeStartError,
+        )
+      }
+      throw error
+    }
     if (this.#tasks.has(protocol.taskRef) || this.#released.has(protocol.taskRef)) {
       throw new Error(`Native protocol повторно выдал captureTaskRef ${protocol.taskRef}`)
     }

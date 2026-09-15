@@ -453,6 +453,49 @@ test("production command loop проводит observer ACK перед PUSH и c
         stopTimeoutMs: 100,
       },
     })
+    const staleRequest = nativeCaptureStartRequestSchema.parse({
+      ...request,
+      requestId: "capture-start-stale-1",
+      operation: {
+        ...request.operation,
+        operationId: "operation-stale-1",
+        clientRequestId: "client-request-stale-1",
+      },
+      payload: {
+        ...request.payload,
+        nativeMapping: {
+          kind: "display",
+          display: { nativeDisplayId: 20, ref: secondDisplayRef },
+        },
+      },
+    })
+    adapter.mutationDelivery.register(staleRequest.operation)
+    const staleStart = await adapter.request(
+      nativeCaptureStartRequestSchema,
+      staleRequest,
+      nativeCaptureStartResponseSchema,
+      control(),
+    )
+    expect(staleStart.ok).toBe(false)
+    if (staleStart.ok) throw new Error("Stale capture неожиданно принят")
+    expect(staleStart.error).toMatchObject({
+      code: "target-stale",
+      stage: "capture-start",
+      recoveryAction: "refresh-inventory",
+    })
+    expect(staleStart.error.message).toContain("Display mapping")
+    expect(staleStart.nativeStatus).toBeUndefined()
+    const heartbeatAfterRejectedStart = await adapter.heartbeat(
+      nativeHeartbeatRequestSchema.parse({
+        requestId: "heartbeat-after-rejected-capture",
+        ...generation,
+        deadlineAt: new Date(Date.now() + 3_000).toISOString(),
+      }),
+      control(),
+    )
+    expect(heartbeatAfterRejectedStart.accepted).toBe(true)
+    expect(heartbeatAfterRejectedStart.quarantined).toBe(false)
+
     const started = await adapter.request(
       nativeCaptureStartRequestSchema,
       request,

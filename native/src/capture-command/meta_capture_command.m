@@ -6,15 +6,7 @@
 
 #include "../../include/meta_serialization.h"
 
-static NSString *const MetaCaptureCommandErrorDomain = @"@meta/macos.capture-command";
-
-typedef NS_ENUM(NSInteger, MetaCaptureCommandError) {
-  MetaCaptureCommandInvalidRequest = 1,
-  MetaCaptureCommandStaleAuthority = 2,
-  MetaCaptureCommandUnsupportedTarget = 3,
-  MetaCaptureCommandRouterFailure = 4,
-  MetaCaptureCommandBinaryFailure = 5,
-};
+NSErrorDomain const MetaCaptureCommandErrorDomain = @"@meta/macos.capture-command";
 
 @interface MetaCaptureCommandRecord : NSObject
 
@@ -360,6 +352,7 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
 
 @property(nonatomic) MetaCaptureRouter *router;
 @property(nonatomic, copy) MetaCaptureInventoryProvider inventoryProvider;
+@property(nonatomic, copy) MetaCaptureTopologyValidator topologyValidator;
 @property(nonatomic, copy) NSString *nativeGeneration;
 @property(nonatomic, copy) NSString *nativeBuildId;
 @property(nonatomic) NSLock *lock;
@@ -373,9 +366,10 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
 
 - (nullable instancetype)initWithRouter:(MetaCaptureRouter *)router
                        inventoryProvider:(MetaCaptureInventoryProvider)inventoryProvider
+                       topologyValidator:(MetaCaptureTopologyValidator)topologyValidator
                         nativeGeneration:(NSString *)nativeGeneration
                            nativeBuildId:(NSString *)nativeBuildId {
-  if (router == NULL || inventoryProvider == nil ||
+  if (router == NULL || inventoryProvider == nil || topologyValidator == nil ||
       !valid_string(nativeGeneration, 64) || !valid_string(nativeBuildId, 127)) {
     return nil;
   }
@@ -383,6 +377,7 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
   if (self == nil) return nil;
   _router = router;
   _inventoryProvider = [inventoryProvider copy];
+  _topologyValidator = [topologyValidator copy];
   _nativeGeneration = [nativeGeneration copy];
   _nativeBuildId = [nativeBuildId copy];
   _lock = [[NSLock alloc] init];
@@ -391,8 +386,9 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
   return self;
 }
 
-- (nullable NSDictionary *)startRequest:(NSDictionary *)request
-                                   error:(NSError **)error {
+- (nullable NSDictionary *)handleStartRequest:(NSDictionary *)request
+                               validationOnly:(BOOL)validationOnly
+                                        error:(NSError **)error {
   if (![request isKindOfClass:[NSDictionary class]]) {
     fail(error, MetaCaptureCommandInvalidRequest,
          @"Capture start должен быть JSON object");
@@ -428,7 +424,7 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
   const MetaInventorySnapshot *snapshot = self.inventoryProvider();
   uint64_t inventory_revision = 0;
   uint64_t layout_revision = 0;
-  if (snapshot == NULL || !snapshot->complete ||
+  if (snapshot == NULL ||
       strcmp(snapshot->native_generation, self.nativeGeneration.UTF8String) != 0 ||
       ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
       !unsigned_integer(operation[@"inventoryRevision"], &inventory_revision) ||
@@ -445,6 +441,13 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
     return nil;
   }
   NSString *target_kind = target_wrapper[@"kind"];
+  if (([target_kind isEqual:@"display"] ||
+       [target_kind isEqual:@"desktop-layout"]) &&
+      !self.topologyValidator(snapshot)) {
+    fail(error, MetaCaptureCommandStaleAuthority,
+         @"Capture display topology не подтверждена независимо от AX inventory");
+    return nil;
+  }
   NSDate *operation_deadline = date_from_iso(request[@"deadlineAt"]);
   NSTimeInterval remaining_seconds =
       [operation_deadline timeIntervalSinceDate:NSDate.date];
@@ -630,8 +633,22 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
   NSDate *maximum_expiry = [now dateByAddingTimeInterval:120];
   NSDate *geometry_expiry = [publication_expiry earlierDate:maximum_expiry];
   [self.lock lock];
+  BOOL has_capacity = self.records.count + self.pendingStarts < 1024;
+  [self.lock unlock];
+  if (!has_capacity) {
+    free(layout_children);
+    fail(error, MetaCaptureCommandRouterFailure,
+         @"Capture command metadata достигла bounded capacity");
+    return nil;
+  }
+  if (validationOnly) {
+    free(layout_children);
+    return @{};
+  }
+  [self.lock lock];
   if (self.records.count + self.pendingStarts >= 1024) {
     [self.lock unlock];
+    free(layout_children);
     fail(error, MetaCaptureCommandRouterFailure,
          @"Capture command metadata достигла bounded capacity");
     return nil;
@@ -727,6 +744,15 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
     @"acceptedAt" : iso_now(),
     @"status" : status_value(task_ref, status),
   };
+}
+
+- (BOOL)validateStartRequest:(NSDictionary *)request error:(NSError **)error {
+  return [self handleStartRequest:request validationOnly:YES error:error] != nil;
+}
+
+- (nullable NSDictionary *)startRequest:(NSDictionary *)request
+                                   error:(NSError **)error {
+  return [self handleStartRequest:request validationOnly:NO error:error];
 }
 
 - (NSDictionary *)statusEvidence:(MetaCaptureCommandRecord *)record
@@ -846,6 +872,9 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
          @"Capture completion имеет противоречивый outcome/status/error");
     return nil;
   }
+  NSString *completion_observed_at = result->outcome == MetaCaptureOutcomeSucceeded
+      ? iso_from_micros(result->capturedAtUnixNanoseconds / 1000ULL)
+      : record.observedAt;
   NSMutableDictionary *value = [@{
     @"captureTaskRef" : record.taskRef,
     @"operationId" : record.operationId,
@@ -855,7 +884,7 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
     @"inventoryId" : record.inventoryId,
     @"inventoryRevision" : @(record.inventoryRevision),
     @"displayLayoutRevision" : @(record.displayLayoutRevision),
-    @"observedAt" : record.observedAt,
+    @"observedAt" : completion_observed_at,
     @"outcome" : outcome_value(result->outcome),
     @"cleanup" : complete ? @"complete" : @"unknown",
     @"errorCode" : error_code_value(result->errorCode),

@@ -424,17 +424,21 @@ int main(void) {
         .native_generation = "native-1",
         .revision = 4,
         .display_layout_revision = 3,
-        .captured_at_micros = 1789466400000000ULL,
+        .captured_at_micros = 1789466399000000ULL,
         .complete = true,
         .windows = windows,
         .window_count = 1,
         .displays = displays,
         .display_count = 2,
     };
+    __block BOOL topologyCurrent = YES;
     MetaCaptureCommandBinder *binder = [[MetaCaptureCommandBinder alloc]
         initWithRouter:router
         inventoryProvider:^const MetaInventorySnapshot *{
           return &snapshot;
+        }
+        topologyValidator:^BOOL(const MetaInventorySnapshot *value) {
+          return topologyCurrent && value != NULL;
         }
         nativeGeneration:@"native-1"
         nativeBuildId:@"native-build-1"];
@@ -527,6 +531,9 @@ int main(void) {
         error:&error];
     assert([completed[@"poll"][@"state"] isEqual:@"completed"]);
     NSDictionary *execution = completed[@"poll"][@"result"];
+    assert(![execution[@"observedAt"] isEqual:started[@"observedAt"]]);
+    assert([execution[@"observedAt"]
+        isEqual:execution[@"frame"][@"capturedAt"]]);
     assert([execution[@"backend"][@"buildId"] isEqual:@"native-build-1"]);
     assert([execution[@"frame"][@"frameRef"] isEqual:@"frame-1"]);
     assert([execution[@"frame"][@"encodedBytes"] unsignedLongLongValue] == 4);
@@ -610,6 +617,24 @@ int main(void) {
     assert(fake.release_result_count == 1);
     assert([binder lookupFrameGeometry:@"frame-1"] != nil);
 
+    snapshot.complete = false;
+    topologyCurrent = NO;
+    error = nil;
+    BOOL display_without_topology = [binder validateStartRequest:
+        start_request(@"inventory-1", 4, @"display",
+                      @"2099-09-15T10:02:00.000Z") error:&error];
+    assert(!display_without_topology);
+    assert(error.code == MetaCaptureCommandStaleAuthority);
+    assert(fake.start_count == 1);
+    windows[0].mapping = META_MAPPING_AMBIGUOUS;
+    error = nil;
+    BOOL unproven_window = [binder validateStartRequest:
+        start_request(@"inventory-1", 4, @"window",
+                      @"2099-09-15T10:02:00.000Z") error:&error];
+    assert(!unproven_window);
+    assert(error.code == MetaCaptureCommandStaleAuthority);
+    assert(fake.start_count == 1);
+    windows[0].mapping = META_MAPPING_CORROBORATED;
     error = nil;
     NSDictionary *window_started = [binder startRequest:
         start_request(@"inventory-1", 4, @"window",
@@ -695,6 +720,7 @@ int main(void) {
     assert(fake.release_task_count == 3);
     assert(fake.release_result_count == 3);
 
+    topologyCurrent = YES;
     error = nil;
     NSDictionary *layout_started = [binder startRequest:
         start_request(@"inventory-1", 4, @"desktop-layout",

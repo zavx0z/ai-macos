@@ -19,6 +19,7 @@ import type {
   NativeTransportRequestFrame,
 } from "@meta/native/protocol"
 import { ProtocolNativeCaptureDriver } from "../src/native-driver.ts"
+import { NativeCaptureDriverStartError } from "../src/adapter.ts"
 
 const runtimeEpoch = "runtime:protocol"
 const loginSessionId = "login:protocol"
@@ -257,7 +258,7 @@ class FakeCaptureTransport implements NativeTransport {
   closed = false
   lateStart: Extract<NativeTransportPacket, { kind: "message" }>["frame"] | undefined
 
-  constructor(readonly mode: "success" | "cancel" | "late-start" | "unknown" = "success") {}
+  constructor(readonly mode: "success" | "cancel" | "late-start" | "unknown" | "rejected-before-start" | "rejected-unknown" = "success") {}
 
   async send(frame: NativeTransportRequestFrame) {
     this.sent.push(frame)
@@ -286,6 +287,33 @@ class FakeCaptureTransport implements NativeTransport {
       return
     }
     if (frame.channel === "request" && frame.payload.method === "capture.start") {
+      if (this.mode === "rejected-before-start" || this.mode === "rejected-unknown") {
+        this.pushMessage({
+          channel: "response",
+          payload: {
+            kind: "response",
+            protocolVersion: "1",
+            requestId: frame.payload.requestId,
+            runtimeEpoch,
+            loginSessionId,
+            nativeGeneration,
+            operationId: frame.payload.operation.operationId,
+            ok: false,
+            error: {
+              code: "target-stale",
+              message: "Capture mapping rejected before start",
+              stage: "capture-start",
+              retryable: false,
+              replayAllowed: false,
+              recoveryAction: "refresh-inventory",
+            },
+            ...(this.mode === "rejected-before-start"
+              ? { startDisposition: "rejected-before-start" as const }
+              : {}),
+          },
+        })
+        return
+      }
       const response = {
         channel: "response",
         payload: {
@@ -632,6 +660,65 @@ function evidenceReceipt(report: NativeEvidenceReport): VerifiedNativeEvidenceRe
     issuedAt: now,
   }
 }
+
+test("ProtocolNativeCaptureDriver доверяет no-task только typed rejected-before-start reply", async () => {
+  for (const [mode, rejectedBeforeStart] of [
+    ["rejected-before-start", true],
+    ["rejected-unknown", false],
+  ] as const) {
+    const transport = new FakeCaptureTransport(mode)
+    const broker = new NativeBrokerAdapter({
+      host,
+      transport,
+      ledgerSink: { async persist() { throw new Error("ledger не ожидался") } },
+      adapterInstanceRef: `native-adapter:${mode}`,
+      bindEvidence() {
+        return {
+          sourceResponses: { register() {} },
+          publisher: { async publish(report) { return evidenceReceipt(report) } },
+        }
+      },
+    })
+    await broker.handshake({
+      kind: "handshake",
+      protocolVersion: "1",
+      requestId: `handshake:${mode}`,
+      runtimeEpoch,
+      loginSessionId,
+      runtimeBuildId: "runtime-build:protocol",
+      expectedNativeBuildId: "native-build:protocol",
+      capabilitySchemaVersion: "1",
+    })
+    const driver = new ProtocolNativeCaptureDriver(
+      new NativeCaptureClient(broker, new FakeContinuationAuthority()),
+      0,
+    )
+    const context = operationContext()
+    broker.mutationDelivery.register(context.wire)
+    let failure: unknown
+    try {
+      await driver.start(context, {
+        request: captureRequest(),
+        nativeMapping: mapping,
+        captureTimeoutMs: 5_000,
+        stopTimeoutMs: 1_000,
+      })
+    } catch (error) {
+      failure = error
+    }
+    expect(failure).toBeInstanceOf(NativeCaptureDriverStartError)
+    const rejected = failure as NativeCaptureDriverStartError
+    expect(rejected.rejectedBeforeStart).toBe(rejectedBeforeStart)
+    expect(rejected.nativeStatus).toBeUndefined()
+    expect(rejected.nativeError.code).toBe("target-stale")
+    if (rejectedBeforeStart) {
+      expect(() => broker.mutationDelivery.assertNeverAttempted(context.wire)).not.toThrow()
+    } else {
+      expect(() => broker.mutationDelivery.assertNeverAttempted(context.wire)).toThrow("never-attempted")
+    }
+    await broker.close()
+  }
+})
 
 test("ProtocolNativeCaptureDriver проходит start/pending/result/binary/evidence/release", async () => {
   const transport = new FakeCaptureTransport()

@@ -10,6 +10,7 @@ import {
   type NativeTransport,
 } from "../src/adapter.ts"
 import {
+  nativeCaptureStartResponseSchema,
   nativeInputExecutionRequestSchema,
   nativeInputExecutionResponseSchema,
   type NativeTransportPacket,
@@ -321,6 +322,29 @@ describe("NativeBrokerAdapter", () => {
       await expect(adapter.request(nativeInputExecutionRequestSchema, failed, nativeInputExecutionResponseSchema,
         { signal: new AbortController().signal, checkpoint: () => undefined })).rejects.toThrow("send rejected")
       expect(() => adapter.mutationDelivery.assertNeverAttempted(failed.operation)).toThrow("never-attempted")
+
+      const rejected = nativeInputExecutionRequestSchema.parse({ ...request, requestId: "pre-start-rejected", operation: {
+        ...request.operation, operationId: "pre-start-rejected-operation", fence: { ...request.operation.fence, counter: 3 },
+      } })
+      adapter.mutationDelivery.register(rejected.operation)
+      transport.send = async (frame) => {
+        transport.sent.push(frame)
+        if (frame.channel !== "request") throw new Error("ожидался request")
+        transport.push({ kind: "message", frame: { channel: "response", payload: {
+          kind: "response", protocolVersion: "1", requestId: frame.payload.requestId, ...generation,
+          operationId: rejected.operation.operationId, ok: false,
+          error: { code: "target-stale", message: "Fixture pre-start rejection", stage: "capture-start",
+            retryable: false, replayAllowed: false, recoveryAction: "refresh-inventory" },
+          startDisposition: "rejected-before-start",
+        } } })
+      }
+      await expect(adapter.request(
+        nativeInputExecutionRequestSchema,
+        rejected,
+        nativeCaptureStartResponseSchema,
+        { signal: new AbortController().signal, checkpoint: () => undefined },
+      )).rejects.toThrow("exact pending capture.start")
+      expect(() => adapter.mutationDelivery.assertNeverAttempted(rejected.operation)).toThrow("never-attempted")
     } finally { await adapter.close() }
   })
   test("PUSH observer event сохраняет instance и имеет единственного consumer", async () => {

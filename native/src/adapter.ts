@@ -129,6 +129,7 @@ export type NativeEvidenceBinder = (identity: {
 
 type PendingResponse = {
   channel: NativeTransportResponseFrame["channel"]
+  request: NativeTransportRequestFrame
   resolve: (frame: NativeTransportResponseFrame) => void
   reject: (error: Error) => void
 }
@@ -168,7 +169,12 @@ export class NativeBrokerAdapter implements NativeAdapter {
   readonly #pending = new Map<string, PendingResponse>()
   readonly #expired = new Map<string, number>()
   readonly #seenRequestIds = new Map<string, number>()
-  readonly #mutationDeliveries = new Map<string, { fingerprint: string, registered: boolean, attempted: boolean }>()
+  readonly #mutationDeliveries = new Map<string, {
+    fingerprint: string
+    registered: boolean
+    attempted: boolean
+    rejectedBeforeStart: boolean
+  }>()
   readonly mutationDelivery: NativeMutationDeliveryAuthority = Object.freeze({
     register: (wire: NativeExecutionContext) => {
       const entry = this.#deliveryEntry(wire)
@@ -178,7 +184,8 @@ export class NativeBrokerAdapter implements NativeAdapter {
       const parsed = parseWireValue(nativeExecutionContextSchema, wire)
       this.#assertGeneration(parsed)
       const entry = this.#mutationDeliveries.get(this.#deliveryKey(parsed))
-      if (entry === undefined || !entry.registered || entry.fingerprint !== JSON.stringify(parsed) || entry.attempted) {
+      if (entry === undefined || !entry.registered || entry.fingerprint !== JSON.stringify(parsed)
+        || entry.attempted && !entry.rejectedBeforeStart) {
         throw new Error("Native mutation delivery не подтверждает registered never-attempted context")
       }
     },
@@ -737,6 +744,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
       }
       this.#pending.set(key, {
         channel: expectedChannel,
+        request: frame,
         resolve: (response) => {
           signal?.removeEventListener("abort", onAbort)
           if (timer !== undefined) clearTimeout(timer)
@@ -747,7 +755,11 @@ export class NativeBrokerAdapter implements NativeAdapter {
       try {
         if ((frame.channel === "request" && frame.payload.intent === "mutation")
           || (frame.channel === "clipboard" && frame.payload.command.method === "clipboard.write")) this.#anyMutationAttempted = true
-        if (frame.channel === "request" && frame.payload.intent === "mutation") this.#deliveryEntry(frame.payload.operation).attempted = true
+        if (frame.channel === "request" && frame.payload.intent === "mutation") {
+          const delivery = this.#deliveryEntry(frame.payload.operation)
+          delivery.rejectedBeforeStart = false
+          delivery.attempted = true
+        }
       } catch (error) {
         this.#pending.delete(key)
         signal?.removeEventListener("abort", onAbort)
@@ -856,6 +868,22 @@ export class NativeBrokerAdapter implements NativeAdapter {
       }
       throw new Error(`Неожиданный native response: ${key}`)
     }
+    if (frame.channel === "response" && !frame.payload.ok
+      && "startDisposition" in frame.payload
+      && frame.payload.startDisposition === "rejected-before-start") {
+      const original = pending.request
+      if (original.channel !== "request"
+        || original.payload.intent !== "mutation"
+        || original.payload.method !== "capture.start"
+        || !nativeResponseMatchesRequest(original.payload, frame.payload)) {
+        throw new Error("Native pre-start rejection не связан с exact pending capture.start")
+      }
+      const delivery = this.#deliveryEntry(original.payload.operation)
+      if (!delivery.registered || !delivery.attempted) {
+        throw new Error("Native pre-start rejection не подтверждает registered delivered capture operation")
+      }
+      delivery.rejectedBeforeStart = true
+    }
     this.#pending.delete(key)
     pending.resolve(frame)
   }
@@ -959,7 +987,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
       return previous
     }
     if (this.#mutationDeliveries.size >= 10000) throw new Error("Native mutation delivery horizon исчерпан; требуется rotation")
-    const entry = { fingerprint, registered: false, attempted: false }
+    const entry = { fingerprint, registered: false, attempted: false, rejectedBeforeStart: false }
     this.#mutationDeliveries.set(key, entry)
     return entry
   }

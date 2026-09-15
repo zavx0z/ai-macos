@@ -190,6 +190,25 @@ fi
   -Wextra \
   -Werror \
   -Inative/include \
+  -Inative/src \
+  -Inative/src/capture-command \
+  native/src/capture-command/meta_capture_command.m \
+  native/src/capture_router.m \
+  native/src/serialization.m \
+  native/src/capture-command/meta_capture_command_test.m \
+  -framework Foundation \
+  -framework CoreGraphics \
+  -o "$CHECK_DIR/capture-command-test"
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -DMETA_CAPTURE_ROUTER_TESTING=1 \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
   native/src/executor.c \
   native/src/ledger.c \
   native/src/capture_router.m \
@@ -316,6 +335,7 @@ fi
 "$CHECK_DIR/input-bridge-test"
 "$CHECK_DIR/serialization-test"
 "$CHECK_DIR/capture-router-test"
+"$CHECK_DIR/capture-command-test"
 "$CHECK_DIR/broker-core-test"
 "$CHECK_DIR/ax-inspector-test"
 "$CHECK_DIR/geometry-probe-test"

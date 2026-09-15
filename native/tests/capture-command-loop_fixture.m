@@ -268,6 +268,9 @@ static bool fake_cleanup_up(void *context, MetaHeldEventKind kind,
         inventoryProvider:^const MetaInventorySnapshot * {
           return &self->_snapshot;
         }
+        topologyValidator:^BOOL(const MetaInventorySnapshot *snapshot) {
+          return snapshot == &self->_snapshot;
+        }
         nativeGeneration:@"native-1"
         nativeBuildId:@"capture-loop-build"];
     _lock = [[NSLock alloc] init];
@@ -357,6 +360,20 @@ static bool fake_cleanup_up(void *context, MetaHeldEventKind kind,
         @"replayAllowed" : @NO,
         @"recoveryAction" : @"inspect-health",
       },
+    };
+  }
+  NSError *validation_error = nil;
+  if (![_binder validateStartRequest:request error:&validation_error]) {
+    return @{
+      @"nativeError" : @{
+        @"code" : @"target-stale",
+        @"message" : validation_error.localizedDescription,
+        @"stage" : @"capture-start",
+        @"retryable" : @NO,
+        @"replayAllowed" : @NO,
+        @"recoveryAction" : @"refresh-inventory",
+      },
+      @"startDisposition" : @"rejected-before-start",
     };
   }
   __block NSError *capture_error = nil;

@@ -17,6 +17,7 @@ import {
   type Evidence,
   type NativeCaptureTarget,
   type NativeExecutionContext,
+  type NativeOperationStatus,
   type OperationOutcome,
   type OperationTarget,
   type ReadinessPolicy,
@@ -123,6 +124,16 @@ export type NativeCaptureTaskStatus = {
   revision: number
   cleanup: "pending" | "complete" | "unknown"
   drained: boolean
+}
+
+export class NativeCaptureDriverStartError extends Error {
+  constructor(
+    readonly nativeError: ContractError,
+    readonly nativeStatus: NativeOperationStatus | undefined,
+    readonly rejectedBeforeStart: boolean,
+  ) {
+    super(nativeError.message)
+  }
 }
 
 export type CaptureReconciliation = {
@@ -312,7 +323,12 @@ export class RuntimeScreenAdapter implements ScreenAdapter {
       }
     } catch (error) {
       let reportedError = error
-      let cleanupState: "complete" | "unknown" = error instanceof NativeBufferReleaseError
+      const startFailure = error instanceof NativeCaptureDriverStartError ? error : undefined
+      let cleanupState: "complete" | "unknown" = startFailure?.rejectedBeforeStart === true
+        ? "complete"
+        : startFailure !== undefined
+          ? "unknown"
+        : error instanceof NativeBufferReleaseError
         ? "unknown"
         : startAttempted ? nativeCleanup ?? "unknown" : "complete"
       if (task !== undefined && cleanupState === "complete" && !(error instanceof NativeBufferReleaseError)) {
@@ -333,7 +349,10 @@ export class RuntimeScreenAdapter implements ScreenAdapter {
       return {
         ok: false,
         error: contractError(reportedError, context.wire.target, cleanupState),
-        outcome: failureOutcome(cleanup, targetVerified, cleanupState === "unknown"),
+        outcome: startFailure?.nativeStatus === undefined
+          ? failureOutcome(cleanup, targetVerified, cleanupState === "unknown")
+          : failureOutcomeFromStatus(startFailure.nativeStatus, cleanup),
+        ...(startFailure?.nativeStatus === undefined ? {} : { nativeStatus: startFailure.nativeStatus }),
       }
     }
   }
@@ -956,11 +975,32 @@ function failureOutcome(
   }
 }
 
+function failureOutcomeFromStatus(
+  status: NativeOperationStatus,
+  cleanup: CleanupOutcome,
+): OperationOutcome {
+  return {
+    dispatch: status.dispatch,
+    targetVerified: status.targetVerified,
+    userInterference: status.userInterference,
+    observation: "unavailable",
+    effect: { state: "unverified", proofRefs: [] },
+    cleanup,
+    restoration: status.restorationAllowed ? "kept-target" : "unknown",
+    ...(status.lastCheckpoint === undefined ? {} : { lastCheckpoint: status.lastCheckpoint }),
+    dispatchAttempts: status.dispatchAttempts,
+    ledgerRevision: status.ledgerRevision,
+  }
+}
+
 function contractError(
   error: unknown,
   target: OperationTarget,
   cleanup: "complete" | "unknown",
 ): ContractError {
+  if (error instanceof NativeCaptureDriverStartError) {
+    return { ...error.nativeError, context: { target } }
+  }
   const native = error instanceof NativeCaptureError ? error.completion : undefined
   const unresolved = error instanceof UnresolvedCaptureError
   const releaseUnknown = error instanceof NativeBufferReleaseError

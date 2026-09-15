@@ -521,6 +521,9 @@ static NSDictionary *failure(NSString *code, NSString *message) {
           response[@"ok"] = @NO;
           response[@"error"] = result[@"nativeError"];
           if ([result[@"nativeStatus"] isKindOfClass:NSDictionary.class]) response[@"nativeStatus"] = result[@"nativeStatus"];
+          if (capture && [result[@"startDisposition"] isEqual:@"rejected-before-start"]) {
+            response[@"startDisposition"] = @"rejected-before-start";
+          }
         } else if (input && result != nil) {
           NSMutableDictionary *report = [result mutableCopy];
           BOOL finished = [report[@"finished"] boolValue];

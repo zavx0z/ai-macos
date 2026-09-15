@@ -16,6 +16,7 @@ import {
 import { ResourceRegistry } from "@meta/runtime"
 import {
   RuntimeScreenAdapter,
+  NativeCaptureDriverStartError,
   type NativeCaptureCompletion,
   type NativeCaptureDriver,
   type NativeCaptureDriverRequest,
@@ -432,6 +433,96 @@ function services(
 }
 
 describe("RuntimeScreenAdapter", () => {
+  test("confirmed native start rejection освобождает runtime lease без fake task quarantine", async () => {
+    const native = new FakeNativeDriver()
+    native.start = async () => {
+      throw new NativeCaptureDriverStartError(
+        {
+          code: "target-stale" as const,
+          message: "Capture start ссылается не на текущий authoritative inventory",
+          stage: "capture-start",
+          retryable: false,
+          replayAllowed: false,
+          recoveryAction: "refresh-inventory" as const,
+        },
+        undefined,
+        true,
+      )
+    }
+    const result = await new RuntimeScreenAdapter(host, services(), native, () => new Date(nowMs))
+      .capture(context(), request())
+    expect(result.ok).toBe(false)
+    if (result.ok) throw new Error("expected failure")
+    expect(result.error).toMatchObject({ code: "target-stale", stage: "capture-start" })
+    expect(result.outcome.dispatch).toBe("none")
+    expect(result.outcome.dispatchAttempts).toBe(0)
+    expect(result.outcome.cleanup.state).toBe("complete")
+    expect(result.nativeStatus).toBeUndefined()
+  })
+
+  test("неподтверждённый start failure без task disposition сохраняет unknown cleanup", async () => {
+    const native = new FakeNativeDriver()
+    const wire = context().wire
+    const nativeStatus = {
+      requestId: "native-start-failure:1",
+      runtimeEpoch,
+      loginSessionId,
+      nativeGeneration,
+      highWaterFence: wire.fence,
+      acceptedFence: wire.fence,
+      operationId: wire.operationId,
+      execution: "failed" as const,
+      dispatch: "none" as const,
+      cleanup: "complete" as const,
+      targetVerified: "failed" as const,
+      cancellationRequested: false,
+      userInterference: "unknown" as const,
+      restorationAllowed: false,
+      quarantined: false,
+      heldCount: 0,
+      lastCheckpoint: "capture-start-failed",
+      dispatchAttempts: 0,
+      ledgerRevision: 0,
+      observer: {
+        state: "unavailable" as const,
+        runtimeEpoch,
+        loginSessionId,
+        nativeGeneration,
+        coverageStartCursor: "cursor:screen-start-failure",
+        cursor: "cursor:screen-start-failure",
+        nextSequence: 1,
+        startedAt: now,
+        coveredFrom: now,
+        coveredThrough: now,
+        heartbeatAt: now,
+        coveredKinds: [],
+        droppedEvents: 0,
+        gapDetected: false,
+        reason: "Fixture observer unavailable",
+      },
+    }
+    native.start = async () => {
+      throw new NativeCaptureDriverStartError(
+        {
+          code: "internal-error",
+          message: "Native start reply потерян после возможного dispatch",
+          stage: "capture-start",
+          retryable: false,
+          replayAllowed: false,
+          recoveryAction: "get-operation",
+        },
+        nativeStatus,
+        false,
+      )
+    }
+    const result = await new RuntimeScreenAdapter(host, services(), native, () => new Date(nowMs))
+      .capture(context(), request())
+    expect(result.ok).toBe(false)
+    expect(result.outcome.cleanup.state).toBe("unknown")
+    expect(result.outcome.dispatch).toBe("none")
+    expect(result.nativeStatus).toBe(nativeStatus)
+  })
+
   test("публикует complete frame только после authority, policy и binary checks", async () => {
     const native = new FakeNativeDriver()
     const runtime = services()

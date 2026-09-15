@@ -713,8 +713,13 @@ export const nativeCaptureStartResponseSchema = z.discriminatedUnion("ok", [
     ok: z.literal(false),
     error: contractErrorSchema,
     nativeStatus: nativeOperationStatusSchema.optional(),
+    startDisposition: z.literal("rejected-before-start").optional(),
   }).strict(),
 ]).superRefine((response, context) => {
+  if (!response.ok && response.startDisposition === "rejected-before-start" &&
+      response.nativeStatus !== undefined) {
+    context.addIssue({ code: "custom", path: ["nativeStatus"], message: "Pre-start rejection не может содержать dispatched native status" })
+  }
   if (!response.ok && response.nativeStatus !== undefined && (
     response.operationId === undefined
     || response.nativeStatus.requestId !== response.requestId

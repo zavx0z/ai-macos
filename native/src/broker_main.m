@@ -89,6 +89,45 @@ static uint64_t observer_index_now(void *context) {
   return (uint64_t)(NSProcessInfo.processInfo.systemUptime * 1000.0);
 }
 
+static NSDictionary *capture_native_error(NSError *error) {
+  NSString *code = @"internal-error";
+  NSString *recovery = @"inspect-health";
+  if ([error.domain isEqual:MetaCaptureCommandErrorDomain]) {
+    if (error.code == MetaCaptureCommandInvalidRequest) {
+      code = @"invalid-request";
+      recovery = @"none";
+    } else if (error.code == MetaCaptureCommandStaleAuthority) {
+      code = @"target-stale";
+      recovery = @"refresh-inventory";
+    } else if (error.code == MetaCaptureCommandUnsupportedTarget) {
+      code = @"unsupported-capability";
+      recovery = @"none";
+    } else if (error.code == MetaCaptureCommandBinaryFailure) {
+      code = @"binary-frame-mismatch";
+    }
+  }
+  return @{
+    @"code" : code,
+    @"message" : error.localizedDescription ?: @"Native capture command failed",
+    @"stage" : @"capture-start",
+    @"retryable" : @NO,
+    @"replayAllowed" : @NO,
+    @"recoveryAction" : recovery,
+  };
+}
+
+static NSDictionary *capture_start_error(NSString *code, NSString *message,
+                                         NSString *recovery) {
+  return @{
+    @"code" : code,
+    @"message" : message,
+    @"stage" : @"capture-start",
+    @"retryable" : @NO,
+    @"replayAllowed" : @NO,
+    @"recoveryAction" : recovery,
+  };
+}
+
 static bool observer_index_refresh(void *context, uint64_t budget) {
   MetaObserverIndexBuildContext *binding =
       (__bridge MetaObserverIndexBuildContext *)context;
@@ -315,6 +354,9 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
     _core = meta_broker_core_create([_inputExecutor executorOnActionWorker], _captures);
     _captureCommands = [[MetaCaptureCommandBinder alloc] initWithRouter:_captures inventoryProvider:^const MetaInventorySnapshot * {
       return meta_macos_backend_snapshot(windows);
+    } topologyValidator:^BOOL(const MetaInventorySnapshot *snapshot) {
+      MetaTopologyProbe topology = {0};
+      return meta_macos_probe_topology(windows, snapshot, &topology) && topology.topology_unchanged;
     } nativeGeneration:generation nativeBuildId:@META_NATIVE_BUILD_ID];
     if (_windows == NULL || _captures == NULL || _input == NULL || _inputExecutor == nil || _core == NULL || _captureCommands == nil || _axSnapshots == nil || _permissionRequests == nil) return nil;
   }
@@ -1095,8 +1137,31 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
   NSDictionary *target = operation[@"target"], *ref = target[@"ref"];
   NSString *targetRef = ref[@"windowRef"] ?: ref[@"displayRef"] ?: ref[@"layoutRef"];
   if (![targetRef isKindOfClass:NSString.class]) return nil;
-  if ([self pendingOperationIds].count >= 128) return nil;
+  if ([self pendingOperationIds].count >= 128) {
+    return @{
+      @"nativeError" : capture_start_error(
+          @"capability-unavailable", @"Capture operation capacity исчерпана",
+          @"inspect-health"),
+      @"startDisposition" : @"rejected-before-start",
+    };
+  }
+  if (!meta_capture_preflight_screen_recording()) {
+    return @{
+      @"nativeError" : capture_start_error(
+          @"permission-denied", @"Screen Recording не выдан native capture",
+          @"request-user-action"),
+      @"startDisposition" : @"rejected-before-start",
+    };
+  }
+  NSError *validationError = nil;
+  if (![_captureCommands validateStartRequest:request error:&validationError]) {
+    return @{
+      @"nativeError" : capture_native_error(validationError),
+      @"startDisposition" : @"rejected-before-start",
+    };
+  }
   MetaMacOSBackend *windows = _windows;
+  __block NSError *captureError = nil;
   NSDictionary *execution = [_inputExecutor executeExternal:request job:job targetRef:targetRef verify:^BOOL(NSString *value) {
     const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(windows);
     if (snapshot == NULL || ![value isEqual:targetRef] || ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
@@ -1111,9 +1176,26 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
     }
     return NO;
   } action:^NSDictionary * {
-    NSError *error = nil;
-    return [self->_captureCommands startRequest:request error:&error];
+    return [self->_captureCommands startRequest:request error:&captureError];
   }];
+  if (execution != nil && execution[@"value"] == nil && captureError != nil) {
+    NSMutableDictionary *failure = [@{
+      @"nativeError" : capture_native_error(captureError),
+    } mutableCopy];
+    if ([execution[@"status"] isKindOfClass:NSDictionary.class]) {
+      failure[@"nativeStatus"] = execution[@"status"];
+    }
+    return failure;
+  }
+  if (execution != nil && execution[@"value"] == nil &&
+      [execution[@"status"] isKindOfClass:NSDictionary.class]) {
+    return @{
+      @"nativeError" : capture_start_error(
+          @"target-stale", @"Capture target verification failed before start",
+          @"refresh-inventory"),
+      @"nativeStatus" : execution[@"status"],
+    };
+  }
   if (execution[@"value"] != nil) {
     [_asyncLock lock]; [_captureOperationIds addObject:operation[@"operationId"]]; [_asyncLock unlock];
   }
