@@ -9,11 +9,11 @@ import {
 import { RuntimeBrowserAdapter, type BrowserDriver } from "@meta/chrome/adapter"
 import { RuntimeCore } from "../src/core.ts"
 
-export function browserFixture(options: { ttlMs?: number } = {}) {
+export function browserFixture(options: { ttlMs?: number, clientGraceMs?: number } = {}) {
   let nowMs = Date.now()
   const clock = { now: () => new Date(nowMs) }
   const generation = { runtimeEpoch: "runtime:lifetime", loginSessionId: "login:lifetime" }
-  const runtime = new RuntimeCore({ generation, runtimeBuildId: "build:lifetime", clock, reservationTtlMs: options.ttlMs })
+  const runtime = new RuntimeCore({ generation, runtimeBuildId: "build:lifetime", clock, reservationTtlMs: options.ttlMs, clientGraceMs: options.clientGraceMs })
   const driver = new FixtureBrowserDriver()
   let sequence = 0
   const initial = { ...generation, browserInstanceRef: "browser:lifetime", transportGeneration: "transport:0" }

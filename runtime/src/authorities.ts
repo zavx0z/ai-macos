@@ -8,6 +8,7 @@ import {
   proofRefSchema,
   verifiedNativeEvidenceReceiptSchema,
   type AuthorizedObservationPoint,
+  type AdapterControl,
   type BinaryFramePublisher,
   type BoundNativeEvidencePublisher,
   type EvidenceIssuer,
@@ -227,6 +228,11 @@ type PublishedEvidence = {
 }
 
 export type NativeEvidenceSourceExtractor = (bytes: Uint8Array) => readonly NativeEvidenceReport[]
+export type NativePointEvidenceProvider = (
+  request: ResolveStoredObservationPointRequest,
+  observation: Observation,
+  control: AdapterControl,
+) => Promise<VerifiedNativeEvidenceReceipt>
 
 type RegisteredSourceResponse = {
   sha256: string
@@ -672,6 +678,7 @@ export class ObservationRegistry implements ObservationResolver {
   readonly #evidence: NativeEvidenceAuthority
   readonly #clock: RuntimeClock
   readonly #observations = new Map<string, Observation>()
+  #pointEvidence?: (request: ResolveStoredObservationPointRequest, observation: Observation) => Promise<VerifiedNativeEvidenceReceipt>
 
   constructor(
     proofs: ProofAuthority,
@@ -681,6 +688,11 @@ export class ObservationRegistry implements ObservationResolver {
     this.#proofs = proofs
     this.#evidence = evidence
     this.#clock = options.clock ?? systemClock
+  }
+
+  bindPointEvidence(provider: (request: ResolveStoredObservationPointRequest, observation: Observation) => Promise<VerifiedNativeEvidenceReceipt>): void {
+    if (this.#pointEvidence !== undefined) throw new Error("Observation point evidence provider уже настроен")
+    this.#pointEvidence = provider
   }
 
   register(value: unknown): Observation {
@@ -717,7 +729,8 @@ export class ObservationRegistry implements ObservationResolver {
     ) {
       throw new Error("Stored observation ref/operation/interaction target не совпадают")
     }
-    const receipt = this.#evidence.findPointReceipt(request)
+    const receipt = this.#pointEvidence === undefined ? this.#evidence.findPointReceipt(request)
+      : await this.#pointEvidence(request, structuredClone(stored))
     const interactionProof = await this.#evidence.issueInteractionPoint({
       operation: request.operation,
       receipt,

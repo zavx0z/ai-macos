@@ -248,6 +248,13 @@ test("stored observation resolver obtains point-bound proof without Input proof 
     interactionTarget: windowTarget,
     destinationPoint: { x: 100.5, y: 200.5 },
   })
+  let providerCalls = 0
+  const provider = async () => { providerCalls++; throw new Error("unexpected provider") }
+  runtime.bindPointEvidenceProvider(provider)
+  await expect(runtime.observations.resolvePoint({ operation, observationRef, interactionTarget: windowTarget,
+    imagePoint: { x: 0.5, y: 0.5 }, expectedSpace: "macos-screen" })).rejects.toThrow("active exact operation")
+  expect(providerCalls).toBe(0)
+  expect(() => runtime.bindPointEvidenceProvider(provider)).toThrow("уже настроен")
 })
 
 test("FrameStore принимает только runtime-preissued frameRef и scoped publication", async () => {

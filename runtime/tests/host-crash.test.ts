@@ -26,7 +26,6 @@ test("RuntimeHost SIGKILL освобождает kernel lease, reclaim stale art
     expect((await stat(join(directory, "credential.json"))).isFile()).toBe(true)
     replacement = await createProcessFixtureHost(directory)
     await replacement.start()
-    await client.resume()
     const next = (await client.callTool("lineage", {}, new AbortController().signal)).structuredContent!
     expect(next.lineage).toBe(first.lineage)
     expect(next.epoch).not.toBe(first.epoch)

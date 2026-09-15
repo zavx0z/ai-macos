@@ -53,8 +53,11 @@ import { NativeContinuationRegistry } from "./continuations.ts"
 import { BrowserLifetimeCoordinator, type CoordinatedLifecycle } from "./reservations.ts"
 import type { PersistentOperationJournal, StoredOperationEvidence } from "./storage/index.ts"
 import type { StoredClientSession } from "./client-sessions.ts"
+import type { NativePointEvidenceProvider } from "./authorities.ts"
+import { ClientDisconnectGrace } from "./client-grace.ts"
 
 type JournalEntry = {
+  session?: RuntimeClientSession
   digest: string
   lineageId: string
   record: OperationRecord
@@ -73,6 +76,11 @@ export interface BackendCompletionVerifier {
   verify(context: RuntimeOperationContext, result: AdapterResult<unknown>): Promise<void>
   verifyReconciliation?(record: OperationRecord, report: LateCleanupReport): Promise<void>
 }
+
+export type RuntimeNativeDeliveryAuthority = Readonly<{
+  register(wire: NativeExecutionContext): void
+  assertNeverAttempted(wire: NativeExecutionContext): void
+}>
 
 export type LateCleanupReport = {
   operationId: string
@@ -100,6 +108,8 @@ export type RuntimeCoreOptions = {
   durableTimeoutMs?: number
   hmacKeyGeneration?: string
   clientPersistence?: { sessions: readonly StoredClientSession[], persist(sessions: readonly StoredClientSession[]): Promise<void> }
+  clientGraceMs?: number
+  nativeDelivery?: RuntimeNativeDeliveryAuthority
 }
 
 export type ReserveCapturePublicationRequest = Pick<ObservationPublication,
@@ -126,6 +136,7 @@ export class RuntimeCore implements RuntimeAdapter {
   readonly services: AdapterServices
   readonly #runtimeBuildId: string
   readonly #nativeGeneration?: string
+  readonly #nativeDelivery?: RuntimeNativeDeliveryAuthority
   readonly #clock: RuntimeClock
   readonly #ids: RuntimeIdSource
   readonly #secret: Uint8Array
@@ -148,6 +159,9 @@ export class RuntimeCore implements RuntimeAdapter {
   readonly #clientPersistence?: RuntimeCoreOptions["clientPersistence"]
   #credentialTail: Promise<void> = Promise.resolve()
   readonly #persistedSessions = new Set<string>()
+  readonly #clientGrace: ClientDisconnectGrace
+  readonly #clientCleanupFailures = new Set<string>()
+  readonly #disconnectListeners = new Set<(clientSessionId: string) => void>()
   #storagePoisoned = false
   #storageInitialized: boolean
   #recoveryEvidence: StoredOperationEvidence[] = []
@@ -158,6 +172,10 @@ export class RuntimeCore implements RuntimeAdapter {
     this.generation = options.generation
     this.#runtimeBuildId = options.runtimeBuildId
     this.#nativeGeneration = options.nativeGeneration
+    this.#nativeDelivery = options.nativeDelivery === undefined ? undefined : Object.freeze({
+      register: options.nativeDelivery.register.bind(options.nativeDelivery),
+      assertNeverAttempted: options.nativeDelivery.assertNeverAttempted.bind(options.nativeDelivery),
+    })
     this.native = options.native
     this.#clock = options.clock ?? systemClock
     this.#ids = options.ids ?? randomIdSource
@@ -188,6 +206,15 @@ export class RuntimeCore implements RuntimeAdapter {
       run: (session, intent, request, execute, lifecycle, signal) => this.#runOperation(session, intent, request, execute, lifecycle, signal),
     })
     this.reservations = this.browserLifetime.authority
+    this.#clientGrace = new ClientDisconnectGrace({ graceMs: options.clientGraceMs,
+      cleanup: async (lineageId, signal) => {
+        await Promise.all([...this.#journal.values()].filter(entry => entry.lineageId === lineageId && !entry.settled)
+          .map(entry => entry.promise?.catch(() => undefined)))
+        await this.browserLifetime.shutdownLineage(lineageId, signal)
+        this.#clientCleanupFailures.delete(lineageId)
+      },
+      failed: lineageId => { this.#clientCleanupFailures.add(lineageId) },
+    })
     this.targets = new TargetRegistry(this.generation, { clock: this.#clock })
     this.proofs = new ProofRegistry(this.generation, {
       ...(this.#nativeGeneration === undefined ? {} : { nativeGeneration: this.#nativeGeneration }),
@@ -260,14 +287,43 @@ export class RuntimeCore implements RuntimeAdapter {
     if (this.#clientPersistence !== undefined) await this.#awaitDurable(this.#clientPersistence.persist(this.clients.snapshot()))
   }
 
+  bindPointEvidenceProvider(provider: NativePointEvidenceProvider): void {
+    this.observations.bindPointEvidence(async (request, observation) => {
+      const entry = this.#journal.get(request.operation.operationId)
+      const checkpoint = async () => {
+        if (entry === undefined || entry.settled || !entry.adapterStarted || entry.session === undefined
+          || canonicalJson(entry.record.context) !== canonicalJson(request.operation)
+          || this.#observationOwners.get(observation.observationId) !== entry.lineageId
+          || !entry.record.resources.some(handle => handle.kind === "desktop-input")
+          || !this.frames.hasVerified(observation.image.frameRef, observation.image.sha256)) throw new Error("Point evidence требует active exact operation/resource/frame")
+        entry.controller.signal.throwIfAborted()
+        const now = this.#clock.now()
+        if (now.getTime() >= Date.parse(request.operation.deadlineAt)) throw new Error("Point evidence operation deadline")
+        await this.clients.assertActive(entry.session, now)
+        for (const handle of entry.record.resources) await this.resources.assertActive({ handle,
+          operationId: request.operation.operationId, clientSessionId: entry.session.clientSessionId,
+          principalId: entry.session.principalId, ...this.generation, now })
+      }
+      await checkpoint()
+      const receipt = await provider(request, observation, { signal: entry!.controller.signal, checkpoint })
+      await checkpoint()
+      return receipt
+    })
+  }
+
   async #persistCredential(create: () => RuntimeClientCredential): Promise<RuntimeClientCredential> {
-    if (this.#clientPersistence === undefined) return create()
+    if (this.#clientPersistence === undefined) {
+      const credential = create()
+      this.#clientGrace.connected(this.clients.lineage(credential.session))
+      return credential
+    }
     const persist = async () => {
       if (this.#storagePoisoned) throw new Error("Durable storage poisoned")
       const credential = create()
       try { await this.#awaitDurable(this.#clientPersistence!.persist(this.clients.snapshot())) }
       catch (error) { this.#storagePoisoned = true; this.quarantineStartup("Client credential persistence не подтверждена"); throw error }
       this.#persistedSessions.add(credential.session.clientSessionId)
+      this.#clientGrace.connected(this.clients.lineage(credential.session))
       return credential
     }
     const pending = this.#credentialTail.then(persist, persist)
@@ -363,7 +419,8 @@ export class RuntimeCore implements RuntimeAdapter {
     if (this.#operationJournal === undefined) return []
     if (this.#storageInitialized) return structuredClone(this.#recoveryEvidence)
     this.sealAdmission()
-    this.#recoveryEvidence = await this.#operationJournal.loadRecoveryEvidence()
+    this.#recoveryEvidence = (await this.#operationJournal.loadRecoveryEvidence())
+      .filter(evidence => evidence.record.context.loginSessionId === this.generation.loginSessionId)
     if (this.#clientPersistence !== undefined && this.#operationJournal.loadAll !== undefined) {
       for (const { record, revision } of await this.#operationJournal.loadAll()) {
         const lineageId = this.clients.historicalLineage(record.clientSessionId, record.principalId)
@@ -484,7 +541,7 @@ export class RuntimeCore implements RuntimeAdapter {
 
     this.#assertIntentAuthority(session, intent, now)
     if (!this.#storageInitialized) throw new RuntimeContractError("capability-unavailable", "Runtime durable recovery не инициализирована", "runtime-admission")
-    if (this.#admissionSealed) throw new RuntimeContractError("capability-unavailable", "Runtime admission sealed", "runtime-admission")
+    if (this.#admissionSealed && (lifecycle?.admission !== "stored-cleanup" || this.#storagePoisoned)) throw new RuntimeContractError("capability-unavailable", "Runtime admission sealed", "runtime-admission")
     if (signal?.aborted) throw new RuntimeContractError("cancelled", "Operation отменена до admission", "runtime-admission")
     if (lifecycle?.admission !== "stored-cleanup") {
       await this.targets.resolve({
@@ -522,6 +579,7 @@ export class RuntimeCore implements RuntimeAdapter {
       updatedAt: now.toISOString(),
     })
     const entry: JournalEntry = {
+      session: structuredClone(session),
       digest,
       lineageId,
       record,
@@ -577,13 +635,29 @@ export class RuntimeCore implements RuntimeAdapter {
   }
 
   disconnectClient(clientSessionId: string): void {
+    const session = this.clients.snapshot().find(stored => stored.session.clientSessionId === clientSessionId)
     this.clients.disconnect(clientSessionId)
+    if (session !== undefined) this.#clientGrace.disconnected(session.lineageId)
+    for (const listener of this.#disconnectListeners) listener(clientSessionId)
     for (const entry of this.#journal.values()) {
       if (entry.record.clientSessionId === clientSessionId && !isTerminal(entry.record)) {
         entry.controller.abort("client disconnected")
       }
     }
   }
+
+  subscribeClientDisconnected(listener: (clientSessionId: string) => void): () => void {
+    this.#disconnectListeners.add(listener)
+    return () => { this.#disconnectListeners.delete(listener) }
+  }
+
+  sweepClientExpiries(): void {
+    for (const session of this.clients.expiredSessions(this.#clock.now())) this.disconnectClient(session.clientSessionId)
+  }
+
+  clientLifecycleStatus() { return { pendingGrace: this.#clientGrace.pendingCount, cleanupFailures: this.#clientCleanupFailures.size } }
+  async drainClientGrace(): Promise<void> { await this.#clientGrace.drain() }
+  async closeClientLifecycle(): Promise<void> { await this.#clientGrace.close(); this.#disconnectListeners.clear() }
 
   async reconcileCleanup(report: LateCleanupReport): Promise<CleanupAuthorityReceipt> {
     const { nativeStatus: _reportedStatus, ...reconciliationFacts } = report
@@ -752,7 +826,7 @@ export class RuntimeCore implements RuntimeAdapter {
     try {
       await this.#persist(entry, entry.record)
       await context.control.checkpoint("before-adapter-dispatch")
-      if (this.#admissionSealed) throw new RuntimeContractError("capability-unavailable", "Runtime admission sealed", "runtime-admission")
+      if (this.#admissionSealed && (lifecycle?.admission !== "stored-cleanup" || this.#storagePoisoned)) throw new RuntimeContractError("capability-unavailable", "Runtime admission sealed", "runtime-admission")
       await lifecycle?.before(context)
       if (entry.controller.signal.aborted) throw new RuntimeContractError("cancelled", "Operation отменена", "before-adapter-dispatch")
       entry.record = operationRecordSchema.parse({
@@ -761,9 +835,11 @@ export class RuntimeCore implements RuntimeAdapter {
         updatedAt: this.#clock.now().toISOString(),
       })
       await this.#persist(entry, entry.record)
-      if (this.#admissionSealed || entry.controller.signal.aborted) throw new RuntimeContractError("cancelled", "Admission отменена до durable dispatch", "runtime-dispatch")
+      if (this.#admissionSealed && (lifecycle?.admission !== "stored-cleanup" || this.#storagePoisoned)
+        || entry.controller.signal.aborted) throw new RuntimeContractError("cancelled", "Admission отменена до durable dispatch", "runtime-dispatch")
       entry.adapterStarted = true
       abortGuard = this.#createAbortGuard(entry, context)
+      if (context.wire.kind === "native") this.#nativeDelivery?.register(context.wire)
       const adapterPromise = Promise.resolve().then(() => execute(context, request))
       const rawResult = await Promise.race([adapterPromise, abortGuard.promise])
       const parsedResult = parseWireValue(adapterResultSchema(z.unknown()), rawResult, {
@@ -877,6 +953,13 @@ export class RuntimeCore implements RuntimeAdapter {
         throw new Error("Adapter вернул foreign native status")
       }
       if (this.native === undefined) throw new Error("Native adapter отсутствует при native completion")
+      if (!result.ok && result.nativeStatus === undefined && result.outcome.dispatch === "none"
+        && result.outcome.dispatchAttempts === 0 && result.outcome.cleanup.state === "complete"
+        && result.outcome.effect.state === "unverified" && result.outcome.effect.proofRefs.length === 0
+        && this.#nativeDelivery !== undefined) {
+        this.#nativeDelivery.assertNeverAttempted(context.wire)
+        return undefined
+      }
       let status: NativeOperationStatus
       try {
         status = await this.#queryNativeStatus(context.wire, "native-status-finalize")

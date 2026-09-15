@@ -126,6 +126,12 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
     return stored?.session.principalId === principalId ? stored.lineageId : undefined
   }
 
+  expiredSessions(now: Date): RuntimeClientSession[] {
+    return [...this.#sessions.values()].filter(stored => !stored.disconnected && !stored.revoked
+      && stored.session.runtimeEpoch === this.#generation.runtimeEpoch && now.getTime() >= Date.parse(stored.session.expiresAt))
+      .map(stored => structuredClone(stored.session))
+  }
+
   disconnect(clientSessionId: string): void {
     const stored = this.#sessions.get(clientSessionId)
     if (stored !== undefined) {

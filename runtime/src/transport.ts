@@ -474,25 +474,21 @@ export class RuntimeUdsClient {
   }
 
   async getOperation(operationId: string): Promise<OperationRecord | undefined> {
-    const lease = await this.#renewal.enter(this.#timeoutMs * 2)
     try {
-    const response = await this.#raw(`/v1/operations/${encodeURIComponent(operationId)}`, { signal: lease.signal })
-    const body = await readResponseJson(response, this.#timeoutMs)
-    if (response.status === 404) return undefined
-    if (!response.ok) throw new RuntimeUdsHttpError(response.status, body)
-    return operationRecordSchema.parse(body)
-    } finally { lease.release() }
+      return operationRecordSchema.parse(await this.#request(`/v1/operations/${encodeURIComponent(operationId)}`))
+    } catch (error) {
+      if (error instanceof RuntimeUdsHttpError && error.status === 404) return undefined
+      throw error
+    }
   }
 
   async getOperationByRequest(clientRequestId: string): Promise<OperationRecord | undefined> {
-    const lease = await this.#renewal.enter(this.#timeoutMs * 2)
     try {
-    const response = await this.#raw(`/v1/operations/by-request/${encodeURIComponent(clientRequestId)}`, { signal: lease.signal })
-    const body = await readResponseJson(response, this.#timeoutMs)
-    if (response.status === 404) return undefined
-    if (!response.ok) throw new RuntimeUdsHttpError(response.status, body)
-    return operationRecordSchema.parse(body)
-    } finally { lease.release() }
+      return operationRecordSchema.parse(await this.#request(`/v1/operations/by-request/${encodeURIComponent(clientRequestId)}`))
+    } catch (error) {
+      if (error instanceof RuntimeUdsHttpError && error.status === 404) return undefined
+      throw error
+    }
   }
 
   async cancelOperation(operationId: string, reason: string): Promise<OperationRecord> {
@@ -504,12 +500,19 @@ export class RuntimeUdsClient {
 
   async #request(
     path: string,
-    options: { method?: string, body?: unknown, bootstrap?: boolean, admin?: boolean, signal?: AbortSignal, timeoutMs?: number, skipRenewal?: boolean } = {},
+    options: { method?: string, body?: unknown, bootstrap?: boolean, admin?: boolean, signal?: AbortSignal, timeoutMs?: number, skipRenewal?: boolean, retriedRead?: boolean } = {},
   ): Promise<unknown> {
     if (!options.bootstrap && !options.admin && !options.skipRenewal) {
       const lease = await this.#renewal.enter((options.timeoutMs ?? this.#timeoutMs) + this.#timeoutMs, options.signal)
       try { return await this.#request(path, { ...options, skipRenewal: true, signal: lease.signal }) }
-      finally { lease.release() }
+      catch (error) {
+        lease.release()
+        if (!options.retriedRead && (options.method ?? "GET") === "GET" && error instanceof RuntimeUdsHttpError && error.status === 401) {
+          await this.#renewal.renewNow(options.signal)
+          return this.#request(path, { ...options, retriedRead: true })
+        }
+        throw error
+      } finally { lease.release() }
     }
     const response = await this.#raw(path, options)
     const body = await readResponseJson(response, this.#timeoutMs)

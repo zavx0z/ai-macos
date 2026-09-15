@@ -2,11 +2,43 @@
 
 ## Текущее состояние
 
-Статус: C1 принят. C2 runtime core/evidence/continuation принят scoped ведущим.
-C3 lifetime coordinator связан с RuntimeCore; текущий атомарный checkpoint
-компилируется и проходит 34 runtime tests. Transport foundation принят scoped;
-production cutover ещё впереди. Recovery и Android composition приняты scoped;
-следующий checkpoint подключает durable journal и native held-input ledger.
+Контракты, durable core, UDS/MCP, host lifecycle и scoped recovery приняты
+несколькими проверенными checkpoint. Production cutover пока не выполнен.
+Остаются полноценная host-интеграция observer/readiness/interaction,
+startup recovery receipts и управляемая rotation; pointer readiness не
+объявляется по одному факту наличия C dispatch.
+
+## Последующий проверенный integration slice
+
+- State физически разделён по `state/login-<sha256(audit)>/`: credentials,
+  operations, held-input и native-actors не смешиваются между login sessions.
+  Старые flat development files не удаляются и не импортируются автоматически.
+- Active point provider проверяет exact operation, session, desktop lease,
+  frame hash и ownership observation по lineage до и после Native query.
+  Raw-backed provider подключён к host; proof выпускает ObservationRegistry.
+- Native mutation delivery authority регистрирует контекст до callback.
+  Failed predispatch с доказанным отсутствием mutation send освобождает lease
+  без запроса несуществующего Native job. Без authority остаётся quarantine.
+  Проверен настоящий RuntimeCore → DesktopInputAdapter → NativeBrokerAdapter
+  с fake transport, а не только adapter stub.
+- Client close/expiry запускают ограниченный grace cleanup своей lineage;
+  ранний resume отменяет ожидание. Host drain дожидается cleanup и закрывает
+  owned browser connections через проверенный coordinator.
+- После смены host epoch клиент автоматически повторяет только безопасное
+  чтение после 401 и подтверждённого resume. Mutation POST не повторяется.
+- Native actor journal сохраняет verified handshake process identity.
+  Quiescence подтверждается owned child exit либо ESRCH; живой/reused PID
+  остаётся unknown. Exit — ещё не доказательство освобождения held inputs.
+- ALL-UP DTO отделяет active-console, SecureInput и lockState; unknown lock
+  не переименовывается в unlocked. Старый ledger не переписывается.
+- Rotation coordinator отдельно проверен на seal → drain → close → exit и
+  запрет exit после late/hung drain или close. Host wiring ещё не завершён.
+- Последний общий run: **184 pass / 767 assertions**, root typecheck и
+  diff-check прошли. После него добавлена проверка lineage в point hook;
+  она требует повторной focused проверки перед приёмкой этого slice.
+- `runtime.install` принадлежит внешнему installer; его отсутствие в MCP
+  не подменяется ready-константой. Функциональный UI/browser readiness
+  проверяется отдельно от artifact/signature/launchd/admin transaction.
 
 ## Checkpoint durable core и host integration
 

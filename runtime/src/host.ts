@@ -32,6 +32,10 @@ import { DesktopInputAdapter } from "@meta/input/adapter"
 import { RuntimeScreenAdapter } from "@meta/screen/adapter"
 import { ProtocolNativeCaptureDriver } from "@meta/screen/native-driver"
 import { NativeCaptureClient } from "@meta/native/capture-client"
+import { NativeApplicationAdapter } from "@meta/native/application-adapter"
+import { registerApplicationMethods } from "./application-methods.ts"
+import { NativeActorJournal, type NativeActorRecord } from "./native-actor.ts"
+import { RuntimeNativePointHitProvider } from "./input-hit-test.ts"
 
 export type RuntimeHostOptions = {
   socketPath: string
@@ -60,8 +64,6 @@ export async function createRuntimeHost(options: RuntimeHostOptions) {
 
 async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => Promise<void>) {
   const stateDirectory = options.stateDirectory ?? join(dirname(options.socketPath), "state")
-  const journal = new FileOperationJournal(join(stateDirectory, "operations"))
-  const heldLedger = new FileHeldInputLedger(join(stateDirectory, "held-input"))
   const metadata = options.metadata ?? (options.helperPath === undefined ? undefined : await readNativeMetadata(options.helperPath))
   const session = metadata === undefined ? undefined : nativeAuditSessionSchema.parse(z.object({ session: nativeAuditSessionSchema }).parse(metadata).session)
   if (options.helperPath !== undefined && (session === undefined || !session.verified)) throw new Error("Verified native audit session metadata обязательна")
@@ -69,23 +71,30 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   const loginSessionId = session?.verified ? `audit:${session.uid}:${session.auditSessionId}` : options.loginSessionId
   if (loginSessionId === undefined) throw new Error("Native audit login identity unavailable")
   const generation = { runtimeEpoch: `runtime:${crypto.randomUUID()}`, loginSessionId }
-  const clientState = new FileClientState(join(stateDirectory, `clients-${sha256(loginSessionId)}.json`))
+  const auditStateDirectory = join(stateDirectory, `login-${sha256(loginSessionId)}`)
+  const journal = new FileOperationJournal(join(auditStateDirectory, "operations"))
+  const heldLedger = new FileHeldInputLedger(join(auditStateDirectory, "held-input"))
+  const clientState = new FileClientState(join(auditStateDirectory, "clients.json"))
+  const actorJournal = new NativeActorJournal(join(auditStateDirectory, "native-actors"), loginSessionId)
   const clientIdentity = await clientState.initialize(loginSessionId)
   const adapterInstanceRef = `adapter:${crypto.randomUUID()}`
   let runtime: RuntimeCore | undefined
   let native: NativeBrokerAdapter | undefined
+  let ownedProcess: NativeProcessTransport | undefined
+  let actorRecord: NativeActorRecord | undefined
   let handshake: NativeHandshakeResponse | undefined
   let nativeError: string | undefined
   let clipboard: RuntimeClipboardHandler | undefined
   let draining = false
   let heartbeat: ReturnType<typeof startRuntimeHeartbeat> | undefined
+  let clientSweep: ReturnType<typeof setInterval> | undefined
   let browserHost: ReturnType<typeof createBrowserHostComposition> | undefined
   const revokeNative = (reason: string) => {
     nativeError = reason
     runtime?.updateCapabilities(composeHostCapabilities("host:runtime", undefined, reason, browserHost?.capabilitySet))
   }
   if (options.transport !== undefined || options.transportFactory !== undefined || options.helperPath !== undefined) {
-    const delegate = options.transport ?? options.transportFactory?.() ?? new NativeProcessTransport(options.helperPath!)
+    const delegate = options.transport ?? options.transportFactory?.() ?? (ownedProcess = new NativeProcessTransport(options.helperPath!))
     const transport: NativeTransport = {
       send: frame => delegate.send(frame),
       close: () => delegate.close(),
@@ -127,10 +136,21 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       const mismatch = nativeHandshakeCompatibility(request, handshake)
       if (mismatch !== undefined) throw new Error(mismatch.message)
       if (session !== undefined && (!session.verified || !structurallyEqual(handshake.session, session))) throw new Error("Live helper audit session не совпадает с metadata")
+      if (ownedProcess !== undefined && options.helperPath !== undefined) {
+        if (ownedProcess.processStatus.pid !== handshake.process.pid || ownedProcess.processStatus.exitConfirmed) throw new Error("Native handshake не принадлежит живому owned child")
+        actorRecord = await actorJournal.register(handshake, options.helperPath)
+      }
     } catch (error) {
       nativeError = error instanceof Error ? error.message : String(error)
       await native.close()
       native = undefined
+    }
+  }
+  const closeNative = async () => {
+    await native?.close()
+    if (ownedProcess !== undefined && actorRecord !== undefined) {
+      if (!ownedProcess.processStatus.exitConfirmed || ownedProcess.processStatus.pid !== actorRecord.process.pid) throw new Error("Owned native process exit не подтверждён")
+      await actorJournal.markConfirmedExit(actorRecord)
     }
   }
   try {
@@ -144,16 +164,17 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       await clipboard.verify(context, result)
     } },
     ...(native === undefined || handshake === undefined ? {} : {
-      native, nativeGeneration: handshake.nativeGeneration,
+      native, nativeGeneration: handshake.nativeGeneration, nativeDelivery: native.mutationDelivery,
       nativeSourceIdentity: { adapterInstanceRef, backendBuildId: handshake.nativeBuildId, nativeGeneration: handshake.nativeGeneration },
     }),
   })
   await runtime.initializeRecovery()
-  const heldEvidence = await heldLedger.loadAll()
+  const heldEvidence = (await heldLedger.loadAll()).filter(evidence => evidence.snapshot.loginSessionId === loginSessionId)
   if (heldEvidence.some(evidence => evidence.snapshot.entries.some(entry => entry.state !== "released"))) {
     runtime.quarantineStartup("Durable native held-input ledger требует explicit recovery")
   }
   if (native !== undefined && handshake !== undefined) {
+    runtime.bindPointEvidenceProvider(new RuntimeNativePointHitProvider({ native }).provide)
     runtime.evidence.registerSourceExtractor({ adapterInstanceRef, backendBuildId: handshake.nativeBuildId, nativeGeneration: handshake.nativeGeneration }, extractNativeEvidenceReports)
     clipboard = new RuntimeClipboardHandler(runtime, native)
   }
@@ -163,6 +184,9 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   const catalog = new MethodRegistry(core)
   registerBrowserMethods(catalog, core, browserHost.bindings)
   if (native !== undefined && handshake !== undefined) {
+    if (handshake.capabilities.capabilities.some(capability => capability.id === "desktop.application.lifecycle" && capability.state === "ready")) {
+      registerApplicationMethods(catalog, core, new NativeApplicationAdapter({ native, services: core.services }))
+    }
     const adapterHost = freezeAdapterHostContext({ generation, runtimeBuildId: options.runtimeBuildId, capabilities: handshake.capabilities })
     registerInputMethods(catalog, core, new DesktopInputAdapter(adapterHost, core.services, native))
     registerCaptureMethods(catalog, core, new RuntimeScreenAdapter(adapterHost, core.services,
@@ -172,7 +196,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     machine: { hostname: hostname(), matchesExpected: hostname() === options.expectedHostname },
     runtime: { buildId: options.runtimeBuildId, ...generation, draining,
       admissionSealed: core.admissionSealed, recoveryOperations: core.recoveryEvidence().length,
-      recoveryReasons: [...core.startupRecoveryReasons()] },
+      recoveryReasons: [...core.startupRecoveryReasons()], clients: core.clientLifecycleStatus() },
     native: native === undefined || handshake === undefined
       ? { state: "unavailable" as const, reason: nativeError ?? "native helper not configured" }
       : nativeError !== undefined ? { state: "unavailable" as const, reason: nativeError }
@@ -183,7 +207,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   const doctorSchema = z.strictObject({
     machine: z.strictObject({ hostname: z.string(), matchesExpected: z.boolean() }),
     runtime: z.strictObject({ buildId: z.string(), runtimeEpoch: z.string(), loginSessionId: z.string(), draining: z.boolean(),
-      admissionSealed: z.boolean(), recoveryOperations: z.number().int().min(0), recoveryReasons: z.array(z.string()) }),
+      admissionSealed: z.boolean(), recoveryOperations: z.number().int().min(0), recoveryReasons: z.array(z.string()),
+      clients: z.strictObject({ pendingGrace: z.number().int().min(0), cleanupFailures: z.number().int().min(0) }) }),
     native: z.union([
       z.strictObject({ state: z.literal("unavailable"), reason: z.string() }),
       z.strictObject({ state: z.literal("compatible"), buildId: z.string(), generation: z.string() }),
@@ -264,8 +289,11 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   const drain = async (signal?: AbortSignal) => {
     draining = true
     core.sealAdmission()
+    if (clientSweep !== undefined) clearInterval(clientSweep)
     await heartbeat?.stop()
     await core.drainOperations()
+    await core.drainClientGrace()
+    await core.browserLifetime.shutdownLineage(undefined, signal)
     if (core.recoveryEvidence().length > 0 || core.startupRecoveryReasons().length > 0) throw new Error("Startup recovery не завершена")
     if (native === undefined || handshake === undefined) return { cleanup: "complete" as const }
     const control = AbortSignal.any([AbortSignal.timeout(1000), ...(signal === undefined ? [] : [signal])])
@@ -296,13 +324,23 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
           onFailure(error) { core.quarantineStartup(`Native heartbeat unavailable: ${error.message}`); revokeNative("Native heartbeat unavailable") },
         })
         await uds.start()
+        clientSweep = setInterval(() => core.sweepClientExpiries(), 1000)
+        clientSweep.unref?.()
       }
-      catch (error) { core.sealAdmission(); await heartbeat?.stop(); await native?.close(); await releaseLock(); throw error }
+      catch (error) { core.sealAdmission(); await heartbeat?.stop(); await closeNative(); await releaseLock(); throw error }
     },
     drain,
-    async close() { core.sealAdmission(); await heartbeat?.stop(); await uds.stop(); await native?.close(); await releaseLock() },
+    async close() {
+      core.sealAdmission()
+      if (clientSweep !== undefined) clearInterval(clientSweep)
+      await core.closeClientLifecycle()
+      await heartbeat?.stop()
+      await uds.stop()
+      await closeNative()
+      await releaseLock()
+    },
   }
-  } catch (error) { await native?.close(); throw error }
+  } catch (error) { await closeNative(); throw error }
 }
 
 async function readNativeMetadata(helperPath: string): Promise<unknown> {

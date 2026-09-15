@@ -6,8 +6,10 @@ import { operationOutcomeSchema, runtimeOperationIntentSchema, z } from "@meta/s
 import { FileClientState } from "../src/client-state.ts"
 import { RuntimeCore } from "../src/core.ts"
 import { FileOperationJournal } from "../src/storage/index.ts"
+import { FileHeldInputLedger } from "../src/storage/index.ts"
 import { createRuntimeHost } from "../src/host.ts"
 import { RuntimeUdsClient } from "../src/transport.ts"
+import { sha256 } from "../src/primitives.ts"
 
 test("restart сохраняет exact lineage, HMAC и receipt без replay или plaintext credentials", async () => {
   const directory = await mkdtemp(join(tmpdir(), "client-state-"))
@@ -95,3 +97,36 @@ test("hung credential persistence не выдаёт client credential и зак�
   expect(core.admissionSealed).toBe(true)
   expect(() => core.unsealAdmission()).toThrow("active/unknown")
 }, 1000)
+
+test("новая audit session не наследует old lineage/quarantine и сохраняет старые evidence files", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "client-new-audit-"))
+  const options = { socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    expectedHostname: hostname(), runtimeBuildId: "build:audit-partition", expectedNativeBuildId: "native:unused" }
+  let host = await createRuntimeHost({ ...options, loginSessionId: "login:old-audit" })
+  try {
+    const old = await host.core.openClientDurable("principal:audit")
+    const target = { kind: "clipboard" as const, ref: { ...host.core.generation, clipboardRef: "system" as const } }
+    host.core.targets.register(target, "inventory:audit", 0, "resolution:audit", "proof:audit", 0)
+    const execution = await host.core.runOperation(old.session, runtimeOperationIntentSchema.parse({
+      intent: "mutation", clientRequestId: "request:audit", precondition: { target, inventoryId: "inventory:audit", inventoryRevision: 0 },
+      deadlineAt: new Date(Date.now() + 5000).toISOString(), requestedResources: [{ kind: "clipboard", resourceRef: "system" }],
+    }), {}, async () => { throw new Error("injected unknown delivery") })
+    const oldPartition = join(directory, "state", `login-${sha256("login:old-audit")}`)
+    const ledgerStore = new FileHeldInputLedger(join(oldPartition, "held-input"))
+    await ledgerStore.persist("ledger:old-audit", { canonicalVersion: "1", ...host.core.generation,
+      nativeGeneration: "native:old-audit", operationId: execution.operation.context.operationId, revision: 1,
+      entries: [{ sequence: 1, kind: "key", code: 56, state: "pending-down" }] })
+    const original = JSON.stringify(await ledgerStore.loadAll())
+    await host.close()
+    host = await createRuntimeHost({ ...options, loginSessionId: "login:new-audit" })
+    expect(host.core.admissionSealed).toBe(false)
+    expect(host.core.recoveryEvidence()).toHaveLength(0)
+    await expect(host.core.resumeClientDurable(old.resumptionToken)).rejects.toThrow("credential")
+    const fresh = await host.core.openClientDurable("principal:audit")
+    expect(await host.core.getOperation(fresh.session, execution.operation.context.operationId)).toBeUndefined()
+    expect(JSON.stringify(await ledgerStore.loadAll())).toBe(original)
+    const saved = await new FileOperationJournal(join(oldPartition, "operations")).read({
+      runtimeEpoch: execution.operation.context.runtimeEpoch, loginSessionId: "login:old-audit", operationId: execution.operation.context.operationId })
+    expect(saved?.record.state).toBe("interrupted-unknown")
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+})

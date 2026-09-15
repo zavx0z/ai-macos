@@ -87,7 +87,7 @@ export class ClientRenewalCoordinator {
   #refresh(): Promise<void> {
     if (this.#renewing !== undefined) return this.#renewing
     if (this.#closed || this.#active > 0) return Promise.reject(new Error("Client renewal требует idle connection"))
-    const pending = this.#renew(this.#closedSignal.signal).then(timing => { this.setCredential(timing) })
+    const pending = Promise.resolve().then(() => this.#renew(this.#closedSignal.signal)).then(timing => { this.setCredential(timing) })
     this.#renewing = pending
     void pending.finally(() => { if (this.#renewing === pending) this.#renewing = undefined }).catch(() => undefined)
     return pending

@@ -6,6 +6,7 @@ const hostCapabilities: readonly CapabilityId[] = [
 const implementedNative: readonly CapabilityId[] = [
   "desktop.applications", "desktop.windows.all", "desktop.displays", "input.clipboard",
   "desktop.window.identity", "desktop.window.show", "desktop.window.lifecycle", "desktop.ax",
+  "desktop.application.lifecycle",
   "capture.desktop", "capture.window", "capture.observation", "input.keyboard",
 ]
 const browserCapabilities: readonly CapabilityId[] = [
@@ -18,6 +19,8 @@ export function composeHostCapabilities(producerRef: string, native?: Capability
     reason: "Capability implementation не подключена к host",
   }]))
   for (const id of hostCapabilities) statuses.set(id, { id, state: "ready", reason: "Runtime implementation connected" })
+  statuses.set("runtime.install", { id: "runtime.install", state: "unavailable",
+    reason: "External installer owns artifact/signature/launchd/admin transaction; capability не исполняется через MCP" })
   for (const id of implementedNative) {
     const declared = native?.capabilities.find(capability => capability.id === id)
     statuses.set(id, declared === undefined ? { id, state: "unavailable", reason: unavailableReason }

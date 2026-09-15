@@ -1,5 +1,6 @@
 import { createRuntimeHost } from "./host.ts"
 import { RuntimeUdsClient } from "./transport.ts"
+import { parseBrowserHostConfig } from "./browser-config.ts"
 
 declare const __META_RUNTIME_BUILD_ID__: string | undefined
 const embeddedBuildId = typeof __META_RUNTIME_BUILD_ID__ === "undefined" ? undefined : __META_RUNTIME_BUILD_ID__
@@ -24,6 +25,7 @@ export async function main(): Promise<void> {
     socketPath: required("META_RUNTIME_SOCKET"), credentialPath: required("META_RUNTIME_CREDENTIAL"),
     runtimeBuildId: embeddedBuildId ?? required("META_RUNTIME_BUILD_ID"),
     expectedNativeBuildId: required("META_NATIVE_BUILD_ID"),
+    browser: parseBrowserHostConfig(process.env.META_RUNTIME_BROWSER_CONFIG),
     ...(process.env.META_RUNTIME_STATE_DIR === undefined ? {} : { stateDirectory: process.env.META_RUNTIME_STATE_DIR }),
     expectedHostname: required("AI_MACOS_EXPECTED_HOSTNAME"), helperPath: required("META_NATIVE_HELPER"),
   })
