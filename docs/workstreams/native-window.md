@@ -257,6 +257,26 @@ drain и pending binary запрещают replacement. Последние 128 d
 Ещё требуется production C quiescence/rotation path и его wiring в runtime
 factory; этот checkpoint не объявляет завершение всего retention lifecycle.
 
+Следующий C checkpoint добавляет `meta_broker_core_begin_rotation` и
+`meta_broker_core_seal_for_rotation`. Begin безусловно и необратимо закрывает
+обе admissions независимо от готовности executor/router; возвращает
+`SEALED_PENDING` до quiescence и `READY` после неё. Обе проверки выполняются
+без short-circuit. Проверяются active/unknown/held input, released tasks,
+callback_pending, in-flight calls, borrowed results и ongoing cleanup.
+Только после этой проверки
+старый router можно уничтожить и создать новый с другой native generation.
+Старые operation receipts остаются у runtime.
+
+`sh native/scripts/check.sh` — 8 C/Objective-C fixtures pass. Новый
+`rotation_horizon_test.m` выполняет 10 000 capture/release cycles, сохраняет
+первый tombstone, проверяет stop admission на cap, controlled retirement и
+новую generation без старых refs. Отложенный callback после drained/release/
+destroy блокирует seal до завершения callback. `git diff --check` — pass.
+Regression проверяет active capture → sealed-pending → запрет новых input и
+capture → cancel/callback/release → ready. Command-loop drain ACK и actual
+runtime replacement factory wiring остаются
+следующим отдельным checkpoint.
+
 Ведущий принимает C2 diff и определяет cutover production broker executable.
 После него native-owner связывает общий command/event loop с уже проверенными
 `MetaBrokerCore`/registry/input/capture modules, затем ведущий выполняет C3 live

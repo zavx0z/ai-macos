@@ -400,6 +400,7 @@ MetaExecutor *meta_executor_create(const char *native_generation,
                                    uint64_t watchdog_timeout_millis,
                                    MetaExecutorBackend backend);
 void meta_executor_destroy(MetaExecutor *executor);
+bool meta_executor_seal_for_rotation(MetaExecutor *executor);
 bool meta_executor_open_runtime_epoch(MetaExecutor *executor,
                                       const char *runtime_epoch,
                                       const char *login_session_id);

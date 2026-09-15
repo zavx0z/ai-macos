@@ -24,6 +24,7 @@ struct MetaExecutor {
   MetaExecutorStatus status;
   MetaObserverState observer_state;
   bool active;
+  bool rotation_sealed;
   MetaRecoveryLedgerStatus recovery_status;
   bool has_previous_ledger_digest;
   char previous_ledger_digest[65];
@@ -241,7 +242,7 @@ bool meta_executor_open_runtime_epoch(MetaExecutor *executor,
                                       const char *login_session_id) {
   if (executor == NULL || !valid_identifier(runtime_epoch, 64) ||
       !valid_identifier(login_session_id, 64) ||
-      executor->active || executor->status.quarantined) {
+      executor->active || executor->status.quarantined || executor->rotation_sealed) {
     return false;
   }
   if (strcmp(executor->runtime_epoch, runtime_epoch) == 0 &&
@@ -363,6 +364,7 @@ bool meta_executor_begin(MetaExecutor *executor, const char *operation_id,
                          uint64_t deadline_millis) {
   if (executor == NULL || !valid_identifier(operation_id, 127) ||
       !valid_identifier(target_ref, 127) || executor->active ||
+      executor->rotation_sealed ||
       executor->status.quarantined ||
       !valid_identifier(fence.runtime_epoch, 64) ||
       !valid_identifier(fence.login_session_id, 64) ||
@@ -763,6 +765,17 @@ MetaExecutorStatus meta_executor_status(const MetaExecutor *executor) {
   MetaExecutorStatus status = executor->status;
   status.held_count = held_count(executor);
   return status;
+}
+
+bool meta_executor_seal_for_rotation(MetaExecutor *executor) {
+  if (executor == NULL) return false;
+  executor->rotation_sealed = true;
+  if (executor->active || executor->status.quarantined ||
+      executor->status.cleanup != META_CLEANUP_COMPLETE ||
+      held_count(executor) != 0 || executor->recovery_status.present) {
+    return false;
+  }
+  return true;
 }
 
 MetaRecoveryLedgerStatus meta_executor_recovery_status(

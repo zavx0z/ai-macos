@@ -195,3 +195,20 @@ fi
 "$CHECK_DIR/serialization-test"
 "$CHECK_DIR/capture-router-test"
 "$CHECK_DIR/broker-core-test"
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -DMETA_CAPTURE_ROUTER_TESTING=1 \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
+  native/src/capture_router.m \
+  native/tests/rotation_horizon_test.m \
+  -framework Foundation \
+  -framework CoreGraphics \
+  -o "$CHECK_DIR/rotation-horizon-test"
+
+"$CHECK_DIR/rotation-horizon-test"

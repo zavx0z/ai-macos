@@ -30,6 +30,7 @@ struct MetaCaptureRouter {
   NSCondition *lock;
   CaptureEntry **entries;
   size_t entry_count;
+  bool rotation_sealed;
 };
 
 static bool valid_identifier(const char *value, size_t maximum) {
@@ -178,7 +179,7 @@ bool meta_capture_router_start(
       operation_task_count += 1;
     }
   }
-  if (router->entry_count >= 10000 || operation_task_count >= 64) {
+  if (router->rotation_sealed || router->entry_count >= 10000 || operation_task_count >= 64) {
     [router->lock unlock];
     free(entry);
     return false;
@@ -603,6 +604,22 @@ bool meta_capture_router_forget_released(
   }
   router->entry_count -= 1;
   free(entry);
+  [router->lock unlock];
+  return true;
+}
+
+bool meta_capture_router_seal_for_rotation(MetaCaptureRouter *router) {
+  if (router == NULL) return false;
+  [router->lock lock];
+  router->rotation_sealed = true;
+  for (size_t index = 0; index < router->entry_count; index += 1) {
+    CaptureEntry *entry = router->entries[index];
+    if (!entry->released || entry->releasing || entry->callback_pending ||
+        entry->in_flight > 0 || entry->pending_cleanup_request_id[0] != '\0') {
+      [router->lock unlock];
+      return false;
+    }
+  }
   [router->lock unlock];
   return true;
 }

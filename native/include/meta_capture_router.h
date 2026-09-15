@@ -25,6 +25,7 @@ MetaCaptureRouter *meta_capture_router_create(
     const char *native_generation,
     MetaCaptureRouterBackend backend);
 void meta_capture_router_destroy(MetaCaptureRouter *router);
+bool meta_capture_router_seal_for_rotation(MetaCaptureRouter *router);
 bool meta_capture_router_start(
     MetaCaptureRouter *router,
     const char *operation_id,

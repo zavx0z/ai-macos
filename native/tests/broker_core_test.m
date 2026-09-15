@@ -145,6 +145,12 @@ int main(void) {
                                      &request, ignored_task_ref,
                                      &initial_status));
     MetaBrokerCore *broker = meta_broker_core_create(executor, capture_router);
+    assert(meta_broker_core_begin_rotation(broker) == META_BROKER_ROTATION_SEALED_PENDING);
+    MetaFence pending_fence = fence();
+    pending_fence.counter = 2;
+    assert(!meta_executor_begin(executor, "sealed-pending", "window-1", pending_fence, 1000));
+    assert(!meta_capture_router_start(capture_router, "sealed-pending", &request,
+                                     ignored_task_ref, &initial_status));
     MetaBrokerCancelResult cancelled = meta_broker_core_cancel_operation(
         broker, "operation-lost-start", fence());
     assert(cancelled.acknowledged);
@@ -152,6 +158,10 @@ int main(void) {
     assert(cancelled.capture_tasks_cancelled == 1);
     assert(!cancelled.all_capture_tasks_drained);
     assert(fixture.capture_cancel_count == 1);
+    assert(meta_broker_core_begin_rotation(broker) == META_BROKER_ROTATION_SEALED_PENDING);
+    assert(!meta_executor_begin(executor, "sealed-after-cancel", "window-1", pending_fence, 1000));
+    assert(!meta_capture_router_start(capture_router, "sealed-after-cancel", &request,
+                                     ignored_task_ref, &initial_status));
 
     MetaCaptureResult *late_result = calloc(1, sizeof(*late_result));
     late_result->outcome = MetaCaptureOutcomeCancelled;
@@ -171,9 +181,18 @@ int main(void) {
     assert(status.capture_task_count == 1);
     assert(status.all_capture_tasks_drained);
     assert(status.cleanup == META_CLEANUP_COMPLETE);
+    assert(meta_broker_core_begin_rotation(broker) == META_BROKER_ROTATION_SEALED_PENDING);
     assert(meta_broker_core_release_drained_operation(
                broker, "operation-lost-start", false) == 1);
     assert(meta_capture_router_active_tasks(capture_router, NULL, 0) == 0);
+    assert(meta_broker_core_seal_for_rotation(broker));
+    assert(meta_broker_core_begin_rotation(broker) == META_BROKER_ROTATION_READY);
+    MetaFence next_fence = fence();
+    next_fence.counter = 2;
+    assert(!meta_executor_begin(executor, "after-seal", "window-1",
+                                next_fence, 1000));
+    assert(!meta_capture_router_start(capture_router, "after-seal", &request,
+                                      ignored_task_ref, &initial_status));
     meta_broker_core_destroy(broker);
     meta_capture_router_destroy(capture_router);
     meta_executor_destroy(executor);

@@ -27,6 +27,14 @@ typedef struct MetaBrokerCore MetaBrokerCore;
 MetaBrokerCore *meta_broker_core_create(MetaExecutor *executor,
                                         MetaCaptureRouter *capture_router);
 void meta_broker_core_destroy(MetaBrokerCore *broker);
+typedef enum {
+  META_BROKER_ROTATION_INVALID,
+  META_BROKER_ROTATION_SEALED_PENDING,
+  META_BROKER_ROTATION_READY,
+} MetaBrokerRotationState;
+
+MetaBrokerRotationState meta_broker_core_begin_rotation(MetaBrokerCore *broker);
+bool meta_broker_core_seal_for_rotation(MetaBrokerCore *broker);
 MetaBrokerCancelResult meta_broker_core_cancel_operation(
     MetaBrokerCore *broker,
     const char *operation_id,

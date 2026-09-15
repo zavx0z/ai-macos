@@ -65,6 +65,18 @@ void meta_broker_core_destroy(MetaBrokerCore *broker) {
   free(broker);
 }
 
+bool meta_broker_core_seal_for_rotation(MetaBrokerCore *broker) {
+  return meta_broker_core_begin_rotation(broker) == META_BROKER_ROTATION_READY;
+}
+
+MetaBrokerRotationState meta_broker_core_begin_rotation(MetaBrokerCore *broker) {
+  if (broker == NULL) return META_BROKER_ROTATION_INVALID;
+  const bool executor_ready = meta_executor_seal_for_rotation(broker->executor);
+  const bool capture_ready = meta_capture_router_seal_for_rotation(broker->capture_router);
+  return executor_ready && capture_ready ? META_BROKER_ROTATION_READY
+                                         : META_BROKER_ROTATION_SEALED_PENDING;
+}
+
 MetaBrokerCancelResult meta_broker_core_cancel_operation(
     MetaBrokerCore *broker,
     const char *operation_id,
