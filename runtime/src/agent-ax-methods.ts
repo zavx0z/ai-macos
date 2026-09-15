@@ -12,7 +12,7 @@ import type { AgentTargetRegistry } from "./agent-targets.ts"
 import type { RuntimeCore } from "./core.ts"
 import type { MethodRegistry, RuntimeMethodResponse } from "./method-registry.ts"
 import type { AxPressMethodOutput } from "./window-methods.ts"
-import type { AgentImagePoint, AgentPointClickHandler, AgentPointClickOptions } from "./agent-pointer-methods.ts"
+import { agentImagePointSchema, type AgentImagePoint, type AgentPointClickHandler, type AgentPointClickOptions } from "./agent-pointer-methods.ts"
 
 const actionOutcomeSchema = z.strictObject({
   state: z.enum(OPERATION_STATES),
@@ -29,7 +29,6 @@ const clickResultSchema = z.strictObject({
   outcome: actionOutcomeSchema,
 })
 
-const imagePointSchema = z.tuple([z.number().finite(), z.number().finite()])
 type AgentClickInput = AgentPointClickOptions & { targetId: string, elementId?: string, point?: AgentImagePoint }
 
 /** Регистрирует AXPress по elementId и явно выбранный клик по точке снимка. */
@@ -49,7 +48,7 @@ export class RuntimeAgentAxMethods {
       : z.strictObject({
           targetId: agentTargetIdSchema,
           elementId: agentTargetIdSchema.optional(),
-          point: imagePointSchema.optional(),
+          point: agentImagePointSchema.optional(),
           button: z.enum(["left", "right", "middle"]).optional(),
           count: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
         }).superRefine((value, context) => {

@@ -39,6 +39,32 @@ const displayTarget = { kind: "display" as const, ref: { ...generation, nativeGe
 const layoutTarget = { kind: "desktop-layout" as const, ref: { ...generation, nativeGeneration,
   layoutRef: "layout:agent-pointer", displayLayoutRevision: 1 } }
 
+test("каталог и runtime принимают числовые пары без tuple prefixItems", async () => {
+  const fixture = await createFixture()
+  try {
+    const catalog = fixture.registry.descriptors().tools
+    for (const [name, field] of [["click", "point"], ["hover", "point"],
+      ["scroll", "anchor"], ["drag", "from"], ["drag", "to"]]) {
+      const descriptor = catalog.find(tool => tool.name === name)!
+      const coordinate = descriptor.inputSchema.properties![field!] as Record<string, unknown>
+      expect(coordinate).toMatchObject({ type: "array", items: { type: "number" }, minItems: 2, maxItems: 2 })
+      expect(coordinate).not.toHaveProperty("prefixItems")
+    }
+    for (const invalid of [["10", "20"], [10], [10, 20, 30], [10, Infinity]]) {
+      await expect(fixture.registry.dispatch(fixture.session, "click", {
+        targetId: fixture.targetId, point: invalid,
+      }, new AbortController().signal)).rejects.toThrow()
+    }
+    expect(fixture.input.calls).toHaveLength(0)
+    await fixture.registry.dispatch(fixture.session, "click", {
+      targetId: fixture.targetId, point: [10, 20],
+    }, new AbortController().signal)
+    expect(fixture.input.calls).toHaveLength(1)
+  } finally {
+    await fixture.guard.close()
+  }
+})
+
 test("point click использует исходные image pixels, fresh inventory и тот же observationRef", async () => {
   const fixture = await createFixture()
   const clicked = await fixture.registry.dispatch(fixture.session, "click", {

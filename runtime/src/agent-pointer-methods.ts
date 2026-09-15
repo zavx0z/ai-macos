@@ -12,8 +12,9 @@ import { agentTargetIdSchema, type RuntimeAgentMethods } from "./agent-methods.t
 import type { InputMethodOutput } from "./input-methods.ts"
 import type { MethodRegistry, RuntimeMethodResponse } from "./method-registry.ts"
 
-const imagePointSchema = z.tuple([z.number().finite(), z.number().finite()])
-export type AgentImagePoint = z.infer<typeof imagePointSchema>
+export type AgentImagePoint = [number, number]
+// Однородный items поддерживается MCP-клиентами; длина сохраняет контракт [x, y].
+export const agentImagePointSchema = z.array(z.number().finite()).length(2) as unknown as z.ZodType<AgentImagePoint>
 export type AgentPointClickOptions = Readonly<{
   button?: z.input<typeof clickActionSchema>["button"]
   count?: z.input<typeof clickActionSchema>["count"]
@@ -57,7 +58,7 @@ export class RuntimeAgentPointerMethods implements AgentPointClickHandler {
     this.registry.register("hover", {
       title: "Навести на точку снимка",
       description: "Наводит указатель на точку исходного observation без recapture или rebasing.",
-      input: z.strictObject({ targetId: agentTargetIdSchema, point: imagePointSchema }),
+      input: z.strictObject({ targetId: agentTargetIdSchema, point: agentImagePointSchema }),
       output: agentPointerResultSchema,
       readOnly: false,
       destructive: true,
@@ -80,7 +81,7 @@ export class RuntimeAgentPointerMethods implements AgentPointClickHandler {
       description: "Прокручивает exact native target от точки исходного observation в явных line или pixel units.",
       input: z.strictObject({
         targetId: agentTargetIdSchema,
-        anchor: imagePointSchema,
+        anchor: agentImagePointSchema,
         dx: scrollActionSchema.shape.dx,
         dy: scrollActionSchema.shape.dy,
         unit: z.enum(["line", "pixel"]),
@@ -116,8 +117,8 @@ export class RuntimeAgentPointerMethods implements AgentPointClickHandler {
       description: "Перетаскивает между двумя точками одного сохранённого observation без recapture или rebasing.",
       input: z.strictObject({
         targetId: agentTargetIdSchema,
-        from: imagePointSchema,
-        to: imagePointSchema,
+        from: agentImagePointSchema,
+        to: agentImagePointSchema,
         durationMs: dragActionSchema.shape.durationMs.default(300),
         button: dragActionSchema.shape.button,
         modifiers: dragActionSchema.shape.modifiers,
