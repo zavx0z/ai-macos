@@ -13,6 +13,8 @@ export type AgentTarget = Extract<OperationTarget, {
   kind:
     | "window"
     | "surface"
+    | "display"
+    | "desktop-layout"
     | "browser-instance"
     | "browser-target"
     | "device"
@@ -493,6 +495,8 @@ function parseAgentTarget(value: AgentTarget): AgentTarget {
   if (![
     "window",
     "surface",
+    "display",
+    "desktop-layout",
     "browser-instance",
     "browser-target",
     "device",

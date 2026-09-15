@@ -33,6 +33,27 @@ test("same target ID и URL в разных profiles не смешивают bro
   expect(scope.resolveAction(two.targetId).target).toEqual(profileTwo)
 })
 
+test("display и desktop layout сохраняют exact native/layout generation identity", () => {
+  const value = fixture()
+  const scope = value.registry.forLineage("lineage:display")
+  const display = displayTarget("display:main", 3)
+  const first = scope.registerTarget(display, authority(1))
+  const refreshed = scope.registerTarget(display, authority(2))
+  const changedLayout = scope.registerTarget(displayTarget("display:main", 4), authority(3))
+  const changedGeneration = scope.registerTarget(
+    displayTarget("display:main", 4, "native:replacement"),
+    authority(4),
+  )
+  const layout = scope.registerTarget(layoutTarget("layout:desktop", 4), authority(3))
+
+  expect(first.kind).toBe("display")
+  expect(refreshed.targetId).toBe(first.targetId)
+  expect(changedLayout.targetId).not.toBe(first.targetId)
+  expect(changedGeneration.targetId).not.toBe(changedLayout.targetId)
+  expect(scope.resolveAction(first.targetId).target).toEqual(display)
+  expect(scope.resolveAction(layout.targetId).target).toEqual(layoutTarget("layout:desktop", 4))
+})
+
 test("foreign lineage не читает target или element handle", () => {
   const value = fixture()
   const owner = value.registry.forLineage("lineage:owner")
@@ -188,6 +209,37 @@ function browserTarget(browserInstanceRef: string, transportGeneration: string, 
       transportGeneration,
       targetId,
       resourceRef: `resource:${browserInstanceRef}`,
+    },
+  }
+}
+
+function displayTarget(
+  displayRef: string,
+  displayLayoutRevision: number,
+  targetNativeGeneration = nativeGeneration,
+): Extract<AgentTarget, { kind: "display" }> {
+  return {
+    kind: "display",
+    ref: {
+      ...generation,
+      nativeGeneration: targetNativeGeneration,
+      displayRef,
+      displayLayoutRevision,
+    },
+  }
+}
+
+function layoutTarget(
+  layoutRef: string,
+  displayLayoutRevision: number,
+): Extract<AgentTarget, { kind: "desktop-layout" }> {
+  return {
+    kind: "desktop-layout",
+    ref: {
+      ...generation,
+      nativeGeneration,
+      layoutRef,
+      displayLayoutRevision,
     },
   }
 }

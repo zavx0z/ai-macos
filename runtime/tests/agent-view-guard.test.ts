@@ -115,6 +115,54 @@ test("targetId и exact target независимо проверяются trust
   await mismatched.guard.close()
 })
 
+test("display/layout views используют exact generation и broad invalidation", async () => {
+  const display = displayTarget("display:view", 3)
+  const value = fixture()
+  const scope = value.guard.forLineage("lineage:display")
+  const displayTicket = await observe(
+    value,
+    "lineage:display",
+    "target:display",
+    display,
+  )
+  await expect(scope.admit(displayTicket, "operation:display"))
+    .resolves.toMatchObject({ targetId: "target:display" })
+  await scope.settleOperation(
+    displayTicket,
+    operation("operation:display", display, "completed"),
+  )
+
+  const layout = layoutTarget("layout:view", 3)
+  const layoutTicket = await observe(
+    value,
+    "lineage:display",
+    "target:layout",
+    layout,
+  )
+  value.observer.push({
+    kind: "window-structure",
+    source: "unknown",
+    target: windowTarget("window:unrelated"),
+  })
+  await expect(scope.admit(layoutTicket, "operation:layout"))
+    .rejects.toThrow("Relevant window structure changed")
+
+  value.bind("lineage:display", "target:stale-layout", layout)
+  await expect(scope.beginObservation(
+    "target:stale-layout",
+    layoutTarget("layout:view", 4),
+  )).rejects.toThrow("trusted exact target binding")
+  await expect(scope.beginObservation(
+    "target:foreign-generation",
+    layoutTarget("layout:view", 3, "native:foreign"),
+  )).rejects.toThrow("другой native generation")
+  await expect(scope.beginObservation(
+    "target:browser",
+    browserTarget() as unknown as AgentViewTarget,
+  )).rejects.toThrow("поддерживает только window/surface/display/desktop-layout")
+  await value.guard.close()
+})
+
 test("foreign lineage/ticket, expiry, gap, EOF и history loss fail closed", async () => {
   const value = fixture({ ticketTtlMs: 10 })
   const owner = value.guard.forLineage("lineage:owner")
@@ -352,6 +400,50 @@ function windowTarget(windowRef: string): Extract<AgentViewTarget, { kind: "wind
       ...generation,
       applicationRef: "application:view",
       windowRef,
+    },
+  }
+}
+
+function displayTarget(
+  displayRef: string,
+  displayLayoutRevision: number,
+): Extract<AgentViewTarget, { kind: "display" }> {
+  return {
+    kind: "display",
+    ref: {
+      ...generation,
+      displayRef,
+      displayLayoutRevision,
+    },
+  }
+}
+
+function layoutTarget(
+  layoutRef: string,
+  displayLayoutRevision: number,
+  targetNativeGeneration = generation.nativeGeneration,
+): Extract<AgentViewTarget, { kind: "desktop-layout" }> {
+  return {
+    kind: "desktop-layout",
+    ref: {
+      ...generation,
+      nativeGeneration: targetNativeGeneration,
+      layoutRef,
+      displayLayoutRevision,
+    },
+  }
+}
+
+function browserTarget() {
+  return {
+    kind: "browser-target" as const,
+    ref: {
+      runtimeEpoch: generation.runtimeEpoch,
+      loginSessionId: generation.loginSessionId,
+      browserInstanceRef: "browser:view",
+      transportGeneration: "transport:view",
+      targetId: "cdp:view",
+      resourceRef: "resource:view",
     },
   }
 }

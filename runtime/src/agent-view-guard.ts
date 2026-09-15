@@ -1,7 +1,7 @@
 import {
-  axInspectionTargetSchema,
   observedEventSchema,
   opaqueIdSchema,
+  operationTargetSchema,
   operationRecordSchema,
   structurallyEqual,
   type ObservedEvent,
@@ -17,7 +17,9 @@ export type AgentViewObserver = Pick<
   "observerInstanceRef" | "coverage" | "subscribe"
 >
 
-export type AgentViewTarget = Extract<AgentTarget, { kind: "window" | "surface" }>
+export type AgentViewTarget = Extract<AgentTarget, {
+  kind: "window" | "surface" | "display" | "desktop-layout"
+}>
 
 export type AgentObservationDraft = Readonly<{
   targetId: string
@@ -565,7 +567,11 @@ export class AgentViewGuard {
 }
 
 function parseTarget(value: AgentTarget, generation: AgentViewGuardOptions["generation"]): AgentViewTarget {
-  const target = axInspectionTargetSchema.parse(value)
+  const target = operationTargetSchema.parse(value)
+  if (target.kind !== "window" && target.kind !== "surface"
+    && target.kind !== "display" && target.kind !== "desktop-layout") {
+    throw new Error("Agent Native view поддерживает только window/surface/display/desktop-layout")
+  }
   if (
     target.ref.runtimeEpoch !== generation.runtimeEpoch
     || target.ref.loginSessionId !== generation.loginSessionId
@@ -575,6 +581,7 @@ function parseTarget(value: AgentTarget, generation: AgentViewGuardOptions["gene
 }
 
 function relevantStructure(left: AgentViewTarget, right: ObservedEvent["target"]): boolean {
+  if (left.kind === "display" || left.kind === "desktop-layout") return true
   if (right === undefined) return true
   if (structurallyEqual(left, right)) return true
   if (!("applicationRef" in left.ref) || !("applicationRef" in right.ref)) return false
