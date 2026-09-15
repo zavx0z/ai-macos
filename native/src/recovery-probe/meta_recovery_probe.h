@@ -52,4 +52,8 @@ NSDictionary *meta_recovery_probe_receive(NSDictionary *owner,
 // намеренно отсутствует и должна прийти от владельца observer/session state.
 MetaRecoveryProbeBackend meta_recovery_probe_system_backend(void);
 
+// Только проверка исходного ledger и его настоящего durable ACK. Не читает
+// состояние системы, не создаёт ledger и не выполняет recovery.
+BOOL meta_recovery_ledger_ack_valid(NSDictionary *ledger, NSDictionary *ack);
+
 #endif

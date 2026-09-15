@@ -3,13 +3,15 @@ import { mkdtemp, rm } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { nativeHandshakeResponseSchema, heldInputLedgerDigest, runtimeOperationIntentSchema, type NativeAdapter } from "@meta/shared/contracts"
-import type { NativeHeldRecoveryRequest, NativeHeldRecoveryResponse } from "@meta/native/protocol"
+import { recoveryValueSha256, type NativeDomainRecoveryRequest, type NativeDomainRecoveryResponse,
+  type NativeHeldRecoveryRequest, type NativeHeldRecoveryResponse } from "@meta/native/protocol"
 import { RuntimeCore } from "../src/core.ts"
 import { FileHeldInputLedger, FileOperationJournal } from "../src/storage/index.ts"
 import { NativeActorJournal } from "../src/native-actor.ts"
 import { StartupHeldRecovery } from "../src/startup-held-recovery.ts"
 
-test("restart recovery оставляет ledger immutable, held блокирует, all-up с actor exit снимает только cleanup", async () => {
+for (const mode of ["ledger", "unicode-no-ledger", "partial-prefix"] as const) {
+test(`restart recovery ${mode}: immutable ledger, all-up после actor exit снимает только cleanup`, async () => {
   const directory = await mkdtemp(join(tmpdir(), "startup-held-"))
   const loginSessionId = "login:startup-held"
   const journal = new FileOperationJournal(join(directory, "operations"))
@@ -33,11 +35,12 @@ test("restart recovery оставляет ledger immutable, held блокиру�
     }), {}, async context => {
       if (context.wire.kind !== "native") throw new Error("Native context expected")
       await old.authorizeNativeMutation(context.wire, { policyVersion: "1", nativeBuildId: "build:held", method: "input.execute",
-        domain: "possible-held-input", possibleHolds: [{ kind: "key", code: 56 }] })
+        domain: "possible-held-input", possibleHolds: mode === "unicode-no-ledger" ? [{ kind: "key", code: 0 }]
+          : mode === "partial-prefix" ? [{ kind: "key", code: 36 }, { kind: "key", code: 56 }] : [{ kind: "key", code: 56 }] })
       throw new Error("injected crash boundary")
     })
     const operationId = interrupted.operation.context.operationId
-    await ledgers.persist("ledger:old", { canonicalVersion: "1", ...oldGeneration, nativeGeneration: oldNative,
+    if (mode !== "unicode-no-ledger") await ledgers.persist("ledger:old", { canonicalVersion: "1", ...oldGeneration, nativeGeneration: oldNative,
       operationId, revision: 1, entries: [{ sequence: 1, kind: "key", code: 56, state: "pending-down" }] })
     const originalLedger = JSON.stringify(await ledgers.loadAll())
     await actors.register(nativeHandshakeResponseSchema.parse({ kind: "handshake-response", protocolVersion: "1", requestId: "handshake:held",
@@ -49,6 +52,14 @@ test("restart recovery оставляет ledger immutable, held блокиру�
     const generation = { runtimeEpoch: "runtime:new-held", loginSessionId }
     const native = {
       generation: { ...generation, nativeGeneration: "native:new-held" }, loadedBuildId: "build:held",
+      async domainRecovery(request: NativeDomainRecoveryRequest): Promise<NativeDomainRecoveryResponse> {
+        probes++
+        return { kind: "domain-recovery-response", protocolVersion: "1", requestId: request.requestId, ...this.generation,
+          nativeBuildId: this.loadedBuildId, oldOperationId: request.grant.operationId, oldRuntimeEpoch: request.grant.runtimeEpoch,
+          oldNativeGeneration: request.grant.nativeGeneration, grantSha256: recoveryValueSha256(request.grant), descriptorSha256: request.grant.descriptorSha256,
+          sampledAt: new Date().toISOString(), inputMonitoring: true, observerReady: true, sessionState: "active-console", lockState: "unknown", secureInput: "off",
+          source: "cg-combined-session-state", entries: request.grant.descriptor.possibleHolds.map(entry => ({ ...entry, observed: held ? "held" : "up" })) }
+      },
       async heldRecovery(request: NativeHeldRecoveryRequest): Promise<NativeHeldRecoveryResponse> {
         probes++
         return { kind: "held-recovery-response", protocolVersion: "1", requestId: request.requestId, ...this.generation,
@@ -60,7 +71,8 @@ test("restart recovery оставляет ledger immutable, held блокиру�
           })) }
       },
     }
-    const recovery = new StartupHeldRecovery({ directory: join(directory, "recovery"), generation, ledgers, actors, native })
+    const recovery = new StartupHeldRecovery({ directory: join(directory, "recovery"), generation, ledgers, actors, native,
+      ...(mode === "ledger" ? {} : { journal }) })
     const core = new RuntimeCore({ generation, runtimeBuildId: "build:held", operationJournal: journal, startupRecovery: recovery,
       clientPersistence: { sessions: old.clients.snapshot(), async persist() {} } })
     await core.initializeRecovery()
@@ -68,7 +80,8 @@ test("restart recovery оставляет ledger immutable, held блокиру�
     expect((await recovery.recover(operationId)).resolved).toBe(0)
     expect(probes).toBe(0)
     actorAbsent = true
-    expect((await recovery.recover(operationId)).unresolved).toBe(1)
+    await recovery.recover(operationId)
+    expect(await recovery.receiptFor(interrupted.operation)).toBeUndefined()
     held = false
     expect(await recovery.recover(operationId)).toEqual({ resolved: 1, unresolved: 0 })
     await core.refreshStartupRecovery(true)
@@ -91,3 +104,4 @@ test("restart recovery оставляет ledger immutable, held блокиру�
     await rm(directory, { recursive: true, force: true })
   }
 })
+}

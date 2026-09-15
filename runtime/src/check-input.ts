@@ -89,7 +89,7 @@ export function registerCheckInputMethod(registry: MethodRegistry, dependencies:
 }
 
 async function executeProbe(registry: MethodRegistry, session: RuntimeClientSession, args: z.infer<typeof inputReadinessMethodInputSchema>, signal: AbortSignal): Promise<CheckInputResult> {
-  const response = await registry.dispatch(session, "input_readiness", args, signal)
+  const response = await registry.internal.dispatch(session, "input_readiness", args, signal)
   const execution = executionSchema.parse(response.data)
   if (execution.operation.clientSessionId !== session.clientSessionId || execution.operation.principalId !== session.principalId
     || execution.operation.context.clientRequestId !== args.clientRequestId

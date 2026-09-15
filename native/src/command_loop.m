@@ -274,6 +274,16 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     [self send:channel payload:result];
     return;
   }
+  if ([channel isEqual:@"domain-recovery"]) {
+    if (![_backend respondsToSelector:@selector(domainRecovery:owner:)]) { [self shutdown:70]; return; }
+    NSDictionary *owner = @{@"protocolVersion": @"1", @"runtimeEpoch": _runtimeEpoch, @"loginSessionId": _loginSessionId,
+      @"nativeGeneration": _generation, @"nativeBuildId": _buildId};
+    [self maintenance:payload work:^NSDictionary * { return [self->_backend domainRecovery:payload owner:owner]; } completed:^(NSDictionary *result) {
+      if (result == nil) [self shutdown:65];
+      else [self send:channel payload:result];
+    }];
+    return;
+  }
   if ([channel isEqual:@"held-recovery"]) {
     if (![_backend respondsToSelector:@selector(heldRecovery:owner:)]) { [self shutdown:70]; return; }
     NSDictionary *owner = @{@"protocolVersion": @"1", @"runtimeEpoch": _runtimeEpoch, @"loginSessionId": _loginSessionId,

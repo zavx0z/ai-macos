@@ -10,6 +10,30 @@ startup recovery receipts и управляемая rotation; pointer readiness 
 
 ## Последующий проверенный integration slice
 
+Domain recovery и restart-liveness:
+
+- Новый DomainRecoveryStore использует весь persisted possible-hold set, а не
+  только уже появившиеся ledger entries. Unicode key0 без ledger и частичный
+  prefix shortcut проходят positive ALL-UP recovery после actor exit.
+- Sidecar связан с exact grant/hash, actor identity, readiness facts и optional
+  неизменным ledger snapshot. Исходный ledger и effect не переписываются;
+  unknown/held response не снимает quarantine. Повторное чтение receipt
+  подтверждает fsync файла и каталога.
+- Host передаёт operation journal в recovery. Вызов не попадает в dead-end
+  поиска только ledger-backed операций; успешный domain probe не вызывает
+  второй legacy probe.
+- Managed rotation при current actor failure/operation quarantine имеет
+  отдельный путь `restart-safe-quarantined`: durable journal retention →
+  cleanup owned browser resources → confirmed owned Native exit → durable
+  restart receipt. Обычный admin drain сохраняет требование complete cleanup.
+  Историческая startup quarantine сама по себе не запускает restart loop.
+- `check_input` использует trusted internal dispatch readiness registrar;
+  actual Core test проверяет точные inventoryId/revision, status query и release.
+- Проверки rotation/startup recovery/host SIGKILL: **9 pass / 50 assertions**;
+  check_input/startup/domain core: **11 pass / 82 assertions**. Это injected
+  Native replies и process fixtures, не live input acceptance. Native C probe
+  и final high-level/guard composition остаются отдельными verification gates.
+
 RecoveryDomain v1 — первый внутренний checkpoint:
 
 - В operation journal добавлен atomic gate `not-authorized` → `send-authorized`.

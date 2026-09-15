@@ -39,6 +39,7 @@ function fixture() {
   let ready = true
   let probeTarget: unknown
   registry.register("input_readiness", { title: "Fixture", description: "Проверенный internal handler fixture", readOnly: false,
+    visibility: "internal",
     input: inputReadinessMethodInputSchema, output: z.object({ operation: operationRecordSchema, result: z.any() }),
     async execute(context, input) {
       probes++

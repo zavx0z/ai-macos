@@ -11,6 +11,8 @@ import type { PersistentHeldInputLedger, StoredHeldLedgerEvidence } from "./stor
 import { atomicReplace } from "./storage/atomic-file.ts"
 import { readStorageFile, assertRecordCapacity } from "./storage/common.ts"
 import { canonicalJson, sha256 } from "./primitives.ts"
+import { DomainRecoveryStore, type DomainRecoveryNative } from "./domain-recovery.ts"
+import type { PersistentOperationJournal } from "./storage/operation-journal.ts"
 
 const receiptSchema = z.strictObject({
   format: z.literal("meta-held-recovery"), version: z.literal(1),
@@ -22,7 +24,7 @@ const receiptSchema = z.strictObject({
 })
 const envelopeSchema = z.strictObject({ receipt: receiptSchema, checksum: z.string().regex(/^[a-f0-9]{64}$/) })
 type RecoveryReceipt = z.infer<typeof receiptSchema>
-type RecoveryNative = Pick<NativeBrokerAdapter, "heldRecovery" | "generation" | "loadedBuildId">
+type RecoveryNative = Pick<NativeBrokerAdapter, "heldRecovery" | "generation" | "loadedBuildId"> & Partial<Pick<DomainRecoveryNative, "domainRecovery">>
 
 /** Не отправляет input events и не изменяет исходные ledger snapshots. */
 export class StartupHeldRecovery {
@@ -32,18 +34,29 @@ export class StartupHeldRecovery {
   readonly #actors: NativeActorJournal
   readonly #native?: RecoveryNative
   #tail: Promise<void> = Promise.resolve()
+  readonly #domains: DomainRecoveryStore
+  readonly #journal?: PersistentOperationJournal
 
-  constructor(options: { directory: string, generation: RuntimeGeneration, ledgers: PersistentHeldInputLedger, actors: NativeActorJournal, native?: RecoveryNative }) {
+  constructor(options: { directory: string, generation: RuntimeGeneration, ledgers: PersistentHeldInputLedger, actors: NativeActorJournal, native?: RecoveryNative, journal?: PersistentOperationJournal }) {
     this.#directory = options.directory
     this.#generation = structuredClone(options.generation)
     this.#ledgers = options.ledgers
     this.#actors = options.actors
     this.#native = options.native
+    this.#journal = options.journal
+    this.#domains = new DomainRecoveryStore({ directory: join(options.directory, "domains"), ...options.generation,
+      ledgers: options.ledgers, actors: options.actors,
+      ...(options.native?.domainRecovery === undefined ? {} : { native: options.native as DomainRecoveryNative }) })
   }
 
   async unresolvedHeld(): Promise<number> {
     let count = 0
-    for (const evidence of await this.#pending()) if (await this.#read(evidence) === undefined) count++
+    for (const evidence of await this.#pending()) {
+      const record = await this.#journal?.read({ runtimeEpoch: evidence.snapshot.runtimeEpoch, loginSessionId: evidence.snapshot.loginSessionId,
+        operationId: evidence.snapshot.operationId })
+      if (record !== undefined && await this.#domains.read(record.record) !== undefined) continue
+      if (await this.#read(evidence) === undefined) count++
+    }
     return count
   }
 
@@ -79,6 +92,8 @@ export class StartupHeldRecovery {
       }
     }
     if (record.resources.some(handle => handle.kind !== "desktop-input")) return undefined
+    const domain = await this.#domains.read(record)
+    if (domain !== undefined) return this.#cleanupReceipt(record, sha256(canonicalRecoveryJson(domain)), domain.acceptedAt)
     const evidence = await this.#ledgers.read({ runtimeEpoch: record.context.runtimeEpoch, loginSessionId: record.context.loginSessionId,
       nativeGeneration, operationId: record.context.operationId })
     if (evidence === undefined) return undefined
@@ -102,9 +117,18 @@ export class StartupHeldRecovery {
     let result!: { resolved: number, unresolved: number }
     const run = async () => {
       let resolved = 0
+      const records = (await this.#journal?.loadAll?.() ?? []).filter(item => item.record.context.loginSessionId === this.#generation.loginSessionId
+        && item.record.outcome.cleanup.state !== "complete" && (operationId === undefined || item.record.context.operationId === operationId))
+      for (const item of records) {
+        signal?.throwIfAborted()
+        if (await this.#domains.read(item.record) === undefined && await this.#domains.recover(item.record, signal)) resolved++
+      }
       for (const evidence of await this.#pending()) {
         signal?.throwIfAborted()
         if (operationId !== undefined && evidence.snapshot.operationId !== operationId) continue
+        const record = records.find(item => item.record.context.operationId === evidence.snapshot.operationId
+          && item.record.context.runtimeEpoch === evidence.snapshot.runtimeEpoch)
+        if (record?.record.nativeRecovery?.phase === "send-authorized" && record.record.nativeRecovery.grant.descriptor.domain === "possible-held-input") continue
         if (await this.#read(evidence) !== undefined) continue
         const native = this.#native
         const generation = native?.generation
@@ -126,7 +150,16 @@ export class StartupHeldRecovery {
         await atomicReplace(this.#path(evidence), new TextEncoder().encode(canonicalJson({ receipt, checksum: sha256(canonicalJson(receipt)) })))
         resolved++
       }
-      result = { resolved, unresolved: await this.unresolvedHeld() }
+      let unresolved = await this.unresolvedHeld()
+      for (const item of records) {
+        const gate = item.record.nativeRecovery
+        if (gate?.phase !== "send-authorized" || gate.grant.descriptor.domain !== "possible-held-input"
+          || await this.#domains.read(item.record) !== undefined) continue
+        const ledger = await this.#ledgers.read({ runtimeEpoch: item.record.context.runtimeEpoch, loginSessionId: item.record.context.loginSessionId,
+          nativeGeneration: gate.grant.nativeGeneration, operationId: item.record.context.operationId })
+        if (ledger === undefined || ledger.snapshot.entries.every(entry => entry.state === "released")) unresolved++
+      }
+      result = { resolved, unresolved }
     }
     const pending = this.#tail.then(run, run)
     this.#tail = pending.catch(() => undefined)

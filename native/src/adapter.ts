@@ -55,6 +55,8 @@ import { nativePermissionsRequestSchema, nativePermissionsResponseSchema, native
   type NativePermissionsRequest, type NativePermissionsResponse } from "./permissions-protocol.ts"
 import { nativeHeldRecoveryRequestSchema, nativeHeldRecoveryResponseSchema, nativeHeldRecoveryResponseMatches,
   type NativeHeldRecoveryRequest, type NativeHeldRecoveryResponse } from "./recovery-protocol.ts"
+import { nativeDomainRecoveryRequestSchema, nativeDomainRecoveryResponseSchema, nativeDomainRecoveryResponseMatches,
+  type NativeDomainRecoveryRequest, type NativeDomainRecoveryResponse } from "./domain-recovery-protocol.ts"
 import { nativeObserverRequestSchema, nativeObserverResponseSchema, nativeObserverResponseMatches,
   type NativeObserverRequest, type NativeObserverResponse, type NativeObservedEvent } from "./observer-protocol.ts"
 import { nativeHitTestRequestSchema, nativeHitTestResponseSchema, nativeHitTestResultMatches,
@@ -421,6 +423,19 @@ export class NativeBrokerAdapter implements NativeAdapter {
     return value
   }
 
+  async domainRecovery(request: NativeDomainRecoveryRequest, control: AdapterControl): Promise<NativeDomainRecoveryResponse> {
+    control.signal.throwIfAborted()
+    const parsed = parseWireValue(nativeDomainRecoveryRequestSchema, request)
+    this.#assertGeneration(parsed)
+    await control.checkpoint("native-before-passive-domain-recovery")
+    const response = await this.#exchange("domain-recovery", { channel: "domain-recovery", payload: parsed }, parsed.requestId, control.signal, parsed.deadlineAt)
+    if (response.channel !== "domain-recovery") throw new Error("Native domain recovery response channel mismatch")
+    const value = parseWireValue(nativeDomainRecoveryResponseSchema, response.payload)
+    if (!nativeDomainRecoveryResponseMatches(parsed, value, this.loadedBuildId)) throw new Error("Native domain recovery response identity mismatch")
+    await control.checkpoint("native-after-passive-domain-recovery")
+    return value
+  }
+
   async clipboard(request: NativeClipboardRequest, control: AdapterControl): Promise<NativeClipboardResponse> {
     control.signal.throwIfAborted()
     const parsed = parseWireValue(nativeClipboardRequestSchema, request, { maxBytes: NATIVE_CLIPBOARD_WIRE_BYTES, maxDepth: 32 })
@@ -597,7 +612,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
     signal?.throwIfAborted()
     if (this.#closed) throw new Error("Native adapter закрыт")
     frame = nativeTransportRequestFrameSchema.parse(frame)
-    const sealedControl = ["drain", "cleanup", "status", "cancel", "held-recovery", "permissions"].includes(frame.channel)
+    const sealedControl = ["drain", "cleanup", "status", "cancel", "held-recovery", "domain-recovery", "permissions"].includes(frame.channel)
       || (frame.channel === "observer" && frame.payload.command !== "prepare")
     if (this.#rotationSealed && !sealedControl) throw new Error("Native session draining: runtime rotation выполняется")
     if (this.sessionState.state === "rotation-required" && (frame.channel === "request" || frame.channel === "clipboard")) {

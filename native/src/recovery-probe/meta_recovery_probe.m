@@ -253,6 +253,14 @@ static BOOL ack_matches(NSDictionary *ack,
          [ack[@"snapshotSha256"] isEqual:@(digest)];
 }
 
+BOOL meta_recovery_ledger_ack_valid(NSDictionary *value, NSDictionary *ack) {
+  MetaLedgerEntry entries[META_RECOVERY_MAX_ENTRIES] = {0};
+  MetaHeldInputLedgerSnapshot ledger = {0};
+  char digest[65] = {0};
+  return parse_ledger(value, &ledger, entries) &&
+      meta_ledger_snapshot_sha256(&ledger, digest) && ack_matches(ack, &ledger, digest);
+}
+
 static NSString *session_state(MetaRecoverySessionState state) {
   switch (state) {
     case MetaRecoverySessionStateActiveConsole:

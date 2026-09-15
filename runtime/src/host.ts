@@ -29,6 +29,8 @@ import { registerBrowserMethods } from "./browser-methods.ts"
 import { registerInputMethods } from "./input-methods.ts"
 import { registerReadinessMethods } from "./readiness-methods.ts"
 import { registerCheckInputMethod } from "./check-input.ts"
+import { prepareQuarantinedRestart } from "./restart-quarantined.ts"
+import { atomicReplace } from "./storage/atomic-file.ts"
 import { registerCaptureMethods } from "./capture-methods.ts"
 import { DesktopInputAdapter } from "@meta/input/adapter"
 import { RuntimeScreenAdapter } from "@meta/screen/adapter"
@@ -172,7 +174,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   try {
   const startupRecovery = new StartupHeldRecovery({ directory: join(auditStateDirectory, "held-recovery"),
-    generation, ledgers: heldLedger, actors: actorJournal, ...(native === undefined ? {} : { native }) })
+    generation, journal, ledgers: heldLedger, actors: actorJournal, ...(native === undefined ? {} : { native }) })
   runtime = new RuntimeCore({
     generation, runtimeBuildId: options.runtimeBuildId,
     operationJournal: journal,
@@ -257,7 +259,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     runtime: z.strictObject({ buildId: z.string(), runtimeEpoch: z.string(), loginSessionId: z.string(), draining: z.boolean(),
       admissionSealed: z.boolean(), recoveryOperations: z.number().int().min(0), recoveryReasons: z.array(z.string()),
       clients: z.strictObject({ pendingGrace: z.number().int().min(0), cleanupFailures: z.number().int().min(0) }),
-      rotation: z.strictObject({ state: z.enum(["running", "restart-needed", "draining", "blocked", "restarting"]), reason: z.string().optional() }) }),
+      rotation: z.strictObject({ state: z.enum(["running", "restart-needed", "draining", "blocked", "restarting"]), reason: z.string().optional(), recovery: z.literal("restart-safe-quarantined").optional() }) }),
     native: z.union([
       z.strictObject({ state: z.literal("unavailable"), reason: z.string() }),
       z.strictObject({ state: z.literal("compatible"), buildId: z.string(), generation: z.string() }),
@@ -382,6 +384,32 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     },
   })
   let closing: Promise<void> | undefined
+  const prepareRecoveryRestart = async (signal?: AbortSignal) => {
+    if (ownedProcess === undefined || actorRecord === undefined || handshake?.recoveryDomainVersion !== "1") throw new Error("Recovery restart требует owned v1 Native actor")
+    return prepareQuarantinedRestart({ signal,
+      seal() { core.sealAdmission(); preparationAbort.abort("Recovery restart") },
+      async retain(control) {
+        const retained = await core.retainForRecoveryRestart()
+        control.throwIfAborted()
+        await core.drainClientGrace()
+        await core.browserLifetime.shutdownLineage(undefined, control)
+        return retained
+      },
+      async stopOwnedNative() {
+        await heartbeat?.stop()
+        await backendPreparation
+        await observerBinding?.hub.close()
+        await closeNative()
+        observerBinding = undefined
+        return ownedProcess!.processStatus
+      },
+      async persistExit(receipt) {
+        await atomicReplace(join(auditStateDirectory, `restart-${generation.runtimeEpoch.replaceAll(":", "-")}.json`),
+          new TextEncoder().encode(JSON.stringify({ ...generation, nativeGeneration: handshake!.nativeGeneration,
+            nativeBuildId: handshake!.nativeBuildId, recordedAt: new Date().toISOString(), ...receipt })))
+      },
+    })
+  }
   const close = () => {
     closing ??= (async () => {
       rotation?.stop()
@@ -399,7 +427,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     return closing
   }
   return {
-    core, catalog, doctor, recoverStartup,
+    core, catalog, doctor, recoverStartup, prepareRecoveryRestart,
     async start() {
       try {
         if (native !== undefined && handshake !== undefined) heartbeat = startRuntimeHeartbeat({ native,
@@ -442,6 +470,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
         rotation = startRuntimeRotation({
           managed: options.managed === true,
           reason() {
+            if (nativeError !== undefined && actorRecord !== undefined) return "Owned Native actor недоступен; требуется recovery restart"
+            if (actorRecord !== undefined && core.activeOperationCount() === 0 && core.resources.quarantinedCount() > 0) return "Current operations quarantined; требуется новый recovery actor"
             if (native !== undefined && native.sessionState.requestsUsed >= 8500) return "Native request budget требует нового процесса"
             if (Date.now() - startedAt >= 23 * 60 * 60 * 1000) return "Runtime достиг rotation horizon"
             if (core.frames.stats().issuedRefs >= 9000) return "Frame reference budget требует нового процесса"
@@ -449,6 +479,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
           },
           seal: () => core.sealAdmission(),
           async drain(signal) { await drain(signal) },
+          prepareRecoveryRestart,
           close,
           exit: options.exitAfterRotation ?? (() => process.exit(0)),
         })

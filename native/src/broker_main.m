@@ -26,6 +26,7 @@
 #include "ax-actions/meta_ax_retained_snapshot.h"
 #include "ax-actions/meta_ax_press.h"
 #include "recovery-domain/meta_recovery_domain.h"
+#include "domain-recovery/meta_domain_recovery.h"
 #include <time.h>
 #include <math.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -613,6 +614,16 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
     value[@"interference"] = execution[@"status"][@"userInterference"];
   }
   return @{@"value": value, @"status": execution[@"status"]};
+}
+
+- (NSDictionary *)domainRecovery:(NSDictionary *)request owner:(NSDictionary *)owner {
+  _recoveryRequest = request;
+  MetaRecoveryProbeBackend backend = meta_recovery_probe_system_backend();
+  backend.context = (__bridge void *)self;
+  backend.readiness = recovery_readiness;
+  NSDictionary *result = meta_domain_recovery_receive(owner, request, backend);
+  _recoveryRequest = nil;
+  return result;
 }
 
 - (NSDictionary *)heldRecovery:(NSDictionary *)request owner:(NSDictionary *)owner {
