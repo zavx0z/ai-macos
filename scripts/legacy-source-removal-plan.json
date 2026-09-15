@@ -1,7 +1,7 @@
 {
   "format": "meta-ai-macos-legacy-source-removal-plan-v1",
-  "generatedFromCommit": "8eabedf",
-  "state": "proposal-blocked-until-root-integration-and-api-decision",
+  "generatedFromCommit": "c5e8d71aefa514289ee3e8969d3eac58c4bd5ac8",
+  "state": "awaiting-host-integration-and-verified-installed-cutover",
   "scope": "repository-source-only",
   "preconditions": [
     "Полный production RuntimeHost catalog и native binding проходят root integration без legacy REST.",
@@ -14,8 +14,8 @@
     "Принято решение о внешнем API после сравнения вариантов; выбранный интерфейс проверен и не использует legacy REST/CLI как реализацию."
   ],
   "externalApiCompatibility": {
-    "goal": "Оценить пользу и стоимость полной либо частичной совместимости с Computer Use API Codex/ChatGPT",
-    "contractStatus": "source-verified-adoption-paused-pending-decision",
+    "goal": "Удобный агентский слой поверх собственного runtime с точной адресацией; полный JavaScript REPL отложен",
+    "contractStatus": "selective-high-level-api-approved-source-implementation-in-progress",
     "researchSources": [
       "/Applications/ChatGPT.app bundled API inspected by root",
       "https://learn.chatgpt.com/docs/computer-use"
@@ -25,7 +25,7 @@
       "Cancellation/deadline behavior",
       "Image/frame transport semantics",
       "Capability advertisement и unavailable behavior",
-      "Contract tests против подтвержденного external API"
+      "Проверки согласованных сценариев и production schemas собственного API; совместимость один-к-одному с Codex не заявляется"
     ],
     "constraint": "Не проектировать facade по предположению и не сохранять legacy REST/CLI как compatibility layer."
   },
@@ -86,7 +86,7 @@
       "consumer": "android/src/adapter.ts",
       "required": [
         "android/src/adb.ts",
-        "android selectCreatedTarget helper extracted from android/src/android.ts",
+        "android/src/target-identity.ts",
         "@meta/chrome/adapter"
       ]
     },
