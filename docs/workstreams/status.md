@@ -1,62 +1,62 @@
 # Текущий статус computer use
 
-Этот файл содержит текущий срез координации. История решений и проверок —
-[computer-use-coordination.md](../computer-use-coordination.md).
-Принятый ограниченный этап не означает готовность установленного сервиса.
+Дата: 15 сентября 2026. Ведущий работает в каноническом checkout, ветка `main`.
+Каждый принятый этап сохраняется отдельным коммитом и отправляется в `origin/main`.
+Принятый этап исходного кода не означает готовность установленного продукта.
 
-**Git checkpoints:** исходное незавершённое состояние сохранено в `3796409`;
-его описание — [WIP checkpoint](../checkpoints/2026-09-15-computer-use-wip.md).
-Миграция coordinator теперь связана с core: root 34 runtime tests / 172 assertions
-и общий TypeScript check проходят. Каждый следующий проверенный этап коммитится
-и отправляется отдельно.
+## Подтверждённые результаты
 
-| Задача | Что принято | Что остаётся |
+- Native transport: настоящий собранный helper вернул проверенную Darwin audit
+  session; runtime выполнил с ним совместимый handshake. Проверка пассивная,
+  без действий с окнами, вводом, снимками или clipboard.
+- Динамический MCP-каталог приходит из RuntimeHost через аутентифицированный UDS.
+  При недоступном runtime MCP оставляет только пассивную диагностику.
+- Native transport поддерживает bounded clipboard JSON profile; тест с миллионом
+  NUL-символов проходит через настоящий command loop с подставным clipboard.
+- Runtime регистрирует точную личность AX-only окна независимо от CG mapping.
+  Hidden window и sheet проверены через raw inventory и реальный evidence issuer.
+  Для снимка окна по-прежнему требуется отдельное CG-AX подтверждение.
+- Каталог окон и ввода передаёт точные refs, inventory и clientRequestId;
+  runtime сам выдаёт ресурсы и fence. Потерянный ответ не повторяет действие.
+- Приёмочный runner различает pass, fail и not-run. Отсутствующие live checks
+  не становятся pass после зелёных unit tests.
+
+## Работа владельцев
+
+| Задача | Принято | Следующий результат |
 | --- | --- | --- |
-| Computer use: runtime, контракты и MCP | C2 core/evidence/continuation, thin UDS, coordinator, exact recovery и injected Android composition | Production host, MCP tools/frame/catalog и live profiles |
-| Computer use: native broker и окна | C0 native core, ABI v2 subset, identity/extractor и часть C2 integration | На Astra/high исправляет concurrent task lifetime, tombstone horizon, capture outcome schema и memory bounds; затем command-loop/live |
-| Computer use: ввод и interaction | C2 adapter/authorization/status/compiler, injected clipboard; text bridge до C executor с fake sink | Остальные native actions, runtime wiring, versioned clipboard backend, live |
-| Computer use: снимки и координаты | C2 adapter/protocol driver, late reconciliation/ACK tombstones/taskRef protection и pixel orientation | Dropped-start production cancel/drain wiring, installed helper и live capture/mixed displays |
-| Computer use: Chrome и Android | C2 adapters/concrete backend и lifecycle/bounded IO review | Runtime lifetime reservation/recovery/composition, live A34–A40 |
-| Computer use: приёмочные проверки | ABI v2 + real Runtime cross-client subset: root 25 pass / 56 assertions | UDS/STDIO/client lineage, durable restart/retention и live ещё не приняты |
+| Computer use: runtime, контракты и MCP | Core authorities, arbitration, continuation, browser lifetime; UDS host и динамический каталог | Durable recovery, bounded storage, admin drain, interaction, общий host wiring |
+| Computer use: native broker и окна | Registry, exact identity, framed async key/text, audit identity, clipboard protocol | AX wiring, window transitions, pointer, observer/readiness, capture dispatch и приложения |
+| Computer use: ввод и interaction | Input adapter, Unicode compiler, clipboard backend, методы каталога | Граничные бюджеты, readiness/interaction через runtime authority, live |
+| Computer use: снимки и координаты | SCStream module, compositor, continuation/cleanup и capture adapter | Publication/commit через core, каталог и production wiring, live |
+| Computer use: Chrome и Android | Concrete adapters, bounded CDP/ADB, lifetime recovery | Методы каталога, отмена и idempotent capture, host composition, live |
+| Computer use: приёмочные проверки | Native/core fixtures, RuntimeHost → UDS → MCP isolation/catalog/drain | Process startup, durable restart, полная evidence matrix, live |
 
-## Последние подтверждённые проверки
+Ведущий проверяет архитектурные стыки, коммитит и отправляет принятые изменения.
+Отдельный helper реализует installer с immutable releases, атомарным обновлением
+и rollback; до приёмки он не изменяет действующий сервис.
 
-- Runtime: root 23 tests / 114 assertions pass, включая actual NativeCaptureClient
-  normal/late cleanup integration. C2 core/continuation scoped accepted;
-  единственный текущий UDS test не закрывает известные transport замечания.
-- Chrome/Android/CDP: root 62 pass / 121 assertions; C2 scoped accepted.
-- Input: independent review 47 pass / 90 assertions, root C bridge fixture
-  1 pass / 2 assertions. Последний safe allowlist владельца: 55 pass / 107 assertions.
-- Screen: root 22 targeted adapter/protocol tests / 146 assertions pass;
-  full package по handoff 34 pass / 170 assertions. C2 scoped accepted.
-- Native: root package check — шесть C/Objective-C fixtures и 24 TypeScript
-  tests / 129 assertions на предыдущем checkpoint; latest root — семь fixtures,
-  28 TypeScript tests / 133 assertions pass. Independent final Native review идёт.
-- Thin UDS/MCP foundation: root 6 tests / 39 assertions pass, scoped accepted.
-  Это ещё не полный набор computer-use инструментов.
+## Последние проверки ведущего
 
-## Следующие зависимости
+- Native protocol + host + MCP: 43 tests, 168 assertions.
+- AX identity + core + evidence contracts: 17 tests, 97 assertions.
+- Каталог окон и ввода: 7 tests, 26 assertions.
+- Host/MCP и runner: 5 tests, 25 assertions.
+- AX inspector: 8 injected C/Objective-C cases; command loop и AX contract:
+  13 tests, 43 assertions. Production AX context wiring ещё проверяется отдельно.
+- Общий TypeScript check прошёл после каталога окон и ввода.
 
-1. Native завершает C router concurrency/retention и protocol memory bounds.
-   Runtime authorities и Capture driver приняты в своей ограниченной области.
-2. Native связывает production command loop с operation-level cancel/drain;
-   dropped-start C core test не заменяет проверку этого общего пути.
-3. Runtime исправляет замечания UDS/MCP и реализует lifetime Android reservation;
-   thin transport и coordinator/recovery checkpoints приняты. Root35tests /
-   196assertions pass; recovery использует private stored cleanup authority.
-   Workspace связи Runtime→Chrome/Android установлены для concrete composition.
-   Production host/catalogue и exposure recovery через UDS ещё впереди.
-4. QA проверяет реальные межпакетные цепочки, затем ведущий проводит общий
-   integration/cutover gate и отдельно живые сценарии.
+Это проверки названных коммитов; во время параллельной работы текущий dirty tree
+может содержать следующий ещё не принятый этап.
 
 ## Эксплуатационный статус
 
-`git diff --check` и общий TypeScript check прошли после завершения coordinator
-wiring и блокировки raw browser/device admission. Это проверка текущего кода,
-но не installed/live acceptance.
+Установленные сервисы, helper и конфигурация Codex ещё не переключены.
+Текущий подключённый MCP остаётся 0.3.0. Финальная приёмка требует полного пути
+`discovery → show → observation → input → outcome → recovery` через direct MCP,
+включая существующий скрытый Chrome и несколько одноимённых процессов.
 
-Installed services, helper и Codex configuration не переключены.
-Live input/capture/ADB в этой волне не выполнялись, кроме ошибочного запуска
-существовавшего clipboard-теста агентом Input: текст восстановлен тестом,
-прежние non-text formats неизвестны. Инцидент сообщён Владимиру; test теперь
-явно opt-in и root подтвердил его skip в безопасном режиме.
+Случайный live clipboard test прежнего этапа восстановил текст в finally,
+но сохранность прежних non-text formats неизвестна. Инцидент сообщён Владимиру;
+live clipboard test теперь opt-in. Остальные проверки этой волны не используют
+пользовательский clipboard и не вводят данные в приложения.
