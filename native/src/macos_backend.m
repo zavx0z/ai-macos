@@ -700,6 +700,42 @@ static AXHandle *resolve_transition_target(MetaMacOSBackend *backend,
   return handle;
 }
 
+MetaAXBorrowStatus meta_macos_with_ax_target(MetaMacOSBackend *backend,
+                                            const char *target_ref,
+                                            const char *inventory_id,
+                                            uint64_t inventory_revision,
+                                            const char *native_generation,
+                                            MetaAXTargetConsumer consume,
+                                            void *context) {
+  if (backend == NULL || target_ref == NULL || inventory_id == NULL || native_generation == NULL || consume == NULL ||
+      target_ref[0] == '\0' || strnlen(target_ref, META_NATIVE_REF_CAPACITY) >= META_NATIVE_REF_CAPACITY) {
+    return META_AX_BORROW_INVALID_REQUEST;
+  }
+  const MetaInventorySnapshot *snapshot = meta_registry_snapshot(backend->registry);
+  if (snapshot == NULL || strcmp(snapshot->inventory_id, inventory_id) != 0 ||
+      snapshot->revision != inventory_revision || strcmp(snapshot->native_generation, native_generation) != 0) {
+    return META_AX_BORROW_TARGET_STALE;
+  }
+  const MetaWindowRecord *record = meta_registry_resolve_target(backend->registry, target_ref);
+  if (record == NULL || record->actionability != META_ACTIONABILITY_AX) return META_AX_BORROW_TARGET_STALE;
+  AXHandle *handle = find_handle(backend, record->ax_token);
+  if (!process_matches(record, handle)) return META_AX_BORROW_TARGET_STALE;
+  if (!AXIsProcessTrusted()) return META_AX_BORROW_PERMISSION_DENIED;
+  MetaAXTargetBorrow borrow = {
+    .element = (AXUIElementRef)CFRetain(handle->element),
+    .target = *record,
+    .launch_time_micros = handle->launch_time_micros,
+    .inventory_revision = snapshot->revision,
+  };
+  snprintf(borrow.native_generation, sizeof(borrow.native_generation), "%s", snapshot->native_generation);
+  snprintf(borrow.inventory_id, sizeof(borrow.inventory_id), "%s", snapshot->inventory_id);
+  AXUIElementSetMessagingTimeout(borrow.element, 0.5f);
+  bool consumed = consume(context, &borrow);
+  CFRelease(borrow.element);
+  if (process_start_micros(borrow.target.pid) != borrow.launch_time_micros) return META_AX_BORROW_TARGET_STALE;
+  return consumed ? META_AX_BORROW_OK : META_AX_BORROW_CONSUMER_FAILED;
+}
+
 static bool element_is_owned_sheet(AXUIElementRef owner,
                                    AXUIElementRef candidate) {
   CFTypeRef sheets_value = NULL;

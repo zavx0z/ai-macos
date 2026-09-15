@@ -2,6 +2,7 @@
 #define META_MACOS_H
 
 #include "meta_native.h"
+#include <ApplicationServices/ApplicationServices.h>
 
 typedef enum {
   META_TRANSITION_SUCCEEDED,
@@ -39,6 +40,35 @@ typedef struct {
 } MetaWindowTransition;
 
 typedef struct MetaMacOSBackend MetaMacOSBackend;
+
+typedef enum {
+  META_AX_BORROW_OK,
+  META_AX_BORROW_INVALID_REQUEST,
+  META_AX_BORROW_TARGET_STALE,
+  META_AX_BORROW_PERMISSION_DENIED,
+  META_AX_BORROW_CONSUMER_FAILED,
+} MetaAXBorrowStatus;
+
+typedef struct {
+  AXUIElementRef element;
+  MetaWindowRecord target;
+  uint64_t launch_time_micros;
+  uint64_t inventory_revision;
+  char inventory_id[META_NATIVE_REF_CAPACITY];
+  char native_generation[META_NATIVE_REF_CAPACITY];
+} MetaAXTargetBorrow;
+
+// Вызывается только на action worker владельца backend. element и borrow
+// действительны до возврата callback; callback не освобождает element и не
+// сохраняет ссылку для асинхронной работы. Registry остаётся у native-owner.
+typedef bool (*MetaAXTargetConsumer)(void *context, const MetaAXTargetBorrow *borrow);
+MetaAXBorrowStatus meta_macos_with_ax_target(MetaMacOSBackend *backend,
+                                            const char *target_ref,
+                                            const char *inventory_id,
+                                            uint64_t inventory_revision,
+                                            const char *native_generation,
+                                            MetaAXTargetConsumer consume,
+                                            void *context);
 
 MetaMacOSBackend *meta_macos_backend_create(const char *native_generation);
 bool meta_macos_target_is_focused(MetaMacOSBackend *backend, const char *target_ref);

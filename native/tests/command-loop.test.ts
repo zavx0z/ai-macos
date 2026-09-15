@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { NativeBrokerAdapter, NativeProcessTransport } from "../src/adapter.ts"
 import { nativeInventoryRequestSchema, nativeInventoryResponseSchema } from "../src/protocol.ts"
+import { nativeAxInspectionRequestSchema, nativeAxInspectionResponseSchema } from "../src/protocol.ts"
 import { nativeInputExecutionRequestSchema, nativeInputExecutionResponseSchema, type NativeInputExecutionPayload } from "../src/protocol.ts"
 import { heldInputLedgerDigest, type HeldInputLedgerSink } from "@meta/shared/contracts"
 import { nativeClipboardRequestSchema } from "../src/clipboard-protocol.ts"
@@ -243,5 +244,21 @@ test("slow inventory не блокирует control heartbeat; drain sealed-pen
     expect((await inventory).ok).toBe(false)
     const completed = await adapter.drain({ requestId: "drain-completed", ...generation, deadlineAt }, control)
     expect(completed.cleanup).toBe("complete")
+  } finally { await adapter.close() }
+})
+
+test("ax.inspect request проходит production action queue и сохраняет raw nodes", async () => {
+  const adapter = createAdapter()
+  try {
+    await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "handshake", runtimeEpoch: "runtime", loginSessionId: "login",
+      runtimeBuildId: "runtime-build", expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" })
+    const result = await adapter.request(nativeAxInspectionRequestSchema, {
+      kind: "request", intent: "read", protocolVersion: "1", requestId: "inspect", ...adapter.generation!,
+      deadlineAt: new Date(Date.now() + 1_000).toISOString(), method: "ax.inspect",
+      payload: { target: { kind: "window", ref: { ...adapter.generation!, applicationRef: "application-fixture", windowRef: "window-fixture" } },
+        depth: 2, maxNodes: 10, maxBytes: 4096 },
+    }, nativeAxInspectionResponseSchema, { signal: new AbortController().signal, checkpoint: () => undefined })
+    expect(result.ok).toBe(true)
+    if (result.ok) expect(result.result.nodes[0]?.title).toBe("Fixture button")
   } finally { await adapter.close() }
 })

@@ -237,6 +237,28 @@ sh native/scripts/build.sh /tmp/meta-native-build.*/libmeta-native.dylib
 
 ## Следующий шаг
 
+### Read-only AX handler checkpoint
+
+`ax.inspect` подключён к action worker через
+`meta_macos_with_ax_target` и `meta_ax_inspect_borrowed_element`. Borrow проверяет
+current inventory/native generation, exact AX ref, application/process
+incarnation и permission. Raw nodes возвращаются через существующий protocol;
+public structured-node mapper находится у выделенного AX helper. Permission и
+stale-target failures возвращаются как typed errors. Cursor paging пока не
+подключён: запрос с cursor отклоняется.
+
+Production build включает `native/src/accessibility/meta_ax_inspector.m`.
+Production request-builder `native/src/ax_request.m` передаёт inspector именно
+`inventory_id` и `inventory_revision` из проверенного borrow, проверяет
+window/surface kind и точный `ownerWindowRef` у surface. Injected regression
+использует этот же builder и настоящий inspector: результат содержит один
+узел, несовпадение kind или owner отвергается. Проверка fixture и сборка
+временного executable с build ID `native-ax-context-check` прошли; live AX
+операции и установленный helper не затрагивались.
+Command-loop suite — 10 tests / 39 assertions pass; temporary candidate
+`native-ax-handler-check` собирается, не запускался. Shared definitions и
+inspector subtree меняет AX helper, inventory/evidence registry — root.
+
 ### Audit session metadata checkpoint
 
 Production `--metadata`, `--doctor` и framed handshake теперь содержат `session`

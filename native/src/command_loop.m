@@ -222,6 +222,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   BOOL clipboard = [channel isEqual:@"clipboard"];
   BOOL input = [payload[@"method"] isEqual:@"input.execute"] && [payload[@"intent"] isEqual:@"mutation"];
   BOOL inventory = [payload[@"method"] isEqual:@"window.inventory"] && [payload[@"intent"] isEqual:@"read"] && operation == nil;
+  BOOL inspection = [payload[@"method"] isEqual:@"ax.inspect"] && [payload[@"intent"] isEqual:@"read"] && operation == nil;
   NSDictionary *command = payload[@"command"];
   if (clipboard) {
     NSDictionary *target = operation[@"target"];
@@ -240,7 +241,14 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     MetaBrokerTransport *transport = _transport;
     _job = [[MetaInputJob alloc] initWithRequest:payload emitter:^(NSDictionary *message) { return [transport enqueueFrame:message]; }];
   }
-  if (!clipboard && !inventory && !input) {
+  if (inspection) {
+    NSDictionary *inspectPayload = payload[@"payload"];
+    NSDictionary *target = [inspectPayload isKindOfClass:NSDictionary.class] ? inspectPayload[@"target"] : nil;
+    NSDictionary *ref = [target isKindOfClass:NSDictionary.class] ? target[@"ref"] : nil;
+    if (![ref isKindOfClass:NSDictionary.class] || ![ref[@"runtimeEpoch"] isEqual:_runtimeEpoch] ||
+        ![ref[@"loginSessionId"] isEqual:_loginSessionId] || ![ref[@"nativeGeneration"] isEqual:_generation]) { [self shutdown:65]; return; }
+  }
+  if (!clipboard && !inventory && !input && !inspection) {
     response[@"ok"] = @NO;
     response[@"error"] = failure(@"unsupported-capability", @"Native command ещё не подключена к broker");
     [self send:responseChannel payload:response];
@@ -255,14 +263,18 @@ static NSDictionary *failure(NSString *code, NSString *message) {
       dispatch_sync(self->_control, ^{ allowed = !self->_sealed && self->_requestedExit < 0; });
       NSDictionary *result = nil;
       if (allowed && future_deadline(payload[@"deadlineAt"])) {
-        result = input ? [self->_backend executeInput:payload job:job] : clipboard ? [self->_backend clipboard:command] : [self->_backend inventory];
+        result = input ? [self->_backend executeInput:payload job:job] : clipboard ? [self->_backend clipboard:command] :
+            inspection ? [self->_backend inspect:payload] : [self->_backend inventory];
       }
       dispatch_async(self->_control, ^{
         self->_busy = NO;
         self->_activeOperation = nil;
         if (self->_requestedExit >= 0) { atomic_store(&self->_exitCode, self->_requestedExit); return; }
         response[@"ok"] = result != nil ? @YES : @NO;
-        if (input && result != nil) {
+        if ([result[@"nativeError"] isKindOfClass:NSDictionary.class]) {
+          response[@"ok"] = @NO;
+          response[@"error"] = result[@"nativeError"];
+        } else if (input && result != nil) {
           NSMutableDictionary *report = [result mutableCopy];
           BOOL finished = [report[@"finished"] boolValue];
           [report removeObjectForKey:@"finished"];

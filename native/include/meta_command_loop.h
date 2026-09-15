@@ -8,6 +8,7 @@
 - (NSDictionary *)sessionIdentity;
 - (NSDictionary *)permissions;
 - (NSDictionary *)inventory;
+- (NSDictionary *)inspect:(NSDictionary *)request;
 - (NSDictionary *)clipboard:(NSDictionary *)command;
 - (NSDictionary *)status:(NSString *)operationId requestId:(NSString *)requestId;
 - (NSDictionary *)cancel:(NSDictionary *)request;

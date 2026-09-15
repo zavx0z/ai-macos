@@ -38,6 +38,11 @@ static bool fixtureFlags(void *context, uint64_t flags) { (void)context; (void)f
   usleep(500000);
   return nil;
 }
+- (NSDictionary *)inspect:(NSDictionary *)request {
+  (void)request;
+  return @{@"snapshotId": @"ax-fixture", @"complete": @YES, @"nodeCount": @1, @"encodedBytes": @100,
+    @"nodes": @[@{@"elementRef": @"element-fixture", @"role": @"AXButton", @"subrole": @"", @"title": @"Fixture button", @"actions": @[@"AXPress"]}], @"errors": @[]};
+}
 - (NSDictionary *)clipboard:(NSDictionary *)command {
   if ([command[@"method"] isEqual:@"clipboard.version"]) {
     return @{@"method": @"clipboard.version", @"value": @{@"status": @"ok", @"changeCount": @(_clipboardVersion)}};

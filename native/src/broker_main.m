@@ -7,6 +7,9 @@
 #include "meta_macos_input.h"
 #include "meta_session_identity.h"
 #include "clipboard/meta_clipboard.h"
+#include "accessibility/meta_ax_inspector.h"
+#include "meta_ax_request.h"
+#include <time.h>
 #include <ApplicationServices/ApplicationServices.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <unistd.h>
@@ -21,6 +24,22 @@
 @interface MetaSystemCommandBackend : NSObject <MetaCommandBackend>
 - (instancetype)initWithGeneration:(NSString *)generation;
 @end
+
+@interface MetaInspectionBorrowContext : NSObject
+@property(nonatomic, strong) NSDictionary *request;
+@property(nonatomic, strong) NSDictionary *result;
+@property(nonatomic, strong) NSString *snapshotId;
+@end
+@implementation MetaInspectionBorrowContext
+@end
+
+static bool inspect_borrowed(void *context, const MetaAXTargetBorrow *borrow) {
+  MetaInspectionBorrowContext *binding = (__bridge MetaInspectionBorrowContext *)context;
+  MetaAXInspectionContext request = {0};
+  if (!meta_ax_build_request(borrow, binding.request, binding.snapshotId, &request)) return false;
+  binding.result = meta_ax_inspect_borrowed_element(borrow->element, request);
+  return binding.result != nil;
+}
 
 @implementation MetaSystemCommandBackend {
   MetaMacOSBackend *_windows;
@@ -78,6 +97,33 @@
   NSDictionary *result = [NSJSONSerialization JSONObjectWithData:(__bridge NSData *)data options:0 error:NULL];
   CFRelease(data);
   return result;
+}
+
+- (NSDictionary *)inspect:(NSDictionary *)request {
+  NSDictionary *payload = request[@"payload"];
+  NSDictionary *target = payload[@"target"];
+  NSDictionary *ref = target[@"ref"];
+  if (![ref isKindOfClass:NSDictionary.class] || payload[@"cursor"] != nil ||
+      [payload[@"depth"] integerValue] < 0 || [payload[@"depth"] integerValue] > 12 ||
+      [payload[@"maxNodes"] integerValue] < 1 || [payload[@"maxNodes"] integerValue] > 1500 ||
+      [payload[@"maxBytes"] integerValue] < 1 || [payload[@"maxBytes"] integerValue] > 1024 * 1024) return nil;
+  NSString *targetRef = [target[@"kind"] isEqual:@"surface"] ? ref[@"surfaceRef"] : ref[@"windowRef"];
+  if (![targetRef isKindOfClass:NSString.class]) return nil;
+  const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(_windows);
+  if (snapshot == NULL) return nil;
+  MetaInspectionBorrowContext *binding = [[MetaInspectionBorrowContext alloc] init];
+  binding.request = request;
+  binding.snapshotId = [@"ax-" stringByAppendingString:NSUUID.UUID.UUIDString];
+  MetaAXBorrowStatus status = meta_macos_with_ax_target(_windows, targetRef.UTF8String,
+      snapshot->inventory_id, snapshot->revision, [request[@"nativeGeneration"] UTF8String],
+      inspect_borrowed, (__bridge void *)binding);
+  if (status != META_AX_BORROW_OK) {
+    NSString *code = status == META_AX_BORROW_PERMISSION_DENIED ? @"permission-denied" :
+                     status == META_AX_BORROW_TARGET_STALE ? @"target-stale" : @"inventory-incomplete";
+    return @{@"nativeError": @{@"code": code, @"message": @"AX inspector не получил подтверждённую live target reference",
+      @"stage": @"ax-inspect-borrow", @"retryable": @NO, @"replayAllowed": @NO, @"recoveryAction": @"refresh-inventory"}};
+  }
+  return binding.result;
 }
 
 static NSString *clipboard_error(MetaClipboardStatus status) {
