@@ -9,6 +9,7 @@ typedef struct {
   bool live_owned_down;
   bool up_attempted;
   bool durability_lost;
+  bool prepared_down_not_posted;
 } MetaVolatileHold;
 
 struct MetaExecutor {
@@ -152,6 +153,14 @@ static bool release_live_owned_entry(MetaExecutor *executor, size_t index,
                                      uint64_t cleanup_deadline) {
   MetaLedgerEntry *entry = &executor->ledger[index];
   MetaVolatileHold *hold = &executor->volatile_holds[index];
+  if (hold->prepared_down_not_posted && !hold->live_owned_down && !executor->persistence_unavailable) {
+    hold->prepared_down_not_posted = false;
+    entry->state = META_LEDGER_RELEASED;
+    if (persist_ledger(executor)) return true;
+    hold->durability_lost = true;
+    entry->state = META_LEDGER_UNCERTAIN;
+    return false;
+  }
   if (!hold->live_owned_down) {
     if (entry->state == META_LEDGER_RELEASED && !hold->durability_lost) {
       return true;
@@ -236,6 +245,20 @@ static bool stop_for_reason(MetaExecutor *executor,
           : META_DISPATCH_PARTIAL;
   executor->active = false;
   return true;
+}
+
+static bool dispatch_allowed(MetaExecutor *executor) {
+  return executor->backend.before_dispatch == NULL ||
+      executor->backend.before_dispatch(executor->backend.context);
+}
+
+static bool check_dispatch(MetaExecutor *executor) {
+  if (dispatch_allowed(executor)) return true;
+  if (executor->active) {
+    copy_text(executor->status.last_checkpoint, sizeof(executor->status.last_checkpoint), "dispatch-admission-rejected");
+    stop_for_reason(executor, META_EXECUTOR_FAILED);
+  }
+  return false;
 }
 
 MetaExecutor *meta_executor_create(const char *native_generation,
@@ -509,6 +532,7 @@ bool meta_executor_checkpoint(MetaExecutor *executor, const char *stage) {
 bool meta_executor_post_down(MetaExecutor *executor, MetaHeldEventKind kind,
                              uint32_t code) {
   if (!meta_executor_checkpoint(executor, "before-down")) return false;
+  if (!check_dispatch(executor)) return false;
   for (size_t index = 0; index < executor->ledger_count; index += 1) {
     if (executor->ledger[index].kind == kind &&
         executor->ledger[index].code == code &&
@@ -554,8 +578,22 @@ bool meta_executor_post_down(MetaExecutor *executor, MetaHeldEventKind kind,
     return false;
   }
 
+  executor->volatile_holds[next_count - 1].prepared_down_not_posted = true;
   if (!meta_executor_checkpoint(executor, "after-down-ledger-ack")) return false;
 
+  if (!dispatch_allowed(executor)) {
+    if (!executor->active) return false;
+    // Down заведомо не отправлен. Durable pending entry закрывается без UP;
+    // потерянный ACK оставляет quarantine, а не выдуманное нажатие/release.
+    entry->state = META_LEDGER_RELEASED;
+    executor->volatile_holds[next_count - 1].prepared_down_not_posted = false;
+    if (!persist_ledger(executor)) { quarantine(executor); return false; }
+    copy_text(executor->status.last_checkpoint, sizeof(executor->status.last_checkpoint), "dispatch-admission-rejected");
+    stop_for_reason(executor, META_EXECUTOR_FAILED);
+    return false;
+  }
+
+  executor->volatile_holds[next_count - 1].prepared_down_not_posted = false;
   const bool posted = executor->backend.post_held_event(
       executor->backend.context, kind, code, true, executor->synthetic_tag);
   executor->status.dispatch_attempts += 1;
@@ -606,6 +644,7 @@ bool meta_executor_post_up(MetaExecutor *executor, MetaHeldEventKind kind,
     release_confirmed_holds(executor);
     return false;
   }
+  if (!check_dispatch(executor)) return false;
   // Обычный up также помечается до post: его неопределённый результат нельзя
   // повторять через cleanup callback.
   hold->up_attempted = true;
@@ -640,6 +679,7 @@ bool meta_executor_post_text_cluster(MetaExecutor *executor,
       !meta_executor_checkpoint(executor, checkpoint)) {
     return false;
   }
+  if (!check_dispatch(executor)) return false;
   const bool posted = executor->backend.post_text_cluster(
       executor->backend.context, utf16_units, utf16_count,
       executor->synthetic_tag);
@@ -661,6 +701,12 @@ bool meta_executor_post_pointer_event(MetaExecutor *executor,
       !meta_executor_checkpoint(executor, checkpoint)) {
     return false;
   }
+  if (executor->backend.prepare_pointer_event != NULL &&
+      !executor->backend.prepare_pointer_event(executor->backend.context, event)) {
+    stop_for_reason(executor, META_EXECUTOR_FAILED);
+    return false;
+  }
+  if (!check_dispatch(executor)) return false;
   const bool posted = executor->backend.post_pointer_event(
       executor->backend.context, event, executor->synthetic_tag);
   executor->status.dispatch_attempts += 1;
@@ -681,6 +727,12 @@ bool meta_executor_post_scroll_event(MetaExecutor *executor,
       !meta_executor_checkpoint(executor, checkpoint)) {
     return false;
   }
+  if (executor->backend.prepare_scroll_event != NULL &&
+      !executor->backend.prepare_scroll_event(executor->backend.context, event)) {
+    stop_for_reason(executor, META_EXECUTOR_FAILED);
+    return false;
+  }
+  if (!check_dispatch(executor)) return false;
   const bool posted = executor->backend.post_scroll_event(
       executor->backend.context, event, executor->synthetic_tag);
   executor->status.dispatch_attempts += 1;
@@ -698,6 +750,7 @@ bool meta_executor_dispatch_action(MetaExecutor *executor,
                                    void *context,
                                    const char *checkpoint) {
   if (executor == NULL || dispatch == NULL || !meta_executor_checkpoint(executor, checkpoint)) return false;
+  if (!check_dispatch(executor)) return false;
   executor->status.dispatch_attempts += 1;
   executor->status.dispatch = META_DISPATCH_ATTEMPTED;
   if (!dispatch(context)) {

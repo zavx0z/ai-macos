@@ -385,6 +385,12 @@ typedef struct {
                             uint64_t synthetic_tag);
   bool (*set_event_flags)(void *context, uint64_t flags);
   bool (*should_cancel)(void *context);
+  // Последняя проверка после медленных target/point checks, до post, на том же
+  // worker. Отказ не считается dispatch. Обнаруженный interference может
+  // завершить executor его штатным cancel/cleanup; terminal state сохраняется.
+  bool (*before_dispatch)(void *context);
+  bool (*prepare_pointer_event)(void *context, const MetaPointerEvent *event);
+  bool (*prepare_scroll_event)(void *context, const MetaScrollEvent *event);
 } MetaExecutorBackend;
 
 typedef struct MetaExecutor MetaExecutor;

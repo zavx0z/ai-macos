@@ -7,6 +7,9 @@
 static size_t posts = 0, cleanups = 0;
 static uint64_t registeredTag = 0;
 static BOOL simultaneousCancel = NO;
+static BOOL foreignDuringPointCheck = NO;
+static BOOL injectDuringUpAck = NO, foreignDuringUpAck = NO;
+static size_t pointerPosts = 0;
 static bool post(void *context, MetaHeldEventKind kind, uint32_t code, bool down, uint64_t tag) {
   (void)context; (void)kind; (void)code; (void)down;
   assert(registeredTag != 0 && tag == registeredTag);
@@ -19,11 +22,18 @@ static bool cleanup(void *context, MetaHeldEventKind kind, uint32_t code, uint64
   return post(context, kind, code, false, tag);
 }
 static bool flags(void *context, uint64_t value) { (void)context; (void)value; return true; }
+static bool pointer(void *context, const MetaPointerEvent *event, uint64_t tag) {
+  (void)event;
+  pointerPosts += 1;
+  return post(context, META_EVENT_BUTTON, 0, false, tag);
+}
 
 @interface ObserverFixtureJob : MetaInputJob
 @end
 @implementation ObserverFixtureJob
 - (BOOL)persistLedger:(const MetaLedgerPersistenceRequest *)request ack:(MetaLedgerPersistenceAck *)ack {
+  if (injectDuringUpAck && request->snapshot.entry_count > 0 &&
+      request->snapshot.entries[request->snapshot.entry_count - 1].state == META_LEDGER_PENDING_UP) foreignDuringUpAck = YES;
   snprintf(ack->request_id, sizeof(ack->request_id), "%s", request->request_id);
   snprintf(ack->operation_id, sizeof(ack->operation_id), "%s", request->snapshot.operation_id);
   snprintf(ack->runtime_epoch, sizeof(ack->runtime_epoch), "%s", request->snapshot.runtime_epoch);
@@ -40,6 +50,7 @@ int main(int argc, char **argv) {
   @autoreleasepool {
     NSString *mode = argc > 1 ? @(argv[1]) : @"own";
     simultaneousCancel = [mode isEqual:@"foreign-cancel"];
+    injectDuringUpAck = [mode isEqual:@"up-ack-foreign"];
     NSDictionary *generation = @{@"runtimeEpoch": @"runtime", @"loginSessionId": @"login", @"nativeGeneration": @"native"};
     NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
     formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
@@ -54,6 +65,13 @@ int main(int argc, char **argv) {
     NSMutableDictionary *request = [generation mutableCopy];
     [request addEntriesFromDictionary:@{@"requestId": @"request", @"operation": operation, @"deadlineAt": deadline,
       @"payload": @{@"actionDeadlineAt": deadline, @"action": @{@"kind": @"key", @"stroke": @{@"keyCode": @0, @"flags": @0}}}}];
+    if ([mode isEqual:@"slow-point-foreign"]) {
+      operation[@"inventoryRevision"] = @1;
+      operation[@"observationRef"] = @{@"observationId": @"observation", @"inventoryRevision": @1, @"displayLayoutRevision": @1, @"proofRef": @"proof"};
+      request[@"payload"] = @{@"actionDeadlineAt": deadline, @"action": @{@"kind": @"drag", @"button": @"left", @"durationMs": @20,
+        @"modifiers": @{@"names": @[], @"flags": @0}, @"trajectory": @[
+          @{@"point": @{@"x": @10, @"y": @10}, @"atMs": @0}, @{@"point": @{@"x": @20, @"y": @20}, @"atMs": @20}]}};
+    }
     ObserverFixtureJob *job = [[ObserverFixtureJob alloc] initWithRequest:request emitter:^BOOL(NSDictionary *frame) { (void)frame; return YES; }];
     __block BOOL gap = NO;
     [job setObserverCoverageProvider:^NSDictionary * {
@@ -64,8 +82,13 @@ int main(int argc, char **argv) {
       if (gap) coverage[@"reason"] = @"Fixture observer gap";
       return coverage;
     }];
-    MetaExecutorBackend sink = {.context = (__bridge void *)job, .post_held_event = post, .post_cleanup_up = cleanup, .set_event_flags = flags};
+    MetaExecutorBackend sink = {.context = (__bridge void *)job, .post_held_event = post, .post_cleanup_up = cleanup, .set_event_flags = flags, .post_pointer_event = pointer};
     MetaInputExecutor *input = [[MetaInputExecutor alloc] initWithGeneration:@"native" sink:sink verify:^BOOL(NSString *ref) { return [ref isEqual:@"window"]; }];
+    [input setScopedPointVerifier:^BOOL(NSDictionary *scope, double x, double y) {
+      (void)scope; (void)y;
+      if ([mode isEqual:@"slow-point-foreign"] && x >= 20) foreignDuringPointCheck = YES;
+      return YES;
+    }];
     meta_executor_set_observer_state([input executorOnActionWorker], META_OBSERVER_READY);
     [input setInputObserverAfterBegin:^BOOL(MetaExecutor *executor, MetaInputJob *current) {
       assert(current == job);
@@ -73,13 +96,15 @@ int main(int argc, char **argv) {
       registeredTag = meta_executor_synthetic_tag(executor);
       return registeredTag != 0;
     } poll:^MetaInputObserverDecision {
+      if (injectDuringUpAck) return foreignDuringUpAck ? MetaInputObserverForeignEvent : MetaInputObserverContinue;
+      if ([mode isEqual:@"slow-point-foreign"]) return foreignDuringPointCheck ? MetaInputObserverForeignEvent : MetaInputObserverContinue;
       if (posts == 0 || [mode isEqual:@"own"]) return MetaInputObserverContinue;
       if ([mode isEqual:@"foreign"] || [mode isEqual:@"foreign-cancel"]) return MetaInputObserverForeignEvent;
       gap = YES;
       return MetaInputObserverUnavailable;
     }];
     NSDictionary *report = [input execute:request job:job];
-    NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"report": report, @"posts": @(posts), @"cleanups": @(cleanups)} options:0 error:NULL];
+    NSData *json = [NSJSONSerialization dataWithJSONObject:@{@"report": report, @"posts": @(posts), @"cleanups": @(cleanups), @"pointerPosts": @(pointerPosts)} options:0 error:NULL];
     assert(json != nil);
     fwrite(json.bytes, 1, json.length, stdout);
   }

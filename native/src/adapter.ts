@@ -10,6 +10,7 @@ import {
   clipboardExecutionContextSchema,
   nativeRecoveryGrantSchema,
   nativeRecoveryDescriptorSchema,
+  nativeViewAdmissionSchema,
   canonicalRecoveryJson,
   opaqueIdSchema,
   parseWireValue,
@@ -34,6 +35,7 @@ import {
   type ClipboardExecutionContext,
   type NativeRecoveryDescriptor,
   type NativeRecoveryGrant,
+  type NativeViewAdmission,
   type NativeStatusRequest,
   type ObservedEvent,
   type z,
@@ -70,11 +72,17 @@ export type NativeRecoveryAuthorizer = (
   descriptor: NativeRecoveryDescriptor,
 ) => Promise<NativeRecoveryGrant>
 
+export type NativeViewAdmissionAuthorizer = (
+  wire: NativeExecutionContext,
+  action: Readonly<{ method: "input.execute" | "ax.press", actionKind?: string }>,
+  control: AdapterControl,
+) => Promise<NativeViewAdmission>
+
 function recoveryDigest(value: unknown): string {
   return new Bun.CryptoHasher("sha256").update(canonicalRecoveryJson(value)).digest("hex")
 }
 
-async function waitForRecoveryGrant(work: Promise<NativeRecoveryGrant>, signal: AbortSignal, deadlineAt: string): Promise<NativeRecoveryGrant> {
+async function waitForAuthority<Value>(work: Promise<Value>, signal: AbortSignal, deadlineAt: string): Promise<Value> {
   signal.throwIfAborted()
   const remaining = Date.parse(deadlineAt) - Date.now()
   if (remaining <= 0) throw new Error("Recovery authorization deadline истёк до send")
@@ -148,6 +156,9 @@ export class NativeBrokerAdapter implements NativeAdapter {
   #evidencePublisher: BoundNativeEvidencePublisher | undefined
   #loadedBuildId: string | undefined
   #recoveryDomainVersion: "1" | undefined
+  #viewAdmissionVersion: "1" | undefined
+  #viewAuthorizer: NativeViewAdmissionAuthorizer | undefined
+  #pendingViewAuthorizations = 0
   #recoveryAuthorizer: NativeRecoveryAuthorizer | undefined
   #pendingRecoveryAuthorizations = 0
   #anyMutationAttempted = false
@@ -192,7 +203,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
     return {
       state: this.#poisoned !== undefined ? "poisoned" as const : this.#closed ? "closed" as const : this.#rotationSealed ? "draining" as const : rotationRequired ? "rotation-required" as const : "ready" as const,
       requestsUsed: this.#seenRequestIds.size,
-      pendingRequests: this.#pending.size + this.#pendingRecoveryAuthorizations,
+      pendingRequests: this.#pending.size + this.#pendingRecoveryAuthorizations + this.#pendingViewAuthorizations,
       pendingBinaries: this.#binary.size + this.#binaryWaiters.size,
       pendingLedgerWrites: this.#ledgerWrites,
     }
@@ -200,7 +211,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
 
   sealForRotation(): void {
     if (this.#closed || this.#rotationSealed) throw new Error("Native session уже закрыта или дренируется")
-    if (this.#pending.size || this.#pendingRecoveryAuthorizations || this.#binary.size || this.#binaryWaiters.size || this.#ledgerWrites) {
+    if (this.#pending.size || this.#pendingRecoveryAuthorizations || this.#pendingViewAuthorizations || this.#binary.size || this.#binaryWaiters.size || this.#ledgerWrites) {
       throw new Error("Native rotation требует завершённых requests/binaries/ledger writes")
     }
     this.#rotationSealed = true
@@ -249,6 +260,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
     }
     this.#loadedBuildId = response.payload.nativeBuildId
     this.#recoveryDomainVersion = response.payload.recoveryDomainVersion
+    this.#viewAdmissionVersion = response.payload.viewAdmissionVersion
     const evidence = this.#bindEvidence({
       adapterInstanceRef: this.adapterInstanceRef,
       loadedBuildId: this.#loadedBuildId,
@@ -265,6 +277,49 @@ export class NativeBrokerAdapter implements NativeAdapter {
       throw new Error("Recovery authority задаётся один раз до mutation send")
     }
     this.#recoveryAuthorizer = authorize
+  }
+
+  configureViewAdmissionAuthorizer(authorize: NativeViewAdmissionAuthorizer): void {
+    if (typeof authorize !== "function" || this.#closed || this.#viewAuthorizer !== undefined
+      || this.#pendingViewAuthorizations > 0 || this.#anyMutationAttempted) {
+      throw new Error("View admission authorizer задаётся один раз до mutation send")
+    }
+    this.#viewAuthorizer = authorize
+  }
+
+  async #authorizeViewFrame(frame: NativeTransportRequestFrame, control: AdapterControl): Promise<NativeTransportRequestFrame> {
+    if (frame.channel !== "request" || frame.payload.intent !== "mutation") return frame
+    const request = frame.payload
+    if (request.viewAdmission !== undefined) throw new Error("Caller viewAdmission не является Runtime authority")
+    if (request.method !== "input.execute" && request.method !== "ax.press") return frame
+    if (this.#viewAdmissionVersion !== "1") return frame
+    const authorize = this.#viewAuthorizer
+    if (authorize === undefined) throw new Error("Native view admission v1 требует configured Runtime authorizer")
+    if (request.recoveryGrant === undefined || this.#recoveryDomainVersion !== "1") throw new Error("View admission требует предшествующий durable recovery grant")
+    control.signal.throwIfAborted()
+    if (this.#closed || this.#rotationSealed || this.#pending.size + this.#pendingViewAuthorizations + this.#pendingRecoveryAuthorizations >= 128) {
+      throw new Error("Native session не принимает view admission")
+    }
+    const contextSha256 = recoveryDigest(request.operation)
+    const wire = parseWireValue(nativeExecutionContextSchema, request.operation)
+    const action = request.method === "input.execute"
+      ? { method: request.method, actionKind: request.payload.action.kind }
+      : { method: request.method }
+    this.#pendingViewAuthorizations += 1
+    const work = Promise.resolve().then(async () => {
+      control.signal.throwIfAborted()
+      return await authorize(wire, action, control)
+    }).finally(() => { this.#pendingViewAuthorizations -= 1 })
+    void work.catch(() => undefined)
+    const proof = nativeViewAdmissionSchema.parse(await waitForAuthority(work, control.signal, request.deadlineAt))
+    if (proof.contextSha256 !== contextSha256 || Date.parse(proof.expiresAt) > Date.parse(request.deadlineAt)
+      || Date.parse(proof.expiresAt) <= Date.now()) {
+      throw new Error("View admission не соответствует current context, action или expiry")
+    }
+    control.signal.throwIfAborted()
+    await control.checkpoint("native-after-view-admission")
+    if (this.#closed || this.#rotationSealed) throw new Error("Native session закрылась до guarded send")
+    return nativeTransportRequestFrameSchema.parse({ ...frame, payload: { ...request, viewAdmission: proof } })
   }
 
   async #authorizeRecoveryFrame(frame: NativeTransportRequestFrame, control: AdapterControl): Promise<NativeTransportRequestFrame> {
@@ -292,7 +347,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
       return await authorize(wire, nativeRecoveryDescriptorSchema.parse(descriptor))
     }).finally(() => { this.#pendingRecoveryAuthorizations -= 1 })
     void work.catch(() => undefined)
-    const grant = nativeRecoveryGrantSchema.parse(await waitForRecoveryGrant(work, control.signal, mutation.deadlineAt))
+    const grant = nativeRecoveryGrantSchema.parse(await waitForAuthority(work, control.signal, mutation.deadlineAt))
     if (grant.runtimeEpoch !== mutation.runtimeEpoch || grant.loginSessionId !== mutation.loginSessionId
       || grant.nativeGeneration !== mutation.nativeGeneration || grant.operationId !== mutation.operation.operationId
       || grant.contextSha256 !== contextSha256 || grant.descriptorSha256 !== descriptorSha256
@@ -320,10 +375,14 @@ export class NativeBrokerAdapter implements NativeAdapter {
       operation?: { operationId: string }
     }
     this.#assertGeneration(parsedRequest)
-    const frame = await this.#authorizeRecoveryFrame(nativeTransportRequestFrameSchema.parse({
+    const rawFrame = nativeTransportRequestFrameSchema.parse({
       channel: "request",
       payload: parsedRequest,
-    }), control)
+    })
+    if (rawFrame.channel === "request" && rawFrame.payload.intent === "mutation" && rawFrame.payload.viewAdmission !== undefined) {
+      throw new Error("Caller viewAdmission не является Runtime authority")
+    }
+    const frame = await this.#authorizeViewFrame(await this.#authorizeRecoveryFrame(rawFrame, control), control)
     const response = await this.#exchange(
       "response",
       frame,

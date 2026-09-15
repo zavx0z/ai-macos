@@ -27,6 +27,8 @@ test.each([
   { mode: "foreign-cancel", execution: "cancelled", posts: 2, cleanups: 1, interference: "observed" },
   { mode: "gap", execution: "cancelled", posts: 2, cleanups: 1, interference: "unknown" },
   { mode: "missing", execution: "failed", posts: 0, cleanups: 0, interference: "unknown" },
+  { mode: "slow-point-foreign", execution: "cancelled", posts: 3, cleanups: 1, interference: "observed" },
+  { mode: "up-ack-foreign", execution: "cancelled", posts: 2, cleanups: 1, interference: "observed" },
 ])("input observer lifecycle: $mode", async scenario => {
   const process = Bun.spawn([binary, scenario.mode], { stdout: "pipe", stderr: "pipe" })
   const [exit, output] = await Promise.all([process.exited, new Response(process.stdout).text()])
@@ -36,4 +38,5 @@ test.each([
   expect([status.execution, status.userInterference, status.cleanup, status.quarantined, result.posts, result.cleanups]).toEqual([
     scenario.execution, scenario.interference, "complete", false, scenario.posts, scenario.cleanups,
   ])
+  if (scenario.mode === "slow-point-foreign") expect(result.pointerPosts).toBe(1)
 })

@@ -11,6 +11,9 @@
 - (MetaExecutorBackend)sink;
 - (BOOL)postPointer:(const MetaPointerEvent *)event tag:(uint64_t)tag;
 - (BOOL)postScroll:(const MetaScrollEvent *)event tag:(uint64_t)tag;
+- (BOOL)preparePointer:(const MetaPointerEvent *)event;
+- (BOOL)prepareScroll:(const MetaScrollEvent *)event;
+- (BOOL)beforeDispatch;
 @end
 
 static uint64_t clock_now(void *context) {
@@ -51,6 +54,9 @@ static bool flags(void *context, uint64_t value) {
 static bool wait_bool(void *context, uint64_t until) { return wait_until(context, until); }
 static bool pointer(void *context, const MetaPointerEvent *event, uint64_t tag) { return [(__bridge MetaInputExecutor *)context postPointer:event tag:tag]; }
 static bool scroll(void *context, const MetaScrollEvent *event, uint64_t tag) { return [(__bridge MetaInputExecutor *)context postScroll:event tag:tag]; }
+static bool prepare_pointer(void *context, const MetaPointerEvent *event) { return [(__bridge MetaInputExecutor *)context preparePointer:event]; }
+static bool prepare_scroll(void *context, const MetaScrollEvent *event) { return [(__bridge MetaInputExecutor *)context prepareScroll:event]; }
+static bool before_dispatch(void *context) { return [(__bridge MetaInputExecutor *)context beforeDispatch]; }
 static bool number(id value) { return [value isKindOfClass:NSNumber.class] && isfinite([value doubleValue]); }
 static bool point_value(id value, double *x, double *y) {
   if (![value isKindOfClass:NSDictionary.class] || !number(value[@"x"]) || !number(value[@"y"])) return false;
@@ -77,6 +83,7 @@ static bool dispatch_external(void *context) {
   BOOL (^_observerAfterBegin)(MetaExecutor *, MetaInputJob *);
   MetaInputObserverDecision (^_observerPoll)(void);
   BOOL _observerAttached;
+  BOOL (^_firstDispatchGuard)(void);
 }
 - (instancetype)initWithGeneration:(NSString *)generation sink:(MetaExecutorBackend)sink verify:(BOOL (^)(NSString *))targetVerify {
   self = [super init];
@@ -85,7 +92,8 @@ static bool dispatch_external(void *context) {
     _verify = [targetVerify copy];
     MetaExecutorBackend backend = {.context = (__bridge void *)self, .monotonic_millis = clock_now, .verify_target = verify,
       .persist_ledger = persist, .post_held_event = post, .post_text_cluster = text, .set_event_flags = flags,
-      .post_pointer_event = pointer, .post_scroll_event = scroll, .post_cleanup_up = cleanup_up, .should_cancel = cancelled};
+      .post_pointer_event = pointer, .post_scroll_event = scroll, .post_cleanup_up = cleanup_up, .should_cancel = cancelled,
+      .prepare_pointer_event = prepare_pointer, .prepare_scroll_event = prepare_scroll, .before_dispatch = before_dispatch};
     _executor = meta_executor_create(generation.UTF8String, 1000, backend);
     if (_executor == NULL) return nil;
   }
@@ -124,26 +132,32 @@ static bool dispatch_external(void *context) {
   return _verify(@(target)) && pointVerified;
 }
 - (void)setPointVerifier:(BOOL (^)(NSString *, double, double))verify { _pointVerify = [verify copy]; }
+- (void)setFirstDispatchGuard:(BOOL (^)(void))guard { _firstDispatchGuard = [guard copy]; }
+- (BOOL)beforeDispatch {
+  if ([self cancelled] || clock_now(NULL) >= _actionDeadline) return NO;
+  return meta_executor_status(_executor).dispatch_attempts > 0 || _firstDispatchGuard == nil || _firstDispatchGuard();
+}
 - (void)setScopedPointVerifier:(BOOL (^)(NSDictionary *, double, double))verify { _scopedPointVerify = [verify copy]; }
-- (BOOL)postPointer:(const MetaPointerEvent *)event tag:(uint64_t)tag {
+- (BOOL)preparePointer:(const MetaPointerEvent *)event {
   NSDictionary *scope = _job.operation[@"target"];
   NSString *target = scope[@"ref"][@"windowRef"] ?: scope[@"ref"][@"surfaceRef"];
   if (event == NULL) return NO;
   BOOL verified = _scopedPointVerify != nil ? _scopedPointVerify(scope, event->x, event->y) :
       _pointVerify != nil && target != nil && _pointVerify(target, event->x, event->y);
-  if (!verified || [self cancelled] || clock_now(NULL) >= _actionDeadline || _sink.post_pointer_event == NULL) return NO;
+  if (!verified || clock_now(NULL) >= _actionDeadline || _sink.post_pointer_event == NULL) return NO;
   _hasPoint = YES; _pointX = event->x; _pointY = event->y;
-  return _sink.post_pointer_event(_sink.context, event, tag);
+  return YES;
 }
-- (BOOL)postScroll:(const MetaScrollEvent *)event tag:(uint64_t)tag {
+- (BOOL)postPointer:(const MetaPointerEvent *)event tag:(uint64_t)tag { return _sink.post_pointer_event(_sink.context, event, tag); }
+- (BOOL)prepareScroll:(const MetaScrollEvent *)event {
   NSDictionary *scope = _job.operation[@"target"];
   NSString *target = scope[@"ref"][@"windowRef"] ?: scope[@"ref"][@"surfaceRef"];
   if (event == NULL) return NO;
   BOOL verified = _scopedPointVerify != nil ? _scopedPointVerify(scope, event->x, event->y) :
       _pointVerify != nil && target != nil && _pointVerify(target, event->x, event->y);
-  if (!verified || [self cancelled] || clock_now(NULL) >= _actionDeadline || _sink.post_scroll_event == NULL) return NO;
-  return _sink.post_scroll_event(_sink.context, event, tag);
+  return verified && clock_now(NULL) < _actionDeadline && _sink.post_scroll_event != NULL;
 }
+- (BOOL)postScroll:(const MetaScrollEvent *)event tag:(uint64_t)tag { return _sink.post_scroll_event(_sink.context, event, tag); }
 - (BOOL)persist:(const MetaLedgerPersistenceRequest *)request ack:(MetaLedgerPersistenceAck *)ack {
   [_job publishStatus:meta_executor_status(_executor)];
   return [_job persistLedger:request ack:ack];

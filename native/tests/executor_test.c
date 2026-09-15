@@ -14,6 +14,8 @@ typedef struct {
   size_t event_count;
   size_t cleanup_count;
   bool fail_cleanup;
+  size_t dispatch_guard_calls;
+  size_t reject_dispatch_call;
   struct {
     MetaHeldEventKind kind;
     uint32_t code;
@@ -24,6 +26,12 @@ typedef struct {
 
 static uint64_t fake_now(void *context) {
   return ((FakeBackend *)context)->now;
+}
+
+static bool fake_dispatch_guard(void *context) {
+  FakeBackend *backend = context;
+  backend->dispatch_guard_calls += 1;
+  return backend->reject_dispatch_call == 0 || backend->dispatch_guard_calls != backend->reject_dispatch_call;
 }
 
 static bool fake_verify_target(void *context, const char *target_ref) {
@@ -98,6 +106,7 @@ static MetaExecutor *executor(FakeBackend *backend,
       .persist_ledger = fake_persist,
       .post_held_event = fake_post,
       .post_cleanup_up = fake_cleanup_up,
+      .before_dispatch = fake_dispatch_guard,
   };
   return meta_executor_create(native_generation, 500, callbacks);
 }
@@ -112,6 +121,22 @@ static MetaFence fence(const char *runtime_epoch,
   snprintf(value.login_session_id, sizeof(value.login_session_id), "%s",
            "login-1");
   return value;
+}
+
+static void test_dispatch_guard_does_not_invent_event_or_cleanup_up(void) {
+  for (size_t rejected_call = 1; rejected_call <= 2; rejected_call += 1) {
+    FakeBackend backend = {.now = 100, .target_valid = true, .reject_dispatch_call = rejected_call};
+    MetaExecutor *value = executor(&backend, "native-1");
+    assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+    assert(meta_executor_begin(value, "guarded", "window-1", fence("runtime-1", "native-1", 1), 1000));
+    assert(!meta_executor_post_down(value, META_EVENT_KEY, 55));
+    MetaExecutorStatus status = meta_executor_status(value);
+    assert(status.execution == META_EXECUTOR_FAILED && status.dispatch == META_DISPATCH_NONE);
+    assert(status.dispatch_attempts == 0 && status.held_count == 0 && !status.quarantined);
+    assert(status.cleanup == META_CLEANUP_COMPLETE && backend.event_count == 0 && backend.cleanup_count == 0);
+    assert(backend.persist_calls == (rejected_call == 1 ? 0 : 2));
+    meta_executor_destroy(value);
+  }
 }
 
 static void test_known_failure_preserves_actual_dispatch(void) {
@@ -567,6 +592,7 @@ static void test_external_action_uses_same_fence(void) {
 }
 
 int main(void) {
+  test_dispatch_guard_does_not_invent_event_or_cleanup_up();
   test_known_failure_preserves_actual_dispatch();
   test_external_action_uses_same_fence();
   test_cancel_before_first_event();

@@ -15,6 +15,7 @@ typedef NS_ENUM(NSInteger, MetaInputObserverDecision) {
 - (NSDictionary *)execute:(NSDictionary *)request job:(MetaInputJob *)job;
 - (void)setPointVerifier:(BOOL (^)(NSString *target, double x, double y))verify;
 - (void)setScopedPointVerifier:(BOOL (^)(NSDictionary *target, double x, double y))verify;
+- (void)setFirstDispatchGuard:(BOOL (^)(void))guard;
 // Только normal input: register вызывается после begin до первого post,
 // poll — на том же action worker между primitives, без потребления PUSH.
 // Caller снимает exact tag после возврата execute и не меняет executor с callbacks.
