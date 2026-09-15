@@ -8,6 +8,11 @@ static uint64_t job_millis(void) {
   return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
 }
 
+static NSDictionary *status_fence(MetaFence fence) {
+  return @{@"runtimeEpoch": @(fence.runtime_epoch), @"loginSessionId": @(fence.login_session_id),
+    @"nativeGeneration": @(fence.native_generation), @"counter": @(fence.counter)};
+}
+
 @implementation MetaInputJob {
   NSDictionary *_operation;
   NSString *_requestId;
@@ -124,6 +129,7 @@ static uint64_t job_millis(void) {
 }
 
 - (void)publishStatus:(MetaExecutorStatus)status {
+  if (!status.has_accepted_fence) return;
   static NSString *executions[] = {@"idle", @"dispatching", @"cancelling", @"cancelled", @"finished", @"failed", @"interrupted-unknown", @"quarantined"};
   static NSString *dispatches[] = {@"none", @"attempted", @"partial", @"finished", @"unknown"};
   static NSString *cleanups[] = {@"complete", @"incomplete", @"unknown"};
@@ -138,7 +144,7 @@ static uint64_t job_millis(void) {
     @"coveredKinds": @[], @"droppedEvents": @0, @"gapDetected": @NO, @"reason": @"Native event observer ещё не подключён"}];
   NSMutableDictionary *value = [generation mutableCopy];
   [value addEntriesFromDictionary:@{@"requestId": _requestId, @"operationId": _operation[@"operationId"],
-    @"acceptedFence": _operation[@"fence"], @"highWaterFence": _operation[@"fence"],
+    @"acceptedFence": status_fence(status.accepted_fence), @"highWaterFence": status_fence(status.has_high_water_fence ? status.high_water_fence : status.accepted_fence),
     @"execution": executions[status.execution], @"dispatch": dispatches[status.dispatch], @"cleanup": cleanups[status.cleanup],
     @"targetVerified": verification[status.target_verification], @"cancellationRequested": status.cancellation_requested ? @YES : @NO,
     @"userInterference": @"unknown", @"restorationAllowed": @NO, @"quarantined": status.quarantined ? @YES : @NO,

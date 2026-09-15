@@ -19,7 +19,7 @@ beforeAll(async () => {
   const compile = Bun.spawn([
     "/usr/bin/clang", "-fobjc-arc", "-fblocks", "-Wall", "-Wextra", "-Werror",
     `-I${join(root, "include")}`, join(root, "src/command_loop.m"), join(root, "src/broker_transport.m"), join(root, "tests/command_backend_fixture.m"),
-    ...["input_job.m", "input_executor.m", "executor.c", "ledger.c", "input_bridge.c"].map(file => join(root, "src", file)),
+    ...["input_job.m", "input_executor.m", "executor.c", "ledger.c", "input_bridge.c", "operation-receipts/meta_operation_receipts.m"].map(file => join(root, "src", file)),
     "-framework", "Foundation", "-o", binary,
   ], { stderr: "pipe" })
   const [code, error] = await Promise.all([compile.exited, new Response(compile.stderr).text()])
@@ -110,6 +110,16 @@ test("window transition и input используют один native fence high
       operation: { ...input.operation, operationId: "input-next-operation", fence: { ...input.operation.fence, counter: 2 } } })
     const accepted = await adapter.request(nativeInputExecutionRequestSchema, next, nativeInputExecutionResponseSchema, control)
     expect(accepted.ok).toBe(true)
+    const old = await adapter.status({ requestId: "old-window-status", ...adapter.generation!,
+      operationId: request.operation.operationId, deadlineAt: request.deadlineAt })
+    expect(old.operationId).toBe("window-operation")
+    expect(old.dispatchAttempts).toBe(1)
+    expect(old.execution).toBe("finished")
+    expect(old.highWaterFence?.counter).toBe(2)
+    expect(old.restorationAllowed).toBe(false)
+    const oldCancel = await adapter.cancel({ requestId: "old-window-cancel", ...adapter.generation!,
+      operationId: request.operation.operationId, fence: request.operation.fence, deadlineAt: request.deadlineAt, reason: "проверка старого статуса" }, control)
+    expect(oldCancel.stopped).toBe(true)
   } finally { await adapter.close() }
 })
 

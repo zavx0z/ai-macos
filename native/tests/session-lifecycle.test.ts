@@ -26,6 +26,11 @@ class RotationTransport implements NativeTransport {
         installRoot: "/tmp/rotation-fixture", process: { pid: 123, nonce: "fixture", startedAt: new Date().toISOString() },
         capabilities: host.capabilities,
       } } })
+    } else if (frame.channel === "permissions") {
+      await this.writer.write({ kind: "message", frame: { channel: "permissions", payload: {
+        kind: "permissions-response", protocolVersion: "1", requestId: frame.payload.requestId, ...generation,
+        nativeBuildId: "native-build", accessibility: false, postEvents: false, screenRecording: false,
+      } } })
     } else if (frame.channel === "heartbeat") {
       await this.writer.write({ kind: "message", frame: { channel: "heartbeat", payload: {
         requestId: frame.payload.requestId, ...generation, accepted: true,
@@ -99,8 +104,8 @@ test("request admission сообщает rotation до cap; runtime сохран
   const current = await adapter("native-old")
   const control = { signal: new AbortController().signal, checkpoint: () => undefined }
   for (let index = 0; index < 8_999; index += 1) {
-    await current.value.heartbeat({
-      requestId: `heartbeat-${index}`, ...current.value.generation!, deadlineAt: new Date(Date.now() + 2_000).toISOString(),
+    await current.value.permissions({
+      kind: "permissions", protocolVersion: "1", requestId: `permissions-${index}`, ...current.value.generation!, deadlineAt: new Date(Date.now() + 2_000).toISOString(),
     }, control)
   }
   expect(current.value.sessionState.state).toBe("rotation-required")

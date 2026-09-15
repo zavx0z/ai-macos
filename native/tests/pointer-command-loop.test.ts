@@ -13,7 +13,7 @@ beforeAll(async () => {
   binary = join(directory, "fixture")
   const root = join(import.meta.dir, "..")
   const compile = Bun.spawn(["/usr/bin/clang", "-fobjc-arc", "-fblocks", "-Wall", "-Wextra", "-Werror", `-I${join(root, "include")}`,
-    ...["command_loop.m", "broker_transport.m", "input_job.m", "input_executor.m", "executor.c", "ledger.c", "input_bridge.c"].map(file => join(root, "src", file)),
+    ...["command_loop.m", "broker_transport.m", "input_job.m", "input_executor.m", "executor.c", "ledger.c", "input_bridge.c", "operation-receipts/meta_operation_receipts.m"].map(file => join(root, "src", file)),
     join(root, "tests/command_backend_fixture.m"), "-framework", "Foundation", "-o", binary], { stderr: "pipe" })
   const [exit, errors] = await Promise.all([compile.exited, new Response(compile.stderr).text()])
   if (exit !== 0) throw new Error(errors)

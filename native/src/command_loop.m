@@ -1,5 +1,6 @@
 #include "meta_command_loop.h"
 #include "meta_broker_transport.h"
+#include "operation-receipts/meta_operation_receipts.h"
 #include <stdatomic.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -80,6 +81,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   BOOL _busy;
   NSString *_activeOperation;
   MetaInputJob *_job;
+  MetaOperationReceipts *_receipts;
   atomic_int _exitCode;
   int _requestedExit;
 }
@@ -97,6 +99,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     _actions = dispatch_queue_create("meta.native.actions", DISPATCH_QUEUE_SERIAL);
     _requestIds = [NSMutableSet set];
     _heartbeatIds = [NSMutableDictionary dictionary];
+    _receipts = [[MetaOperationReceipts alloc] init];
     _startedAt = timestamp();
     _nonce = NSUUID.UUID.UUIDString;
     atomic_init(&_exitCode, -1);
@@ -123,6 +126,20 @@ static NSDictionary *failure(NSString *code, NSString *message) {
 
 - (void)send:(NSString *)channel payload:(NSDictionary *)payload {
   if (![_transport enqueueFrame:@{@"channel": channel, @"payload": payload}]) [self shutdown:74];
+}
+
+- (NSDictionary *)statusForOperation:(NSString *)operationId requestId:(NSString *)requestId {
+  NSDictionary *current = [_job statusForRequest:requestId];
+  NSDictionary *status = [operationId isEqual:_job.operation[@"operationId"]] ? current :
+      [_receipts statusForOperation:operationId requestId:requestId];
+  if (status == nil) return nil;
+  if ([current[@"highWaterFence"][@"counter"] unsignedLongLongValue] > [status[@"highWaterFence"][@"counter"] unsignedLongLongValue]) {
+    NSMutableDictionary *updated = [status mutableCopy];
+    updated[@"highWaterFence"] = current[@"highWaterFence"];
+    updated[@"restorationAllowed"] = @NO;
+    return updated;
+  }
+  return status;
 }
 
 - (void)handle:(NSDictionary *)frame {
@@ -189,16 +206,17 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     return;
   }
   if ([channel isEqual:@"status"]) {
-    if (_job == nil || ![payload[@"operationId"] isEqual:_job.operation[@"operationId"]]) { [self shutdown:65]; return; }
-    NSDictionary *status = [_job statusForRequest:requestId];
+    NSDictionary *status = [self statusForOperation:payload[@"operationId"] requestId:requestId];
     if (status == nil) { [self shutdown:65]; return; }
     [self send:channel payload:status];
     return;
   }
   if ([channel isEqual:@"cancel"]) {
-    if (_job == nil || ![payload[@"operationId"] isEqual:_job.operation[@"operationId"]] || ![payload[@"fence"] isEqual:_job.operation[@"fence"]]) { [self shutdown:65]; return; }
-    [_job requestCancel];
-    NSDictionary *status = [_job statusForRequest:requestId];
+    BOOL current = [payload[@"operationId"] isEqual:_job.operation[@"operationId"]];
+    NSDictionary *status = [self statusForOperation:payload[@"operationId"] requestId:requestId];
+    NSDictionary *acceptedFence = current ? _job.operation[@"fence"] : status[@"acceptedFence"];
+    if (acceptedFence == nil || ![payload[@"fence"] isEqual:acceptedFence]) { [self shutdown:65]; return; }
+    if (current) [_job requestCancel];
     BOOL stopped = status != nil && [@[@"finished", @"cancelled", @"failed"] containsObject:status[@"execution"]];
     NSMutableDictionary *ack = [identity mutableCopy];
     [ack addEntriesFromDictionary:@{@"operationId": payload[@"operationId"], @"fence": payload[@"fence"],
@@ -295,6 +313,10 @@ static NSDictionary *failure(NSString *code, NSString *message) {
             inspection ? [self->_backend inspect:payload] : [self->_backend inventory];
       }
       dispatch_async(self->_control, ^{
+        if (input || window) {
+          NSDictionary *terminal = [job statusForRequest:job.requestId];
+          if (terminal != nil && ![self->_receipts recordStatus:terminal]) self->_sealed = YES;
+        }
         if ((input || window) && [job heartbeatExpired]) self->_sealed = YES;
         self->_busy = NO;
         self->_activeOperation = nil;
