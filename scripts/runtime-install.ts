@@ -29,6 +29,15 @@ export const HELPER_SIGNING_IDENTIFIER = "com.meta.input.helper"
 const RELEASE_FORMAT = "meta-ai-macos-runtime-release-v1"
 const MAX_COMMAND_OUTPUT = 8 * 1024 * 1024
 const MAX_BROWSER_CONFIG_BYTES = 64 * 1024
+export type RuntimeReadinessProfile = "full" | "foundation" | "desktop-browser-selected"
+
+export type DeferredCapability = {
+  id: CapabilityId
+  reason: string
+}
+
+const SELECTED_INTERACTION_REASON =
+  "Выбранный agent API использует observation-bound input guard; explicit focus session и automatic old-focus restore отложены"
 
 // Установка проверяется внешней транзакцией, а не самооценкой устанавливаемого
 // runtime. Android включается в обязательный набор только по явному выбору.
@@ -89,7 +98,7 @@ export type RuntimeInstallOptions = {
   testOnlyAllowNonCanonicalRoot?: boolean
   doctorTimeoutMs?: number
   browserConfig?: string
-  readinessProfile?: "full" | "foundation"
+  readinessProfile?: RuntimeReadinessProfile
   requiredCapabilities?: readonly CapabilityId[]
   failpoint?: (stage: InstallFailpoint) => void | Promise<void>
 }
@@ -137,8 +146,9 @@ export type RuntimeInstallPlan = {
     browser: Record<string, unknown>
     browserJson: string
     sha256: string
-    readinessProfile: "full" | "foundation"
+    readinessProfile: RuntimeReadinessProfile
     requiredCapabilities: CapabilityId[]
+    deferredCapabilities: DeferredCapability[]
   }
   paths: RuntimeInstallPaths
   service: {
@@ -207,7 +217,12 @@ export type RuntimeInstallResult = {
   manifestSha256: string
   rollbackUsed: boolean
   doctor: unknown
-  readiness: { profile: "full" | "foundation", requiredCapabilities: CapabilityId[], state: "ready" }
+  readiness: {
+    profile: RuntimeReadinessProfile
+    requiredCapabilities: CapabilityId[]
+    deferredCapabilities: DeferredCapability[]
+    state: "ready"
+  }
 }
 
 export class LocalCommandRunner implements CommandRunner {
@@ -305,7 +320,16 @@ function installConfiguration(options: RuntimeInstallOptions): RuntimeInstallPla
   const browser = parseBrowserHostConfig(options.browserConfig)
   const browserJson = stableJson(browser)
   const readinessProfile = options.readinessProfile ?? "full"
-  const requested = options.requiredCapabilities ?? (readinessProfile === "full" ? DEFAULT_FULL_CAPABILITIES : [])
+  const selectedRequirements = selectedDesktopBrowserCapabilities(browser)
+  if (readinessProfile === "desktop-browser-selected" && options.requiredCapabilities !== undefined
+    && stableJson(normalizeCapabilities(options.requiredCapabilities)) !== stableJson(selectedRequirements)) {
+    throw new Error("desktop-browser-selected имеет фиксированный required capability set")
+  }
+  const requested = options.requiredCapabilities ?? (readinessProfile === "full"
+    ? DEFAULT_FULL_CAPABILITIES
+    : readinessProfile === "desktop-browser-selected"
+      ? selectedRequirements
+      : [])
   const unique = new Set<CapabilityId>()
   for (const id of requested) {
     if (!(CAPABILITY_IDS as readonly string[]).includes(id)) throw new Error(`Unknown required capability: ${id}`)
@@ -318,7 +342,25 @@ function installConfiguration(options: RuntimeInstallOptions): RuntimeInstallPla
     sha256: sha256(browserJson),
     readinessProfile,
     requiredCapabilities,
+    deferredCapabilities: readinessProfile === "desktop-browser-selected"
+      ? [{ id: "input.interaction", reason: SELECTED_INTERACTION_REASON }]
+      : [],
   }
+}
+
+function selectedDesktopBrowserCapabilities(
+  browser: ReturnType<typeof parseBrowserHostConfig>,
+): CapabilityId[] {
+  const selected = new Set<CapabilityId>(
+    DEFAULT_FULL_CAPABILITIES.filter(id => id !== "input.interaction"),
+  )
+  if (browser.android !== undefined) selected.add("android.chrome")
+  return CAPABILITY_IDS.filter(id => selected.has(id))
+}
+
+function normalizeCapabilities(values: readonly CapabilityId[]): CapabilityId[] {
+  const selected = new Set(values)
+  return CAPABILITY_IDS.filter(id => selected.has(id))
 }
 
 function requiredConfigurationPresent(configuration: RuntimeInstallPlan["configuration"]): boolean {
@@ -330,14 +372,27 @@ function requiredConfigurationPresent(configuration: RuntimeInstallPlan["configu
 }
 
 function validManifestConfiguration(value: RuntimeInstallPlan["configuration"] | undefined): boolean {
-  if (value === undefined || !["full", "foundation"].includes(value.readinessProfile)
+  if (value === undefined || !["full", "foundation", "desktop-browser-selected"].includes(value.readinessProfile)
     || !Array.isArray(value.requiredCapabilities) || new Set(value.requiredCapabilities).size !== value.requiredCapabilities.length
-    || value.requiredCapabilities.some(id => !(CAPABILITY_IDS as readonly string[]).includes(id))) return false
+    || value.requiredCapabilities.some(id => !(CAPABILITY_IDS as readonly string[]).includes(id))
+    || !Array.isArray(value.deferredCapabilities)
+    || new Set(value.deferredCapabilities.map(capability => capability.id)).size !== value.deferredCapabilities.length
+    || value.deferredCapabilities.some(capability => !(CAPABILITY_IDS as readonly string[]).includes(capability.id)
+      || typeof capability.reason !== "string" || capability.reason.length < 1 || capability.reason.length > 1024)) return false
   try {
     const browser = parseBrowserHostConfig(value.browserJson)
-    return stableJson(browser) === stableJson(value.browser)
+    const baseValid = stableJson(browser) === stableJson(value.browser)
       && sha256(value.browserJson) === value.sha256
       && stableJson(value.requiredCapabilities) === stableJson(CAPABILITY_IDS.filter(id => value.requiredCapabilities.includes(id)))
+    if (!baseValid) return false
+    if (value.readinessProfile === "desktop-browser-selected") {
+      return stableJson(value.requiredCapabilities) === stableJson(selectedDesktopBrowserCapabilities(browser))
+        && stableJson(value.deferredCapabilities) === stableJson([{
+          id: "input.interaction",
+          reason: SELECTED_INTERACTION_REASON,
+        }])
+    }
+    return value.deferredCapabilities.length === 0
   } catch { return false }
 }
 
@@ -408,7 +463,8 @@ async function applyRuntimeInstallLocked(
       rollbackUsed: false,
       doctor,
       readiness: { profile: plan.configuration.readinessProfile,
-        requiredCapabilities: [...plan.configuration.requiredCapabilities], state: "ready" },
+        requiredCapabilities: [...plan.configuration.requiredCapabilities],
+        deferredCapabilities: structuredClone(plan.configuration.deferredCapabilities), state: "ready" },
     }
   }
   const existing = serviceWasLoaded ? await options.runtimeAdmin?.inspect() : undefined
@@ -454,7 +510,8 @@ async function applyRuntimeInstallLocked(
       rollbackUsed,
       doctor,
       readiness: { profile: plan.configuration.readinessProfile,
-        requiredCapabilities: [...plan.configuration.requiredCapabilities], state: "ready" },
+        requiredCapabilities: [...plan.configuration.requiredCapabilities],
+        deferredCapabilities: structuredClone(plan.configuration.deferredCapabilities), state: "ready" },
     }
   } catch (error) {
     rollbackUsed = true
@@ -1380,7 +1437,7 @@ async function cli(): Promise<void> {
     expectedHostname,
     uid: process.getuid?.() ?? (() => { throw new Error("UID недоступен") })(),
     ...(browserConfig === undefined ? {} : { browserConfig }),
-    readinessProfile: process.argv.includes("--foundation") ? "foundation" : "full",
+    readinessProfile: readinessProfileFromArguments(process.argv),
   }
   let plan = await planRuntimeInstall(options)
   if (execute && plan.service.loaded && !plan.release.alreadyInstalled) {
@@ -1392,6 +1449,15 @@ async function cli(): Promise<void> {
   if (!execute) return
   const result = await applyRuntimeInstall(plan, options)
   process.stdout.write(`${JSON.stringify(result, null, 2)}\n`)
+}
+
+export function readinessProfileFromArguments(argv: readonly string[]): RuntimeReadinessProfile {
+  const foundation = argv.includes("--foundation")
+  const selected = argv.includes("--desktop-browser-selected")
+  if (foundation && selected) {
+    throw new Error("--foundation и --desktop-browser-selected взаимоисключающие")
+  }
+  return foundation ? "foundation" : selected ? "desktop-browser-selected" : "full"
 }
 
 async function readBrowserConfigFile(path: string): Promise<string> {

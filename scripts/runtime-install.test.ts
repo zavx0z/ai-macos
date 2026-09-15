@@ -8,6 +8,7 @@ import {
   RUNTIME_SERVICE_LABEL,
   applyRuntimeInstall,
   planRuntimeInstall,
+  readinessProfileFromArguments,
   type CommandResult,
   type CommandRunner,
   type RuntimeAdmin,
@@ -197,12 +198,116 @@ test("browser configuration входит в release identity, а full readiness 
     requiredCapabilities: ["runtime.health", "browser.instances"] as const }
   const installed = await applyRuntimeInstall(configured, configuredOptions)
   expect(installed.readiness).toEqual({ profile: "foundation",
-    requiredCapabilities: ["runtime.health", "browser.instances"], state: "ready" })
+    requiredCapabilities: ["runtime.health", "browser.instances"],
+    deferredCapabilities: [], state: "ready" })
   const plist = await readFile(fixture.options.paths.launchAgentPath, "utf8")
   expect(plist).toContain("META_RUNTIME_MANAGED")
   expect(plist).toContain("&quot;chrome&quot;")
   fixture.runner.unavailableCapabilities.add("browser.instances")
   await expect(applyRuntimeInstall(configured, configuredOptions)).rejects.toThrow("required capability")
+})
+
+test("desktop-browser-selected явно откладывает interaction и сохраняет обязательный desktop/browser set", async () => {
+  const fixture = await createFixture()
+  const browserConfig = JSON.stringify({
+    chrome: {
+      bindingId: "chrome:selected",
+      instances: [{
+        browserInstanceRef: "chrome:selected-instance",
+        initialTransportGeneration: "cdp:selected-initial",
+        endpointHost: "127.0.0.1",
+        endpointPort: 9222,
+        profilePath: "/Users/tester/Library/Application Support/Google/Chrome-CDP",
+      }],
+    },
+  })
+  const options = {
+    ...fixture.options,
+    browserConfig,
+    readinessProfile: "desktop-browser-selected" as const,
+  }
+  const plan = await planRuntimeInstall(options)
+
+  expect(plan.configuration.readinessProfile).toBe("desktop-browser-selected")
+  expect(plan.configuration.requiredCapabilities).toEqual(
+    CAPABILITY_IDS.filter(id => !["android.chrome", "runtime.install", "input.interaction"].includes(id)),
+  )
+  expect(plan.configuration.requiredCapabilities).toContain("input.pointer")
+  expect(plan.configuration.requiredCapabilities).toContain("input.drag")
+  expect(plan.configuration.requiredCapabilities).toContain("desktop.application.lifecycle")
+  expect(plan.configuration.deferredCapabilities).toEqual([{
+    id: "input.interaction",
+    reason: expect.stringContaining("observation-bound input guard"),
+  }])
+  expect(plan.gates.requiredConfigurationPresent).toBe(true)
+
+  const installed = await applyRuntimeInstall(plan, options)
+  expect(installed.readiness).toEqual({
+    profile: "desktop-browser-selected",
+    requiredCapabilities: plan.configuration.requiredCapabilities,
+    deferredCapabilities: plan.configuration.deferredCapabilities,
+    state: "ready",
+  })
+  const manifest = JSON.parse(await readFile(join(plan.release.releasePath, "manifest.json"), "utf8"))
+  expect(manifest.configuration).toEqual(plan.configuration)
+
+  await expect(planRuntimeInstall({
+    ...options,
+    requiredCapabilities: ["runtime.health"],
+  })).rejects.toThrow("фиксированный required capability set")
+})
+
+test("desktop-browser-selected включает Android только при explicit config, full остаётся строгим", async () => {
+  const fixture = await createFixture()
+  const browserConfig = JSON.stringify({
+    chrome: {
+      bindingId: "chrome:selected-with-android",
+      instances: [{
+        browserInstanceRef: "chrome:selected-instance",
+        initialTransportGeneration: "cdp:selected-initial",
+        endpointHost: "127.0.0.1",
+        endpointPort: 9222,
+        profilePath: "/Users/tester/Library/Application Support/Google/Chrome-CDP",
+      }],
+    },
+    android: {
+      bindingId: "android:selected",
+      serial: "fixture-device",
+      localPort: 9223,
+      deviceRef: "device:selected",
+      initialDeviceTransportGeneration: "usb:selected",
+      browserInstanceRef: "android-browser:selected",
+      initialBrowserTransportGeneration: "android-cdp:selected",
+    },
+  })
+  const selected = await planRuntimeInstall({
+    ...fixture.options,
+    browserConfig,
+    readinessProfile: "desktop-browser-selected",
+  })
+  const full = await planRuntimeInstall({
+    ...fixture.options,
+    browserConfig,
+    readinessProfile: "full",
+  })
+
+  expect(selected.configuration.requiredCapabilities).toContain("android.chrome")
+  expect(full.configuration.requiredCapabilities).toContain("input.interaction")
+  expect(full.configuration.requiredCapabilities).not.toContain("android.chrome")
+  expect(full.configuration.deferredCapabilities).toEqual([])
+  expect(selected.release.releaseId).not.toBe(full.release.releaseId)
+  expect(selected.release.runtimeBuildId).toBe(full.release.runtimeBuildId)
+  expect(selected.release.nativeBuildId).toBe(full.release.nativeBuildId)
+  expect(readinessProfileFromArguments(["bun", "--desktop-browser-selected"]))
+    .toBe("desktop-browser-selected")
+  expect(readinessProfileFromArguments(["bun", "--foundation"]))
+    .toBe("foundation")
+  expect(readinessProfileFromArguments(["bun"])).toBe("full")
+  expect(() => readinessProfileFromArguments([
+    "bun",
+    "--foundation",
+    "--desktop-browser-selected",
+  ])).toThrow("взаимоисключающие")
 })
 
 test("failed bootout сохраняет pending journal и не меняет installed files", async () => {
