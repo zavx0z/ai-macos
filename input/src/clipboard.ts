@@ -5,6 +5,13 @@ const PBCOPY = "/usr/bin/pbcopy"
 
 export const MAX_CLIPBOARD_TEXT_BYTES = 1_000_000
 
+// pbcopy/pbpaste infer byte encoding from locale. A headless service may
+// inherit C (or no locale), unlike Terminal. Only these children use UTF-8;
+// the user's shell environment and macOS preferences remain unchanged.
+export function utf8ClipboardEnvironment(base: Readonly<Record<string, string | undefined>> = Bun.env): Record<string, string | undefined> {
+  return { ...base, LANG: "en_US.UTF-8", LC_CTYPE: "en_US.UTF-8", LC_ALL: "en_US.UTF-8" }
+}
+
 export type ClipboardHealth = {
   ok: boolean
   backend: "pbpaste/pbcopy"
@@ -38,6 +45,7 @@ export async function clipboardHealth(): Promise<ClipboardHealth> {
 
 export async function readClipboardText(): Promise<{ text: string; length: number; bytes: number }> {
   const process = Bun.spawn([PBPASTE], {
+    env: utf8ClipboardEnvironment(),
     stdout: "pipe",
     stderr: "pipe",
   })
@@ -63,6 +71,7 @@ export async function writeClipboardText(text: string): Promise<{ length: number
   }
 
   const process = Bun.spawn([PBCOPY], {
+    env: utf8ClipboardEnvironment(),
     stdin: "pipe",
     stdout: "pipe",
     stderr: "pipe",

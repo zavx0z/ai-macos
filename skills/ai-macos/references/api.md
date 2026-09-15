@@ -45,6 +45,9 @@ Always compare a capture with its caption before acting.
   the application and system scrolling behavior.
 - `clipboard_read` requires an explicit user request to inspect content.
 - `clipboard_write` writes plain text without UI shortcuts.
+  The backend forces UTF-8 locale for pbcopy/pbpaste child processes, including
+  headless service launches. Returned length/bytes describe the supplied text;
+  visually verify a subsequent paste before treating it as successful insertion.
 
 ## Save/Open sheet sequence
 
