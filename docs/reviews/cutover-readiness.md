@@ -5,9 +5,9 @@
 
 ## Установленная версия
 
-Последний подтверждённый installed checkpoint — source `990e548`, release
-`release-87f82221cfe2798f2c1d11c0`, runtime/native build suffix
-`70f57be1e9fe2dce6fd970e0`. Последующие коммиты требуют новой установки.
+Последний подтверждённый installed checkpoint — source `c9951df`, release
+`release-97510f3e15d016dda8ac7402`, runtime/native build suffix
+`f21decdba11f01ccff5be296`. Последующие коммиты требуют новой установки.
 
 - Стабильный подписанный bundle: `Application Support/ai-macos/runtime/computer-use.app`.
 - Executable: `Contents/MacOS/computer-use`; Native: `Contents/Helpers/meta-input-helper`.
@@ -39,7 +39,7 @@
 | `show_window` | Одна операция show успешно возвращает точное окно; ошибочного второго focus и malformed wrapper больше нет |
 | AXPress `fixture.sheet.open` | Одна операция completed, exact target verified, cleanup complete; oracle подтвердил `sheet-opened` и `sheet.open=1` |
 
-Основные receipts текущего checkpoint:
+Основные receipts успешных действий на предыдущем installed `990e548`:
 
 - input readiness: `operation:12f644c5-2939-4c56-8dc7-f398242bd564`;
 - AXPress: `operation:95dc9286-c8ae-4bb1-ac1a-e98c80b4625b`;
@@ -52,11 +52,23 @@ sheet отдельным evidence служит read-only oracle самой fixtu
 
 ## Текущий live blocker
 
-После открытия sheet `get_state` не опубликовал его как отдельную owned surface:
-`surfaces=[]`, хотя fixture подтверждала открытый диалог. Дальнейший ввод не
-выполнялся. Source diagnosis: повторный AX element из `AXSheets` отбрасывался
-как дубль ранее полученного элемента из `AXWindows`, вместе с exact owner proof.
-Исправление collector/registry должно пройти live повтор до закрытия gate.
+После открытия sheet `get_state` не опубликовал его как отдельную owned surface.
+Source `0e486d7` исправляет потерю exact AXSheets owner при дедупликации и уже
+установлен. После обновления пользователь подтвердил переключение на другой
+macOS Space. Первый scoped `get_state(pid)` вернул только CG-only records;
+повторный — одно AX окно при `axStatus: timed-out`. Sheet не выбран, ввод не
+выполнялся. Это не доказывает regression sheet patch.
+
+Проверка source обнаружила scheduling flaw: `list_windows` применяет app/pid
+фильтр после полного Native опроса. Foreground получает первый бюджет, а
+явно выбранное фоновое приложение конкурирует с примерно 95 приложениями за
+общий deadline. Исправление должно передавать scheduling hint и при первичном
+поиске, и при fresh re-resolution уже выданной цели, сохраняя exact incarnation
+proof и честную completeness. Переключение Space или фокуса не является обходом.
+
+Дополнительно `ae4a4af` исправляет диагностический `axWindowCount`: теперь это
+число опубликованных AX окон, а не общий application.windowCount, включавший
+CG-only records. Прежнее значение 6 не доказывало наличие шести AX окон.
 
 Primary AX сохраняет `complete=false` при ошибке optional description. API не
 скрывает эту ошибку: `observe(mode:"both")` возвращает aggregate incompleteness,
@@ -65,6 +77,12 @@ Pointer input отдельно требует image-ready и свежий Native
 
 Ещё не подтверждены live: закрытие owned sheet, pointer/text/keyboard actions,
 скрытие/сворачивание и точный show, отмена во время ввода, выбранный Chrome target.
+
+## Проверки исходников
+
+Последний общий safe прогон: 865 pass, 1 skip, 0 fail; 3659 assertions,
+144 files. System clipboard live test отключён. Последующие изменения требуют
+собственных targeted checks и проверки новой установленной сборки.
 
 ## Что исправлено по результатам live
 
@@ -97,7 +115,7 @@ Pointer input отдельно требует image-ready и свежий Native
 | Старые listeners 7878–7882 | Собственные legacy services остановлены ранее; архивные процессы не затрагивались |
 | Старый Chrome CDP LaunchAgent | Exact plist/job отсутствуют; уже работающий browser не остановлен |
 | Reverse imports | Повторный source audit выполнен; Android tests мигрированы отдельно |
-| Installer/source doctor | До удаления `input/bin` нужно убрать обязательную зависимость v2 installer от legacy parent directory, сохранив безопасный v1 rollback |
+| Installer/source doctor | `c9951df`: v2 не требует legacy parent; v1 recovery сохраняет strict write gate и journal при отсутствующем trusted parent |
 | Manifests/entrypoints/docs | Нужна одна согласованная migration/removal delta и обновление lockfile |
 
 `scripts/legacy-source-removal-plan.json` остаётся планом, не фактом удаления.
