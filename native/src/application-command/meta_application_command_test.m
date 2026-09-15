@@ -1,7 +1,9 @@
 #include "meta_application_command.h"
 
 #include <assert.h>
+#include <pthread.h>
 #include <stdio.h>
+#include <time.h>
 
 typedef struct {
   uint64_t now;
@@ -12,6 +14,65 @@ typedef struct {
   MetaApplicationProcess current;
   MetaApplicationWorkspaceTerminateStatus terminate_status;
 } Fixture;
+
+typedef struct {
+  pthread_mutex_t mutex;
+  pthread_cond_t condition;
+  bool block_clock;
+  bool clock_entered;
+  bool allow_clock;
+  bool block_candidate;
+  bool candidate_entered;
+  bool allow_candidate;
+} ConcurrentGate;
+
+static ConcurrentGate concurrent_gate = {
+    .mutex = PTHREAD_MUTEX_INITIALIZER,
+    .condition = PTHREAD_COND_INITIALIZER,
+};
+
+static void reset_gate(void) {
+  pthread_mutex_lock(&concurrent_gate.mutex);
+  concurrent_gate.block_clock = false;
+  concurrent_gate.clock_entered = false;
+  concurrent_gate.allow_clock = false;
+  concurrent_gate.block_candidate = false;
+  concurrent_gate.candidate_entered = false;
+  concurrent_gate.allow_candidate = false;
+  pthread_mutex_unlock(&concurrent_gate.mutex);
+}
+
+static void wait_for_gate(bool *entered) {
+  struct timespec deadline;
+  assert(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+  deadline.tv_sec += 2;
+  pthread_mutex_lock(&concurrent_gate.mutex);
+  while (!*entered) {
+    int result = pthread_cond_timedwait(&concurrent_gate.condition,
+                                        &concurrent_gate.mutex, &deadline);
+    assert(result == 0);
+  }
+  pthread_mutex_unlock(&concurrent_gate.mutex);
+}
+
+static void open_gate(bool *allowed) {
+  pthread_mutex_lock(&concurrent_gate.mutex);
+  *allowed = true;
+  pthread_cond_broadcast(&concurrent_gate.condition);
+  pthread_mutex_unlock(&concurrent_gate.mutex);
+}
+
+static void candidate_checkpoint(void) {
+  pthread_mutex_lock(&concurrent_gate.mutex);
+  if (concurrent_gate.block_candidate) {
+    concurrent_gate.candidate_entered = true;
+    pthread_cond_broadcast(&concurrent_gate.condition);
+    while (!concurrent_gate.allow_candidate) {
+      pthread_cond_wait(&concurrent_gate.condition, &concurrent_gate.mutex);
+    }
+  }
+  pthread_mutex_unlock(&concurrent_gate.mutex);
+}
 
 static void copy_text(char *target, size_t capacity, const char *source) {
   snprintf(target, capacity, "%s", source);
@@ -29,6 +90,15 @@ static MetaApplicationProcess process(int32_t pid,
 }
 
 static uint64_t now(void *context) {
+  pthread_mutex_lock(&concurrent_gate.mutex);
+  if (concurrent_gate.block_clock) {
+    concurrent_gate.clock_entered = true;
+    pthread_cond_broadcast(&concurrent_gate.condition);
+    while (!concurrent_gate.allow_clock) {
+      pthread_cond_wait(&concurrent_gate.condition, &concurrent_gate.mutex);
+    }
+  }
+  pthread_mutex_unlock(&concurrent_gate.mutex);
   return ((Fixture *)context)->now;
 }
 
@@ -152,6 +222,7 @@ static MetaApplicationCommandBinder *binder(
                   backend:backend(fixture)
         candidateResolver:^NSDictionary *(const MetaApplicationProcess *candidate,
                                            __unused NSDictionary *operation) {
+          candidate_checkpoint();
           *candidate_resolutions += 1;
           return record(*candidate);
         }
@@ -181,6 +252,56 @@ static void complete(Fixture *fixture, MetaApplicationProcess candidate) {
   callback(fixture->completion_context,
            META_APPLICATION_LAUNCH_CALLBACK_COMPLETED, &candidate, false,
            NULL);
+}
+
+typedef enum {
+  CONCURRENT_LAUNCH_STATUS,
+  CONCURRENT_LAUNCH_FINALIZE,
+  CONCURRENT_LAUNCH_CANCEL,
+} ConcurrentLaunchCallKind;
+
+typedef struct {
+  __unsafe_unretained MetaApplicationCommandBinder *binder;
+  __unsafe_unretained NSString *task_ref;
+  ConcurrentLaunchCallKind kind;
+  bool result_present;
+} ConcurrentLaunchCall;
+
+static void *run_concurrent_launch_call(void *context) {
+  ConcurrentLaunchCall *call = context;
+  @autoreleasepool {
+    NSDictionary *result = nil;
+    switch (call->kind) {
+      case CONCURRENT_LAUNCH_STATUS:
+        result = [call->binder launchStatus:call->task_ref
+                                  requestId:@"concurrent-status"];
+        break;
+      case CONCURRENT_LAUNCH_FINALIZE:
+        result = [call->binder finalizeLaunch:call->task_ref
+                                    requestId:@"concurrent-finalize"];
+        break;
+      case CONCURRENT_LAUNCH_CANCEL:
+        result = [call->binder cancelLaunch:call->task_ref
+                                  requestId:@"concurrent-cancel"];
+        break;
+    }
+    call->result_present = result != nil;
+  }
+  return NULL;
+}
+
+static NSString *start_bound_launch(MetaApplicationCommandBinder *owner,
+                                    NSDictionary *target,
+                                    BOOL activate_requested,
+                                    NSString *request_id) {
+  NSDictionary *started = [owner startLaunch:@{
+    @"bundle": target[@"ref"],
+    @"activate": @(activate_requested),
+    @"newInstance": @NO,
+  } operation:operation(target) requestId:request_id
+                         deadlineMillis:1000];
+  assert(started != nil);
+  return started[@"launchTaskRef"];
 }
 
 static void test_resolve_launch_finalize_activate(void) {
@@ -267,6 +388,90 @@ static void test_pending_drain_and_late_candidate(void) {
       stringByDeletingLastPathComponent] error:NULL];
 }
 
+static void test_concurrent_borrows_block_terminal_release(void) {
+  reset_gate();
+  Fixture fixture = {
+      .current = process(504, 4000000, "com.example.fixture"),
+  };
+  size_t resolutions = 0;
+  NSString *bundlePath = create_bundle();
+  MetaApplicationBundles *bundles = [[MetaApplicationBundles alloc]
+      initWithGeneration:generation()];
+  MetaApplicationCommandBinder *owner = binder(&fixture, bundles, &resolutions);
+  NSDictionary *target = resolve_bundle(owner, bundlePath)[@"target"];
+
+  NSString *statusTask = start_bound_launch(
+      owner, target, NO, @"request-concurrent-status");
+  pthread_mutex_lock(&concurrent_gate.mutex);
+  concurrent_gate.block_clock = true;
+  pthread_mutex_unlock(&concurrent_gate.mutex);
+  ConcurrentLaunchCall statusCall = {
+      .binder = owner,
+      .task_ref = statusTask,
+      .kind = CONCURRENT_LAUNCH_STATUS,
+  };
+  pthread_t statusThread;
+  assert(pthread_create(&statusThread, NULL, run_concurrent_launch_call,
+                        &statusCall) == 0);
+  wait_for_gate(&concurrent_gate.clock_entered);
+  assert(![owner releaseLaunch:statusTask]);
+  open_gate(&concurrent_gate.allow_clock);
+  assert(pthread_join(statusThread, NULL) == 0);
+  assert(statusCall.result_present);
+  reset_gate();
+  complete(&fixture, fixture.current);
+  assert([owner finalizeLaunch:statusTask requestId:@"status-final"] != nil);
+  assert([owner releaseLaunch:statusTask]);
+
+  NSString *finalizeTask = start_bound_launch(
+      owner, target, NO, @"request-concurrent-finalize");
+  complete(&fixture, fixture.current);
+  pthread_mutex_lock(&concurrent_gate.mutex);
+  concurrent_gate.block_candidate = true;
+  pthread_mutex_unlock(&concurrent_gate.mutex);
+  ConcurrentLaunchCall finalizeCall = {
+      .binder = owner,
+      .task_ref = finalizeTask,
+      .kind = CONCURRENT_LAUNCH_FINALIZE,
+  };
+  pthread_t finalizeThread;
+  assert(pthread_create(&finalizeThread, NULL, run_concurrent_launch_call,
+                        &finalizeCall) == 0);
+  wait_for_gate(&concurrent_gate.candidate_entered);
+  assert(![owner releaseLaunch:finalizeTask]);
+  open_gate(&concurrent_gate.allow_candidate);
+  assert(pthread_join(finalizeThread, NULL) == 0);
+  assert(finalizeCall.result_present);
+  reset_gate();
+  assert([owner releaseLaunch:finalizeTask]);
+
+  NSString *cancelTask = start_bound_launch(
+      owner, target, NO, @"request-concurrent-cancel");
+  pthread_mutex_lock(&concurrent_gate.mutex);
+  concurrent_gate.block_clock = true;
+  pthread_mutex_unlock(&concurrent_gate.mutex);
+  ConcurrentLaunchCall cancelCall = {
+      .binder = owner,
+      .task_ref = cancelTask,
+      .kind = CONCURRENT_LAUNCH_CANCEL,
+  };
+  pthread_t cancelThread;
+  assert(pthread_create(&cancelThread, NULL, run_concurrent_launch_call,
+                        &cancelCall) == 0);
+  wait_for_gate(&concurrent_gate.clock_entered);
+  assert(![owner releaseLaunch:cancelTask]);
+  open_gate(&concurrent_gate.allow_clock);
+  assert(pthread_join(cancelThread, NULL) == 0);
+  assert(cancelCall.result_present);
+  reset_gate();
+  complete(&fixture, fixture.current);
+  assert([owner finalizeLaunch:cancelTask requestId:@"cancel-final"] != nil);
+  assert([owner releaseLaunch:cancelTask]);
+  assert([owner activeLaunchCount] == 0);
+  [NSFileManager.defaultManager removeItemAtPath:[bundlePath
+      stringByDeletingLastPathComponent] error:NULL];
+}
+
 static void test_quit_still_running_uses_exact_reference(void) {
   Fixture fixture = {
       .current = process(503, 3000000, "com.example.fixture"),
@@ -297,6 +502,7 @@ int main(void) {
   @autoreleasepool {
     test_resolve_launch_finalize_activate();
     test_pending_drain_and_late_candidate();
+    test_concurrent_borrows_block_terminal_release();
     test_quit_still_running_uses_exact_reference();
     puts("application command binder tests passed");
   }

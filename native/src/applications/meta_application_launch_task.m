@@ -1,5 +1,6 @@
-#include "meta_application_controller.h"
+#include "meta_application_launch_task.h"
 
+#include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -49,8 +50,17 @@ static bool valid_backend(MetaApplicationBackend backend) {
          backend.activate != NULL && backend.wait_millis != NULL;
 }
 
-static void retain_task(MetaApplicationLaunchTask *task) {
-  atomic_fetch_add(&task->references, 1);
+bool meta_application_launch_task_retain_borrow(
+    MetaApplicationLaunchTask *task) {
+  if (task == NULL) return false;
+  unsigned int references = atomic_load(&task->references);
+  while (references > 0 && references < UINT_MAX) {
+    if (atomic_compare_exchange_weak(&task->references, &references,
+                                     references + 1)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 static void drop_task(MetaApplicationLaunchTask *task) {
@@ -58,6 +68,12 @@ static void drop_task(MetaApplicationLaunchTask *task) {
   pthread_mutex_destroy(&task->mutex);
   memset(task, 0, sizeof(*task));
   free(task);
+}
+
+void meta_application_launch_task_release_borrow(
+    MetaApplicationLaunchTask *task) {
+  if (task == NULL) return;
+  drop_task(task);
 }
 
 static void mark_deadline_locked(MetaApplicationLaunchTask *task) {
@@ -189,7 +205,10 @@ MetaApplicationLaunchTask *meta_application_launch_task_start(
               "launch deadline expired before dispatch");
     return task;
   }
-  retain_task(task);
+  if (!meta_application_launch_task_retain_borrow(task)) {
+    drop_task(task);
+    return NULL;
+  }
   MetaApplicationWorkspaceLaunchStart started = backend.start_launch(
       backend.context, &task->request, launch_completion, task);
   if (started == META_APPLICATION_LAUNCH_REJECTED_NO_DISPATCH) {

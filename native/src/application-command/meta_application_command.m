@@ -1,4 +1,5 @@
 #include "meta_application_command.h"
+#include "../applications/meta_application_launch_task.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -11,10 +12,19 @@
 @property(nonatomic) BOOL parentActivationSucceeded;
 @property(nonatomic) BOOL parentActivationInFlight;
 @property(nonatomic) BOOL parentActivationAbandoned;
+@property(nonatomic) NSUInteger taskBorrowers;
+@property(nonatomic) BOOL releaseInProgress;
 @property(nonatomic, copy) NSDictionary *mappedValue;
 @end
 
 @implementation MetaApplicationLaunchEntry
+@end
+
+@interface MetaApplicationCommandBinder ()
+- (nullable MetaApplicationLaunchEntry *)borrowLaunchEntry:(NSString *)taskRef;
+- (void)releaseLaunchEntry:(MetaApplicationLaunchEntry *)entry;
+- (NSDictionary *)launchStatusForEntry:(MetaApplicationLaunchEntry *)entry
+                              requestId:(NSString *)requestId;
 @end
 
 static BOOL string_value(id value, NSUInteger maximum) {
@@ -147,6 +157,27 @@ static BOOL generation_matches(NSDictionary *generation,
   return self;
 }
 
+- (MetaApplicationLaunchEntry *)borrowLaunchEntry:(NSString *)taskRef {
+  [_lock lock];
+  MetaApplicationLaunchEntry *entry = _launches[taskRef];
+  if (entry == nil || entry.releaseInProgress ||
+      !meta_application_launch_task_retain_borrow(entry.task)) {
+    [_lock unlock];
+    return nil;
+  }
+  entry.taskBorrowers += 1;
+  [_lock unlock];
+  return entry;
+}
+
+- (void)releaseLaunchEntry:(MetaApplicationLaunchEntry *)entry {
+  meta_application_launch_task_release_borrow(entry.task);
+  [_lock lock];
+  NSCAssert(entry.taskBorrowers > 0, @"Launch task borrow underflow");
+  entry.taskBorrowers -= 1;
+  [_lock unlock];
+}
+
 - (NSDictionary *)resolve:(NSDictionary *)request
                  evidence:(NSDictionary *)evidence {
   NSString *path = request[@"path"];
@@ -245,8 +276,16 @@ static BOOL generation_matches(NSDictionary *generation,
   if (!string_value(launchTaskRef, 127) || !string_value(requestId, 127)) {
     return nil;
   }
+  MetaApplicationLaunchEntry *entry = [self borrowLaunchEntry:launchTaskRef];
+  if (entry == nil) return nil;
+  NSDictionary *result = [self launchStatusForEntry:entry requestId:requestId];
+  [self releaseLaunchEntry:entry];
+  return result;
+}
+
+- (NSDictionary *)launchStatusForEntry:(MetaApplicationLaunchEntry *)entry
+                              requestId:(NSString *)requestId {
   [_lock lock];
-  MetaApplicationLaunchEntry *entry = _launches[launchTaskRef];
   NSDictionary *mappedValue = entry.mappedValue;
   const BOOL publicActivationRequested = entry.publicActivationRequested;
   const BOOL parentActivationAttempted = entry.parentActivationAttempted;
@@ -254,7 +293,6 @@ static BOOL generation_matches(NSDictionary *generation,
   const BOOL parentActivationInFlight = entry.parentActivationInFlight;
   const BOOL parentActivationAbandoned = entry.parentActivationAbandoned;
   [_lock unlock];
-  if (entry == nil) return nil;
   MetaApplicationLaunchTaskStatus status =
       meta_application_launch_task_status(entry.task);
   const BOOL mappedRunning = [mappedValue[@"state"] isEqual:@"running"];
@@ -314,47 +352,56 @@ static BOOL generation_matches(NSDictionary *generation,
 
 - (NSDictionary *)finalizeLaunch:(NSString *)launchTaskRef
                         requestId:(NSString *)requestId {
-  [_lock lock];
-  MetaApplicationLaunchEntry *entry = _launches[launchTaskRef];
-  [_lock unlock];
+  if (!string_value(launchTaskRef, 127) || !string_value(requestId, 127)) {
+    return nil;
+  }
+  MetaApplicationLaunchEntry *entry = [self borrowLaunchEntry:launchTaskRef];
   if (entry == nil) return nil;
   MetaApplicationLaunchTaskStatus status =
       meta_application_launch_task_status(entry.task);
-  if (!status.drained) return [self launchStatus:launchTaskRef
-                                      requestId:requestId];
-  [_lock lock];
-  const BOOL needsMapping = entry.mappedValue == nil;
-  [_lock unlock];
-  if (needsMapping) {
-    NSDictionary *mapped = [self mapLaunchStatus:status entry:entry];
+  if (status.drained) {
     [_lock lock];
-    if (entry.mappedValue == nil) {
-      entry.mappedValue = entry.parentActivationAbandoned
-                              ? abandoned_activation(mapped)
-                              : mapped;
-    }
+    const BOOL needsMapping = entry.mappedValue == nil;
     [_lock unlock];
+    if (needsMapping) {
+      NSDictionary *mapped = [self mapLaunchStatus:status entry:entry];
+      [_lock lock];
+      if (entry.mappedValue == nil) {
+        entry.mappedValue = entry.parentActivationAbandoned
+                                ? abandoned_activation(mapped)
+                                : mapped;
+      }
+      [_lock unlock];
+    }
   }
-  return [self launchStatus:launchTaskRef requestId:requestId];
+  NSDictionary *result = [self launchStatusForEntry:entry requestId:requestId];
+  [self releaseLaunchEntry:entry];
+  return result;
 }
 
 - (NSDictionary *)activateLaunch:(NSString *)launchTaskRef
                   deadlineMillis:(uint64_t)deadlineMillis {
-  [_lock lock];
-  MetaApplicationLaunchEntry *entry = _launches[launchTaskRef];
-  if (entry == nil || !entry.publicActivationRequested ||
-      entry.parentActivationAttempted || entry.parentActivationAbandoned) {
-    [_lock unlock];
-    return nil;
-  }
+  if (!string_value(launchTaskRef, 127)) return nil;
+  MetaApplicationLaunchEntry *entry = [self borrowLaunchEntry:launchTaskRef];
+  if (entry == nil) return nil;
   MetaApplicationLaunchTaskStatus status =
       meta_application_launch_task_status(entry.task);
+  const BOOL activationExpired =
+      _backend.monotonic_millis(_backend.context) >= deadlineMillis;
+  [_lock lock];
+  if (!entry.publicActivationRequested ||
+      entry.parentActivationAttempted || entry.parentActivationAbandoned) {
+    [_lock unlock];
+    [self releaseLaunchEntry:entry];
+    return nil;
+  }
   if (!status.drained || status.state != META_APPLICATION_LAUNCH_TASK_COMPLETED ||
       !status.process_present || status.timed_out ||
       status.cancellation_requested || entry.mappedValue == nil ||
       ![entry.mappedValue[@"state"] isEqual:@"running"] ||
-      _backend.monotonic_millis(_backend.context) >= deadlineMillis) {
+      activationExpired) {
     [_lock unlock];
+    [self releaseLaunchEntry:entry];
     return nil;
   }
   entry.parentActivationAttempted = YES;
@@ -378,17 +425,23 @@ static BOOL generation_matches(NSDictionary *generation,
     };
   }
   [_lock unlock];
-  return [self launchStatus:launchTaskRef requestId:@"activation-status"];
+  NSDictionary *result = [self launchStatusForEntry:entry
+                                          requestId:@"activation-status"];
+  [self releaseLaunchEntry:entry];
+  return result;
 }
 
 - (NSDictionary *)cancelLaunch:(NSString *)launchTaskRef
                       requestId:(NSString *)requestId {
-  [_lock lock];
-  MetaApplicationLaunchEntry *entry = _launches[launchTaskRef];
-  [_lock unlock];
+  if (!string_value(launchTaskRef, 127) || !string_value(requestId, 127)) {
+    return nil;
+  }
+  MetaApplicationLaunchEntry *entry = [self borrowLaunchEntry:launchTaskRef];
   if (entry == nil) return nil;
   meta_application_launch_task_cancel(entry.task);
-  return [self launchStatus:launchTaskRef requestId:requestId];
+  NSDictionary *result = [self launchStatusForEntry:entry requestId:requestId];
+  [self releaseLaunchEntry:entry];
+  return result;
 }
 
 - (NSDictionary *)drainLaunchesUntil:(uint64_t)deadlineMillis {
@@ -403,7 +456,19 @@ static BOOL generation_matches(NSDictionary *generation,
       }
     }
   }
-  NSArray<MetaApplicationLaunchEntry *> *entries = _launches.allValues;
+  NSMutableArray<MetaApplicationLaunchEntry *> *entries =
+      [NSMutableArray array];
+  NSMutableArray<NSString *> *unborrowed = [NSMutableArray array];
+  for (NSString *taskRef in _launches) {
+    MetaApplicationLaunchEntry *entry = _launches[taskRef];
+    if (!entry.releaseInProgress &&
+        meta_application_launch_task_retain_borrow(entry.task)) {
+      entry.taskBorrowers += 1;
+      [entries addObject:entry];
+    } else {
+      [unborrowed addObject:taskRef];
+    }
+  }
   [_lock unlock];
   for (MetaApplicationLaunchEntry *entry in entries) {
     meta_application_launch_task_cancel(entry.task);
@@ -423,20 +488,19 @@ static BOOL generation_matches(NSDictionary *generation,
     if (drained) break;
     _backend.wait_millis(_backend.context, 10);
   }
-  NSMutableArray<NSString *> *active = [NSMutableArray array];
-  [_lock lock];
-  NSDictionary<NSString *, MetaApplicationLaunchEntry *> *launches =
-      [_launches copy];
-  [_lock unlock];
-  for (NSString *taskRef in launches) {
-    MetaApplicationLaunchEntry *entry = launches[taskRef];
+  NSMutableArray<NSString *> *active = [unborrowed mutableCopy];
+  for (MetaApplicationLaunchEntry *entry in entries) {
     [_lock lock];
     const BOOL activationInFlight = entry.parentActivationInFlight;
     [_lock unlock];
-    if (!meta_application_launch_task_status(entry.task).drained ||
-        activationInFlight) {
-      [active addObject:taskRef];
+    MetaApplicationLaunchTaskStatus status =
+        meta_application_launch_task_status(entry.task);
+    if (!status.drained || activationInFlight) {
+      [active addObject:@(status.launch_task_ref)];
     }
+  }
+  for (MetaApplicationLaunchEntry *entry in entries) {
+    [self releaseLaunchEntry:entry];
   }
   return @{
     @"drained": @(active.count == 0),
@@ -447,14 +511,19 @@ static BOOL generation_matches(NSDictionary *generation,
 }
 
 - (BOOL)releaseLaunch:(NSString *)launchTaskRef {
+  if (!string_value(launchTaskRef, 127)) return NO;
   [_lock lock];
   MetaApplicationLaunchEntry *entry = _launches[launchTaskRef];
-  if (entry == nil) {
+  if (entry == nil || entry.releaseInProgress || entry.taskBorrowers > 0 ||
+      !meta_application_launch_task_retain_borrow(entry.task)) {
     [_lock unlock];
     return NO;
   }
+  entry.releaseInProgress = YES;
+  [_lock unlock];
   MetaApplicationLaunchTaskStatus status =
       meta_application_launch_task_status(entry.task);
+  [_lock lock];
   const BOOL mappedRunning =
       [entry.mappedValue[@"state"] isEqual:@"running"];
   const BOOL requiresActivation = entry.publicActivationRequested &&
@@ -466,14 +535,17 @@ static BOOL generation_matches(NSDictionary *generation,
       (!requiresActivation ||
        (entry.parentActivationAttempted &&
         !entry.parentActivationInFlight));
-  if (!effectiveTerminal ||
-      !meta_application_launch_task_release(entry.task)) {
+  if (!effectiveTerminal) {
+    entry.releaseInProgress = NO;
     [_lock unlock];
+    meta_application_launch_task_release_borrow(entry.task);
     return NO;
   }
   [_launches removeObjectForKey:launchTaskRef];
   [_lock unlock];
-  return YES;
+  const BOOL released = meta_application_launch_task_release(entry.task);
+  meta_application_launch_task_release_borrow(entry.task);
+  return released;
 }
 
 - (NSDictionary *)quit:(NSDictionary *)request
