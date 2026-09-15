@@ -10,6 +10,7 @@ import {
 import { nativeExecutionContextSchema } from "./operations.ts"
 import { isoTimestampSchema, utf8ByteLength } from "./schema.ts"
 import { nativeRecoveryGrantSchema } from "./recovery-domain.ts"
+import { nativeViewAdmissionSchema } from "./native-view-admission.ts"
 
 export const MAX_NATIVE_ENVELOPE_BYTES = 1024 * 1024
 export const MAX_NATIVE_JSON_DEPTH = 32
@@ -39,6 +40,7 @@ export const nativeHandshakeRequestSchema = z.strictObject({
   runtimeBuildId: opaqueIdSchema,
   expectedNativeBuildId: opaqueIdSchema,
   requiredRecoveryDomainVersion: z.literal("1").optional(),
+  requiredViewAdmissionVersion: z.literal("1").optional(),
   capabilitySchemaVersion: z.literal(CAPABILITY_SCHEMA_VERSION),
 })
 export type NativeHandshakeRequest = z.infer<typeof nativeHandshakeRequestSchema>
@@ -52,6 +54,7 @@ export const nativeHandshakeResponseSchema = z.strictObject({
   nativeGeneration: generationIdSchema,
   nativeBuildId: opaqueIdSchema,
   recoveryDomainVersion: z.literal("1").optional(),
+  viewAdmissionVersion: z.literal("1").optional(),
   capabilitySchemaVersion: z.literal(CAPABILITY_SCHEMA_VERSION),
   installRoot: z.string().min(1).max(4_096).refine(path => path.startsWith("/"), "installRoot должен быть абсолютным"),
   process: processInstanceSchema,
@@ -99,9 +102,13 @@ export function createNativeMutationRequestEnvelopeSchema<Method extends string,
     method: z.literal(method),
     operation: nativeExecutionContextSchema,
     recoveryGrant: nativeRecoveryGrantSchema.optional(),
+    viewAdmission: nativeViewAdmissionSchema.optional(),
     payload,
   }).superRefine((request, context) => {
     const grant = request.recoveryGrant
+    if (request.viewAdmission !== undefined && method !== "input.execute" && method !== "ax.press") {
+      context.addIssue({ code: "custom", path: ["viewAdmission"], message: "View admission допустим только для guarded input/AX action" })
+    }
     if (grant !== undefined && (grant.runtimeEpoch !== request.runtimeEpoch || grant.loginSessionId !== request.loginSessionId
       || grant.nativeGeneration !== request.nativeGeneration || grant.operationId !== request.operation.operationId
       || grant.descriptor.method !== request.method)) {
@@ -148,6 +155,9 @@ export function nativeHandshakeCompatibility(
   request: NativeHandshakeRequest,
   response: NativeHandshakeResponse,
 ): ContractError | undefined {
+  if (request.requiredViewAdmissionVersion !== undefined && response.viewAdmissionVersion !== request.requiredViewAdmissionVersion) {
+    return mismatch("Native view admission protocol не поддержан", "apply-compatible-update")
+  }
   if (request.requiredRecoveryDomainVersion !== undefined && response.recoveryDomainVersion !== request.requiredRecoveryDomainVersion) {
     return mismatch("Native recovery domain protocol не поддержан", "apply-compatible-update")
   }

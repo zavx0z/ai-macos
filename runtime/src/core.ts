@@ -89,6 +89,14 @@ export type RuntimeNativeDeliveryAuthority = Readonly<{
   register(wire: NativeExecutionContext): void
   assertNeverAttempted(wire: NativeExecutionContext): void
 }>
+export type RuntimeViewOperation = Readonly<{ method: "input.execute" | "ax.press", actionKind?: string }>
+export type RuntimeViewAdmissionContext = Readonly<{
+  wire: NativeExecutionContext
+  session: RuntimeClientSession
+  lineageId: string
+  operation: RuntimeViewOperation
+  control: { signal: AbortSignal, checkpoint(): Promise<void> }
+}>
 export type StartupRecoveryAuthority = Readonly<{
   receiptFor(record: OperationRecord): Promise<CleanupAuthorityReceipt | undefined>
   unresolvedHeld(): Promise<number>
@@ -185,6 +193,7 @@ export class RuntimeCore implements RuntimeAdapter {
   readonly #startupRecovery?: StartupRecoveryAuthority
   #startupPendingHeld = 0
   #fenceCounter = 0
+  #viewAdmissionBound = false
 
   constructor(options: RuntimeCoreOptions) {
     this.generation = options.generation
@@ -334,6 +343,36 @@ export class RuntimeCore implements RuntimeAdapter {
       await checkpoint()
       return receipt
     })
+  }
+
+  bindNativeViewAdmission<Proof>(provider: (context: RuntimeViewAdmissionContext) => Promise<Proof>) {
+    if (this.#viewAdmissionBound) throw new Error("Native view admission binding immutable")
+    this.#viewAdmissionBound = true
+    return async (wireValue: NativeExecutionContext, operationValue: RuntimeViewOperation): Promise<Proof> => {
+      const wire = nativeExecutionContextSchema.parse(wireValue)
+      const operation = z.strictObject({ method: z.enum(["input.execute", "ax.press"]), actionKind: z.string().min(1).max(128).optional() }).parse(operationValue)
+      const entry = this.#journal.get(wire.operationId)
+      const checkpoint = async () => {
+        if (this.#storagePoisoned || this.#admissionSealed || entry === undefined || entry.session === undefined || entry.settled || !entry.adapterStarted
+          || canonicalRecoveryJson(entry.record.context) !== canonicalRecoveryJson(wire)
+          || !entry.record.resources.some(handle => handle.kind === "desktop-input")
+          || this.#nativeRecovery !== undefined && entry.record.nativeRecovery?.phase !== "send-authorized") {
+          throw new RuntimeContractError("unauthorized", "View admission требует exact active Core operation и durable send gate", "view-admission")
+        }
+        entry.controller.signal.throwIfAborted()
+        const now = this.#clock.now()
+        if (now.getTime() >= Date.parse(wire.deadlineAt)) throw new RuntimeContractError("deadline-exceeded", "View admission deadline", "view-admission")
+        await this.clients.assertActive(entry.session, now)
+        for (const handle of entry.record.resources) await this.resources.assertActive({ handle, operationId: wire.operationId,
+          clientSessionId: entry.session.clientSessionId, principalId: entry.session.principalId, ...this.generation, now })
+      }
+      await checkpoint()
+      const context: RuntimeViewAdmissionContext = Object.freeze({ wire: structuredClone(wire), session: structuredClone(entry!.session!),
+        lineageId: entry!.lineageId, operation: Object.freeze(operation), control: Object.freeze({ signal: entry!.controller.signal, checkpoint }) })
+      const proof = await provider(context)
+      await checkpoint()
+      return proof
+    }
   }
 
   async authorizeNativeMutation(wire: NativeExecutionContext | ClipboardExecutionContext, descriptorValue: NativeRecoveryDescriptor): Promise<NativeRecoveryGrant> {

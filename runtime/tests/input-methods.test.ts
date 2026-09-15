@@ -26,6 +26,16 @@ const generation = {
 }
 const nativeGeneration = "native:input-methods"
 
+test("pointer precondition разделяет fresh inventory и original capture provenance", () => {
+  const precondition = pointerInputPreconditionSchema.parse({
+    target: { kind: "window", ref: { ...generation, nativeGeneration, applicationRef: "app:original", windowRef: "window:original" } },
+    inventoryId: "inventory:current", inventoryRevision: 20,
+    observationRef: { observationId: "observation:original", inventoryRevision: 10, displayLayoutRevision: 3, proofRef: "proof:original" },
+  })
+  expect(precondition.inventoryRevision).toBe(20)
+  expect(precondition.observationRef.inventoryRevision).toBe(10)
+})
+
 function readyCapabilities() {
   const ready = new Set<CapabilityId>([
     "runtime.identity",

@@ -17,12 +17,6 @@ export type AgentViewObserver = Pick<
   "observerInstanceRef" | "coverage" | "subscribe"
 >
 
-export type AgentSyntheticOwner = {
-  operationId: string
-  lineageId: string
-  targetId: string
-}
-
 export type AgentViewTarget = Extract<AgentTarget, { kind: "window" | "surface" }>
 
 export type AgentObservationDraft = Readonly<{
@@ -36,17 +30,10 @@ export type AgentViewTicket = Readonly<{
   expiresAt: string
 }>
 
-export type AgentKeyboardContinuation = Readonly<{
-  targetId: string
-  previousOperationId: string
-  expiresAt: string
-}>
-
 export type AgentViewAdmissionProof = Readonly<{
   viewNonce: string
   targetId: string
   operationId: string
-  mode: "ui-action" | "keyboard-continuation"
   observerInstanceRef: string
   expectedCoverageStartCursor: string
   baselineCursor: string
@@ -65,18 +52,8 @@ export interface AgentViewScope {
   admit(
     ticket: AgentViewTicket,
     operationId: string,
-    mode: "ui-action" | "keyboard",
   ): Promise<AgentViewAdmissionProof>
   settleOperation(ticket: AgentViewTicket, operation: OperationRecord): Promise<void>
-  createKeyboardContinuation(
-    ticket: AgentViewTicket,
-    operation: OperationRecord,
-  ): Promise<AgentKeyboardContinuation>
-  admitKeyboardContinuation(
-    continuation: AgentKeyboardContinuation,
-    operationId: string,
-  ): Promise<AgentViewAdmissionProof>
-  finishKeyboardContinuation(continuation: AgentKeyboardContinuation): void
   invalidateView(ticket: AgentViewTicket, reason: string): void
 }
 
@@ -100,26 +77,12 @@ type ViewRecord = {
 type BoundOperation = {
   operationId: string
   record: ViewRecord
-  mode: "ui-action" | "keyboard"
-  admittedCursor: string
-  admittedNextSequence: number
-  sawEvent: boolean
-  eventKinds: Set<ObservedEvent["kind"]>
-  unrelatedEvent: boolean
-}
-
-type ContinuationRecord = {
-  continuationId: string
-  record: ViewRecord
-  previousOperationId: string
-  expiresAtMs: number
 }
 
 export type AgentViewGuardOptions = {
   generation: { runtimeEpoch: string, loginSessionId: string, nativeGeneration: string }
   observer: AgentViewObserver
   resolveTarget(lineageId: string, targetId: string): Promise<AgentTargetActionResolution> | AgentTargetActionResolution
-  syntheticOwner(event: ObservedEvent): Promise<AgentSyntheticOwner | false | undefined> | AgentSyntheticOwner | false | undefined
   clock?: RuntimeClock
   ids?: RuntimeIdSource
   ticketTtlMs?: number
@@ -135,7 +98,6 @@ export class AgentViewGuard {
   readonly #generation: AgentViewGuardOptions["generation"]
   readonly #observer: AgentViewObserver
   readonly #resolveTarget: AgentViewGuardOptions["resolveTarget"]
-  readonly #syntheticOwner: AgentViewGuardOptions["syntheticOwner"]
   readonly #clock: RuntimeClock
   readonly #ids: RuntimeIdSource
   readonly #ticketTtlMs: number
@@ -147,10 +109,8 @@ export class AgentViewGuard {
   readonly #records = new Map<string, ViewRecord>()
   readonly #current = new Map<string, string>()
   readonly #operations = new Map<string, BoundOperation>()
-  readonly #continuations = new Map<string, ContinuationRecord>()
   readonly #draftKeys = new WeakMap<AgentObservationDraft, string>()
   readonly #ticketKeys = new WeakMap<AgentViewTicket, string>()
-  readonly #continuationKeys = new WeakMap<AgentKeyboardContinuation, string>()
   readonly #readerAbort = new AbortController()
   #reader: Promise<void> | undefined
   #startPromise: Promise<void> | undefined
@@ -167,7 +127,6 @@ export class AgentViewGuard {
     this.#generation = Object.freeze({ ...options.generation })
     this.#observer = options.observer
     this.#resolveTarget = options.resolveTarget
-    this.#syntheticOwner = options.syntheticOwner
     this.#clock = options.clock ?? systemClock
     this.#ids = options.ids ?? randomIdSource
     this.#ticketTtlMs = limit(options.ticketTtlMs ?? 30_000, 1, 120_000, "view ticket TTL")
@@ -202,13 +161,8 @@ export class AgentViewGuard {
       beginObservation: (targetId, target) => this.#beginObservation(lineageId, targetId, target),
       commitObservation: draft => this.#commitObservation(lineageId, draft),
       cancelObservation: draft => this.#cancelObservation(lineageId, draft),
-      admit: (ticket, operationId, mode) => this.#admit(lineageId, ticket, operationId, mode),
-      settleOperation: (ticket, operation) => this.#settleOperation(lineageId, ticket, operation, false),
-      createKeyboardContinuation: (ticket, operation) =>
-        this.#createKeyboardContinuation(lineageId, ticket, operation),
-      admitKeyboardContinuation: (continuation, operationId) =>
-        this.#admitKeyboardContinuation(lineageId, continuation, operationId),
-      finishKeyboardContinuation: continuation => this.#finishKeyboardContinuation(lineageId, continuation),
+      admit: (ticket, operationId) => this.#admit(lineageId, ticket, operationId),
+      settleOperation: (ticket, operation) => this.#settleOperation(lineageId, ticket, operation),
       invalidateView: (ticket, reason) => this.#invalidateView(lineageId, ticket, reason),
     }
     return Object.freeze(scope)
@@ -219,7 +173,6 @@ export class AgentViewGuard {
     return Object.freeze({
       records: this.#records.size,
       operations: this.#operations.size,
-      continuations: this.#continuations.size,
       bytes: this.#usageBytes(),
     })
   }
@@ -302,7 +255,6 @@ export class AgentViewGuard {
     lineageId: string,
     ticket: AgentViewTicket,
     rawOperationId: string,
-    mode: "ui-action" | "keyboard",
   ): Promise<AgentViewAdmissionProof> {
     const record = this.#freshTicket(lineageId, ticket)
     const operationId = opaqueIdSchema.parse(rawOperationId)
@@ -312,15 +264,8 @@ export class AgentViewGuard {
     const binding: BoundOperation = {
       operationId,
       record,
-      mode,
-      admittedCursor: coverage.cursor,
-      admittedNextSequence: coverage.nextSequence,
-      sawEvent: false,
-      eventKinds: new Set(),
-      unrelatedEvent: false,
     }
-    for (const active of this.#operations.values()) active.unrelatedEvent = true
-    this.#invalidateViews(`View consumed by admitted ${mode}`)
+    this.#invalidateViews("View consumed by admitted action")
     this.#operations.set(operationId, binding)
     try {
       this.#assertCapacity(0)
@@ -329,123 +274,33 @@ export class AgentViewGuard {
       this.#operations.delete(operationId)
       throw error
     }
-    return this.#proof(record, binding, coverage, "ui-action", record.expiresAtMs)
+    return this.#proof(record, binding, coverage)
   }
 
   async #settleOperation(
     lineageId: string,
     ticket: AgentViewTicket,
     rawOperation: OperationRecord,
-    allowContinuation: boolean,
   ): Promise<void> {
     const record = this.#recordForTicket(lineageId, ticket)
     const operation = operationRecordSchema.parse(rawOperation)
     const binding = this.#operations.get(operation.context.operationId)
     if (binding === undefined || binding.record !== record) throw new Error("Operation не admitted этим view")
-    await this.#synchronize()
-    if (!structurallyEqual(operation.context.target, record.target)) {
-      binding.unrelatedEvent = true
-      this.#operations.delete(binding.operationId)
-      throw new Error("Terminal operation содержит другой exact target")
-    }
-    if (!positiveTerminal(operation)) {
-      binding.unrelatedEvent = true
-      this.#deleteContinuations(record)
-    }
-    if (!allowContinuation) this.#operations.delete(binding.operationId)
-  }
-
-  async #createKeyboardContinuation(
-    lineageId: string,
-    ticket: AgentViewTicket,
-    rawOperation: OperationRecord,
-  ): Promise<AgentKeyboardContinuation> {
-    const record = this.#recordForTicket(lineageId, ticket)
-    const operation = operationRecordSchema.parse(rawOperation)
-    await this.#settleOperation(lineageId, ticket, operation, true)
-    const binding = this.#operations.get(operation.context.operationId)!
-    this.#operations.delete(binding.operationId)
-    if (
-      binding.mode !== "keyboard"
-      || !positiveTerminal(operation)
-      || binding.unrelatedEvent
-      || !binding.sawEvent
-      || [...binding.eventKinds].some(kind => kind !== "input")
-    ) {
-      this.#deleteContinuations(record)
-      throw new Error("Keyboard continuation требует positive terminal exact-operation input events only")
-    }
-    this.#prune()
-    this.#assertCapacity(1)
-    const continuationId = this.#uniqueId("agent-keyboard-continuation")
-    const expiresAtMs = this.#clock.now().getTime() + this.#ticketTtlMs
-    const stored: ContinuationRecord = {
-      continuationId,
-      record,
-      previousOperationId: operation.context.operationId,
-      expiresAtMs,
-    }
-    this.#continuations.set(continuationId, stored)
-    try { this.#assertByteBudget() }
-    catch (error) { this.#continuations.delete(continuationId); throw error }
-    const continuation = Object.freeze({
-      targetId: record.targetId,
-      previousOperationId: stored.previousOperationId,
-      expiresAt: timestamp(expiresAtMs),
-    })
-    this.#continuationKeys.set(continuation, continuationId)
-    return continuation
-  }
-
-  async #admitKeyboardContinuation(
-    lineageId: string,
-    continuation: AgentKeyboardContinuation,
-    rawOperationId: string,
-  ): Promise<AgentViewAdmissionProof> {
-    const stored = this.#continuationFor(lineageId, continuation)
-    const operationId = opaqueIdSchema.parse(rawOperationId)
-    if (this.#operations.has(operationId)) throw new Error("Agent view operation уже admitted")
-    const coverage = await this.#synchronize()
-    if (this.#continuations.get(stored.continuationId) !== stored) {
-      throw new Error("Keyboard continuation invalidated observer event")
-    }
-    if (this.#clock.now().getTime() >= stored.expiresAtMs) {
-      this.#continuations.delete(stored.continuationId)
-      throw new Error("Keyboard continuation истёк")
-    }
-    const binding: BoundOperation = {
-      operationId,
-      record: stored.record,
-      mode: "keyboard",
-      admittedCursor: coverage.cursor,
-      admittedNextSequence: coverage.nextSequence,
-      sawEvent: false,
-      eventKinds: new Set(),
-      unrelatedEvent: false,
-    }
-    for (const active of this.#operations.values()) active.unrelatedEvent = true
-    this.#invalidateViews("View consumed by admitted keyboard continuation")
-    this.#continuations.delete(stored.continuationId)
-    this.#operations.set(operationId, binding)
     try {
-      this.#assertCapacity(0)
-      this.#assertByteBudget()
-    } catch (error) {
-      this.#operations.delete(operationId)
-      throw error
+      if (!structurallyEqual(operation.context.target, record.target)) {
+        throw new Error("Terminal operation содержит другой exact target")
+      }
+      if (!["rejected", "completed", "cancelled", "failed", "interrupted-unknown"].includes(operation.state)) {
+        throw new Error("Agent view operation ещё не terminal")
+      }
+    } finally {
+      this.#operations.delete(binding.operationId)
     }
-    return this.#proof(stored.record, binding, coverage, "keyboard-continuation", stored.expiresAtMs)
-  }
-
-  #finishKeyboardContinuation(lineageId: string, continuation: AgentKeyboardContinuation): void {
-    const stored = this.#continuationFor(lineageId, continuation)
-    this.#continuations.delete(stored.continuationId)
   }
 
   #invalidateView(lineageId: string, ticket: AgentViewTicket, rawReason: string): void {
     const record = this.#recordForTicket(lineageId, ticket)
     this.#invalidate(record, boundedReason(rawReason))
-    this.#deleteContinuations(record)
   }
 
   async #consume(events: AsyncIterable<ObservedEvent>): Promise<void> {
@@ -475,6 +330,10 @@ export class AgentViewGuard {
   }
 
   async #handleEvent(event: ObservedEvent): Promise<void> {
+    if (event.source === "synthetic") {
+      this.#invalidateAll(`Observer synthetic ${event.kind}`)
+      return
+    }
     if (event.kind === "lifecycle") {
       this.#invalidateAll(`Observer lifecycle ${event.lifecycle ?? "unknown"}`)
       return
@@ -487,56 +346,9 @@ export class AgentViewGuard {
       for (const record of this.#records.values()) {
         if (relevantStructure(record.target, event.target)) this.#invalidate(record, "Relevant window structure changed")
       }
-      for (const binding of this.#operations.values()) {
-        if (relevantStructure(binding.record.target, event.target)) binding.unrelatedEvent = true
-      }
-      this.#deleteContinuationsWhere(record => relevantStructure(record.target, event.target!))
       return
     }
-    if (event.source !== "synthetic") {
-      this.#invalidateAll(`Observer ${event.kind}/${event.source}`)
-      return
-    }
-    let owner: AgentSyntheticOwner | false | undefined
-    try {
-      owner = await withTimeout(
-        Promise.resolve(this.#syntheticOwner(event)),
-        this.#syncTimeoutMs,
-        "Synthetic owner classification timeout",
-      )
-    } catch {
-      owner = undefined
-    }
-    if (owner === false || owner === undefined) {
-      this.#invalidateAll("Synthetic event ownership не подтверждено")
-      return
-    }
-    const parsedOwner = {
-      operationId: opaqueIdSchema.parse(owner.operationId),
-      lineageId: opaqueIdSchema.parse(owner.lineageId),
-      targetId: opaqueIdSchema.parse(owner.targetId),
-    }
-    const binding = this.#operations.get(parsedOwner.operationId)
-    if (
-      binding === undefined
-      || binding.record.lineageId !== parsedOwner.lineageId
-      || binding.record.targetId !== parsedOwner.targetId
-    ) {
-      this.#invalidateAll("Synthetic event не совпал с admitted Core operation")
-      return
-    }
-    if (event.target !== undefined && !structurallyEqual(event.target, binding.record.target)) {
-      binding.unrelatedEvent = true
-      this.#invalidateAll("Synthetic event содержит foreign exact target")
-      return
-    }
-    binding.sawEvent = true
-    binding.eventKinds.add(event.kind)
-    for (const other of this.#operations.values()) {
-      if (other !== binding) other.unrelatedEvent = true
-    }
-    for (const record of this.#records.values()) this.#invalidate(record, "Synthetic UI action сделал view stale")
-    this.#continuations.clear()
+    this.#invalidateAll(`Observer ${event.kind}/${event.source}`)
   }
 
   async #synchronize(): Promise<ObserverCoverage> {
@@ -613,8 +425,6 @@ export class AgentViewGuard {
     record: ViewRecord,
     binding: BoundOperation,
     coverage: ObserverCoverage,
-    mode: AgentViewAdmissionProof["mode"],
-    expiresAtMs: number,
   ): AgentViewAdmissionProof {
     if (record.observedCursor === undefined || record.observedNextSequence === undefined) {
       throw new Error("View observation watermark отсутствует")
@@ -625,7 +435,6 @@ export class AgentViewGuard {
       viewNonce: record.viewNonce,
       targetId: record.targetId,
       operationId: binding.operationId,
-      mode,
       observerInstanceRef: this.#observer.observerInstanceRef,
       expectedCoverageStartCursor: this.#coverageStartCursor!,
       baselineCursor: record.baselineCursor,
@@ -634,7 +443,7 @@ export class AgentViewGuard {
       observedNextSequence: record.observedNextSequence,
       admissionCursor: coverage.cursor,
       admissionNextSequence: coverage.nextSequence,
-      expiresAt: timestamp(expiresAtMs),
+      expiresAt: timestamp(record.expiresAtMs),
     })
   }
 
@@ -674,15 +483,6 @@ export class AgentViewGuard {
     return record
   }
 
-  #continuationFor(lineageId: string, continuation: AgentKeyboardContinuation): ContinuationRecord {
-    const key = this.#continuationKeys.get(continuation)
-    const stored = key === undefined ? undefined : this.#continuations.get(key)
-    if (stored === undefined || stored.record.lineageId !== lineageId || stored.record.targetId !== continuation.targetId) {
-      throw new Error("Keyboard continuation не принадлежит этой lineage")
-    }
-    return stored
-  }
-
   #invalidate(record: ViewRecord, reason: string): void {
     if (record.state === "stale") return
     record.state = "stale"
@@ -694,22 +494,10 @@ export class AgentViewGuard {
 
   #invalidateAll(reason: string): void {
     this.#invalidateViews(reason)
-    for (const binding of this.#operations.values()) binding.unrelatedEvent = true
   }
 
   #invalidateViews(reason: string): void {
     for (const record of this.#records.values()) this.#invalidate(record, reason)
-    this.#continuations.clear()
-  }
-
-  #deleteContinuations(record: ViewRecord): void {
-    this.#deleteContinuationsWhere(candidate => candidate === record)
-  }
-
-  #deleteContinuationsWhere(predicate: (record: ViewRecord) => boolean): void {
-    for (const [id, continuation] of this.#continuations) {
-      if (predicate(continuation.record)) this.#continuations.delete(id)
-    }
   }
 
   #terminal(error: unknown, prefix: string): void {
@@ -725,18 +513,14 @@ export class AgentViewGuard {
     for (const record of this.#records.values()) {
       if (record.state !== "stale" && now >= record.expiresAtMs) this.#invalidate(record, "Agent view ticket истёк")
     }
-    for (const [id, continuation] of this.#continuations) {
-      if (now >= continuation.expiresAtMs) this.#continuations.delete(id)
-    }
     const retainedRecords = new Set([...this.#operations.values()].map(operation => operation.record))
-    for (const continuation of this.#continuations.values()) retainedRecords.add(continuation.record)
     for (const [id, record] of this.#records) {
       if (record.state === "stale" && now >= record.retainUntilMs && !retainedRecords.has(record)) this.#records.delete(id)
     }
   }
 
   #assertCapacity(additional: number): void {
-    if (this.#records.size + this.#operations.size + this.#continuations.size + additional > this.#maxRecords) {
+    if (this.#records.size + this.#operations.size + additional > this.#maxRecords) {
       throw new Error("Agent view record capacity исчерпана")
     }
   }
@@ -754,26 +538,14 @@ export class AgentViewGuard {
     const operations = [...this.#operations.values()].map(binding => ({
       operationId: binding.operationId,
       viewNonce: binding.record.viewNonce,
-      mode: binding.mode,
-      admittedCursor: binding.admittedCursor,
-      admittedNextSequence: binding.admittedNextSequence,
-      sawEvent: binding.sawEvent,
-      eventKinds: [...binding.eventKinds],
-      unrelatedEvent: binding.unrelatedEvent,
     }))
-    const continuations = [...this.#continuations.values()].map(item => ({
-      continuationId: item.continuationId,
-      viewNonce: item.record.viewNonce,
-      previousOperationId: item.previousOperationId,
-      expiresAtMs: item.expiresAtMs,
-    }))
-    return Buffer.byteLength(canonicalJson({ records, operations, continuations }), "utf8")
+    return Buffer.byteLength(canonicalJson({ records, operations }), "utf8")
   }
 
   #uniqueId(prefix: string): string {
     for (let attempt = 0; attempt < 8; attempt++) {
       const value = opaqueIdSchema.parse(this.#ids.next(prefix))
-      if (!this.#records.has(value) && !this.#operations.has(value) && !this.#continuations.has(value)) return value
+      if (!this.#records.has(value) && !this.#operations.has(value)) return value
     }
     throw new Error(`Не удалось выдать unique ${prefix}`)
   }
@@ -810,14 +582,6 @@ function relevantStructure(left: AgentViewTarget, right: ObservedEvent["target"]
   if (left.kind === "window" && right.kind === "surface") return right.ref.ownerWindowRef === left.ref.windowRef
   if (left.kind === "surface" && right.kind === "window") return left.ref.ownerWindowRef === right.ref.windowRef
   return left.kind === "window" || left.kind === "surface"
-}
-
-function positiveTerminal(operation: OperationRecord): boolean {
-  return operation.state === "completed"
-    && operation.outcome.dispatch === "finished"
-    && operation.outcome.targetVerified === "verified"
-    && operation.outcome.cleanup.state === "complete"
-    && operation.outcome.userInterference === "none-observed"
 }
 
 function viewKey(lineageId: string, targetId: string): string {

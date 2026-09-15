@@ -5,7 +5,7 @@ import {
   type ObserverCoverage,
   type OperationRecord,
 } from "@meta/shared/contracts"
-import { AgentViewGuard, type AgentSyntheticOwner, type AgentViewObserver, type AgentViewTarget } from "../src/agent-view-guard.ts"
+import { AgentViewGuard, type AgentViewObserver, type AgentViewTarget } from "../src/agent-view-guard.ts"
 
 const generation = {
   runtimeEpoch: "runtime:view",
@@ -18,12 +18,11 @@ test("fresh observe выдаёт explicit Native admission proof и однора
   const value = fixture()
   const scope = value.guard.forLineage("lineage:view")
   const ticket = await observe(value, "lineage:view", "target:view", target)
-  const proof = await scope.admit(ticket, "operation:view", "ui-action")
+  const proof = await scope.admit(ticket, "operation:view")
   expect(proof).toEqual({
     viewNonce: "agent-view:1",
     targetId: "target:view",
     operationId: "operation:view",
-    mode: "ui-action",
     observerInstanceRef: "observer:view",
     expectedCoverageStartCursor: "observer:view:start",
     baselineCursor: "observer:view:start",
@@ -34,7 +33,10 @@ test("fresh observe выдаёт explicit Native admission proof и однора
     admissionNextSequence: 1,
     expiresAt: "2026-09-15T10:00:30.000Z",
   })
-  await expect(scope.admit(ticket, "operation:replay", "ui-action")).rejects.toThrow("consumed")
+  await expect(scope.admit(ticket, "operation:replay")).rejects.toThrow("consumed")
+  await scope.settleOperation(ticket, operation("operation:view", target, "completed"))
+  const next = await observe(value, "lineage:view", "target:view", target)
+  await expect(scope.admit(next, "operation:view:next")).resolves.toMatchObject({ operationId: "operation:view:next" })
   await value.guard.close()
 })
 
@@ -49,18 +51,18 @@ test("external input, focus, relevant structure и lifecycle инвалидир�
     const scope = value.guard.forLineage("lineage:event")
     const ticket = await observe(value, "lineage:event", "target:event", target)
     value.observer.push(event)
-    await expect(scope.admit(ticket, "operation:event", "ui-action")).rejects.toThrow()
+    await expect(scope.admit(ticket, "operation:event")).rejects.toThrow()
     await value.guard.close()
   }
 })
 
-test("false synthetic ownership и other-lineage action инвалидируют latch", async () => {
-  const unowned = fixture()
-  const unownedScope = unowned.guard.forLineage("lineage:unowned")
-  const unownedTicket = await observe(unowned, "lineage:unowned", "target:unowned", target)
-  unowned.observer.push({ kind: "input", source: "synthetic", syntheticTag: "synthetic:false" })
-  await expect(unownedScope.admit(unownedTicket, "operation:after-false", "ui-action")).rejects.toThrow()
-  await unowned.guard.close()
+test("own synthetic event и action admission инвалидируют все fresh views", async () => {
+  const synthetic = fixture()
+  const syntheticScope = synthetic.guard.forLineage("lineage:synthetic")
+  const syntheticTicket = await observe(synthetic, "lineage:synthetic", "target:synthetic", target)
+  synthetic.observer.push({ kind: "input", source: "synthetic", syntheticTag: "synthetic:own" })
+  await expect(syntheticScope.admit(syntheticTicket, "operation:after-synthetic")).rejects.toThrow()
+  await synthetic.guard.close()
 
   const value = fixture()
   const first = value.guard.forLineage("lineage:first")
@@ -68,17 +70,9 @@ test("false synthetic ownership и other-lineage action инвалидируют
   const firstTicket = await observe(value, "lineage:first", "target:first", target)
   const secondTicket = await observe(value, "lineage:second", "target:second", windowTarget("window:second"))
   const siblingTicket = await observe(value, "lineage:first", "target:sibling", windowTarget("window:sibling"))
-  await first.admit(firstTicket, "operation:first", "ui-action")
-  await expect(second.admit(secondTicket, "operation:second-before-event", "ui-action")).rejects.toThrow("consumed")
-  await expect(first.admit(siblingTicket, "operation:sibling-before-event", "ui-action")).rejects.toThrow("consumed")
-  value.owners.set("synthetic:first", {
-    operationId: "operation:first",
-    lineageId: "lineage:first",
-    targetId: "target:first",
-  })
-  value.observer.push({ kind: "input", source: "synthetic", syntheticTag: "synthetic:first" })
-  await expect(second.admit(secondTicket, "operation:second", "ui-action")).rejects.toThrow()
-  await expect(first.admit(siblingTicket, "operation:sibling", "ui-action")).rejects.toThrow()
+  await first.admit(firstTicket, "operation:first")
+  await expect(second.admit(secondTicket, "operation:second")).rejects.toThrow("consumed")
+  await expect(first.admit(siblingTicket, "operation:sibling")).rejects.toThrow("consumed")
   await value.guard.close()
 })
 
@@ -92,7 +86,7 @@ test("old draft и ticket cancellation не затрагивают новый su
   const nextDraft = await scope.beginObservation("target:replacement", target)
   const nextTicket = await scope.commitObservation(nextDraft)
   scope.invalidateView(oldTicket, "Old caller cancelled")
-  await expect(scope.admit(nextTicket, "operation:replacement", "ui-action")).resolves.toMatchObject({
+  await expect(scope.admit(nextTicket, "operation:replacement")).resolves.toMatchObject({
     targetId: "target:replacement",
   })
   await value.guard.close()
@@ -102,7 +96,7 @@ test("terminal operation с foreign exact target отвергается", async 
   const value = fixture()
   const scope = value.guard.forLineage("lineage:terminal-target")
   const ticket = await observe(value, "lineage:terminal-target", "target:terminal-target", target)
-  await scope.admit(ticket, "operation:terminal-target", "ui-action")
+  await scope.admit(ticket, "operation:terminal-target")
   await expect(scope.settleOperation(
     ticket,
     operation("operation:terminal-target", windowTarget("window:foreign"), "completed"),
@@ -110,7 +104,7 @@ test("terminal operation с foreign exact target отвергается", async 
   await value.guard.close()
 })
 
-test("target binding, synthetic event target и terminal verification проверяются независимо", async () => {
+test("targetId и exact target независимо проверяются trusted registry resolver", async () => {
   const mismatched = fixture()
   const mismatchScope = mismatched.guard.forLineage("lineage:mismatch")
   mismatched.bind("lineage:mismatch", "target:a", target)
@@ -119,120 +113,6 @@ test("target binding, synthetic event target и terminal verification прове
     windowTarget("window:b"),
   )).rejects.toThrow("trusted exact target binding")
   await mismatched.guard.close()
-
-  const foreignEvent = fixture()
-  const foreignScope = foreignEvent.guard.forLineage("lineage:foreign-event")
-  const foreignTicket = await observe(foreignEvent, "lineage:foreign-event", "target:foreign-event", target)
-  await foreignScope.admit(foreignTicket, "operation:foreign-event", "keyboard")
-  foreignEvent.owners.set("synthetic:foreign-target", {
-    operationId: "operation:foreign-event",
-    lineageId: "lineage:foreign-event",
-    targetId: "target:foreign-event",
-  })
-  foreignEvent.observer.push({
-    kind: "input",
-    source: "synthetic",
-    syntheticTag: "synthetic:foreign-target",
-    target: windowTarget("window:b"),
-  })
-  await expect(foreignScope.createKeyboardContinuation(
-    foreignTicket,
-    operation("operation:foreign-event", target, "completed"),
-  )).rejects.toThrow("positive terminal")
-  await foreignEvent.guard.close()
-
-  const unverified = fixture()
-  const unverifiedScope = unverified.guard.forLineage("lineage:unverified")
-  const unverifiedTicket = await observe(unverified, "lineage:unverified", "target:unverified", target)
-  await unverifiedScope.admit(unverifiedTicket, "operation:unverified", "keyboard")
-  unverified.owners.set("synthetic:unverified", {
-    operationId: "operation:unverified",
-    lineageId: "lineage:unverified",
-    targetId: "target:unverified",
-  })
-  unverified.observer.push({ kind: "input", source: "synthetic", syntheticTag: "synthetic:unverified", target })
-  await expect(unverifiedScope.createKeyboardContinuation(
-    unverifiedTicket,
-    operation("operation:unverified", target, "completed", "unknown"),
-  )).rejects.toThrow("positive terminal")
-  await unverified.guard.close()
-})
-
-test("keyboard continuation требует exact positive terminal Core operation и own input events only", async () => {
-  const value = fixture()
-  const scope = value.guard.forLineage("lineage:keyboard")
-  const ticket = await observe(value, "lineage:keyboard", "target:keyboard", target)
-  await scope.admit(ticket, "operation:keyboard:1", "keyboard")
-  value.owners.set("synthetic:keyboard:1", {
-    operationId: "operation:keyboard:1",
-    lineageId: "lineage:keyboard",
-    targetId: "target:keyboard",
-  })
-  value.observer.push({ kind: "input", source: "synthetic", syntheticTag: "synthetic:keyboard:1" })
-  const continuation = await scope.createKeyboardContinuation(
-    ticket,
-    operation("operation:keyboard:1", target, "completed"),
-  )
-  const proof = await scope.admitKeyboardContinuation(continuation, "operation:keyboard:2")
-  expect(proof).toMatchObject({
-    operationId: "operation:keyboard:2",
-    mode: "keyboard-continuation",
-    observerInstanceRef: "observer:view",
-    admissionCursor: "observer:view:start:s1",
-    admissionNextSequence: 2,
-  })
-  await value.guard.close()
-})
-
-test("failed, unknown и non-input keyboard results не создают continuation", async () => {
-  for (const state of ["failed", "interrupted-unknown", "cancelled"] as const) {
-    const value = fixture()
-    const scope = value.guard.forLineage(`lineage:${state}`)
-    const ticket = await observe(value, `lineage:${state}`, `target:${state}`, target)
-    const operationId = `operation:${state}`
-    await scope.admit(ticket, operationId, "keyboard")
-    const syntheticTag = `synthetic:${state}`
-    value.owners.set(syntheticTag, { operationId, lineageId: `lineage:${state}`, targetId: `target:${state}` })
-    value.observer.push({ kind: "input", source: "synthetic", syntheticTag })
-    await expect(scope.createKeyboardContinuation(ticket, operation(operationId, target, state))).rejects.toThrow("positive terminal")
-    await value.guard.close()
-  }
-
-  const focus = fixture()
-  const scope = focus.guard.forLineage("lineage:focus")
-  const ticket = await observe(focus, "lineage:focus", "target:focus", target)
-  await scope.admit(ticket, "operation:focus", "keyboard")
-  focus.owners.set("synthetic:focus", {
-    operationId: "operation:focus",
-    lineageId: "lineage:focus",
-    targetId: "target:focus",
-  })
-  focus.observer.push({ kind: "focus", source: "synthetic", syntheticTag: "synthetic:focus", target })
-  await expect(scope.createKeyboardContinuation(
-    ticket,
-    operation("operation:focus", target, "completed"),
-  )).rejects.toThrow("input events only")
-  await focus.guard.close()
-})
-
-test("event между continuation lookup и admission инвалидирует continuation", async () => {
-  const value = fixture()
-  const scope = value.guard.forLineage("lineage:race")
-  const ticket = await observe(value, "lineage:race", "target:race", target)
-  await scope.admit(ticket, "operation:race:1", "keyboard")
-  value.owners.set("synthetic:race:1", {
-    operationId: "operation:race:1",
-    lineageId: "lineage:race",
-    targetId: "target:race",
-  })
-  value.observer.push({ kind: "input", source: "synthetic", syntheticTag: "synthetic:race:1" })
-  const continuation = await scope.createKeyboardContinuation(
-    ticket,
-    operation("operation:race:1", target, "completed"),
-  )
-  value.observer.push({ kind: "input", source: "external-user" })
-  await expect(scope.admitKeyboardContinuation(continuation, "operation:race:2")).rejects.toThrow("invalidated")
-  await value.guard.close()
 })
 
 test("foreign lineage/ticket, expiry, gap, EOF и history loss fail closed", async () => {
@@ -240,16 +120,16 @@ test("foreign lineage/ticket, expiry, gap, EOF и history loss fail closed", asy
   const owner = value.guard.forLineage("lineage:owner")
   const foreign = value.guard.forLineage("lineage:foreign")
   const ticket = await observe(value, "lineage:owner", "target:owner", target)
-  await expect(foreign.admit(ticket, "operation:foreign", "ui-action")).rejects.toThrow("этой lineage")
+  await expect(foreign.admit(ticket, "operation:foreign")).rejects.toThrow("этой lineage")
   value.advance(11)
-  await expect(owner.admit(ticket, "operation:expired", "ui-action")).rejects.toThrow("истёк")
+  await expect(owner.admit(ticket, "operation:expired")).rejects.toThrow("истёк")
   await value.guard.close()
 
   const gap = fixture()
   const gapScope = gap.guard.forLineage("lineage:gap")
   const gapTicket = await observe(gap, "lineage:gap", "target:gap", target)
   gap.observer.gap()
-  await expect(gapScope.admit(gapTicket, "operation:gap", "ui-action")).rejects.toThrow("healthy continuous")
+  await expect(gapScope.admit(gapTicket, "operation:gap")).rejects.toThrow("healthy continuous")
   await gap.guard.close()
 
   const eof = fixture()
@@ -257,7 +137,7 @@ test("foreign lineage/ticket, expiry, gap, EOF и history loss fail closed", asy
   const eofTicket = await observe(eof, "lineage:eof", "target:eof", target)
   eof.observer.end()
   await Bun.sleep(0)
-  await expect(eofScope.admit(eofTicket, "operation:eof", "ui-action")).rejects.toThrow("EOF")
+  await expect(eofScope.admit(eofTicket, "operation:eof")).rejects.toThrow("EOF")
   await eof.guard.close()
 
   const history = fixture({ rejectSubscribe: true })
@@ -276,7 +156,7 @@ test("records и bytes bounded, admitted operation удерживает consumed
   const retained = fixture({ maxRecords: 2 })
   const retainedScope = retained.guard.forLineage("lineage:retained")
   const ticket = await observe(retained, "lineage:retained", "target:retained", target)
-  await retainedScope.admit(ticket, "operation:retained", "ui-action")
+  await retainedScope.admit(ticket, "operation:retained")
   retained.advance(400_000)
   expect(retained.guard.stats()).toMatchObject({ records: 1, operations: 1 })
   await retainedScope.settleOperation(ticket, operation("operation:retained", target, "completed"))
@@ -417,7 +297,6 @@ function fixture(options: {
 } = {}) {
   let nowMs = Date.parse("2026-09-15T10:00:00.000Z")
   let id = 0
-  const owners = new Map<string, AgentSyntheticOwner>()
   const bindings = new Map<string, AgentViewTarget>()
   const observer = new FakeObserver(() => new Date(nowMs), options.rejectSubscribe)
   const guard = new AgentViewGuard({
@@ -434,7 +313,6 @@ function fixture(options: {
         actionExpiresAt: "2026-09-15T10:02:00.000Z",
       }
     },
-    syntheticOwner: event => event.syntheticTag === undefined ? false : owners.get(event.syntheticTag) ?? false,
     clock: { now: () => new Date(nowMs) },
     ids: { next: prefix => `${prefix}:${++id}` },
     ticketTtlMs: options.ticketTtlMs,
@@ -444,7 +322,6 @@ function fixture(options: {
   return {
     guard,
     observer,
-    owners,
     bind(lineageId: string, targetId: string, exactTarget: AgentViewTarget) {
       bindings.set(bindingKey(lineageId, targetId), exactTarget)
     },
@@ -483,7 +360,6 @@ function operation(
   operationId: string,
   exactTarget: AgentViewTarget,
   state: "completed" | "failed" | "cancelled" | "interrupted-unknown",
-  targetVerified: "verified" | "unknown" = "verified",
 ): OperationRecord {
   const completed = state === "completed"
   return operationRecordSchema.parse({
@@ -506,7 +382,7 @@ function operation(
     state,
     outcome: {
       dispatch: completed ? "finished" : state === "failed" ? "partial" : "unknown",
-      targetVerified,
+      targetVerified: "verified",
       userInterference: completed ? "none-observed" : "unknown",
       observation: "unavailable",
       effect: { state: "unverified", proofRefs: [] },

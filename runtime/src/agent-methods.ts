@@ -1,6 +1,8 @@
 import {
   browserOperationResources,
   structurallyEqual,
+  observationSchema,
+  type Observation,
   z,
   type AdapterResult,
   type BrowserInstanceRecord,
@@ -18,6 +20,8 @@ import type { RuntimeCore } from "./core.ts"
 import type { MethodRegistry, RuntimeMethodResponse } from "./method-registry.ts"
 import { AgentOperations, type AgentMutationContext } from "./agent-operations.ts"
 import { AgentTargetRegistry, type AgentTargetActionResolution, type AgentTargetScope } from "./agent-targets.ts"
+import { canonicalJson } from "./primitives.ts"
+import type { AgentViewBindings } from "./agent-view-bindings.ts"
 
 export const agentTargetIdSchema = z.string().min(1).max(127)
 const targetId = agentTargetIdSchema
@@ -112,6 +116,7 @@ export type AgentMethodsOptions = {
   now?: () => Date
   ids?: (prefix: string) => string
   operations?: AgentOperations
+  views?: Pick<AgentViewBindings, "observe" | "run">
 }
 
 /** Композирует короткие agent DTO только через уже зарегистрированные runtime methods. */
@@ -121,9 +126,10 @@ export class RuntimeAgentMethods {
   readonly #targets: AgentTargetRegistry
   readonly #now: () => Date
   readonly #ids: (prefix: string) => string
+  readonly #views?: Pick<AgentViewBindings, "observe" | "run">
   readonly operations: AgentOperations
   readonly #frames = new Map<string, string>()
-  readonly #observations = new Map<string, unknown>()
+  readonly #observations = new Map<string, { imageId: string, observation: Observation }>()
 
   constructor(registry: MethodRegistry, core: RuntimeCore, targets: AgentTargetRegistry, options: AgentMethodsOptions = {}) {
     this.#registry = registry
@@ -131,6 +137,7 @@ export class RuntimeAgentMethods {
     this.#targets = targets
     this.#now = options.now ?? (() => new Date())
     this.#ids = options.ids ?? (prefix => `${prefix}:${crypto.randomUUID()}`)
+    this.#views = options.views
     this.operations = options.operations ?? new AgentOperations({ runtime: core, targets })
   }
 
@@ -264,7 +271,7 @@ export class RuntimeAgentMethods {
         errors.push(publicError("list_windows", error))
       }
     }
-    const chromeAvailable = this.#registry.descriptors().tools.some(tool => tool.name === "browser_chrome_instances")
+    const chromeAvailable = this.#registry.internal.descriptors().tools.some(tool => tool.name === "browser_chrome_instances")
     if (chromeAvailable && input.kind !== "window" && input.app === undefined && input.pid === undefined) {
       try {
         const response = await this.#dispatch(session, "browser_chrome_instances", {}, signal)
@@ -365,6 +372,7 @@ export class RuntimeAgentMethods {
 
   async #showWindow(session: RuntimeClientSession, targetIdValue: string, signal: AbortSignal) {
     await this.#health(session, signal)
+    this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
     const show = this.operations.runTrackedMutation(session, targetIdValue, "show-window-show",
       context => this.#transitionWindow(session, targetIdValue, "show", context), signal)
     await Promise.resolve()
@@ -373,6 +381,10 @@ export class RuntimeAgentMethods {
     await Promise.all([show, focus])
     const scope = this.#scope(session)
     const fresh = await this.#refreshWindow(session, scope, targetIdValue, scope.resolveAction(targetIdValue), signal)
+    if (this.#views !== undefined && fresh.selected.target.kind === "window") {
+      return this.#views.observe(session, targetIdValue, fresh.selected.target,
+        () => this.#inspectWindow(session, scope, targetIdValue, fresh.selected, signal), result => result.complete)
+    }
     return this.#inspectWindow(session, scope, targetIdValue, fresh.selected, signal)
   }
 
@@ -384,6 +396,25 @@ export class RuntimeAgentMethods {
   ): Promise<AgentTargetActionResolution> {
     await this.#health(session, signal)
     return (await this.#refreshWindow(session, this.#scope(session), targetIdValue, binding, signal)).selected
+  }
+
+  async getLatestObservation(session: RuntimeClientSession, targetIdValue: string): Promise<{ imageId: string, observation: Observation }> {
+    await this.#core.clients.assertActive(session, this.#now())
+    const lineage = this.#core.clients.lineage(session)
+    const target = this.#scope(session).resolveAction(targetIdValue)
+    const stored = this.#observations.get(canonicalJson([lineage, targetIdValue]))
+    if (stored === undefined || !structurallyEqual(stored.observation.captureTarget, target.target)
+      || this.#now().getTime() >= Date.parse(stored.observation.expiresAt)
+      || !this.#core.frames.hasVerified(stored.observation.image.frameRef, stored.observation.image.sha256)) {
+      throw new Error("Latest owned screenshot отсутствует, истёк или относится к другому target")
+    }
+    return structuredClone(stored)
+  }
+
+  withViewAction<T>(session: RuntimeClientSession, targetIdValue: string, clientRequestId: string,
+    mode: "ui-action" | "keyboard", action: () => Promise<T>): Promise<T> {
+    if (this.#views === undefined) throw new Error("Protected agent action требует configured view admission")
+    return this.#views.run(session, targetIdValue, clientRequestId, mode, action)
   }
 
   async #transitionWindow(
@@ -413,11 +444,13 @@ export class RuntimeAgentMethods {
     await this.#health(session, signal)
     const scope = this.#scope(session)
     const selected = scope.resolveAction(targetIdValue)
+    this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
     if (selected.target.kind === "browser-target") {
       return this.#observeBrowser(session, scope, targetIdValue, selected, mode, caption, signal)
     }
     if (selected.target.kind !== "window") throw new Error("observe поддерживает window или browser target")
     const fresh = await this.#refreshWindow(session, scope, targetIdValue, selected, signal)
+    const capture = async () => {
     const ax = mode === "screenshot" ? undefined : await this.#inspectWindow(session, scope, targetIdValue, fresh.selected, signal)
     const screenshot = mode === "ax" ? undefined : await this.#captureWindow(session, targetIdValue, fresh, caption!, signal)
     if (mode === "screenshot") scope.invalidateElements(targetIdValue)
@@ -429,6 +462,16 @@ export class RuntimeAgentMethods {
       elements: ax?.elements ?? [],
       ...(screenshot === undefined ? {} : screenshot),
     })
+    }
+    if (this.#views !== undefined && fresh.selected.target.kind === "window") {
+      try { return await this.#views.observe(session, targetIdValue, fresh.selected.target, capture, result => result.complete) }
+      catch (error) {
+        scope.invalidateElements(targetIdValue)
+        this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
+        throw error
+      }
+    }
+    return capture()
   }
 
   async #observeBrowser(
@@ -495,7 +538,7 @@ export class RuntimeAgentMethods {
       }
       const imageId = this.#ids("agent-image")
       this.#frames.set(imageId, responseFrameRefs[0])
-      this.#observations.set(`${this.#core.clients.lineage(session)}:${targetIdValue}`, structuredClone(capture.observation))
+      this.#observations.set(canonicalJson([this.#core.clients.lineage(session), targetIdValue]), { imageId, observation: observationSchema.parse(capture.observation) })
       this.#pruneFrames()
       this.#pruneObservations()
       screenshot = { imageId, width: capture.observation.image.widthPx, height: capture.observation.image.heightPx }
@@ -603,7 +646,7 @@ export class RuntimeAgentMethods {
     const observation = capture.result.value.observation
     const imageId = this.#ids("agent-image")
     this.#frames.set(imageId, response.frameRefs[0]!)
-    this.#observations.set(`${this.#core.clients.lineage(session)}:${targetIdValue}`, structuredClone(observation))
+    this.#observations.set(canonicalJson([this.#core.clients.lineage(session), targetIdValue]), { imageId, observation: observationSchema.parse(observation) })
     this.#pruneFrames()
     this.#pruneObservations()
     const errors = observation.unavailableReasons.map(message => ({ stage: "window-capture", message }))
@@ -668,7 +711,7 @@ export class RuntimeAgentMethods {
     signal: AbortSignal,
   ): Promise<RuntimeMethodResponse> {
     signal.throwIfAborted()
-    const response = await this.#registry.dispatch(session, name, input, signal)
+    const response = await this.#registry.internal.dispatch(session, name, input, signal)
     if (response.isError) throw new Error(`Internal runtime method ${name} failed`)
     return response
   }

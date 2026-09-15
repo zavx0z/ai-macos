@@ -212,7 +212,7 @@ export class RuntimeAgentActionMethods {
     signal: AbortSignal,
   ): Promise<RuntimeMethodResponse> {
     signal.throwIfAborted()
-    const response = await this.registry.dispatch(session, name, input, signal)
+    const response = await this.registry.internal.dispatch(session, name, input, signal)
     if (response.isError) throw new Error(`Internal runtime method ${name} failed`)
     return response
   }

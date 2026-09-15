@@ -48,14 +48,6 @@ export const pointerInputPreconditionSchema = z.strictObject({
   inventoryId: opaqueIdSchema,
   inventoryRevision: z.number().int().safe().min(0),
   observationRef: observationRefSchema,
-}).superRefine((precondition, context) => {
-  if (precondition.inventoryRevision !== precondition.observationRef.inventoryRevision) {
-    context.addIssue({
-      code: "custom",
-      path: ["observationRef", "inventoryRevision"],
-      message: "Pointer target и observation должны ссылаться на одну inventory revision",
-    })
-  }
 })
 
 export const keyboardInputPreconditionSchema = z.strictObject({
