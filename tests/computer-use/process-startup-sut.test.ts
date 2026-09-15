@@ -42,8 +42,13 @@ test("A02: два actual MCP subprocess используют один RuntimeHos
     const starts = await Promise.all(managedHosts.map(readJsonLine))
     expect(starts.map((start) => start.state).sort()).toEqual(["blocked", "ready"])
     const winnerIndex = starts.findIndex((start) => start.state === "ready")
-    winner = managedHosts[winnerIndex]
+    if (winnerIndex < 0) throw new Error("RuntimeHost winner отсутствует")
+    const selectedWinner = managedHosts[winnerIndex]
     const loser = managedHosts[1 - winnerIndex]
+    if (selectedWinner === undefined || loser === undefined) {
+      throw new Error("RuntimeHost process pair неполон")
+    }
+    winner = selectedWinner
     expect(await loser.exited).toBe(23)
     expect((await readFile(nativeStartMarker, "utf8")).trim().split("\n")).toHaveLength(1)
     expect((await stat(directory)).mode & 0o777).toBe(0o700)
@@ -69,8 +74,8 @@ test("A02: два actual MCP subprocess используют один RuntimeHos
     })
 
     await cleanupConnections(managedConnections)
-    winner.kill("SIGTERM")
-    expect(await winner.exited).toBe(0)
+    selectedWinner.kill("SIGTERM")
+    expect(await selectedWinner.exited).toBe(0)
     winner = undefined
 
     const foreign = Bun.serve({
