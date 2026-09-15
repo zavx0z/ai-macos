@@ -28,10 +28,10 @@ test("полный Native handshake не объявляет отсутствую
   expect(capabilityIsReady(preparing, "runtime.user-interference")).toBe(false)
   expect(capabilityIsReady(ready, "input.keyboard")).toBe(true)
   expect(capabilityIsReady(ready, "runtime.user-interference")).toBe(true)
-  for (const id of ["capture.desktop", "capture.window", "capture.observation", "desktop.application.lifecycle"] as const) {
+  for (const id of ["capture.desktop", "capture.window", "capture.observation", "desktop.application.lifecycle", "input.readiness"] as const) {
     expect(capabilityIsReady(ready, id)).toBe(true)
   }
-  for (const id of ["input.readiness", "input.interaction", "input.pointer", "input.drag"] as const) {
+  for (const id of ["input.interaction", "input.pointer", "input.drag"] as const) {
     expect(capabilityIsReady(ready, id)).toBe(false)
   }
 })

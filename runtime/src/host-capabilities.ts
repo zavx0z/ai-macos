@@ -7,7 +7,7 @@ const implementedNative: readonly CapabilityId[] = [
   "desktop.applications", "desktop.windows.all", "desktop.displays", "input.clipboard",
   "desktop.window.identity", "desktop.window.show", "desktop.window.lifecycle", "desktop.ax",
   "desktop.application.lifecycle",
-  "capture.desktop", "capture.window", "capture.observation", "input.keyboard",
+  "capture.desktop", "capture.window", "capture.observation", "input.keyboard", "input.readiness",
 ]
 const browserCapabilities: readonly CapabilityId[] = [
   "browser.instances", "browser.targets", "browser.observe", "browser.readiness", "browser.resources", "android.chrome",

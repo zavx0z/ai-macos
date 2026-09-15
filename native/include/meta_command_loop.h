@@ -24,6 +24,8 @@
 - (NSDictionary *)executeApplication:(NSDictionary *)request job:(MetaInputJob *)job;
 - (BOOL)beginRotation;
 @optional
+- (NSArray<NSDictionary *> *)capabilityCatalog;
+- (NSDictionary *)executeReadiness:(NSDictionary *)request job:(MetaInputJob *)job;
 - (NSDictionary *)heldRecovery:(NSDictionary *)request owner:(NSDictionary *)owner;
 - (NSDictionary *)observer:(NSDictionary *)request;
 - (BOOL)activateObserverPush:(NSString *)instanceRef;

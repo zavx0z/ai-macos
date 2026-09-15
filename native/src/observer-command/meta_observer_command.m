@@ -108,10 +108,12 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
 - (void)clearPendingObserver:(MetaNativeObserver *)observer
                        token:(NSObject *)token;
 - (void)scheduleMainThreadStop:(MetaNativeObserver *)observer;
+- (void)signalEventWaiters;
 @end
 
 @implementation MetaObserverCommandBinder {
   NSLock *_lock;
+  NSCondition *_eventCondition;
   MetaNativeObserver *_observer;
   MetaNativeObserver *_pendingObserver;
   NSMutableArray<MetaNativeObserver *> *_cleanupPendingObservers;
@@ -156,6 +158,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
     _readinessProvider = [readinessProvider copy];
     _instanceIdProvider = [instanceIdProvider copy];
     _lock = [[NSLock alloc] init];
+    _eventCondition = [[NSCondition alloc] init];
     _history = [NSMutableArray array];
     _pushQueue = [NSMutableArray array];
     _cleanupPendingObservers = [NSMutableArray array];
@@ -245,6 +248,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   _gapReason = nil;
   _acceptingInstanceRef = instance;
   [_lock unlock];
+  [self signalEventWaiters];
 
   __block MetaNativeObserver *created = nil;
   __block NSString *baselineCursor = nil;
@@ -328,6 +332,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   MetaNativeObserver *pending = _pendingObserver == created ? created : nil;
   if (pending != nil) _pendingObserver = nil;
   [_lock unlock];
+  [self signalEventWaiters];
   if (!accepted) {
     if (pending != nil) [self scheduleMainThreadStop:pending];
     return [self failureResponse:request
@@ -437,6 +442,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   _acceptingInstanceRef = nil;
   _pushActive = NO;
   [_lock unlock];
+  [self signalEventWaiters];
   return [self successResponse:request
                        command:@"stop"
                       snapshot:snapshot
@@ -491,6 +497,136 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   return result;
 }
 
+- (NSDictionary *)currentCoverageForObserverInstance:
+    (NSString *)observerInstanceRef {
+  [_lock lock];
+  MetaNativeObserver *observer =
+      [_observerInstanceRef isEqual:observerInstanceRef] &&
+              [_acceptingInstanceRef isEqual:observerInstanceRef] &&
+              _gapReason == nil
+          ? _observer
+          : nil;
+  [_lock unlock];
+  NSDictionary *coverage = observer == nil
+                                ? nil
+                                : immutable_json_copy(observer.coverage);
+  [_lock lock];
+  BOOL current = observer != nil && _observer == observer &&
+                 [_observerInstanceRef isEqual:observerInstanceRef] &&
+                 [_acceptingInstanceRef isEqual:observerInstanceRef] &&
+                 _gapReason == nil;
+  [_lock unlock];
+  return current ? coverage : nil;
+}
+
+- (BOOL)registerSyntheticTag:(uint64_t)tag
+                 operationId:(NSString *)operationId
+               interactionId:(NSString *)interactionId
+                      target:(NSDictionary *)target
+         observerInstanceRef:(NSString *)observerInstanceRef {
+  [_lock lock];
+  MetaNativeObserver *observer =
+      [_observerInstanceRef isEqual:observerInstanceRef] &&
+              [_acceptingInstanceRef isEqual:observerInstanceRef] &&
+              _gapReason == nil
+          ? _observer
+          : nil;
+  [_lock unlock];
+  if (observer == nil ||
+      ![observer registerSyntheticTag:tag
+                                operationId:operationId
+                              interactionId:interactionId
+                                     target:target]) {
+    return NO;
+  }
+  [_lock lock];
+  BOOL current = _observer == observer &&
+                 [_observerInstanceRef isEqual:observerInstanceRef] &&
+                 _gapReason == nil;
+  [_lock unlock];
+  if (!current) [observer unregisterSyntheticTag:tag];
+  return current;
+}
+
+- (void)unregisterSyntheticTag:(uint64_t)tag
+           observerInstanceRef:(NSString *)observerInstanceRef {
+  [_lock lock];
+  MetaNativeObserver *observer =
+      [_observerInstanceRef isEqual:observerInstanceRef] ? _observer : nil;
+  [_lock unlock];
+  [observer unregisterSyntheticTag:tag];
+}
+
+- (NSDictionary *)scanEventsAfterCursor:(NSString *)cursor
+                    expectedSyntheticTag:(uint64_t)tag
+                         requireOwnEvent:(BOOL)requireOwnEvent
+                           timeoutMillis:(NSUInteger)timeoutMillis
+                     observerInstanceRef:(NSString *)observerInstanceRef {
+  if (!identifier(cursor, 127) || tag == 0 || timeoutMillis == 0 ||
+      timeoutMillis > 250 || !identifier(observerInstanceRef, 127)) {
+    return nil;
+  }
+  NSString *expectedTag =
+      [NSString stringWithFormat:@"event-%016llx", tag];
+  NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:
+                                 (NSTimeInterval)timeoutMillis / 1000.0];
+  [_eventCondition lock];
+  while (YES) {
+    [_lock lock];
+    BOOL current = [_observerInstanceRef isEqual:observerInstanceRef] &&
+                   [_acceptingInstanceRef isEqual:observerInstanceRef] &&
+                   _observer != nil && _gapReason == nil;
+    NSInteger start = NSNotFound;
+    if (current && _baselineAvailable && [cursor isEqual:_baselineCursor]) {
+      start = 0;
+    } else if (current) {
+      for (NSUInteger index = 0; index < _history.count; index += 1) {
+        if ([_history[index][@"cursor"] isEqual:cursor]) {
+          start = (NSInteger)index + 1;
+          break;
+        }
+      }
+    }
+    NSArray<NSDictionary *> *events =
+        start == NSNotFound
+            ? nil
+            : [_history subarrayWithRange:NSMakeRange(
+                  (NSUInteger)start, _history.count - (NSUInteger)start)];
+    [_lock unlock];
+    if (events == nil) {
+      [_eventCondition unlock];
+      return nil;
+    }
+    if (events.count > 0) {
+      BOOL ownOnly = YES;
+      for (NSDictionary *event in events) {
+        if (![event[@"source"] isEqual:@"synthetic"] ||
+            ![event[@"syntheticTag"] isEqual:expectedTag]) {
+          ownOnly = NO;
+          break;
+        }
+      }
+      NSDictionary *last = events.lastObject;
+      NSMutableDictionary *result = [@{
+        @"state" : ownOnly ? @"own-event-only" : @"user-takeover",
+        @"cursor" : last[@"cursor"],
+      } mutableCopy];
+      if (ownOnly) result[@"syntheticTag"] = expectedTag;
+      [_eventCondition unlock];
+      return result;
+    }
+    if (deadline.timeIntervalSinceNow <= 0) {
+      NSDictionary *result = @{
+        @"state" : requireOwnEvent ? @"unknown" : @"no-events",
+        @"cursor" : cursor,
+      };
+      [_eventCondition unlock];
+      return result;
+    }
+    [_eventCondition waitUntilDate:deadline];
+  }
+}
+
 - (void)acceptEvent:(NSDictionary *)event
     observerInstanceRef:(NSString *)observerInstanceRef {
   NSDictionary *immutable = immutable_json_copy(event);
@@ -518,6 +654,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
     _gapReason = @"Observer command unsent PUSH overflow";
     [_observer markUnavailable:_gapReason];
     [_lock unlock];
+    [self signalEventWaiters];
     return;
   }
   while (_history.count >= META_OBSERVER_COMMAND_MAX_EVENTS ||
@@ -529,6 +666,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
       _gapReason = @"Observer command undelivered history overflow";
       [_observer markUnavailable:_gapReason];
       [_lock unlock];
+      [self signalEventWaiters];
       return;
     }
     NSUInteger oldestBytes =
@@ -544,6 +682,13 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   _historyBytes += bytes;
   _pushBytes += envelopeBytes;
   [_lock unlock];
+  [self signalEventWaiters];
+}
+
+- (void)signalEventWaiters {
+  [_eventCondition lock];
+  [_eventCondition broadcast];
+  [_eventCondition unlock];
 }
 
 - (NSDictionary *)currentSnapshot {

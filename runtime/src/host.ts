@@ -27,6 +27,7 @@ import { startRuntimeHeartbeat } from "./heartbeat.ts"
 import { createBrowserHostComposition, type BrowserHostConfig } from "./browser-host.ts"
 import { registerBrowserMethods } from "./browser-methods.ts"
 import { registerInputMethods } from "./input-methods.ts"
+import { registerReadinessMethods } from "./readiness-methods.ts"
 import { registerCaptureMethods } from "./capture-methods.ts"
 import { DesktopInputAdapter } from "@meta/input/adapter"
 import { RuntimeScreenAdapter } from "@meta/screen/adapter"
@@ -226,6 +227,9 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     }
     const adapterHost = freezeAdapterHostContext({ generation, runtimeBuildId: options.runtimeBuildId, capabilities: handshake.capabilities })
     registerInputMethods(catalog, core, new DesktopInputAdapter(adapterHost, core.services, native))
+    if (handshake.capabilities.capabilities.some(capability => capability.id === "input.readiness" && capability.state === "ready")) {
+      registerReadinessMethods(catalog, core, native)
+    }
     registerCaptureMethods(catalog, core, new RuntimeScreenAdapter(adapterHost, core.services,
       new ProtocolNativeCaptureDriver(new NativeCaptureClient(native, core.continuations))))
   }

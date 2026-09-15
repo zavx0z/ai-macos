@@ -42,6 +42,8 @@ class AuditTransport implements NativeTransport {
   closed = false
   permissions: Partial<NativePermissionsResponse> = {}
   permissionCalls = 0
+  readinessCalls = 0
+  readinessState?: "ready" | "degraded" | "unavailable"
   inventoryStarted?: () => void
   #packet: Promise<NativeTransportPacket>
   #resolve!: (packet: NativeTransportPacket) => void
@@ -49,6 +51,10 @@ class AuditTransport implements NativeTransport {
     this.#packet = new Promise(resolve => { this.#resolve = resolve })
   }
   async send(frame: NativeTransportRequestFrame) {
+    if (frame.channel === "request" && frame.payload.method === "input.readiness") {
+      this.readinessCalls++
+      throw new Error("Active readiness не ожидался")
+    }
     if (frame.channel === "heartbeat") {
       this.#resolve({ kind: "message", frame: { channel: "heartbeat", payload: {
         requestId: frame.payload.requestId, runtimeEpoch: frame.payload.runtimeEpoch,
@@ -81,6 +87,8 @@ class AuditTransport implements NativeTransport {
       capabilities: { scope: "adapter", schemaVersion: "1", producerRef: "native:audit", capabilities: [
         { id: "desktop.applications", state: "ready" }, { id: "desktop.windows.all", state: "ready" }, { id: "desktop.displays", state: "ready" },
         { id: "input.clipboard", state: "ready" },
+        ...(this.readinessState === undefined ? [] : [{ id: "input.readiness" as const, state: this.readinessState,
+          ...(this.readinessState === "ready" ? {} : { reason: "Fixture readiness implementation pending" }) }]),
       ] },
     } } })
   }
@@ -146,3 +154,28 @@ test("host close отменяет зависшую background inventory до obs
     await rm(directory, { recursive: true, force: true })
   }
 }, 1000)
+
+for (const readinessState of ["ready", "degraded", "unavailable"] as const) {
+  test(`host readiness gate ${readinessState} не запускает active probe в startup/health`, async () => {
+    const directory = await mkdtemp(join(tmpdir(), "host-readiness-gate-"))
+    const session = { verified: true as const, source: "darwin-audit" as const,
+      uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 127 }
+    const transport = new AuditTransport(session)
+    transport.readinessState = readinessState
+    const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+      runtimeBuildId: "build:readiness-gate", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+    try {
+      await host.start()
+      const client = await host.core.openClientDurable("principal:readiness-gate")
+      await host.catalog.dispatch(client.session, "system_health", {}, new AbortController().signal)
+      expect(host.core.capabilities.capabilities.find(capability => capability.id === "input.readiness")?.state).toBe(readinessState)
+      const method = host.catalog.descriptors().tools.find(tool => tool.name === "input_readiness")
+      expect(method !== undefined).toBe(readinessState === "ready")
+      if (method !== undefined) expect(method.annotations.readOnlyHint).toBe(false)
+      expect(transport.readinessCalls).toBe(0)
+    } finally {
+      await host.close()
+      await rm(directory, { recursive: true, force: true })
+    }
+  })
+}

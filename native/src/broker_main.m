@@ -20,6 +20,7 @@
 #include "hit-test/meta_hit_test_binder.h"
 #include "observer-command/meta_observer_command.h"
 #include "recovery-probe/meta_recovery_probe.h"
+#include "readiness-command/meta_readiness_system.h"
 #include <time.h>
 #include <math.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -228,6 +229,28 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
   NSDictionary *identity = meta_code_identity_read(&failure);
   if (identity != nil) result[@"codeIdentity"] = identity;
   return result;
+}
+
+- (NSArray<NSDictionary *> *)capabilityCatalog {
+  // Handshake описывает подключённые handlers. TCC, session и текущая observer
+  // coverage проверяются отдельно в permissions и перед действием.
+  NSMutableArray *capabilities = [NSMutableArray array];
+  for (NSString *identifier in @[@"runtime.identity", @"runtime.transport", @"desktop.applications",
+      @"desktop.windows.all", @"desktop.window.identity", @"desktop.window.show", @"desktop.window.lifecycle",
+      @"desktop.displays", @"desktop.ax", @"capture.window", @"capture.observation", @"input.clipboard", @"input.readiness"]) {
+    [capabilities addObject:@{@"id": identifier, @"state": @"ready"}];
+  }
+  for (NSString *identifier in @[@"input.pointer", @"input.drag", @"input.keyboard", @"runtime.user-interference"]) {
+    [capabilities addObject:@{@"id": identifier, @"state": @"degraded",
+      @"reason": @"Native dispatch и observer stream подключены; общий operation tag lifecycle ещё не завершён"}];
+  }
+  [capabilities addObject:@{@"id": @"capture.desktop", @"state": @"degraded",
+    @"reason": @"Одиночный display подключён; aggregate desktop-layout capture пока не реализован"}];
+  [capabilities addObject:@{@"id": @"desktop.application.lifecycle", @"state": @"degraded",
+    @"reason": @"Launch и quit подключены; parent callback lifecycle проходит финальную проверку"}];
+  [capabilities addObject:@{@"id": @"input.interaction", @"state": @"unavailable",
+    @"reason": @"Native beginFocus/endRestore и STEP association ещё не подключены"}];
+  return capabilities;
 }
 
 - (NSDictionary *)sessionIdentity {
@@ -467,6 +490,68 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
     @"inputMonitoring": CGPreflightListenEventAccess() ? @YES : @NO, @"observerReady": ready ? @YES : @NO};
 }
 
+- (NSDictionary *)executeReadiness:(NSDictionary *)request job:(MetaInputJob *)job {
+  NSDictionary *expected = request[@"payload"][@"expectedDisplayRef"];
+  const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(_windows);
+  if (snapshot == NULL || ![expected isKindOfClass:NSDictionary.class] ||
+      ![job.operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
+      [job.operation[@"inventoryRevision"] unsignedLongLongValue] != snapshot->revision ||
+      ![job.operation[@"target"][@"kind"] isEqual:@"display"] ||
+      ![job.operation[@"target"][@"ref"] isEqual:expected]) return nil;
+  NSDictionary *generation = @{@"runtimeEpoch": request[@"runtimeEpoch"], @"loginSessionId": request[@"loginSessionId"],
+    @"nativeGeneration": request[@"nativeGeneration"]};
+  MetaObserverCommandBinder *observer = _observerCommands;
+  NSString *instance = [_observerInstance copy];
+  MetaReadinessSystemContext *context = [[MetaReadinessSystemContext alloc] initWithWindows:_windows expectedDisplay:expected
+    observer:observer observerInstance:instance sessionProvider:^NSDictionary * {
+      NSMutableDictionary *session = [meta_current_session_readiness(generation[@"loginSessionId"]) mutableCopy];
+      if (observer != nil && instance != nil) {
+        NSMutableDictionary *query = [generation mutableCopy];
+        NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+        formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+        [query addEntriesFromDictionary:@{@"kind": @"observer", @"protocolVersion": @"1", @"command": @"coverage",
+          @"requestId": [@"readiness-session-" stringByAppendingString:NSUUID.UUID.UUIDString], @"observerInstanceRef": instance,
+          @"deadlineAt": [formatter stringFromDate:[NSDate dateWithTimeIntervalSinceNow:1]]}];
+        NSDictionary *reply = [observer handleRequest:query];
+        if ([reply[@"snapshot"][@"sessionReadiness"][@"lockState"] isEqual:@"locked"]) session[@"lockState"] = @"locked";
+      }
+      return session;
+    }];
+  [job setObserverCoverageProvider:^NSDictionary * { return [context coverage]; }];
+  MetaExecutor *executor = [_inputExecutor executorOnActionWorker];
+  MetaInputReadinessBackend backend = [context backend];
+  MetaReadinessObserverSnapshot observed = {0};
+  BOOL observerReady = backend.read_observer(backend.context, &observed) && observed.ready && observed.continuous && !observed.gap_detected;
+  meta_executor_set_observer_state(executor, observerReady ? META_OBSERVER_READY : META_OBSERVER_UNAVAILABLE);
+  MetaReadinessCommandBinder *binder = [[MetaReadinessCommandBinder alloc] initWithGeneration:generation backend:backend now:^NSDate * { return NSDate.date; }];
+  NSDictionary *execution = [_inputExecutor executePrimitive:request job:job targetRef:expected[@"displayRef"]
+    verify:^BOOL(NSString *target) { return [target isEqual:expected[@"displayRef"]] && [context targetAvailable]; }
+    action:^NSDictionary * {
+      uint64_t tag = meta_executor_synthetic_tag(executor);
+      BOOL registered = [observer registerSyntheticTag:tag operationId:job.operation[@"operationId"] interactionId:nil
+        target:job.operation[@"target"] observerInstanceRef:instance];
+      if (!registered) meta_executor_set_observer_state(executor, META_OBSERVER_UNAVAILABLE);
+      NSError *error = nil;
+      MetaReadinessCommandOutcome *outcome = [binder handleRequest:request currentRequestId:job.requestId
+        currentOperation:job.operation executor:executor error:&error];
+      if (registered) [observer unregisterSyntheticTag:tag observerInstanceRef:instance];
+      if (outcome == nil || ![outcome.result[@"inputReady"] boolValue]) meta_executor_fail(executor, "readiness-not-ready");
+      return outcome.result;
+    }];
+  meta_executor_set_observer_state(executor, META_OBSERVER_UNAVAILABLE);
+  if (execution[@"value"] == nil || execution[@"status"] == nil) return nil;
+  NSMutableDictionary *value = [execution[@"value"] mutableCopy];
+  if (![execution[@"finished"] boolValue] && [value[@"inputReady"] boolValue]) {
+    value[@"inputReady"] = @NO;
+    value[@"reason"] = @"Probe завершён, но parent native operation не подтвердила finish";
+    value[@"dispatch"] = execution[@"status"][@"dispatch"];
+    value[@"cleanup"] = execution[@"status"][@"cleanup"];
+    value[@"quarantined"] = execution[@"status"][@"quarantined"];
+    value[@"interference"] = execution[@"status"][@"userInterference"];
+  }
+  return @{@"value": value, @"status": execution[@"status"]};
+}
+
 - (NSDictionary *)heldRecovery:(NSDictionary *)request owner:(NSDictionary *)owner {
   _recoveryRequest = request;
   MetaRecoveryProbeBackend backend = meta_recovery_probe_system_backend();
@@ -654,6 +739,10 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
 - (NSDictionary *)executeApplication:(NSDictionary *)request job:(MetaInputJob *)job {
   if (_sealed || ![self ensureApplications:request]) return nil;
   NSDictionary *operation = job.operation, *payload = request[@"payload"];
+  [_asyncLock lock];
+  BOOL occupied = _applicationTaskRefs[operation[@"operationId"]] != nil;
+  [_asyncLock unlock];
+  if (occupied) return nil;
   const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(_windows);
   if (snapshot == NULL || ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
       [operation[@"inventoryRevision"] unsignedLongLongValue] != snapshot->revision) return nil;
@@ -715,6 +804,11 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
     if ([state[@"effectiveTerminal"] boolValue] && [_applications releaseLaunch:launchTask]) {
       [_asyncLock lock]; [_applicationTaskRefs removeObjectForKey:operation[@"operationId"]]; [_asyncLock unlock];
     }
+  } else if (value != nil && ![value[@"state"] isEqual:@"unknown"] && ![execution[@"finished"] boolValue]) {
+    NSString *reason = @"Quit callback вернулся, но parent native operation не подтвердила finish";
+    value = @{@"state": @"unknown", @"application": reference,
+      @"reason": reason, @"errors": @[@{@"code": @"operation-outcome-unknown", @"message": reason,
+        @"stage": @"application-quit", @"retryable": @NO, @"replayAllowed": @NO, @"recoveryAction": @"get-operation"}]};
   }
   if (value == nil) return nil;
   return @{@"value": value, @"status": [self supplementStatus:execution[@"status"]]};

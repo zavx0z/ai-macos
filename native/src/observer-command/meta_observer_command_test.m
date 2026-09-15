@@ -256,6 +256,11 @@ static void test_delivered_history_rolls_without_gap(void) {
       handleRequest:request(@"events", @"observer-1", nil, evictedCursor)];
   assert([stale[@"ok"] isEqual:@NO]);
   assert([stale[@"error"][@"code"] isEqual:@"receipt-expired"]);
+  assert([value scanEventsAfterCursor:evictedCursor
+                 expectedSyntheticTag:42
+                      requireOwnEvent:NO
+                        timeoutMillis:10
+                  observerInstanceRef:@"observer-1"] == nil);
 }
 
 static void test_late_prepare_cannot_create_or_replace_observer(void) {
@@ -327,6 +332,65 @@ static void test_expired_prepare_stops_before_main_start(void) {
   assert(fixture.factoryCalls == 0);
 }
 
+static void test_readiness_scan_is_exact_and_nondestructive(void) {
+  Fixture fixture = {.mainSucceeds = YES};
+  MetaObserverCommandBinder *value = binder(&fixture);
+  NSDictionary *prepared =
+      [value handleRequest:request(@"prepare", nil, nil, nil)];
+  assert([prepared[@"ok"] isEqual:@YES]);
+  assert([value activatePushForObserverInstance:@"observer-1"]);
+  NSString *baseline = prepared[@"snapshot"][@"coverage"][@"cursor"];
+  assert([[value currentCoverageForObserverInstance:@"observer-1"][@"state"]
+      isEqual:@"ready"]);
+  assert([value currentCoverageForObserverInstance:@"observer-foreign"] == nil);
+  assert([value registerSyntheticTag:42
+                         operationId:@"operation-readiness"
+                       interactionId:nil
+                              target:target()
+                 observerInstanceRef:@"observer-1"]);
+  assert(![value registerSyntheticTag:43
+                          operationId:@"operation-readiness"
+                        interactionId:nil
+                               target:target()
+                  observerInstanceRef:@"observer-foreign"]);
+
+  [fixture.observer recordInputFromPid:getpid() syntheticTag:42];
+  NSDictionary *own = [value
+      scanEventsAfterCursor:baseline
+       expectedSyntheticTag:42
+            requireOwnEvent:YES
+              timeoutMillis:10
+        observerInstanceRef:@"observer-1"];
+  assert([own[@"state"] isEqual:@"own-event-only"]);
+  assert([own[@"syntheticTag"] isEqual:@"event-000000000000002a"]);
+  NSDictionary *push = [value takePushEnvelopes:10];
+  assert([push[@"events"] count] == 1);
+  assert([push[@"events"][0][@"event"][@"cursor"] isEqual:own[@"cursor"]]);
+
+  NSDictionary *quiet = [value
+      scanEventsAfterCursor:own[@"cursor"]
+       expectedSyntheticTag:42
+            requireOwnEvent:NO
+              timeoutMillis:1
+        observerInstanceRef:@"observer-1"];
+  assert([quiet[@"state"] isEqual:@"no-events"]);
+  [fixture.observer recordInputFromPid:getpid() + 1 syntheticTag:42];
+  NSDictionary *takeover = [value
+      scanEventsAfterCursor:quiet[@"cursor"]
+       expectedSyntheticTag:42
+            requireOwnEvent:NO
+              timeoutMillis:10
+        observerInstanceRef:@"observer-1"];
+  assert([takeover[@"state"] isEqual:@"user-takeover"]);
+  assert(takeover[@"syntheticTag"] == nil);
+  assert([value scanEventsAfterCursor:takeover[@"cursor"]
+                 expectedSyntheticTag:42
+                      requireOwnEvent:NO
+                        timeoutMillis:10
+                  observerInstanceRef:@"observer-foreign"] == nil);
+  [value unregisterSyntheticTag:42 observerInstanceRef:@"observer-1"];
+}
+
 int main(void) {
   @autoreleasepool {
     test_prepare_baseline_push_backfill_and_stop();
@@ -336,6 +400,7 @@ int main(void) {
     test_late_prepare_cannot_create_or_replace_observer();
     test_started_candidate_is_stopped_after_failed_handoff();
     test_expired_prepare_stops_before_main_start();
+    test_readiness_scan_is_exact_and_nondestructive();
   }
   puts("observer command tests passed");
   return 0;

@@ -140,10 +140,16 @@ bool meta_input_readiness_probe_active(MetaExecutor *executor,
   MetaExecutorStatus initial = meta_executor_status(executor);
   if (initial.execution != META_EXECUTOR_DISPATCHING ||
       !initial.has_accepted_fence || !initial.has_high_water_fence ||
-      initial.target_verification != META_VERIFICATION_VERIFIED ||
-      initial.observer_state != META_OBSERVER_READY || initial.quarantined) {
+      initial.target_verification != META_VERIFICATION_VERIFIED || initial.quarantined) {
     return fail_unknown(executor, result,
                         "Readiness probe требует active parent executor");
+  }
+  if (initial.observer_state != META_OBSERVER_READY) {
+    if (initial.dispatch == META_DISPATCH_NONE && initial.dispatch_attempts == 0 && initial.held_count == 0) {
+      reason(result, "Observer недоступен до первого readiness event");
+      return true;
+    }
+    return fail_unknown(executor, result, "Observer недоступен после начатого dispatch");
   }
 
   MetaReadinessSessionFacts session = {0};

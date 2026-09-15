@@ -217,10 +217,10 @@ static NSDictionary *failure(NSString *code, NSString *message) {
       NSString *actualLogin = [NSString stringWithFormat:@"audit:%@:%@", session[@"uid"], session[@"auditSessionId"]];
       _admitted = _admitted && [actualLogin isEqual:_loginSessionId];
     }
+    NSArray *catalog = [_backend respondsToSelector:@selector(capabilityCatalog)] ? [_backend capabilityCatalog] :
+        @[@{@"id": @"runtime.identity", @"state": @"ready"}];
     NSDictionary *capabilities = @{@"schemaVersion": @"1", @"scope": @"adapter", @"producerRef": _generation,
-      @"capabilities": @[@{@"id": @"runtime.identity", @"state": @"ready"},
-                          @{@"id": @"input.pointer", @"state": @"unavailable", @"reason": @"Broker input dispatch integration pending"},
-                          @{@"id": @"capture.window", @"state": @"unavailable", @"reason": @"Broker capture dispatch integration pending"}]};
+      @"capabilities": catalog};
     [self send:@"handshake" payload:@{
       @"kind": @"handshake-response", @"protocolVersion": @"1", @"requestId": requestId,
       @"runtimeEpoch": _runtimeEpoch, @"loginSessionId": _loginSessionId, @"nativeGeneration": _generation,
@@ -357,6 +357,8 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   }
   BOOL clipboard = [channel isEqual:@"clipboard"];
   BOOL input = [payload[@"method"] isEqual:@"input.execute"] && [payload[@"intent"] isEqual:@"mutation"];
+  BOOL readiness = [payload[@"method"] isEqual:@"input.readiness"] && [payload[@"intent"] isEqual:@"mutation"] &&
+      [_backend respondsToSelector:@selector(executeReadiness:job:)];
   BOOL window = [payload[@"method"] isEqual:@"window.transition"] && [payload[@"intent"] isEqual:@"mutation"];
   BOOL capture = [payload[@"method"] isEqual:@"capture.start"] && [payload[@"intent"] isEqual:@"mutation"];
   BOOL application = [@[@"application.launch", @"application.quit"] containsObject:payload[@"method"]] && [payload[@"intent"] isEqual:@"mutation"];
@@ -373,7 +375,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
         || ![ref[@"runtimeEpoch"] isEqual:_runtimeEpoch] || ![ref[@"loginSessionId"] isEqual:_loginSessionId]
         || ![command isKindOfClass:NSDictionary.class]) { [self shutdown:65]; return; }
   }
-  if (input || window || capture || application) {
+  if (input || readiness || window || capture || application) {
     NSDictionary *actionPayload = payload[@"payload"];
     if (![operation[@"kind"] isEqual:@"native"] || ![operation[@"nativeGeneration"] isEqual:_generation]
         || ![operation[@"fence"] isKindOfClass:NSDictionary.class] || ![operation[@"target"] isKindOfClass:NSDictionary.class]
@@ -389,7 +391,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     if (![ref isKindOfClass:NSDictionary.class] || ![ref[@"runtimeEpoch"] isEqual:_runtimeEpoch] ||
         ![ref[@"loginSessionId"] isEqual:_loginSessionId] || ![ref[@"nativeGeneration"] isEqual:_generation]) { [self shutdown:65]; return; }
   }
-  if (!clipboard && !inventory && !input && !inspection && !window && !applicationResolution && !capture && !hitTest && !application) {
+  if (!clipboard && !inventory && !input && !readiness && !inspection && !window && !applicationResolution && !capture && !hitTest && !application) {
     response[@"ok"] = @NO;
     response[@"error"] = failure(@"unsupported-capability", @"Native command ещё не подключена к broker");
     [self send:responseChannel payload:response];
@@ -404,15 +406,15 @@ static NSDictionary *failure(NSString *code, NSString *message) {
       dispatch_sync(self->_control, ^{ allowed = !self->_sealed && self->_requestedExit < 0; });
       NSDictionary *result = nil;
       if (allowed && future_deadline(payload[@"deadlineAt"])) {
-        result = input ? [self->_backend executeInput:payload job:job] : window ? [self->_backend executeWindow:payload job:job] : capture ? [self->_backend startCapture:payload job:job] : application ? [self->_backend executeApplication:payload job:job] : clipboard ? [self->_backend clipboard:command] :
+        result = readiness ? [self->_backend executeReadiness:payload job:job] : input ? [self->_backend executeInput:payload job:job] : window ? [self->_backend executeWindow:payload job:job] : capture ? [self->_backend startCapture:payload job:job] : application ? [self->_backend executeApplication:payload job:job] : clipboard ? [self->_backend clipboard:command] :
             inspection ? [self->_backend inspect:payload] : applicationResolution ? [self->_backend resolveApplication:payload] : hitTest ? [self->_backend hitTest:payload] : [self->_backend inventory];
       }
       dispatch_async(self->_control, ^{
-        if (input || window || capture || application) {
+        if (input || readiness || window || capture || application) {
           NSDictionary *terminal = [job statusForRequest:job.requestId];
           if (terminal != nil && ![self->_receipts recordStatus:terminal]) self->_sealed = YES;
         }
-        if ((input || window || capture || application) && [job heartbeatExpired]) self->_sealed = YES;
+        if ((input || readiness || window || capture || application) && [job heartbeatExpired]) self->_sealed = YES;
         self->_busy = NO;
         self->_activeOperation = nil;
         if (self->_requestedExit >= 0) { atomic_store(&self->_exitCode, self->_requestedExit); return; }

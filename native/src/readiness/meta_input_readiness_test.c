@@ -316,7 +316,25 @@ static void test_unobserved_owned_move_is_unknown_and_quarantined(void) {
   meta_executor_destroy(executor);
 }
 
+static void test_unavailable_observer_before_dispatch(void) {
+  Fixture value = fixture();
+  MetaExecutor *executor = active_executor(&value);
+  meta_executor_set_observer_state(executor, META_OBSERVER_UNAVAILABLE);
+  MetaInputReadinessResult result = {0};
+  assert(meta_input_readiness_probe_active(executor, "display-1", readiness_backend(&value), &result));
+  assert(!result.input_ready && !result.quarantined && value.post_count == 0);
+  assert(result.dispatch == META_DISPATCH_NONE && result.cleanup == META_CLEANUP_COMPLETE);
+  assert(result.interference == META_INTERFERENCE_UNKNOWN);
+  assert(result.restoration == META_READINESS_RESTORE_NOT_ATTEMPTED);
+  assert(meta_executor_fail(executor, "readiness-observer-unavailable"));
+  MetaExecutorStatus status = meta_executor_status(executor);
+  assert(status.execution == META_EXECUTOR_FAILED && status.dispatch_attempts == 0);
+  assert(status.dispatch == META_DISPATCH_NONE && status.cleanup == META_CLEANUP_COMPLETE && !status.quarantined);
+  meta_executor_destroy(executor);
+}
+
 int main(void) {
+  test_unavailable_observer_before_dispatch();
   test_move_and_restore_are_both_confirmed();
   test_secure_input_stops_before_first_post();
   test_foreign_resolved_display_stops_before_first_post();

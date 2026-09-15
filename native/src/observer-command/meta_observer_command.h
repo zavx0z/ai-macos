@@ -43,6 +43,21 @@ typedef NSString *_Nullable (^MetaObserverInstanceIdProvider)(void);
 - (BOOL)activatePushForObserverInstance:(NSString *)observerInstanceRef;
 // Возвращает primary PUSH envelopes и terminal gapReason, если он появился.
 - (NSDictionary *)takePushEnvelopes:(NSUInteger)maximum;
+- (nullable NSDictionary *)currentCoverageForObserverInstance:
+    (NSString *)observerInstanceRef;
+- (BOOL)registerSyntheticTag:(uint64_t)tag
+                 operationId:(NSString *)operationId
+               interactionId:(nullable NSString *)interactionId
+                      target:(NSDictionary *)target
+         observerInstanceRef:(NSString *)observerInstanceRef;
+- (void)unregisterSyntheticTag:(uint64_t)tag
+           observerInstanceRef:(NSString *)observerInstanceRef;
+// Scan читает rolling history и не извлекает события из primary PUSH queue.
+- (nullable NSDictionary *)scanEventsAfterCursor:(NSString *)cursor
+                            expectedSyntheticTag:(uint64_t)tag
+                                 requireOwnEvent:(BOOL)requireOwnEvent
+                                   timeoutMillis:(NSUInteger)timeoutMillis
+                             observerInstanceRef:(NSString *)observerInstanceRef;
 @end
 
 NS_ASSUME_NONNULL_END

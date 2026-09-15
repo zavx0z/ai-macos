@@ -49,6 +49,9 @@ mkdir -p "$(dirname -- "$CANDIDATE_OUTPUT")"
   native/src/capture-command/meta_capture_command.m \
   native/src/hit-test/meta_hit_test_binder.m \
   native/src/recovery-probe/meta_recovery_probe.m \
+  native/src/readiness/meta_input_readiness.c \
+  native/src/readiness-command/meta_readiness_command.m \
+  native/src/readiness-command/meta_readiness_system.m \
   native/src/observer/meta_observer.m \
   native/src/observer-index/meta_observer_target_index.m \
   native/src/observer-command/meta_observer_command.m \
