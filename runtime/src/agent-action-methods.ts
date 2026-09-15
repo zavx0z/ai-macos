@@ -8,7 +8,7 @@ import {
 import { keyActionSchema, textActionSchema, shortcutActionSchema } from "@meta/input/actions"
 import { planKey, planShortcuts } from "@meta/input/action-plan"
 import { AgentOperations, type AgentOperationOutcome } from "./agent-operations.ts"
-import { agentTargetIdSchema, type RuntimeAgentMethods } from "./agent-methods.ts"
+import { agentTargetIdSchema, internalMethodError, type RuntimeAgentMethods } from "./agent-methods.ts"
 import type { InputMethodOutput } from "./input-methods.ts"
 import type { MethodRegistry, RuntimeMethodResponse } from "./method-registry.ts"
 
@@ -229,7 +229,7 @@ export class RuntimeAgentActionMethods {
   ): Promise<RuntimeMethodResponse> {
     signal.throwIfAborted()
     const response = await this.registry.internal.dispatch(session, name, input, signal)
-    if (response.isError) throw new Error(`Internal runtime method ${name} failed`)
+    if (response.isError) throw internalMethodError(response, name)
     return response
   }
 }

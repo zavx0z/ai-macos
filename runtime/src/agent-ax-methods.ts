@@ -7,7 +7,7 @@ import {
   type RuntimeClientSession,
 } from "@meta/shared/contracts"
 import { AgentOperations, type AgentOperationOutcome } from "./agent-operations.ts"
-import { agentTargetIdSchema, type RuntimeAgentMethods } from "./agent-methods.ts"
+import { agentTargetIdSchema, internalMethodError, type RuntimeAgentMethods } from "./agent-methods.ts"
 import type { AgentTargetRegistry } from "./agent-targets.ts"
 import type { RuntimeCore } from "./core.ts"
 import type { MethodRegistry, RuntimeMethodResponse } from "./method-registry.ts"
@@ -164,7 +164,7 @@ export class RuntimeAgentAxMethods {
   ): Promise<RuntimeMethodResponse> {
     signal.throwIfAborted()
     const response = await this.registry.internal.dispatch(session, name, input, signal)
-    if (response.isError) throw new Error(`Internal runtime method ${name} failed`)
+    if (response.isError) throw internalMethodError(response, name)
     return response
   }
 }

@@ -8,7 +8,7 @@ import {
 } from "@meta/shared/contracts"
 import { clickActionSchema, dragActionSchema, hoverActionSchema, scrollActionSchema } from "@meta/input/actions"
 import { AgentOperations, type AgentOperationOutcome } from "./agent-operations.ts"
-import { agentTargetIdSchema, type RuntimeAgentMethods } from "./agent-methods.ts"
+import { agentTargetIdSchema, internalMethodError, type RuntimeAgentMethods } from "./agent-methods.ts"
 import type { InputMethodOutput } from "./input-methods.ts"
 import type { MethodRegistry, RuntimeMethodResponse } from "./method-registry.ts"
 
@@ -235,7 +235,7 @@ export class RuntimeAgentPointerMethods implements AgentPointClickHandler {
   ): Promise<RuntimeMethodResponse> {
     signal.throwIfAborted()
     const response = await this.registry.internal.dispatch(session, name, input, signal)
-    if (response.isError) throw new Error(`Internal runtime method ${name} failed`)
+    if (response.isError) throw internalMethodError(response, name)
     return response
   }
 }

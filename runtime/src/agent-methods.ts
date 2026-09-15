@@ -1021,7 +1021,8 @@ function responseOperationId(response: RuntimeMethodResponse): string | undefine
   return parsed.success ? parsed.data : undefined
 }
 
-function internalMethodError(response: RuntimeMethodResponse, name: string): RuntimeContractError {
+/** Сохраняет проверенную ошибку внутреннего метода и его настоящий operationId. */
+export function internalMethodError(response: RuntimeMethodResponse, name: string): RuntimeContractError {
   const result = objectRecord(response.data.result)
   const parsed = contractErrorSchema.safeParse(objectRecord(result?.error))
   if (parsed.success) {

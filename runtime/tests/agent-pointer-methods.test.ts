@@ -27,6 +27,7 @@ import { AgentTargetRegistry } from "../src/agent-targets.ts"
 import { AgentViewBindings } from "../src/agent-view-bindings.ts"
 import { AgentViewGuard, type AgentViewObserver } from "../src/agent-view-guard.ts"
 import { RuntimeCore } from "../src/core.ts"
+import { RuntimeContractError } from "../src/errors.ts"
 import { registerInputMethods } from "../src/input-methods.ts"
 import { MethodRegistry } from "../src/method-registry.ts"
 
@@ -188,7 +189,10 @@ test("stale observation и geometry вне исходного clip fail closed �
   await expect(outside.registry.dispatch(outside.session, "click", {
     targetId: outside.targetId,
     point: [500, 500],
-  }, new AbortController().signal)).rejects.toThrow("mouse_click failed")
+  }, new AbortController().signal)).rejects.toMatchObject({
+    contract: { code: "point-not-owned", stage: "fixture-point",
+      context: { operationId: expect.any(String) } },
+  })
   const status = await outside.operations.getTargetStatus(outside.session, outside.targetId)
   expect(status.recent).toMatchObject([{ action: "pointer-click", outcome: {
     state: "failed", dispatch: "none", cleanup: "complete",
@@ -222,10 +226,25 @@ test("cancelled и unknown pointer delivery сохраняются в target sta
 
   const unknown = await createFixture()
   unknown.input.mode = "unknown"
-  await expect(unknown.registry.dispatch(unknown.session, "click", {
-    targetId: unknown.targetId,
-    point: [10, 20],
-  }, new AbortController().signal)).rejects.toThrow("mouse_click failed")
+  let failure: unknown
+  try {
+    await unknown.registry.dispatch(unknown.session, "click", {
+      targetId: unknown.targetId,
+      point: [10, 20],
+    }, new AbortController().signal)
+  } catch (error) {
+    failure = error
+  }
+  expect(failure).toBeInstanceOf(RuntimeContractError)
+  const contract = (failure as RuntimeContractError).contract
+  expect(contract).toMatchObject({ code: "internal-error", message: "fixture pointer reply lost",
+    stage: "runtime-execute", replayAllowed: false,
+  })
+  const operationId = contract.context!.operationId!
+  expect(typeof operationId).toBe("string")
+  expect(await unknown.core.getOperation(unknown.session, operationId)).toMatchObject({
+    state: "interrupted-unknown", outcome: { cleanup: { state: "unknown" } },
+  })
   const unknownStatus = await unknown.operations.getTargetStatus(unknown.session, unknown.targetId)
   expect(unknownStatus.recent).toMatchObject([{ action: "pointer-click", outcome: {
     state: "interrupted-unknown", cleanup: "unknown",
