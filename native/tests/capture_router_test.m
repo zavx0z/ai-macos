@@ -127,6 +127,8 @@ int main(void) {
     bool already_released = false;
     assert(!meta_capture_router_release(router, task_ref, false,
                                         &already_released));
+    assert(!meta_capture_router_release(router, task_ref, true,
+                                        &already_released));
 
     fake.status.streamStopped = true;
     fake.status.cleanup = MetaCaptureCleanupComplete;
@@ -166,6 +168,39 @@ int main(void) {
     assert(meta_capture_router_release_drained_operation(
                router, "operation-lost-ack", false) == 1);
     assert(meta_capture_router_active_tasks(router, NULL, 0) == 0);
+    MetaCaptureTaskStatus lost_ack_tombstone = {0};
+    assert(meta_capture_router_status(router, lost_task_ref,
+                                      &lost_ack_tombstone));
+    assert(lost_ack_tombstone.completionDelivered);
+    assert(lost_ack_tombstone.drained);
+    memset(operation_tasks, 0, sizeof(operation_tasks));
+    assert(meta_capture_router_operation_tasks(
+               router, "operation-lost-ack", operation_tasks, 2) == 1);
+    assert(operation_tasks[0].released);
+    assert(operation_tasks[0].status.revision ==
+           lost_ack_tombstone.revision);
+
+    char null_borrow_task_ref[META_NATIVE_REF_CAPACITY] = {0};
+    assert(meta_capture_router_start(router, "operation-null-borrow", &request,
+                                     null_borrow_task_ref, &status));
+    const MetaCaptureResult *empty_result = NULL;
+    assert(meta_capture_router_result(router, null_borrow_task_ref, &status,
+                                      &empty_result));
+    assert(empty_result == NULL);
+    MetaCaptureResult *raced_completion = calloc(1, sizeof(*raced_completion));
+    raced_completion->cleanup = MetaCaptureCleanupComplete;
+    fake.status = (MetaCaptureTaskStatus){
+        .revision = 4,
+        .completionDelivered = true,
+        .streamStopped = true,
+        .cleanup = MetaCaptureCleanupComplete,
+        .drained = true,
+    };
+    fake.completion(raced_completion);
+    assert(meta_capture_router_result_done(router, null_borrow_task_ref,
+                                           empty_result));
+    assert(meta_capture_router_release(router, null_borrow_task_ref, false,
+                                       &already_released));
 
     char concurrent_task_ref[META_NATIVE_REF_CAPACITY] = {0};
     assert(meta_capture_router_start(router, "operation-concurrent", &request,

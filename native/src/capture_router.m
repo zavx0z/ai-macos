@@ -17,7 +17,11 @@ typedef struct {
   bool safe_to_forget;
   bool cancel_requested;
   size_t in_flight;
+  size_t result_borrows;
+  size_t null_result_borrows;
   bool callback_pending;
+  bool has_last_status;
+  MetaCaptureTaskStatus last_status;
   char pending_cleanup_request_id[META_NATIVE_REF_CAPACITY];
   bool has_release_receipt;
   MetaCaptureReleaseReceipt release_receipt;
@@ -238,6 +242,12 @@ bool meta_capture_router_start(
   }
   const bool status_ready =
       router->backend.status(router->backend.context, native_task, status);
+  if (status_ready) {
+    [router->lock lock];
+    entry->last_status = *status;
+    entry->has_last_status = true;
+    [router->lock unlock];
+  }
   release_in_flight(router, entry);
   return status_ready;
 }
@@ -250,7 +260,12 @@ bool meta_capture_router_status(MetaCaptureRouter *router,
     return false;
   }
   [router->lock lock];
-  CaptureEntry *entry = find_entry(router, task_ref);
+  CaptureEntry *entry = find_any_entry(router, task_ref);
+  if (entry != NULL && entry->released && entry->has_last_status) {
+    *status = entry->last_status;
+    [router->lock unlock];
+    return true;
+  }
   if (entry != NULL && !entry->releasing) entry->in_flight += 1;
   MetaCaptureTaskRef native_task =
       entry == NULL || entry->releasing ? NULL : entry->native_task;
@@ -258,6 +273,12 @@ bool meta_capture_router_status(MetaCaptureRouter *router,
   if (native_task == NULL) return false;
   const bool result =
       router->backend.status(router->backend.context, native_task, status);
+  if (result) {
+    [router->lock lock];
+    entry->last_status = *status;
+    entry->has_last_status = true;
+    [router->lock unlock];
+  }
   release_in_flight(router, entry);
   return result;
 }
@@ -282,7 +303,11 @@ bool meta_capture_router_result(MetaCaptureRouter *router,
     return false;
   }
   [router->lock lock];
+  entry->last_status = *status;
+  entry->has_last_status = true;
   *result = entry->result;
+  entry->result_borrows += 1;
+  if (*result == NULL) entry->null_result_borrows += 1;
   [router->lock unlock];
   return true;
 }
@@ -293,10 +318,17 @@ bool meta_capture_router_result_done(MetaCaptureRouter *router,
   if (router == NULL || !valid_identifier(task_ref, 127)) return false;
   [router->lock lock];
   CaptureEntry *entry = find_any_entry(router, task_ref);
-  if (entry == NULL || entry->in_flight == 0 || entry->result != result) {
+  const bool matching_null_borrow = result == NULL && entry != NULL &&
+      entry->null_result_borrows > 0;
+  const bool matching_result_borrow = result != NULL && entry != NULL &&
+      entry->result == result && entry->result_borrows > 0;
+  if (entry == NULL || entry->in_flight == 0 ||
+      (!matching_null_borrow && !matching_result_borrow)) {
     [router->lock unlock];
     return false;
   }
+  entry->result_borrows -= 1;
+  if (matching_null_borrow) entry->null_result_borrows -= 1;
   entry->in_flight -= 1;
   [router->lock broadcast];
   [router->lock unlock];
@@ -359,6 +391,7 @@ bool meta_capture_router_release(MetaCaptureRouter *router,
   if (router == NULL || already_released == NULL ||
       !valid_identifier(task_ref, 127)) return false;
   *already_released = false;
+  (void)recovery_authorized;
   [router->lock lock];
   CaptureEntry *entry = find_any_entry(router, task_ref);
   while (entry != NULL && entry->releasing) {
@@ -379,8 +412,7 @@ bool meta_capture_router_release(MetaCaptureRouter *router,
   MetaCaptureTaskStatus status = {0};
   if (native_task == NULL ||
       !router->backend.status(router->backend.context, native_task, &status) ||
-      (!recovery_authorized &&
-       (!status.drained || status.cleanup != MetaCaptureCleanupComplete))) {
+      !status.drained || status.cleanup != MetaCaptureCleanupComplete) {
     if (entry != NULL) {
       [router->lock lock];
       entry->releasing = false;
@@ -396,6 +428,8 @@ bool meta_capture_router_release(MetaCaptureRouter *router,
     return false;
   }
   MetaCaptureResult *result = entry->result;
+  entry->last_status = status;
+  entry->has_last_status = true;
   entry->result = NULL;
   entry->released = true;
   entry->safe_to_forget = status.drained &&
@@ -505,6 +539,27 @@ bool meta_capture_router_release_authorized(
     [router->lock unlock];
     return true;
   }
+  if (entry->released) {
+    if (!entry->has_last_status ||
+        entry->last_status.revision != authority->expected_status_revision ||
+        !entry->last_status.completionDelivered ||
+        !entry->last_status.drained ||
+        entry->last_status.cleanup != MetaCaptureCleanupComplete) {
+      [router->lock unlock];
+      return false;
+    }
+    entry->release_receipt = (MetaCaptureReleaseReceipt){
+        .authority = *authority,
+        .status_revision = entry->last_status.revision,
+        .already_released = true,
+        .cleanup_complete = true,
+        .drained = true,
+    };
+    entry->has_release_receipt = true;
+    *receipt = entry->release_receipt;
+    [router->lock unlock];
+    return true;
+  }
   if (entry->pending_cleanup_request_id[0] != '\0') {
     if (strcmp(entry->pending_cleanup_request_id,
                authority->cleanup_request_id) != 0) {
@@ -534,7 +589,7 @@ bool meta_capture_router_release_authorized(
   MetaCaptureTaskStatus verified_status = {0};
   if (!meta_capture_router_status(router, authority->task_ref,
                                   &verified_status) ||
-      verified_status.revision < authority->expected_status_revision ||
+      verified_status.revision != authority->expected_status_revision ||
       !verified_status.drained ||
       verified_status.cleanup != MetaCaptureCleanupComplete) {
     [router->lock lock];
@@ -664,6 +719,9 @@ size_t meta_capture_router_operation_tasks(
                entry->task_ref);
       record->released = entry->released;
       record->result_available = entry->result != NULL;
+      if (entry->released && entry->has_last_status) {
+        record->status = entry->last_status;
+      }
     }
     if (count < capacity && count < 128 && !entry->released &&
         !entry->releasing && entry->native_task != NULL) {
