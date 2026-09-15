@@ -54,6 +54,8 @@ typedef struct {
 @property(nonatomic, strong, nullable) dispatch_source_t captureTimer;
 @property(nonatomic, strong, nullable) dispatch_source_t stopTimer;
 @property(nonatomic, strong, nullable) id<MetaCaptureStreamHandle> stream;
+@property(nonatomic) bool outputRegistered;
+@property(nonatomic) bool outputRemovalAttempted;
 @property(nonatomic, strong, nullable) SCWindow *window;
 @property(nonatomic, strong, nullable) SCDisplay *display;
 @property(nonatomic, copy) NSArray<SCDisplay *> *displays;
@@ -98,6 +100,7 @@ typedef struct {
 - (void)begin;
 - (void)cancel;
 - (bool)copyTaskStatus:(MetaCaptureTaskStatus *)status;
+- (void)removeRegisteredOutput;
 
 @end
 
@@ -707,6 +710,8 @@ static MetaCaptureDisplayRegion *MetaBuildRegions(
                       message:addError.localizedDescription ?: @"Не удалось добавить SCStream output"];
     return;
   }
+  _outputRegistered = true;
+  _outputRemovalAttempted = false;
 
   __weak MetaCaptureSession *weakSelf = self;
   [_stream startCaptureWithCompletionHandler:^(NSError *startError) {
@@ -721,7 +726,8 @@ static MetaCaptureDisplayRegion *MetaBuildRegions(
 - (void)captureStarted:(NSError *)error {
   if (_completionDelivered && !_retainedForUnknownCleanup) return;
   if (error != nil) {
-    [_stream removeStreamOutput:self type:SCStreamOutputTypeScreen error:nil];
+    _outputRegistered = false;
+    _outputRemovalAttempted = true;
     _stream = nil;
     _streamStopped = true;
     _stopCallInFlight = false;
@@ -940,6 +946,7 @@ static MetaCaptureDisplayRegion *MetaBuildRegions(
   if (_stopRequested || _stream == nil) return;
   _stopRequested = true;
   [self refreshTaskStatus];
+  [self removeRegisteredOutput];
   [self requestStopAttempt];
 }
 
@@ -983,7 +990,7 @@ static MetaCaptureDisplayRegion *MetaBuildRegions(
 - (void)stoppedWithError:(NSError *)error {
   _stopCallInFlight = false;
   if (error == nil) {
-    [_stream removeStreamOutput:self type:SCStreamOutputTypeScreen error:nil];
+    _outputRegistered = false;
     _stream = nil;
     _streamStopped = true;
     [self finalizeStoppedResourceIfPossible];
@@ -1004,6 +1011,7 @@ static MetaCaptureDisplayRegion *MetaBuildRegions(
     if (session == nil) return;
     session.stopCallInFlight = false;
     session.streamStopped = true;
+    session.outputRegistered = false;
     if (!session.stopRequested) {
       session.stopRequested = true;
       session.pendingOutcome = MetaCaptureOutcomeFailed;
@@ -1013,6 +1021,17 @@ static MetaCaptureDisplayRegion *MetaBuildRegions(
     session.stream = nil;
     [session finalizeStoppedResourceIfPossible];
   });
+}
+
+- (void)removeRegisteredOutput {
+  id<MetaCaptureStreamHandle> stream = _stream;
+  if (!_outputRegistered || _outputRemovalAttempted || stream == nil) return;
+  _outputRemovalAttempted = true;
+  NSError *removeError = nil;
+  BOOL removed = [stream removeStreamOutput:self
+                                       type:SCStreamOutputTypeScreen
+                                      error:&removeError];
+  if (removed) _outputRegistered = false;
 }
 
 - (void)finalizeStoppedResourceIfPossible {
@@ -1505,6 +1524,8 @@ MetaCaptureTaskRef meta_capture_test_create_lifecycle_task(
   ];
   if (session == nil) return NULL;
   session.stream = (__bridge id<MetaCaptureStreamHandle>)streamObject;
+  session.outputRegistered = true;
+  session.outputRemovalAttempted = false;
   session.encodingInFlight = encodingInFlight;
   [session refreshTaskStatus];
   MetaRetainActiveSession(session);

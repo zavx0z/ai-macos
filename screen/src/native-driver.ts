@@ -221,6 +221,14 @@ function mapStatus(status: Awaited<ReturnType<ProtocolCaptureTask["status"]>>): 
   return {
     taskRef: status.captureTaskRef,
     revision: status.revision,
+    completionDelivered: status.completionDelivered,
+    stopRequested: status.stopRequested,
+    stopCallInFlight: status.stopCallInFlight,
+    stopAttemptCount: status.stopAttemptCount,
+    startPending: status.startPending,
+    streamStarted: status.streamStarted,
+    streamStopped: status.streamStopped,
+    encodingInFlight: status.encodingInFlight,
     cleanup: status.cleanup,
     drained: status.drained,
   }

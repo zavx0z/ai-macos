@@ -203,6 +203,27 @@ fi
 /usr/bin/clang \
   -fobjc-arc \
   -fblocks \
+  -DMETA_CAPTURE_TESTING=1 \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
+  -Inative/src \
+  native/src/capture/meta_capture.m \
+  native/src/capture/tests/meta_capture_fixture.m \
+  -framework Foundation \
+  -framework CoreGraphics \
+  -framework CoreImage \
+  -framework CoreMedia \
+  -framework CoreVideo \
+  -framework ImageIO \
+  -framework ScreenCaptureKit \
+  -o "$CHECK_DIR/capture-lifecycle-test"
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
   -DMETA_CAPTURE_ROUTER_TESTING=1 \
   -mmacosx-version-min=13.0 \
   -Wall \
@@ -336,6 +357,7 @@ fi
 "$CHECK_DIR/serialization-test"
 "$CHECK_DIR/capture-router-test"
 "$CHECK_DIR/capture-command-test"
+"$CHECK_DIR/capture-lifecycle-test"
 "$CHECK_DIR/broker-core-test"
 "$CHECK_DIR/ax-inspector-test"
 "$CHECK_DIR/geometry-probe-test"

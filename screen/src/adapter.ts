@@ -122,6 +122,14 @@ export type NativeCaptureTask = {
 export type NativeCaptureTaskStatus = {
   taskRef: string
   revision: number
+  completionDelivered: boolean
+  stopRequested: boolean
+  stopCallInFlight: boolean
+  stopAttemptCount: number
+  startPending: boolean
+  streamStarted: boolean
+  streamStopped: boolean
+  encodingInFlight: boolean
   cleanup: "pending" | "complete" | "unknown"
   drained: boolean
 }
@@ -637,11 +645,32 @@ export class RuntimeScreenAdapter implements ScreenAdapter {
         context.control.signal,
       )
     } catch (error) {
-      await this.native.cancel(task.taskRef, error instanceof Error ? error.message : String(error)).catch(() => {})
+      let cancelError: unknown
+      try {
+        await this.native.cancel(task.taskRef, error instanceof Error ? error.message : String(error))
+      } catch (cause) {
+        cancelError = cause
+      }
       try {
         return await within(task.result, this.stopTimeoutMs, undefined)
-      } catch {
-        throw new UnresolvedCaptureError(task.taskRef, error)
+      } catch (terminalError) {
+        let status: NativeCaptureTaskStatus | undefined
+        let statusError: unknown
+        try {
+          status = await within(
+            this.native.status(task.taskRef),
+            Math.min(this.stopTimeoutMs, 250),
+            undefined,
+          )
+        } catch (cause) {
+          statusError = cause
+        }
+        throw new UnresolvedCaptureError(task.taskRef, error, {
+          cancelError,
+          terminalError,
+          status,
+          statusError,
+        })
       }
     }
   }
@@ -696,8 +725,29 @@ class NativeCaptureError extends Error {
 }
 
 class UnresolvedCaptureError extends Error {
-  constructor(readonly taskRef: string, cause: unknown) {
-    super(`Native capture outcome не подтверждён для ${taskRef}: ${cause instanceof Error ? cause.message : String(cause)}`)
+  constructor(
+    readonly taskRef: string,
+    cause: unknown,
+    diagnostics: {
+      cancelError?: unknown
+      terminalError: unknown
+      status?: NativeCaptureTaskStatus
+      statusError?: unknown
+    },
+  ) {
+    const detail = (value: unknown) => (
+      value instanceof Error ? value.message : String(value)
+    ).slice(0, 256)
+    const facts = [
+      `initial=${detail(cause)}`,
+      `terminal=${detail(diagnostics.terminalError)}`,
+      ...(diagnostics.cancelError === undefined ? [] : [`cancel=${detail(diagnostics.cancelError)}`]),
+      ...(diagnostics.status === undefined ? [] : [
+        `status=revision:${diagnostics.status.revision},completion:${diagnostics.status.completionDelivered},startPending:${diagnostics.status.startPending},streamStarted:${diagnostics.status.streamStarted},streamStopped:${diagnostics.status.streamStopped},encoding:${diagnostics.status.encodingInFlight},stopRequested:${diagnostics.status.stopRequested},stopInFlight:${diagnostics.status.stopCallInFlight},stopAttempts:${diagnostics.status.stopAttemptCount},cleanup:${diagnostics.status.cleanup},drained:${diagnostics.status.drained}`,
+      ]),
+      ...(diagnostics.statusError === undefined ? [] : [`statusError=${detail(diagnostics.statusError)}`]),
+    ]
+    super(`Native capture outcome не подтверждён для ${taskRef}: ${facts.join("; ")}`.slice(0, 1_800))
   }
 }
 

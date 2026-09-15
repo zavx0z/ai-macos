@@ -264,11 +264,20 @@ class FakeNativeDriver implements NativeCaptureDriver {
   readonly cancelled: string[] = []
   readonly released: string[] = []
   readonly releaseKeys: string[] = []
+  statusCalls = 0
   releaseFailures = 0
   completion: Promise<NativeCaptureCompletion>
   nextStatus: NativeCaptureTaskStatus = {
     taskRef: "capture-task:1",
     revision: 3,
+    completionDelivered: true,
+    stopRequested: true,
+    stopCallInFlight: false,
+    stopAttemptCount: 1,
+    startPending: false,
+    streamStarted: true,
+    streamStopped: true,
+    encodingInFlight: false,
     cleanup: "complete",
     drained: true,
   }
@@ -290,6 +299,7 @@ class FakeNativeDriver implements NativeCaptureDriver {
   }
 
   async status() {
+    this.statusCalls += 1
     return this.nextStatus
   }
 
@@ -670,8 +680,7 @@ describe("RuntimeScreenAdapter", () => {
   test("reconciliation не release task при unknown cleanup и drained=true", async () => {
     const native = new FakeNativeDriver(rawSuccess({ cleanup: "unknown", drained: false }))
     native.nextStatus = {
-      taskRef: "capture-task:1",
-      revision: 3,
+      ...native.nextStatus,
       cleanup: "unknown",
       drained: true,
     }
@@ -726,6 +735,8 @@ describe("RuntimeScreenAdapter", () => {
     expect(result.error.code).toBe("operation-outcome-unknown")
     expect(result.outcome.cleanup.state).toBe("unknown")
     expect(native.cancelled).toEqual(["capture-task:1"])
+    expect(native.statusCalls).toBe(1)
+    expect(result.error.message).toContain("status=revision:3,completion:true,startPending:false,streamStarted:true,streamStopped:true,encoding:false,stopRequested:true,stopInFlight:false,stopAttempts:1,cleanup:complete,drained:true")
     expect(native.released).toEqual([])
     expect(runtime.published).toEqual([])
   })

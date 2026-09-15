@@ -14,6 +14,8 @@
 @interface FakeStream : NSObject
 
 @property(nonatomic) NSUInteger stopCount;
+@property(nonatomic) NSUInteger removeCount;
+@property(nonatomic) BOOL removeSucceeds;
 @property(nonatomic, copy, nullable) void (^pendingStop)(NSError *_Nullable error);
 
 - (void)resolveStop:(NSError *_Nullable)error;
@@ -22,6 +24,12 @@
 
 
 @implementation FakeStream
+
+- (instancetype)init {
+  self = [super init];
+  if (self != nil) _removeSucceeds = YES;
+  return self;
+}
 
 - (BOOL)addStreamOutput:(id)output
                    type:(NSInteger)type
@@ -37,7 +45,12 @@
 - (BOOL)removeStreamOutput:(id)output type:(NSInteger)type error:(NSError **)error {
   (void)output;
   (void)type;
-  (void)error;
+  assert(error != NULL);
+  self.removeCount += 1;
+  if (!self.removeSucceeds) {
+    *error = [NSError errorWithDomain:@"fixture-remove" code:1 userInfo:nil];
+    return NO;
+  }
   return YES;
 }
 
@@ -46,6 +59,7 @@
 }
 
 - (void)stopCaptureWithCompletionHandler:(void (^)(NSError *_Nullable error))completionHandler {
+  assert(self.removeCount == 1);
   self.stopCount += 1;
   self.pendingStop = completionHandler;
 }
@@ -361,8 +375,10 @@ static void testStopBeforeLateStartDoesNotRestart(void) {
   meta_capture_cancel(task);
   meta_capture_test_sync(task);
   assert(stream.stopCount == 1);
+  assert(stream.removeCount == 1);
   [stream resolveStop:nil];
   meta_capture_test_sync(task);
+  assert(stream.removeCount == 1);
   flushCallbackQueue(callbacks);
   assert(completionCount == 1);
   assert(cleanup == MetaCaptureCleanupComplete);
@@ -370,10 +386,57 @@ static void testStopBeforeLateStartDoesNotRestart(void) {
   meta_capture_test_resolve_start(task, true);
   meta_capture_test_sync(task);
   assert(stream.stopCount == 1);
+  assert(stream.removeCount == 1);
   MetaCaptureTaskStatus status;
   assert(meta_capture_task_status(task, &status));
   assert(status.drained);
   assert(status.cleanup == MetaCaptureCleanupComplete);
+  meta_capture_task_release(task);
+}
+
+static void testStartFailureReleasesStreamWithoutTerminalDetach(void) {
+  FakeStream *stream = [FakeStream new];
+  dispatch_queue_t callbacks = dispatch_queue_create(
+      "capture.fixture.callbacks.start-failure", DISPATCH_QUEUE_SERIAL);
+  __block NSUInteger completionCount = 0;
+  __block MetaCaptureCleanup cleanup = MetaCaptureCleanupPending;
+  MetaCaptureTaskRef task = lifecycleTask(
+      stream, false, callbacks, &completionCount, &cleanup);
+  assert(task != NULL);
+
+  meta_capture_test_resolve_start(task, false);
+  flushCallbackQueue(callbacks);
+  assert(stream.removeCount == 0);
+  assert(completionCount == 1);
+  assert(cleanup == MetaCaptureCleanupComplete);
+  meta_capture_task_release(task);
+}
+
+static void testDetachFailureStillStopsAndDoesNotRetryRemoval(void) {
+  FakeStream *stream = [FakeStream new];
+  stream.removeSucceeds = NO;
+  dispatch_queue_t callbacks = dispatch_queue_create(
+      "capture.fixture.callbacks.detach-failure", DISPATCH_QUEUE_SERIAL);
+  __block NSUInteger completionCount = 0;
+  __block MetaCaptureCleanup cleanup = MetaCaptureCleanupPending;
+  MetaCaptureTaskRef task = lifecycleTask(
+      stream, false, callbacks, &completionCount, &cleanup);
+  assert(task != NULL);
+
+  meta_capture_cancel(task);
+  meta_capture_test_sync(task);
+  assert(stream.removeCount == 1);
+  assert(stream.stopCount == 1);
+  [stream resolveStop:nil];
+  meta_capture_test_sync(task);
+  flushCallbackQueue(callbacks);
+  assert(stream.removeCount == 1);
+  assert(completionCount == 1);
+  assert(cleanup == MetaCaptureCleanupComplete);
+  meta_capture_test_resolve_start(task, true);
+  meta_capture_test_sync(task);
+  assert(stream.removeCount == 1);
+  assert(stream.stopCount == 1);
   meta_capture_task_release(task);
 }
 
@@ -434,6 +497,7 @@ static void testStopErrorRetriesAfterLateStart(void) {
   meta_capture_test_resolve_start(task, true);
   meta_capture_test_sync(task);
   assert(stream.stopCount == 2);
+  assert(stream.removeCount == 1);
   [stream resolveStop:nil];
   meta_capture_test_sync(task);
   flushCallbackQueue(callbacks);
@@ -562,6 +626,8 @@ int main(void) {
     testRegionTransform();
     testLayoutComposition();
     testStopBeforeLateStartDoesNotRestart();
+    testStartFailureReleasesStreamWithoutTerminalDetach();
+    testDetachFailureStillStopsAndDoesNotRetryRemoval();
     testCaptureTimeoutWhileStartPendingStopsOnce();
     testStopErrorRetriesAfterLateStart();
     testStopTimeoutReconcilesAfterLateSuccess();

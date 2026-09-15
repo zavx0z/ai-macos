@@ -948,7 +948,20 @@ test("ProtocolNativeCaptureDriver reconciles unknown completion через verif
   expect(completion.drained).toBe(false)
 
   const status = await driver.status(task.taskRef)
-  expect(status).toEqual({ taskRef, revision: 3, cleanup: "complete", drained: true })
+  expect(status).toEqual({
+    taskRef,
+    revision: 3,
+    completionDelivered: true,
+    stopRequested: true,
+    stopCallInFlight: false,
+    stopAttemptCount: 1,
+    startPending: false,
+    streamStarted: true,
+    streamStopped: true,
+    encodingInFlight: false,
+    cleanup: "complete",
+    drained: true,
+  })
   expect(continuations.statusAdvances).toEqual([
     { revision: 1, cleanup: "unknown", drained: false },
     { revision: 2, cleanup: "unknown", drained: false },
