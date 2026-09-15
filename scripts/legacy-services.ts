@@ -686,25 +686,29 @@ export class CheckedPidLegacyBackend implements LegacyServiceBackend {
 
   async process(pid: number): Promise<LegacyProcessSnapshot | undefined> {
     if (!Number.isInteger(pid) || pid < 1) throw new Error("Некорректный PID")
-    const ps = await this.#read("/bin/ps", [
+    const psArguments = [
       "-ww",
       "-p",
       String(pid),
       "-o",
       "pid=,ppid=,uid=,lstart=,state=,command=",
-    ], true)
+    ]
+    const ps = await this.#read("/bin/ps", psArguments, true)
     const parsed = parsePsLine(ps.trim())
     if (parsed === undefined) return undefined
     if (parsed.pid !== pid) throw new Error("ps вернул другой PID")
-    const files = await this.#read("/usr/sbin/lsof", [
-      "-nP",
-      "-a",
-      "-p",
-      String(pid),
-      "-d",
-      "cwd,txt",
-      "-Ffn",
-    ], false)
+    let files: string
+    try {
+      files = await this.#read("/usr/sbin/lsof", [
+        "-nP", "-a", "-p", String(pid), "-d", "cwd,txt", "-Ffn",
+      ], false)
+    } catch (error) {
+      // После TERM процесс может исчезнуть между ps и lsof. Ошибка lsof
+      // сама по себе не доказывает exit: требуется повторный ps без записи.
+      const current = parsePsLine((await this.#read("/bin/ps", psArguments, true)).trim())
+      if (current === undefined) return undefined
+      throw error
+    }
     const paths = parseLsofProcessPaths(files)
     if (paths.cwd === undefined || paths.executable === undefined) {
       throw new Error(`lsof не вернул cwd/executable для PID ${pid}`)

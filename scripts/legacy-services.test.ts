@@ -10,6 +10,28 @@ import {
   type PathIdentity,
 } from "./legacy-services.ts"
 
+test("исчезновение между ps и lsof подтверждается повторным ps, а ошибка живого процесса сохраняется", async () => {
+  for (const exited of [true, false]) {
+    let reads = 0
+    const runner: LegacyCommandRunner = {
+      async run(file) {
+        if (file === "/bin/ps") {
+          reads++
+          return reads > 1 && exited
+            ? { stdout: "", stderr: "", exitCode: 1 }
+            : { stdout: "55 1 501 Mon Sep 15 12:00:00 2026 S /tmp/bin/bun src/index.ts\n", stderr: "", exitCode: 0 }
+        }
+        if (file === "/usr/sbin/lsof") return { stdout: "", stderr: "", exitCode: 1 }
+        throw new Error("Проверка завершения не должна отправлять сигналы")
+      },
+    }
+    const backend = new CheckedPidLegacyBackend({ runner })
+    if (exited) expect(await backend.process(55)).toBeUndefined()
+    else await expect(backend.process(55)).rejects.toThrow("lsof failed")
+    expect(reads).toBe(2)
+  }
+})
+
 const uid = 501
 const root = "/tmp/repozitarium/ai-macos"
 const bun = "/tmp/bin/bun"
