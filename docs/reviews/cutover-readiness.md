@@ -5,9 +5,9 @@
 
 ## Установленная версия
 
-Последний подтверждённый installed checkpoint — source `c9951df`, release
-`release-97510f3e15d016dda8ac7402`, runtime/native build suffix
-`f21decdba11f01ccff5be296`. Последующие коммиты требуют новой установки.
+Последний подтверждённый installed checkpoint — source `0b16219`, release
+`release-11596d6e61b1f971e17b4261`, runtime/native build suffix
+`a00b566aa427a8b769229a42`. Последующие коммиты требуют новой установки.
 
 - Стабильный подписанный bundle: `Application Support/ai-macos/runtime/computer-use.app`.
 - Executable: `Contents/MacOS/computer-use`; Native: `Contents/Helpers/meta-input-helper`.
@@ -38,6 +38,8 @@
 | `check_input` | Move и restore posted/observed/readback confirmed, cursor восстановлен, cleanup complete |
 | `show_window` | Одна операция show успешно возвращает точное окно; ошибочного второго focus и malformed wrapper больше нет |
 | AXPress `fixture.sheet.open` | Одна операция completed, exact target verified, cleanup complete; oracle подтвердил `sheet-opened` и `sheet.open=1` |
+| Поиск после переключения Space | `a34dd4b`: scoped PID снова возвращает оба точных AX окна; unrelated apps сохраняют честную global incompleteness |
+| Отдельный sheet и закрытие | `70eec77`: отдельный surface target с ownerTargetId, AX complete; один AXPress close, oracle `sheet-closed`, `sheet.open=0` |
 
 Основные receipts успешных действий на предыдущем installed `990e548`:
 
@@ -52,35 +54,46 @@ sheet отдельным evidence служит read-only oracle самой fixtu
 
 ## Текущий live blocker
 
-После открытия sheet `get_state` не опубликовал его как отдельную owned surface.
-Source `0e486d7` исправляет потерю exact AXSheets owner при дедупликации и уже
-установлен. После обновления пользователь подтвердил переключение на другой
-macOS Space. Первый scoped `get_state(pid)` вернул только CG-only records;
-повторный — одно AX окно при `axStatus: timed-out`. Sheet не выбран, ввод не
-выполнялся. Это не доказывает regression sheet patch.
+Поиск background windows и sheet уже исправлены и проверены. `a34dd4b`
+передаёт scheduling priority через первый app/PID поиск и fresh re-resolution
+applicationRef. `70eec77` дополнительно обнаруживает direct AXChildren sheet
+по роли, PID и exact AXParent, когда AXSheets не дал owner. Это подтвердили
+полная AX hierarchy fixture, отдельный surface и реальное закрытие диалога.
 
-Проверка source обнаружила scheduling flaw: `list_windows` применяет app/pid
-фильтр после полного Native опроса. Foreground получает первый бюджет, а
-явно выбранное фоновое приложение конкурирует с примерно 95 приложениями за
-общий deadline. Исправление должно передавать scheduling hint и при первичном
-поиске, и при fresh re-resolution уже выданной цели, сохраняя exact incarnation
-proof и честную completeness. Переключение Space или фокуса не является обходом.
+Первый numeric pointer click в новой задаче выявил следующий blocker:
+`input_executor.m` требует равенства observation.inventoryRevision и current
+operation.inventoryRevision. Реальный допустимый путь имел capture revision 10
+и свежий target revision 11. Настоящий TS producer → C command loop с fake sink
+воспроизводит отказ до begin и отсутствие физических posts. Исправление должно
+сохранить независимые проверки capture proof, текущей цели, layout и геометрии.
 
-Дополнительно `ae4a4af` исправляет диагностический `axWindowCount`: теперь это
-число опубликованных AX окон, а не общий application.windowCount, включавший
-CG-only records. Прежнее значение 6 не доказывало наличие шести AX окон.
+Live operation `operation:485a50d3-003b-44ce-97fa-8f48f840bd5a` осталась failed
+с dispatch/effect unknown; после запроса статуса Native завершился code 65.
+Managed restart сохранил evidence и закрыл admission. Один штатный пассивный
+`recover_startup_input` подтвердил ALL-UP: resolved=1, unresolved=0,
+remainingOperations=0, admissionSealed=false, cleanup=complete/resources released.
+Это не меняет исторический unknown dispatch и не разрешает слепой replay.
+Следующая попытка требует исправленной сборки и нового observation.
+
+Проверочная задача с новым каталогом:
+«Computer use: ввод и финальный прогон». Предыдущая задача сохранила старое
+`Array<string>` представление numeric tuple. `3db57a4` публикует обычный
+числовой array с minItems=maxItems=2; установленный MCP и свежая задача это
+подтвердили. `d0ac887` обнаруживает изменение схем даже при совпавшей revision.
+`ae4a4af` считает в axWindowCount только опубликованные AX окна, без CG-only.
 
 Primary AX сохраняет `complete=false` при ошибке optional description. API не
 скрывает эту ошибку: `observe(mode:"both")` возвращает aggregate incompleteness,
 а полное изображение может разрешить одно действие того же observation.
 Pointer input отдельно требует image-ready и свежий Native point proof.
 
-Ещё не подтверждены live: закрытие owned sheet, pointer/text/keyboard actions,
-скрытие/сворачивание и точный show, отмена во время ввода, выбранный Chrome target.
+Ещё не подтверждены live: успешные pointer/text/keyboard actions,
+скрытие/сворачивание и точный show, отмена во время ввода. Инвентаризация
+настроенного Chrome-CDP дала пять отдельных target IDs; страницы не менялись.
 
 ## Проверки исходников
 
-Последний общий safe прогон: 865 pass, 1 skip, 0 fail; 3659 assertions,
+Последний общий safe прогон: 874 pass, 1 skip, 0 fail; 3708 assertions,
 144 files. System clipboard live test отключён. Последующие изменения требуют
 собственных targeted checks и проверки новой установленной сборки.
 
@@ -111,7 +124,7 @@ Pointer input отдельно требует image-ready и свежий Native
 | --- | --- |
 | A02, A31 | Отдельные subprocess, private UDS/auth/lineage tests подтверждены (`f2a668e`, `6dfd0ae`) |
 | A43 catalog/recovery | Новый installed runtime и 36 tools подтверждены; action acceptance остаётся частичной |
-| Live capture/input | Capture, active probe и AXPress подтверждены; остальные действия перечислены выше |
+| Live capture/input | Capture, active probe, AXPress и separate sheet close подтверждены; pointer blocker и остальные действия перечислены выше |
 | Старые listeners 7878–7882 | Собственные legacy services остановлены ранее; архивные процессы не затрагивались |
 | Старый Chrome CDP LaunchAgent | Exact plist/job отсутствуют; уже работающий browser не остановлен |
 | Reverse imports | Повторный source audit выполнен; Android tests мигрированы отдельно |
