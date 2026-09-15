@@ -12,6 +12,11 @@
 проходит миграцию, либо отключается с видимой причиной. Нельзя оставить старый
 автоматический bootstrap доступным рядом с безопасным desktop runtime.
 
+Функциональный readiness профиль `full` проверяет desktop/browser capabilities;
+`runtime.install` проверяется отдельной внешней транзакцией installer
+(artifact/signature, launchd identity, drain, rollback). Устанавливаемый процесс
+не должен объявлять собственную установку успешной ради прохождения этой проверки.
+
 Весь UI Android, private Spaces API, обход TCC/Secure Input и фоновые «always on
 top» циклы не входят в desktop computer use. Это явная граница продукта, а не
 список скрытых незавершённых обещаний. Если нужный сценарий внутри обязательной
