@@ -43,6 +43,8 @@ type HelperArtifactName = typeof HELPER_ARTIFACT_NAMES[number]
 const MAX_COMMAND_OUTPUT = 8 * 1024 * 1024
 const MAX_BROWSER_CONFIG_BYTES = 64 * 1024
 const MAX_ICON_BYTES = 16 * 1024 * 1024
+const OBSERVER_PREPARATION_MAX_MS = 26_000
+const OBSERVER_PREPARATION_TRANSPORT_MARGIN_MS = 0
 const STARTUP_PERMISSION_NAMES = ["accessibility", "screenRecording", "postEvents", "inputMonitoring"] as const
 const PENDING_STARTUP_PERMISSION_STATES = new Set(["checking", "requesting", "waiting", "restart-needed"])
 const OBSERVER_REQUIRED_CAPABILITIES = new Set<CapabilityId>([
@@ -1382,12 +1384,16 @@ async function runDoctor(
     : join(plan.paths.installRoot, "current", manifest.artifacts.runtime.path)
   let readinessDeadlineAt = Date.now() + timeoutMs
   let permissionDeadlineAt: number | undefined
+  let observerPreparationDeadlineAt: number | undefined
+  let observerPreparationActive = false
   let previousPermissionStatePending = false
   let lastFailure = "runtime doctor не ответил"
   while (true) {
     const deadlineAt = previousPermissionStatePending && permissionDeadlineAt !== undefined
       ? permissionDeadlineAt
-      : readinessDeadlineAt
+      : observerPreparationActive && observerPreparationDeadlineAt !== undefined
+        ? observerPreparationDeadlineAt
+        : readinessDeadlineAt
     if (Date.now() >= deadlineAt) break
     const result = await runner.run(executable, ["--doctor"], {
       timeoutMs: Math.max(1, Math.min(2_000, deadlineAt - Date.now())),
@@ -1406,7 +1412,7 @@ async function runDoctor(
     structuredContent?: {
       runtime?: { buildId?: string, draining?: boolean, admissionSealed?: boolean,
         recoveryOperations?: number, recoveryReasons?: unknown[] }
-      observer?: { state?: string, viewReady?: boolean }
+      observer?: { state?: string, viewReady?: boolean, preparation?: unknown }
       native?: { state?: string, buildId?: string }
       permissions?: {
         accessibility?: { granted?: boolean, helperPath?: string, cdhash?: string }
@@ -1478,8 +1484,8 @@ async function runDoctor(
     }
     const observerRequired = plan.configuration.requiredCapabilities
       .some(capability => OBSERVER_REQUIRED_CAPABILITIES.has(capability))
-    const observerReady = doctor.structuredContent.observer?.state === "ready"
-      && doctor.structuredContent.observer?.viewReady === true
+    const observer = parseObserverHealth(doctor.structuredContent.observer, observerRequired)
+    const observerReady = observer.state === "ready" && observer.viewReady
     const recoveryClean = doctor.structuredContent.runtime.recoveryOperations === 0
       && Array.isArray(doctor.structuredContent.runtime.recoveryReasons)
       && doctor.structuredContent.runtime.recoveryReasons.length === 0
@@ -1487,8 +1493,26 @@ async function runDoctor(
       && doctor.structuredContent.quarantinedResources === 0
     const observerPreparing = observerRequired && !observerReady
     const sealedPostGrantPreparation = startupPermissions?.state === "ready"
-      && !observerReady && recoveryClean
+      && observer.state === "preparing" && recoveryClean
       && doctor.structuredContent.runtime.admissionSealed === true
+    if (observer.preparation !== undefined && observerPreparing && recoveryClean
+      && (doctor.structuredContent.runtime.admissionSealed === false || sealedPostGrantPreparation)) {
+      if (observerPreparationDeadlineAt === undefined) {
+        observerPreparationDeadlineAt = Math.min(
+          observer.preparation.deadlineAt + OBSERVER_PREPARATION_TRANSPORT_MARGIN_MS,
+          Date.now() + OBSERVER_PREPARATION_MAX_MS + OBSERVER_PREPARATION_TRANSPORT_MARGIN_MS,
+        )
+      }
+      observerPreparationActive = true
+      if (Date.now() >= observerPreparationDeadlineAt) break
+      lastFailure = `observer preparation attempt ${observer.preparation.attempt}/${observer.preparation.maxAttempts}`
+      await boundedDelay(Math.min(100, Math.max(1, observerPreparationDeadlineAt - Date.now())))
+      continue
+    }
+    if (observerPreparationDeadlineAt !== undefined && observer.state === "preparing") {
+      throw new Error("Observer preparation progress исчез после typed retry state")
+    }
+    observerPreparationActive = false
     if (sealedPostGrantPreparation
       || (observerPreparing && recoveryClean && doctor.structuredContent.runtime.admissionSealed === false)) {
       lastFailure = "observer/view ещё не готовы после выдачи startup permissions"
@@ -1508,7 +1532,78 @@ async function runDoctor(
   if (previousPermissionStatePending && permissionDeadlineAt !== undefined) {
     throw new Error(`Installed runtime startup permission wait deadline exceeded: ${lastFailure}`)
   }
+  if (observerPreparationActive && observerPreparationDeadlineAt !== undefined) {
+    throw new Error(`Installed runtime observer preparation deadline exceeded: ${lastFailure}`)
+  }
   throw new Error(`Installed runtime doctor readiness deadline exceeded: ${lastFailure}`)
+}
+
+type ObserverPreparationHealth = {
+  attempt: 1 | 2 | 3
+  maxAttempts: 3
+  startedAt: number
+  deadlineAt: number
+  nextRetryAt?: number
+}
+
+type ObserverHealth = {
+  state: "unavailable" | "preparing" | "ready"
+  viewReady: boolean
+  preparation?: ObserverPreparationHealth
+}
+
+function parseObserverHealth(value: unknown, required: boolean): ObserverHealth {
+  if (value === undefined && !required) return { state: "unavailable", viewReady: false }
+  if (value === null || typeof value !== "object") throw new Error("Observer health отсутствует")
+  const observer = value as { state?: unknown, viewReady?: unknown, preparation?: unknown }
+  if (!["unavailable", "preparing", "ready"].includes(String(observer.state))
+    || typeof observer.viewReady !== "boolean") throw new Error("Observer health повреждён")
+  if ((observer.state === "ready") !== observer.viewReady) {
+    throw new Error("Observer state/viewReady не согласованы")
+  }
+  if (observer.preparation === undefined) {
+    return { state: observer.state as ObserverHealth["state"], viewReady: observer.viewReady }
+  }
+  if (observer.state !== "preparing" || observer.viewReady) {
+    throw new Error("Observer preparation не соответствует state/viewReady")
+  }
+  if (observer.preparation === null || typeof observer.preparation !== "object") {
+    throw new Error("Observer preparation progress повреждён")
+  }
+  const preparation = observer.preparation as Record<string, unknown>
+  if (!exactKeys(preparation, preparation.nextRetryAt === undefined
+    ? ["attempt", "deadlineAt", "maxAttempts", "startedAt"]
+    : ["attempt", "deadlineAt", "maxAttempts", "nextRetryAt", "startedAt"])
+    || typeof preparation.attempt !== "number" || !Number.isSafeInteger(preparation.attempt)
+    || ![1, 2, 3].includes(preparation.attempt) || preparation.maxAttempts !== 3) {
+    throw new Error("Observer preparation attempt/maxAttempts повреждены")
+  }
+  const startedAt = parseObserverTimestamp(preparation.startedAt, "startedAt")
+  const deadlineAt = parseObserverTimestamp(preparation.deadlineAt, "deadlineAt")
+  const nextRetryAt = preparation.nextRetryAt === undefined
+    ? undefined
+    : parseObserverTimestamp(preparation.nextRetryAt, "nextRetryAt")
+  if (startedAt > Date.now() + 1_000
+    || deadlineAt <= startedAt || deadlineAt - startedAt > OBSERVER_PREPARATION_MAX_MS
+    || nextRetryAt !== undefined && (nextRetryAt < startedAt || nextRetryAt > deadlineAt)) {
+    throw new Error("Observer preparation timestamps выходят за bounded contract")
+  }
+  return { state: "preparing", viewReady: false, preparation: {
+    attempt: preparation.attempt as 1 | 2 | 3,
+    maxAttempts: 3,
+    startedAt,
+    deadlineAt,
+    ...(nextRetryAt === undefined ? {} : { nextRetryAt }),
+  } }
+}
+
+function parseObserverTimestamp(value: unknown, name: string): number {
+  if (typeof value !== "string" || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/.test(value)) {
+    throw new Error(`Observer preparation ${name} не является ISO timestamp`)
+  }
+  const timestamp = Date.parse(value)
+  if (!Number.isFinite(timestamp)) throw new Error(`Observer preparation ${name} invalid`)
+  return timestamp
 }
 
 type StartupPermissionsHealth = {

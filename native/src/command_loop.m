@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <poll.h>
 #include <signal.h>
+#include <stdio.h>
 #include <unistd.h>
 
 static BOOL json_safe(id value, NSUInteger depth) {
@@ -60,6 +61,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
                         control:(dispatch_queue_t)control;
 - (void)handle:(NSDictionary *)frame;
 - (void)shutdown:(int)code;
+- (void)shutdown:(int)code stage:(NSString *)stage;
 - (int)exitCode;
 - (void)pumpObserver;
 @end
@@ -121,7 +123,29 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   if (_requestedExit >= 0 || !_admitted || ![_backend respondsToSelector:@selector(takeObserverPush:)]) return;
   NSDictionary *batch = [_backend takeObserverPush:64];
   if (batch == nil) return;
-  if (batch[@"gapReason"] != nil) { [self shutdown:75]; return; }
+  if (batch[@"gapReason"] != nil) {
+    NSString *reason = [batch[@"gapReason"] isKindOfClass:NSString.class]
+        ? batch[@"gapReason"]
+        : @"";
+    NSString *stage = [reason containsString:@"нового foreground application"]
+        ? @"foreground-subscription-failed"
+        : [reason containsString:@"Новое AX window"]
+            ? @"new-window-subscription-failed"
+            : [reason containsString:@"event tap"] ||
+                  [reason containsString:@"Event observation"]
+                ? @"input-observer-gap"
+                : [reason containsString:@"callback не сопоставлен"] ||
+                      [reason containsString:@"Focus event не содержит exact runtime target"]
+                    ? @"observer-target-unresolved"
+                : [reason containsString:@"overflow"]
+                    ? @"observer-buffer-overflow"
+                    : [reason containsString:@"lifecycle"] ||
+                          [reason containsString:@"Lock state"]
+                        ? @"session-lifecycle-gap"
+                        : @"observer-coverage-gap";
+    [self shutdown:75 stage:stage];
+    return;
+  }
   NSArray *events = batch[@"events"];
   if (![events isKindOfClass:NSArray.class] || events.count > 64) { [self shutdown:70]; return; }
   for (NSDictionary *event in events) {
@@ -131,7 +155,18 @@ static NSDictionary *failure(NSString *code, NSString *message) {
 }
 
 - (void)shutdown:(int)code {
+  [self shutdown:code stage:code == 75 ? @"native-resource-limit"
+                                       : @"native-shutdown"];
+}
+
+- (void)shutdown:(int)code stage:(NSString *)stage {
   if (_requestedExit >= 0) return;
+  if (code == 75) {
+    fprintf(stderr,
+            "{\"kind\":\"native-terminal\",\"exitCode\":75,\"stage\":\"%s\"}\n",
+            stage.UTF8String ?: "native-resource-limit");
+    fflush(stderr);
+  }
   _sealed = YES;
   if ([_backend respondsToSelector:@selector(sealPermissionRequests)]) [_backend sealPermissionRequests];
   _requestedExit = code;
@@ -165,7 +200,10 @@ static NSDictionary *failure(NSString *code, NSString *message) {
 
 - (BOOL)maintenance:(NSDictionary *)payload work:(NSDictionary *(^)(void))work completed:(void (^)(NSDictionary *))completed {
   NSUInteger bytes = [NSJSONSerialization dataWithJSONObject:payload options:0 error:NULL].length;
-  if (_maintenanceCount >= 128 || bytes > 4 * 1024 * 1024 || _maintenanceBytes > 4 * 1024 * 1024 - bytes) { [self shutdown:75]; return NO; }
+  if (_maintenanceCount >= 128 || bytes > 4 * 1024 * 1024 || _maintenanceBytes > 4 * 1024 * 1024 - bytes) {
+    [self shutdown:75 stage:@"maintenance-capacity"];
+    return NO;
+  }
   _maintenanceCount += 1;
   _maintenanceBytes += bytes;
   dispatch_async(_actions, ^{
@@ -203,10 +241,13 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   for (NSString *key in _heartbeatIds.allKeys) if ([_heartbeatIds[key] doubleValue] <= now) [_heartbeatIds removeObjectForKey:key];
   if (!identifier(requestId, 127) || [_requestIds containsObject:requestId] || _heartbeatIds[requestId] != nil) { [self shutdown:65]; return; }
   if ([channel isEqual:@"heartbeat"]) {
-    if (_heartbeatIds.count >= 128) { [self shutdown:75]; return; }
+    if (_heartbeatIds.count >= 128) { [self shutdown:75 stage:@"heartbeat-correlation-capacity"]; return; }
     _heartbeatIds[requestId] = @(now + 5);
   } else {
-    if (_requestIds.count >= 10128 || (_requestIds.count >= 10000 && ![channel isEqual:@"drain"])) { [self shutdown:75]; return; }
+    if (_requestIds.count >= 10128 || (_requestIds.count >= 10000 && ![channel isEqual:@"drain"])) {
+      [self shutdown:75 stage:@"request-horizon-exhausted"];
+      return;
+    }
     [_requestIds addObject:requestId];
   }
   if ([channel isEqual:@"handshake"]) {
@@ -257,7 +298,10 @@ static NSDictionary *failure(NSString *code, NSString *message) {
       if ([result[@"ok"] isEqual:@YES] && [result[@"command"] isEqual:@"prepare"]) {
         NSString *instance = result[@"snapshot"][@"observerInstanceRef"];
         if (![self->_backend respondsToSelector:@selector(activateObserverPush:)] ||
-            ![self->_backend activateObserverPush:instance]) { [self shutdown:75]; return; }
+            ![self->_backend activateObserverPush:instance]) {
+          [self shutdown:75 stage:@"observer-push-activation-failed"];
+          return;
+        }
       }
       [self pumpObserver];
     }];

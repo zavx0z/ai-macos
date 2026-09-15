@@ -39,3 +39,18 @@ test("успешный drain и close завершают shutdown без оши�
   await expect(shutdownRuntimeHost({ async drain() { calls.push("drain") }, async close() { calls.push("close") } })).resolves.toBeUndefined()
   expect(calls).toEqual(["drain", "close"])
 })
+
+test("ошибка lifecycle log не блокирует drain/close и сохраняется вместе с ними", async () => {
+  const calls: string[] = []
+  const logFailure = new Error("disk unavailable")
+  let failure: unknown
+  try {
+    await shutdownRuntimeHost({
+      async noteLifecycle() { calls.push("log"); throw logFailure },
+      async drain() { calls.push("drain") }, async close() { calls.push("close") },
+    }, "SIGTERM")
+  } catch (error) { failure = error }
+  expect(calls).toEqual(["log", "drain", "close"])
+  expect(failure).toBeInstanceOf(AggregateError)
+  expect((failure as AggregateError).errors).toMatchObject([{ cause: logFailure }])
+})

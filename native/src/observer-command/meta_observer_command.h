@@ -30,6 +30,8 @@ typedef MetaNativeObserver *_Nullable (^MetaObserverFactory)(
 typedef NSDictionary *_Nullable (^MetaObserverReadinessProvider)(void);
 typedef NSString *_Nullable (^MetaObserverInstanceIdProvider)(void);
 typedef BOOL (^MetaObserverPreparedValidator)(MetaObserverPreparedIndex *prepared);
+// `{reason,stage,transient}`; stage только inventory|index.
+typedef NSDictionary *_Nullable (^MetaObserverIndexFailureProvider)(void);
 
 @interface MetaObserverCommandBinder : NSObject
 - (nullable instancetype)initWithGeneration:(NSDictionary *)generation
@@ -42,6 +44,7 @@ typedef BOOL (^MetaObserverPreparedValidator)(MetaObserverPreparedIndex *prepare
 // Не выполняет refresh: повторно связывает prepared index с exact current
 // foreground receipt непосредственно вокруг main-thread observer start.
 - (void)setPreparedValidator:(nullable MetaObserverPreparedValidator)validator;
+- (void)setIndexFailureProvider:(nullable MetaObserverIndexFailureProvider)provider;
 - (NSDictionary *)handleRequest:(NSDictionary *)request;
 // Вызывается command loop только после успешной отправки prepare ACK.
 - (BOOL)activatePushForObserverInstance:(NSString *)observerInstanceRef;

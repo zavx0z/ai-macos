@@ -54,6 +54,7 @@ import { registerAgentPointerMethods } from "./agent-pointer-methods.ts"
 import { registerAgentAxMethods } from "./agent-ax-methods.ts"
 import { RuntimeStartupPermissions, notRequiredStartupPermissions, startupPermissionsStateSchema,
   type StartupPermissionsState } from "./startup-permissions.ts"
+import { RuntimeLifecycleLog, type RuntimeLifecycleEvent } from "./lifecycle-log.ts"
 import { recentOperationsInputSchema, recentOperationsResultSchema } from "./recent-operations.ts"
 
 export type RuntimeHostOptions = {
@@ -101,6 +102,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   const actorJournal = new NativeActorJournal(join(auditStateDirectory, "native-actors"), loginSessionId)
   const clientIdentity = await clientState.initialize(loginSessionId)
   const adapterInstanceRef = `adapter:${crypto.randomUUID()}`
+  let lifecycle: RuntimeLifecycleLog | undefined
   let runtime: RuntimeCore | undefined
   let native: NativeBrokerAdapter | undefined
   let ownedProcess: NativeProcessTransport | undefined
@@ -120,6 +122,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   let viewReady = false
   let observerState: "unavailable" | "preparing" | "ready" = "unavailable"
   let observerReason = "Observer не подготовлен"
+  let observerPreparation: { attempt: number, maxAttempts: 3, startedAt: string, deadlineAt: string, nextRetryAt?: string } | undefined
   let backendPreparation: Promise<void> | undefined
   const preparationAbort = new AbortController()
   let windowAdapter: NativeWindowAdapter | undefined
@@ -138,6 +141,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   let beginBackendPreparation: () => Promise<void> = async () => undefined
   const revokeNative = (reason: string) => {
     nativeError = reason
+    void lifecycle?.record("native-revoked", reason).catch(() => undefined)
     runtime?.updateCapabilities(composeHostCapabilities("host:runtime", undefined, reason, browserHost?.capabilitySet))
   }
   if (options.transport !== undefined || options.transportFactory !== undefined || options.helperPath !== undefined) {
@@ -185,6 +189,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       const mismatch = nativeHandshakeCompatibility(request, handshake)
       if (mismatch !== undefined) throw new Error(mismatch.message)
       nativeCapabilities = handshake.capabilities
+      lifecycle = new RuntimeLifecycleLog({ directory: join(auditStateDirectory, "lifecycle"), ...generation,
+        nativeGeneration: handshake.nativeGeneration, nativeBuildId: handshake.nativeBuildId })
       if (session !== undefined && (!session.verified || !structurallyEqual(handshake.session, session))) throw new Error("Live helper audit session не совпадает с metadata")
       if (ownedProcess !== undefined && options.helperPath !== undefined) {
         if (ownedProcess.processStatus.pid !== handshake.process.pid || ownedProcess.processStatus.exitConfirmed) throw new Error("Native handshake не принадлежит живому owned child")
@@ -333,7 +339,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       admissionSealed: core.admissionSealed, recoveryOperations: core.recoveryEvidence().length,
       recoveryReasons: [...core.startupRecoveryReasons()], clients: core.clientLifecycleStatus(),
       rotation: rotation?.status() ?? { state: "running" as const } },
-    observer: { state: observerState, reason: observerReason, viewReady },
+    observer: { state: observerState, reason: observerReason, viewReady,
+      ...(observerPreparation === undefined ? {} : { preparation: observerPreparation }) },
     native: native === undefined || handshake === undefined
       ? { state: "unavailable" as const, reason: nativeError ?? "native helper not configured" }
       : nativeError !== undefined ? { state: "unavailable" as const, reason: nativeError }
@@ -343,7 +350,10 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   })
   const doctorSchema = z.strictObject({
     startup: z.strictObject({ permissions: startupPermissionsStateSchema }),
-    observer: z.strictObject({ state: z.enum(["unavailable", "preparing", "ready"]), reason: z.string(), viewReady: z.boolean() }),
+    observer: z.strictObject({ state: z.enum(["unavailable", "preparing", "ready"]), reason: z.string(), viewReady: z.boolean(),
+      preparation: z.strictObject({ attempt: z.number().int().min(1).max(3), maxAttempts: z.literal(3),
+        startedAt: z.iso.datetime({ offset: true }), deadlineAt: z.iso.datetime({ offset: true }),
+        nextRetryAt: z.iso.datetime({ offset: true }).optional() }).optional() }),
     machine: z.strictObject({ hostname: z.string(), matchesExpected: z.boolean() }),
     runtime: z.strictObject({ buildId: z.string(), runtimeEpoch: z.string(), loginSessionId: z.string(), draining: z.boolean(),
       admissionSealed: z.boolean(), recoveryOperations: z.number().int().min(0), recoveryReasons: z.array(z.string()),
@@ -453,6 +463,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   const performDrain = async (signal?: AbortSignal) => {
     draining = true
+    await lifecycle?.record("drain-start").catch(() => undefined)
     core.sealAdmission()
     preparationAbort.abort("Runtime drain отменил preparation")
     if (clientSweep !== undefined) clearInterval(clientSweep)
@@ -466,16 +477,18 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     viewReady = false
     await observerBinding?.close()
     if (core.recoveryEvidence().length > 0 || core.startupRecoveryReasons().length > 0) throw new Error("Startup recovery не завершена")
-    if (native === undefined || handshake === undefined) return { cleanup: "complete" as const }
+    if (native === undefined || handshake === undefined) { await lifecycle?.record("drain-complete").catch(() => undefined); return { cleanup: "complete" as const } }
     const control = AbortSignal.any([AbortSignal.timeout(1000), ...(signal === undefined ? [] : [signal])])
     const ack = await native.drain({ requestId: `drain:${crypto.randomUUID()}`, ...generation, nativeGeneration: handshake.nativeGeneration,
       deadlineAt: new Date(Date.now() + 1000).toISOString() }, { signal: control, checkpoint() { control.throwIfAborted() } })
     if (ack.cleanup !== "complete" || ack.quarantined || ack.activeOperationIds.length > 0) throw new Error("Native drain не подтверждён")
+    await lifecycle?.record("drain-complete").catch(() => undefined)
     return ack
   }
   let drainingPromise: ReturnType<typeof performDrain> | undefined
   const drain = (signal?: AbortSignal) => {
     drainingPromise ??= performDrain(signal).catch(error => {
+      void lifecycle?.record("drain-failed", `drain:${error instanceof Error ? error.name : "unknown"}`).catch(() => undefined)
       drainingPromise = undefined
       throw error
     })
@@ -528,41 +541,77 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     const source = native
     observerState = "preparing"
     observerReason = "Подготовка свежего Native AX index"
+    const preparationStartedAt = new Date()
+    const preparationDeadlineAt = new Date(preparationStartedAt.getTime() + 26_000)
+    observerPreparation = { attempt: 1, maxAttempts: 3, startedAt: preparationStartedAt.toISOString(), deadlineAt: preparationDeadlineAt.toISOString() }
     refreshCapabilities()
+    const preparationSignal = AbortSignal.any([preparationAbort.signal, AbortSignal.timeout(26_000)])
     backendPreparation = (async () => {
       try {
-        preparationAbort.signal.throwIfAborted()
-        observerBinding = await createNativeObserverBinding({ native: source, signal: preparationAbort.signal, onGap(error) {
+        preparationSignal.throwIfAborted()
+        observerBinding = await createNativeObserverBinding({ native: source, signal: preparationSignal, onGap(error) {
           observerState = "unavailable"
           viewReady = false
           void viewGuard?.close()
           observerReason = error.message
           refreshCapabilities()
+        }, async beforeAttempt(_attempt, signal) {
+          const permissionSignal = AbortSignal.any([signal, AbortSignal.timeout(1500)])
+          const response = await readPassivePermissions(permissionSignal)
+          if (!response.accessibility || !response.screenRecording || !response.postEvents || !response.inputMonitoring) {
+            throw new Error("Observer prepare запрещён: passive TCC grants больше не подтверждены")
+          }
+          if (source.generation?.runtimeEpoch !== generation.runtimeEpoch || source.generation.loginSessionId !== generation.loginSessionId
+            || source.generation.nativeGeneration !== handshake?.nativeGeneration) throw new Error("Observer prepare Native generation изменилась")
+        }, onRetry(attempt, error) {
+          observerPreparation = { attempt, maxAttempts: 3, startedAt: preparationStartedAt.toISOString(), deadlineAt: preparationDeadlineAt.toISOString(),
+            nextRetryAt: new Date(Date.now() + 1000).toISOString() }
+          void lifecycle?.record("observer-failed", `transient attempt ${attempt}: ${error.message}`).catch(() => undefined)
+        }, onAttempt(attempt) {
+          observerPreparation = { attempt, maxAttempts: 3, startedAt: preparationStartedAt.toISOString(), deadlineAt: preparationDeadlineAt.toISOString() }
         } })
-        if (preparationAbort.signal.aborted) {
-          await observerBinding.close()
-          preparationAbort.signal.throwIfAborted()
-        }
-        const coverage = await observerBinding.coverage()
-        observerState = coverage.state === "ready" ? "ready" : "unavailable"
-        observerReason = coverage.reason ?? "Native PUSH coverage подтверждено; session/SecureInput проверяются отдельно"
-        if (observerState === "ready" && handshake?.viewAdmissionVersion === "1" && handshake.recoveryDomainVersion === "1") {
+        preparationSignal.throwIfAborted()
+        const coverage = await observerBinding.coverage(preparationSignal)
+        preparationSignal.throwIfAborted()
+        const preparedObserverState = coverage.state === "ready" ? "ready" : "unavailable"
+        const preparedObserverReason = coverage.reason ?? "Native PUSH coverage подтверждено; session/SecureInput проверяются отдельно"
+        if (preparedObserverState === "ready" && handshake?.viewAdmissionVersion === "1" && handshake.recoveryDomainVersion === "1") {
           viewGuard = new AgentViewGuard({ generation: { ...generation, nativeGeneration: handshake.nativeGeneration }, observer: observerBinding.hub,
             resolveTarget: (lineage, targetId) => agentTargets.forLineage(lineage).resolveAction(targetId) })
-          await viewGuard.start()
-          preparationAbort.signal.throwIfAborted()
+          await settleBeforeAbort(viewGuard.start(), preparationSignal, "Agent view guard preparation")
+          preparationSignal.throwIfAborted()
+          observerState = preparedObserverState
+          observerReason = preparedObserverReason
           viewBindings = new AgentViewBindings(core, viewGuard)
           viewReady = true
           const pointer = registerAgentPointerMethods(catalog, agentMethods)
           registerAgentAxMethods(catalog, core, agentTargets, agentMethods, agentMethods.operations, pointer)
           if (permissionMode === "request-missing") {
+            preparationSignal.throwIfAborted()
             try { core.unsealAdmission() }
-            catch { /* Startup recovery сохраняет admission sealed независимо от выданных TCC grants. */ }
+            catch { /* Startup recovery сохраняет admission sealed независимо от observer/view readiness. */ }
           }
+          await lifecycle?.record("observer-ready").catch(() => undefined)
+        } else {
+          preparationSignal.throwIfAborted()
+          observerState = preparedObserverState
+          observerReason = preparedObserverReason
         }
       } catch (error) {
+        core.sealAdmission()
+        if (preparationSignal.aborted) {
+          await viewGuard?.close().catch(() => undefined)
+          viewGuard = undefined
+          viewBindings = undefined
+          viewReady = false
+          await observerBinding?.close().catch(() => undefined)
+          observerBinding = undefined
+        }
         observerState = "unavailable"
         observerReason = error instanceof Error ? error.message : "Observer preparation failed"
+        await lifecycle?.record("observer-failed", observerReason).catch(() => undefined)
+      } finally {
+        observerPreparation = undefined
       }
       refreshCapabilities()
     })()
@@ -570,6 +619,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   const close = () => {
     closing ??= (async () => {
+      await lifecycle?.record("close-start").catch(() => undefined)
       rotation?.stop()
       core.sealAdmission()
       preparationAbort.abort("Runtime close отменил preparation")
@@ -593,15 +643,21 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       } else {
         errors.push(new Error("Host lock сохранён: owned Native exit не подтверждён"))
       }
-      if (errors.length > 0) throw new AggregateError(errors, "Runtime close завершил доступные cleanup steps; часть подтверждений отсутствует")
+      if (errors.length > 0) {
+        await lifecycle?.record("close-failed", errors.map(error => error.message).join("; ").slice(0, 1024)).catch(() => undefined)
+        throw new AggregateError(errors, "Runtime close завершил доступные cleanup steps; часть подтверждений отсутствует")
+      }
+      await lifecycle?.record("close-complete").catch(() => undefined)
     })()
     return closing
   }
   return {
     core, catalog, doctor, recoverStartup, prepareRecoveryRestart,
     async ready() { await permissionPreparation; await backendPreparation },
+    noteLifecycle(event: RuntimeLifecycleEvent, reason?: string) { return lifecycle?.record(event, reason).catch(() => undefined) ?? Promise.resolve() },
     async start() {
       try {
+        await lifecycle?.record("host-start").catch(() => undefined)
         if (permissionFlow !== undefined) core.sealAdmission()
         if (native !== undefined && handshake !== undefined) heartbeat = startRuntimeHeartbeat({ native,
           generation: { ...generation, nativeGeneration: handshake.nativeGeneration },
@@ -615,12 +671,13 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
         rotation = startRuntimeRotation({
           managed: options.managed === true,
           reason() {
-            if (nativeError !== undefined && actorRecord !== undefined) return "Owned Native actor недоступен; требуется recovery restart"
-            if (actorRecord !== undefined && core.activeOperationCount() === 0 && core.resources.quarantinedCount() > 0) return "Current operations quarantined; требуется новый recovery actor"
-            if (native !== undefined && native.sessionState.requestsUsed >= 8500) return "Native request budget требует нового процесса"
-            if (Date.now() - startedAt >= 23 * 60 * 60 * 1000) return "Runtime достиг rotation horizon"
-            if (core.frames.stats().issuedRefs >= 9000) return "Frame reference budget требует нового процесса"
-            return undefined
+            const reason = nativeError !== undefined && actorRecord !== undefined ? "Owned Native actor недоступен; требуется recovery restart"
+              : actorRecord !== undefined && core.activeOperationCount() === 0 && core.resources.quarantinedCount() > 0 ? "Current operations quarantined; требуется новый recovery actor"
+                : native !== undefined && native.sessionState.requestsUsed >= 8500 ? "Native request budget требует нового процесса"
+                  : Date.now() - startedAt >= 23 * 60 * 60 * 1000 ? "Runtime достиг rotation horizon"
+                    : core.frames.stats().issuedRefs >= 9000 ? "Frame reference budget требует нового процесса" : undefined
+            if (reason !== undefined) void lifecycle?.record("rotation-trigger", reason).catch(() => undefined)
+            return reason
           },
           seal: () => core.sealAdmission(),
           async drain(signal) { await drain(signal) },
@@ -635,6 +692,23 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     close,
   }
   } catch (error) { await closeNative(); throw error }
+}
+
+async function settleBeforeAbort<T>(work: Promise<T>, signal: AbortSignal, stage: string): Promise<T> {
+  signal.throwIfAborted()
+  let onAbort: (() => void) | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        onAbort = () => reject(signal.reason ?? new Error(`${stage} отменён`))
+        signal.addEventListener("abort", onAbort, { once: true })
+        if (signal.aborted) onAbort()
+      }),
+    ])
+  } finally {
+    if (onAbort !== undefined) signal.removeEventListener("abort", onAbort)
+  }
 }
 
 async function readNativeMetadata(helperPath: string): Promise<unknown> {

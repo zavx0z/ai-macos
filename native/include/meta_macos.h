@@ -50,6 +50,17 @@ typedef struct {
 
 typedef struct MetaMacOSBackend MetaMacOSBackend;
 
+typedef struct {
+  bool receipt_matches;
+  int32_t foreground_pid;
+  uint64_t foreground_launch_time_micros;
+  MetaAXStatus foreground_ax_status;
+  uint64_t snapshot_revision;
+  bool snapshot_complete;
+  size_t application_count;
+  size_t window_count;
+} MetaObserverSnapshotDiagnostics;
+
 typedef void (*MetaDisplayTopologyChanged)(
     CGDirectDisplayID display,
     CGDisplayChangeSummaryFlags flags,
@@ -108,6 +119,10 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
 bool meta_macos_observer_snapshot_ready(
     MetaMacOSBackend *backend,
     const MetaInventorySnapshot *snapshot);
+bool meta_macos_observer_snapshot_diagnostics(
+    MetaMacOSBackend *backend,
+    const MetaInventorySnapshot *snapshot,
+    MetaObserverSnapshotDiagnostics *diagnostics);
 bool meta_macos_show_window(MetaMacOSBackend *backend, const char *window_ref,
                             MetaWindowTransition *result);
 bool meta_macos_focus_window(MetaMacOSBackend *backend, const char *window_ref,

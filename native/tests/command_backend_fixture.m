@@ -6,6 +6,8 @@
 @end
 static BOOL focusedSheet = NO;
 static BOOL eventLog = NO;
+static BOOL observerGap = NO;
+static BOOL observerTargetGap = NO;
 static bool fixturePost(void *context, MetaHeldEventKind kind, uint32_t code, bool down, uint64_t tag) {
   (void)context; (void)kind; (void)tag;
   if (eventLog) fprintf(stderr, "held:%u:%s\n", code, down ? "down" : "up");
@@ -98,6 +100,15 @@ static bool fixtureScroll(void *context, const MetaScrollEvent *event, uint64_t 
 - (NSDictionary *)supplementStatus:(NSDictionary *)status { return status; }
 - (NSDictionary *)reconcileStatus:(NSDictionary *)status { return status; }
 - (NSArray<NSString *> *)pendingOperationIds { return @[]; }
+- (NSDictionary *)takeObserverPush:(NSUInteger)maximum {
+  (void)maximum;
+  return observerGap
+      ? @{@"events" : @[],
+          @"gapReason" : observerTargetGap
+              ? @"AX callback не сопоставлен с exact runtime target"
+              : @"AX subscription нового foreground application не удалась"}
+      : nil;
+}
 - (BOOL)beginRotation { return [_input sealForRotation]; }
 - (NSDictionary *)executeInput:(NSDictionary *)request job:(MetaInputJob *)job {
   NSDictionary *result = [_input execute:request job:job];
@@ -126,6 +137,11 @@ int main(int argc, const char **argv) {
   @autoreleasepool {
     focusedSheet = argc == 2 && strcmp(argv[1], "--focused-sheet") == 0;
     eventLog = argc == 2 && strcmp(argv[1], "--event-log") == 0;
+    observerGap = argc == 2 &&
+        (strcmp(argv[1], "--observer-gap") == 0 ||
+         strcmp(argv[1], "--observer-target-gap") == 0);
+    observerTargetGap = argc == 2 &&
+        strcmp(argv[1], "--observer-target-gap") == 0;
     return meta_command_loop_run([[FixtureCommandBackend alloc] init], @"command-fixture-build",
                                   @"/tmp/command-fixture", @"native-command-fixture", STDIN_FILENO, STDOUT_FILENO);
   }

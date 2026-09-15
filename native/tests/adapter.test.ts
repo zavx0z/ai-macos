@@ -89,6 +89,9 @@ class FakeTransport implements NativeTransport {
         command: frame.payload.command, nativeBuildId: "native-build-1", ok: false,
         error: { code: "permission-denied", message: "Fixture observer недоступен", stage: "observer-prepare",
           retryable: false, replayAllowed: false, recoveryAction: "inspect-health" },
+        ...(frame.payload.command === "prepare" ? { prepareFailure: {
+          stage: "readiness", retryDisposition: "clean-no-instance", transient: true,
+        } } : {}),
       } } })
       return
     }

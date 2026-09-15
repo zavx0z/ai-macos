@@ -64,12 +64,28 @@ export type NativeObservedEvent = ObservedEvent & { readonly observerInstanceRef
 const response = {
   ...identity, kind: z.literal("observer-response"), command: z.enum(commands), nativeBuildId: opaqueIdSchema,
 }
+export const nativeObserverPrepareFailureSchema = z.strictObject({
+  stage: z.enum(["inventory", "index", "readiness", "main-start", "cleanup"]),
+  retryDisposition: z.enum(["clean-no-instance", "clean-stopped", "unknown"]),
+  transient: z.boolean(),
+}).superRefine((failure, context) => {
+  if (failure.transient && (!["inventory", "index", "readiness"].includes(failure.stage)
+    || failure.retryDisposition === "unknown")) {
+    context.addIssue({ code: "custom", message: "Transient observer failure требует clean inventory/index/readiness disposition" })
+  }
+})
 export const nativeObserverResponseSchema = z.discriminatedUnion("ok", [
   z.strictObject({ ...response, ok: z.literal(true), snapshot: nativeObserverSnapshotSchema,
     fromCursor: opaqueIdSchema.optional(), events: z.array(observedEventSchema).max(1000).optional() }),
-  z.strictObject({ ...response, ok: z.literal(false), error: contractErrorSchema }),
+  z.strictObject({ ...response, ok: z.literal(false), error: contractErrorSchema,
+    prepareFailure: nativeObserverPrepareFailureSchema.optional() }),
 ]).superRefine((value, context) => {
-  if (!value.ok) return
+  if (!value.ok) {
+    if ((value.command === "prepare") !== (value.prepareFailure !== undefined)) {
+      context.addIssue({ code: "custom", path: ["prepareFailure"], message: "Typed prepare failure допустим и обязателен только для prepare" })
+    }
+    return
+  }
   if (value.command === "events" ? value.events === undefined || value.fromCursor === undefined : value.events !== undefined || value.fromCursor !== undefined) {
     context.addIssue({ code: "custom", path: ["events"], message: "Events response требует batch и исходный cursor" })
   }

@@ -105,11 +105,13 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
 @property(nonatomic, copy) MetaObserverReadinessProvider readinessProvider;
 @property(nonatomic, copy) MetaObserverInstanceIdProvider instanceIdProvider;
 @property(nonatomic, copy, nullable) MetaObserverPreparedValidator preparedValidator;
+@property(nonatomic, copy, nullable) MetaObserverIndexFailureProvider indexFailureProvider;
 - (BOOL)prepareTokenIsCurrent:(NSObject *)token;
 - (void)clearPendingObserver:(MetaNativeObserver *)observer
                        token:(NSObject *)token;
 - (void)scheduleMainThreadStop:(MetaNativeObserver *)observer;
 - (void)signalEventWaiters;
+- (void)finishMainWork;
 @end
 
 @implementation MetaObserverCommandBinder {
@@ -127,6 +129,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   NSMutableArray<NSDictionary *> *_pushQueue;
   NSUInteger _historyBytes;
   NSUInteger _pushBytes;
+  NSUInteger _mainWorkOutstanding;
   uint64_t _lastPushedSequence;
   BOOL _baselineAvailable;
   BOOL _pushActive;
@@ -205,6 +208,71 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   [_lock unlock];
 }
 
+- (void)setIndexFailureProvider:(MetaObserverIndexFailureProvider)provider {
+  [_lock lock];
+  _indexFailureProvider = [provider copy];
+  [_lock unlock];
+}
+
+- (NSDictionary *)indexFailure {
+  [_lock lock];
+  MetaObserverIndexFailureProvider provider = _indexFailureProvider;
+  [_lock unlock];
+  NSDictionary *failure = provider == nil ? nil : provider();
+  if (![failure isKindOfClass:NSDictionary.class]) {
+    return @{@"reason" : @"Observer index diagnostics недоступны",
+             @"stage" : @"index", @"transient" : @NO};
+  }
+  NSString *reason = failure[@"reason"];
+  NSString *stage = failure[@"stage"];
+  id transient = failure[@"transient"];
+  if (
+      ![reason isKindOfClass:NSString.class] || reason.length == 0 ||
+      ![@[@"inventory", @"index"] containsObject:stage] ||
+      transient == nil ||
+      CFGetTypeID((__bridge CFTypeRef)transient) !=
+          CFBooleanGetTypeID()) {
+    return @{@"reason" : @"Observer index diagnostics недоступны",
+             @"stage" : @"index", @"transient" : @NO};
+  }
+  return failure;
+}
+
+- (NSString *)cleanDispositionStopped:(BOOL)stopped {
+  [_lock lock];
+  BOOL clean = _prepareToken == nil && _pendingObserver == nil &&
+               _observer == nil && _observerInstanceRef == nil &&
+               _cleanupPendingObservers.count == 0 &&
+               _mainWorkOutstanding == 0;
+  [_lock unlock];
+  return clean ? (stopped ? @"clean-stopped" : @"clean-no-instance")
+               : @"unknown";
+}
+
+- (void)finishMainWork {
+  [_lock lock];
+  if (_mainWorkOutstanding > 0) _mainWorkOutstanding -= 1;
+  [_lock unlock];
+}
+
+- (NSDictionary *)prepareFailureResponse:(NSDictionary *)request
+                                    reason:(NSString *)reason
+                                     stage:(NSString *)stage
+                                 transient:(BOOL)transient
+                                   stopped:(BOOL)stopped {
+  NSMutableDictionary *response = [[self failureResponse:request
+                                                   command:@"prepare"
+                                                      code:@"capability-unavailable"
+                                                    reason:reason] mutableCopy];
+  NSString *disposition = [self cleanDispositionStopped:stopped];
+  response[@"prepareFailure"] = @{
+    @"stage" : stage,
+    @"retryDisposition" : disposition,
+    @"transient" : transient && ![disposition isEqual:@"unknown"] ? @YES : @NO,
+  };
+  return response;
+}
+
 - (BOOL)preparedStillValid:(MetaObserverPreparedIndex *)prepared {
   [_lock lock];
   MetaObserverPreparedValidator validator = _preparedValidator;
@@ -234,13 +302,32 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   MetaObserverPreparedIndex *prepared = self.indexBuilder();
   NSString *instance = self.instanceIdProvider();
   NSDictionary *readiness = self.readinessProvider();
-  if (prepared == nil || ![self preparedStillValid:prepared] ||
-      !identifier(instance, 127) ||
-      !dictionary(readiness) || !request_before_deadline(request)) {
-    return [self failureResponse:request
-                         command:@"prepare"
-                            code:@"capability-unavailable"
-                          reason:@"Observer index, identity или readiness недоступны"];
+  NSString *failureReason = nil;
+  NSString *failureStage = @"index";
+  BOOL failureTransient = NO;
+  if (prepared == nil) {
+    NSDictionary *failure = [self indexFailure];
+    failureReason = failure[@"reason"];
+    failureStage = failure[@"stage"];
+    failureTransient = [failure[@"transient"] boolValue];
+  } else if (![self preparedStillValid:prepared]) {
+    failureReason = @"Observer prepared foreground receipt изменился до start";
+    failureStage = @"inventory";
+    failureTransient = YES;
+  } else if (!identifier(instance, 127)) {
+    failureReason = @"Observer instance identity недоступна";
+  } else if (!dictionary(readiness)) {
+    failureReason = @"Observer session readiness недоступна";
+    failureStage = @"readiness";
+    failureTransient = YES;
+  } else if (!request_before_deadline(request)) {
+    failureReason = @"Observer prepare deadline истёк до main-runloop start";
+    failureStage = @"main-start";
+  }
+  if (failureReason != nil) {
+    return [self prepareFailureResponse:request reason:failureReason
+                                  stage:failureStage
+                              transient:failureTransient stopped:NO];
   }
   NSObject *prepareToken = [[NSObject alloc] init];
   [_lock lock];
@@ -267,14 +354,20 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
 
   __block MetaNativeObserver *created = nil;
   __block NSString *baselineCursor = nil;
+  __block BOOL candidateStopped = NO;
   __weak MetaObserverCommandBinder *weakSelf = self;
+  [_lock lock];
+  _mainWorkOutstanding += 1;
+  [_lock unlock];
   BOOL executed = self.mainExecutor(^BOOL {
     MetaObserverCommandBinder *binder = weakSelf;
-    if (binder == nil || !request_before_deadline(request) ||
-        ![binder preparedStillValid:prepared] ||
-        ![binder prepareTokenIsCurrent:prepareToken]) {
-      return NO;
-    }
+    if (binder == nil) return NO;
+    @try {
+      if (!request_before_deadline(request) ||
+          ![binder preparedStillValid:prepared] ||
+          ![binder prepareTokenIsCurrent:prepareToken]) {
+        return NO;
+      }
     [binder->_lock lock];
     MetaNativeObserver *previousObserver = binder->_observer;
     [binder->_lock unlock];
@@ -306,17 +399,20 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
         ![binder prepareTokenIsCurrent:prepareToken]) return NO;
     if (![created start]) {
       [created stop];
+      candidateStopped = YES;
       [binder clearPendingObserver:created token:prepareToken];
       return NO;
     }
     if (![binder preparedStillValid:prepared]) {
       [created stop];
+      candidateStopped = YES;
       [binder clearPendingObserver:created token:prepareToken];
       return NO;
     }
     if (!request_before_deadline(request) ||
         ![binder prepareTokenIsCurrent:prepareToken]) {
       [created stop];
+      candidateStopped = YES;
       [binder clearPendingObserver:created token:prepareToken];
       return NO;
     }
@@ -330,10 +426,14 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
         ![binder prepareTokenIsCurrent:prepareToken]) {
       [created setEventSink:nil];
       [created stop];
+      candidateStopped = YES;
       [binder clearPendingObserver:created token:prepareToken];
       return NO;
     }
     return YES;
+    } @finally {
+      [binder finishMainWork];
+    }
   });
   BOOL finalPreparedValid = executed && [self preparedStillValid:prepared];
   [_lock lock];
@@ -360,10 +460,13 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   [self signalEventWaiters];
   if (!accepted) {
     if (pending != nil) [self scheduleMainThreadStop:pending];
-    return [self failureResponse:request
-                         command:@"prepare"
-                            code:@"capability-unavailable"
-                          reason:@"Observer main-runloop prepare failed"];
+    return [self prepareFailureResponse:request
+        reason:finalPreparedValid
+            ? @"Observer main-runloop start/subscription failed"
+            : @"Observer foreground receipt изменился во время main-runloop start"
+        stage:pending != nil ? @"cleanup" : @"main-start"
+        transient:NO
+        stopped:candidateStopped && pending == nil];
   }
   return [self successResponse:request
                        command:@"prepare"
@@ -874,6 +977,13 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
     @"replayAllowed" : @NO,
     @"recoveryAction" : @"inspect-health",
   };
+  if ([command isEqual:@"prepare"]) {
+    response[@"prepareFailure"] = @{
+      @"stage" : @"cleanup",
+      @"retryDisposition" : @"unknown",
+      @"transient" : @NO,
+    };
+  }
   return response;
 }
 

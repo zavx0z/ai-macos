@@ -37,6 +37,7 @@ struct MetaMacOSBackend {
   bool topology_observer_ready;
   bool topology_stopping;
   MetaObserverSnapshotReceipt observer_snapshot_receipt;
+  MetaObserverSnapshotDiagnostics last_observer_refresh_diagnostics;
 };
 
 static void display_topology_changed(
@@ -655,6 +656,10 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
   if (backend == NULL || total_budget_millis == 0) return false;
   @autoreleasepool {
     backend->observer_snapshot_receipt = (MetaObserverSnapshotReceipt){0};
+    backend->last_observer_refresh_diagnostics =
+        (MetaObserverSnapshotDiagnostics){
+            .foreground_ax_status = META_AX_UNAVAILABLE,
+        };
     backend->refresh_number += 1;
     const uint64_t started = monotonic_millis();
     MetaObserverRefreshBudget budget = {0};
@@ -910,6 +915,26 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
         .captured_at_micros = unix_micros(),
         .display_topology_epoch = topology_epoch_before,
     };
+    MetaAXStatus attempted_foreground_status = META_AX_UNAVAILABLE;
+    for (size_t index = 0; index < application_count; index += 1) {
+      const MetaApplicationInput *application = &applications[index];
+      if (application->pid == foreground_pid &&
+          application->launch_time_micros == foreground_launch_time) {
+        attempted_foreground_status = application->ax_status;
+        break;
+      }
+    }
+    backend->last_observer_refresh_diagnostics =
+        (MetaObserverSnapshotDiagnostics){
+            .receipt_matches = false,
+            .foreground_pid = foreground_pid,
+            .foreground_launch_time_micros = foreground_launch_time,
+            .foreground_ax_status = attempted_foreground_status,
+            .snapshot_revision = 0,
+            .snapshot_complete = complete,
+            .application_count = application_count,
+            .window_count = ax_window_count + cg_window_count,
+        };
     const bool refreshed = topology_stable &&
         meta_registry_refresh(backend->registry, &input);
     if (refreshed) {
@@ -939,6 +964,18 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
                  snapshot->native_generation);
       }
       backend->observer_snapshot_receipt = receipt;
+      backend->last_observer_refresh_diagnostics =
+          (MetaObserverSnapshotDiagnostics){
+              .receipt_matches = receipt.foreground_slice_complete,
+              .foreground_pid = foreground_pid,
+              .foreground_launch_time_micros = foreground_launch_time,
+              .foreground_ax_status = attempted_foreground_status,
+              .snapshot_revision = snapshot == NULL ? 0 : snapshot->revision,
+              .snapshot_complete = snapshot != NULL && snapshot->complete,
+              .application_count = snapshot == NULL ? 0
+                                                     : snapshot->application_count,
+              .window_count = snapshot == NULL ? 0 : snapshot->window_count,
+          };
     }
     free_application_inputs(applications, application_count);
     free_ax_window_inputs(ax_windows, ax_window_count);
@@ -959,6 +996,43 @@ bool meta_macos_observer_snapshot_ready(
   return meta_observer_snapshot_receipt_matches(
       snapshot, &backend->observer_snapshot_receipt, pid,
       process_start_micros(pid));
+}
+
+bool meta_macos_observer_snapshot_diagnostics(
+    MetaMacOSBackend *backend,
+    const MetaInventorySnapshot *snapshot,
+    MetaObserverSnapshotDiagnostics *diagnostics) {
+  if (backend == NULL || diagnostics == NULL) return false;
+  if (snapshot == NULL) {
+    *diagnostics = backend->last_observer_refresh_diagnostics;
+    return true;
+  }
+  if (snapshot != meta_registry_snapshot(backend->registry)) return false;
+  NSRunningApplication *foreground =
+      NSWorkspace.sharedWorkspace.frontmostApplication;
+  const pid_t pid = foreground.processIdentifier;
+  const uint64_t birth = process_start_micros(pid);
+  MetaAXStatus status = META_AX_UNAVAILABLE;
+  for (size_t index = 0; index < snapshot->application_count; index += 1) {
+    const MetaApplicationRecord *application = &snapshot->applications[index];
+    if (application->pid == pid &&
+        application->launch_time_micros == birth) {
+      status = application->ax_status;
+      break;
+    }
+  }
+  *diagnostics = (MetaObserverSnapshotDiagnostics){
+      .receipt_matches = meta_observer_snapshot_receipt_matches(
+          snapshot, &backend->observer_snapshot_receipt, pid, birth),
+      .foreground_pid = pid,
+      .foreground_launch_time_micros = birth,
+      .foreground_ax_status = status,
+      .snapshot_revision = snapshot->revision,
+      .snapshot_complete = snapshot->complete,
+      .application_count = snapshot->application_count,
+      .window_count = snapshot->window_count,
+  };
+  return true;
 }
 
 static bool process_matches(const MetaWindowRecord *record, AXHandle *handle) {

@@ -62,6 +62,13 @@ class AuditTransport implements NativeTransport {
   inventoryStarted?: () => void
   observerStarted?: () => void
   hangObserverPrepare = false
+  observerPrepareFailures = 0
+  observerPrepareAttempts = 0
+  observerCoverageCalls = 0
+  hangObserverCoverageCall?: number
+  observerCoverageStarted?: () => void
+  observerStopAttempts = 0
+  observerFailureUnknown = false
   #packet: Promise<NativeTransportPacket>
   #resolve!: (packet: NativeTransportPacket) => void
   #end!: () => void
@@ -92,8 +99,31 @@ class AuditTransport implements NativeTransport {
       return
     }
     if (this.fullView && frame.channel === "observer") {
+      if (frame.payload.command === "prepare") this.observerPrepareAttempts++
+      if (frame.payload.command === "coverage") {
+        this.observerCoverageCalls++
+        if (this.observerCoverageCalls === this.hangObserverCoverageCall) {
+          this.observerCoverageStarted?.()
+          return
+        }
+      }
+      if (frame.payload.command === "stop") this.observerStopAttempts++
       if (frame.payload.command === "prepare" && this.hangObserverPrepare) {
         this.observerStarted?.()
+        return
+      }
+      if (frame.payload.command === "prepare" && this.observerPrepareFailures-- > 0) {
+        const generation = { runtimeEpoch: frame.payload.runtimeEpoch, loginSessionId: frame.payload.loginSessionId,
+          nativeGeneration: frame.payload.nativeGeneration }
+        this.#resolve({ kind: "message", frame: { channel: "observer", payload: {
+          kind: "observer-response", protocolVersion: "1", requestId: frame.payload.requestId, command: "prepare",
+          ...generation, nativeBuildId: "build:native-audit", ok: false,
+          error: { code: "capability-unavailable", message: "Fixture observer index unavailable", stage: "native-observer",
+            retryable: false, replayAllowed: false, recoveryAction: "inspect-health" },
+          prepareFailure: this.observerFailureUnknown
+            ? { stage: "cleanup", retryDisposition: "unknown", transient: false }
+            : { stage: "index", retryDisposition: "clean-no-instance", transient: true },
+        } } })
         return
       }
       const request = frame.payload
@@ -208,6 +238,7 @@ for (const guarded of [false, true]) {
       uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 128 }
     const transport = new AuditTransport(session)
     transport.fullView = true
+    transport.grantStartupPermissions()
     transport.readinessState = "ready"
     if (guarded) transport.viewVersion = "1"
     const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
@@ -374,6 +405,7 @@ test("host close отменяет зависший Native observer prepare", asy
   const transport = new AuditTransport(session)
   transport.fullView = true
   transport.hangObserverPrepare = true
+  transport.grantStartupPermissions()
   let entered!: () => void
   const preparing = new Promise<void>(resolve => { entered = resolve })
   transport.observerStarted = entered
@@ -392,6 +424,105 @@ test("host close отменяет зависший Native observer prepare", asy
   }
 }, 1000)
 
+test("host close отменяет view guard coverage в общем preparation budget и очищает observer binding", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-view-preparation-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 135 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.grantStartupPermissions()
+  transport.hangObserverCoverageCall = 2
+  let entered!: () => void
+  const preparing = new Promise<void>(resolve => { entered = resolve })
+  transport.observerCoverageStarted = entered
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:host-view-preparation", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+  try {
+    await host.start()
+    await preparing
+    expect(host.doctor().observer.state).toBe("preparing")
+    await host.close()
+    expect(transport.observerCoverageCalls).toBe(2)
+    expect(transport.observerStopAttempts).toBe(1)
+    expect(host.doctor().observer.state).toBe("unavailable")
+  } finally {
+    await host.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+}, 1000)
+
+test("Host health показывает bounded observer retry progress с единым absolute deadline", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-observer-retry-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 134 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.grantStartupPermissions()
+  transport.observerPrepareFailures = 2
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:observer-retry", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+  try {
+    await host.start()
+    while (transport.observerPrepareAttempts < 1 || host.doctor().observer.preparation?.nextRetryAt === undefined) await Bun.sleep(1)
+    const first = host.doctor().observer.preparation!
+    expect(first).toMatchObject({ attempt: 1, maxAttempts: 3 })
+    expect(Date.parse(first.deadlineAt) - Date.parse(first.startedAt)).toBe(26_000)
+    while (transport.observerPrepareAttempts < 2 || host.doctor().observer.preparation?.attempt !== 2) await Bun.sleep(1)
+    const second = host.doctor().observer.preparation!
+    expect(second.startedAt).toBe(first.startedAt)
+    expect(second.deadlineAt).toBe(first.deadlineAt)
+    await host.ready()
+    expect(transport.observerPrepareAttempts).toBe(3)
+    expect(host.doctor().observer).toMatchObject({ state: "ready", viewReady: true })
+    expect(host.doctor().observer).not.toHaveProperty("preparation")
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+}, 5000)
+
+test("unknown observer prepare failure не повторяется и остаётся sealed", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-observer-unknown-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 135 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.grantStartupPermissions()
+  transport.observerPrepareFailures = 3
+  transport.observerFailureUnknown = true
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:observer-unknown", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+  try {
+    await host.start()
+    await host.ready()
+    expect(transport.observerPrepareAttempts).toBe(1)
+    expect(host.doctor()).toMatchObject({ observer: { state: "unavailable", viewReady: false }, runtime: { admissionSealed: true } })
+    expect(host.doctor().observer.reason).toContain("cleanup/unknown")
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test("grant revocation между clean retries запрещает следующую Native prepare", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-observer-grant-revoke-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 136 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.grantStartupPermissions()
+  transport.observerPrepareFailures = 1
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:observer-revoke", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+  try {
+    await host.start()
+    while (host.doctor().observer.preparation?.nextRetryAt === undefined) await Bun.sleep(1)
+    transport.permissions = { screenRecording: false }
+    await host.ready()
+    expect(transport.observerPrepareAttempts).toBe(1)
+    expect(host.doctor()).toMatchObject({ observer: { state: "unavailable", viewReady: false }, runtime: { admissionSealed: true } })
+    expect(host.doctor().observer.reason).toContain("passive TCC grants")
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+}, 5000)
+
 test("Native disconnect после ready observer не прерывает UDS/lock cleanup при failed stop RPC", async () => {
   const directory = await mkdtemp(join(tmpdir(), "host-disconnect-cleanup-"))
   const session = { verified: true as const, source: "darwin-audit" as const,
@@ -399,6 +530,7 @@ test("Native disconnect после ready observer не прерывает UDS/lo
   const transport = new AuditTransport(session)
   transport.fullView = true
   transport.viewVersion = "1"
+  transport.grantStartupPermissions()
   const options = { socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
     runtimeBuildId: "build:disconnect-cleanup", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session } }
   const host = await createRuntimeHost({ ...options, transport })
@@ -432,6 +564,8 @@ for (const readinessState of ["ready", "degraded", "unavailable"] as const) {
     const session = { verified: true as const, source: "darwin-audit" as const,
       uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 127 }
     const transport = new AuditTransport(session)
+    transport.fullView = true
+    transport.grantStartupPermissions()
     transport.readinessState = readinessState
     const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
       runtimeBuildId: "build:readiness-gate", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })

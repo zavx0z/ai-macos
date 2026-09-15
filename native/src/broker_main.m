@@ -70,6 +70,9 @@
 @interface MetaObserverIndexBuildContext : NSObject
 @property(nonatomic) MetaMacOSBackend *windows;
 @property(nonatomic, strong) NSDictionary *generation;
+@property(nonatomic, strong) NSString *failureReason;
+@property(nonatomic, strong) NSString *failureStage;
+@property(nonatomic) BOOL failureTransient;
 @end
 @implementation MetaObserverIndexBuildContext
 @end
@@ -103,6 +106,15 @@ static bool observer_index_snapshot_ready(
   MetaObserverIndexBuildContext *binding =
       (__bridge MetaObserverIndexBuildContext *)context;
   return meta_macos_observer_snapshot_ready(binding.windows, snapshot);
+}
+
+static bool observer_index_snapshot_diagnostics(
+    void *context, const MetaInventorySnapshot *snapshot,
+    MetaObserverSnapshotDiagnostics *diagnostics) {
+  MetaObserverIndexBuildContext *binding =
+      (__bridge MetaObserverIndexBuildContext *)context;
+  return meta_macos_observer_snapshot_diagnostics(
+      binding.windows, snapshot, diagnostics);
 }
 
 static MetaObserverTargetRecord *observer_index_record(
@@ -503,14 +515,40 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
         .refresh_inventory = observer_index_refresh,
         .snapshot = observer_index_snapshot,
         .snapshot_ready = observer_index_snapshot_ready,
+        .snapshot_diagnostics = observer_index_snapshot_diagnostics,
         .record_for_window = observer_index_record,
     };
     MetaObserverIndexBuildContext *retainedIndexContext = indexContext;
     MetaObserverCommandBinder *binder = [[MetaObserverCommandBinder alloc] initWithGeneration:generation nativeBuildId:@META_NATIVE_BUILD_ID
       indexBuilder:^MetaObserverPreparedIndex * {
         (void)retainedIndexContext;
-        return meta_observer_build_current_index(
-            indexBackend, generation, ++indexRevision);
+        MetaObserverIndexBuildDiagnostics diagnostics = {0};
+        MetaObserverPreparedIndex *prepared =
+            meta_observer_build_current_index(
+                indexBackend, generation, ++indexRevision, &diagnostics);
+        retainedIndexContext.failureReason = prepared == nil
+            ? meta_observer_index_build_failure_reason(&diagnostics)
+            : nil;
+        switch (diagnostics.stage) {
+          case MetaObserverIndexBuildStageRefreshFailed:
+          case MetaObserverIndexBuildStageRefreshDeadline:
+          case MetaObserverIndexBuildStageSnapshotUnavailable:
+          case MetaObserverIndexBuildStageForegroundReceiptInvalid:
+            retainedIndexContext.failureStage = @"inventory";
+            retainedIndexContext.failureTransient = YES;
+            break;
+          case MetaObserverIndexBuildStageRecordFailed:
+          case MetaObserverIndexBuildStageIndexDeadline:
+          case MetaObserverIndexBuildStageIndexPublicationFailed:
+            retainedIndexContext.failureStage = @"index";
+            retainedIndexContext.failureTransient = YES;
+            break;
+          default:
+            retainedIndexContext.failureStage = @"index";
+            retainedIndexContext.failureTransient = NO;
+            break;
+        }
+        return prepared;
       }
       mainExecutor:^BOOL(BOOL (^work)(void)) {
         if (NSThread.isMainThread) return work();
@@ -547,6 +585,12 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
       return snapshot != NULL && snapshot->revision == prepared.inventoryRevision &&
           [prepared.inventoryId isEqual:@(snapshot->inventory_id)] &&
           meta_macos_observer_snapshot_ready(windows, snapshot);
+    }];
+    [binder setIndexFailureProvider:^NSDictionary * {
+      if (retainedIndexContext.failureReason == nil) return nil;
+      return @{@"reason" : retainedIndexContext.failureReason,
+               @"stage" : retainedIndexContext.failureStage ?: @"index",
+               @"transient" : retainedIndexContext.failureTransient ? @YES : @NO};
     }];
     [_asyncLock lock];
     _observerCommands = binder;

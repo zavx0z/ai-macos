@@ -5,11 +5,15 @@ import { parseBrowserHostConfig } from "./browser-config.ts"
 declare const __META_RUNTIME_BUILD_ID__: string | undefined
 const embeddedBuildId = typeof __META_RUNTIME_BUILD_ID__ === "undefined" ? undefined : __META_RUNTIME_BUILD_ID__
 
-export type RuntimeShutdownHost = { drain(): Promise<unknown>, close(): Promise<void> }
+export type RuntimeShutdownHost = { drain(): Promise<unknown>, close(): Promise<void>, noteLifecycle?(event: "stop-requested", reason?: string): Promise<void> }
 
 /** Close выполняется независимо от результата drain; clean shutdown не подменяет ошибку drain. */
-export async function shutdownRuntimeHost(host: RuntimeShutdownHost): Promise<void> {
+export async function shutdownRuntimeHost(host: RuntimeShutdownHost, stopReason?: string): Promise<void> {
   const errors: Error[] = []
+  if (stopReason !== undefined && host.noteLifecycle !== undefined) {
+    try { await host.noteLifecycle("stop-requested", stopReason) }
+    catch (cause) { errors.push(new Error("Runtime stop lifecycle receipt не записан", { cause })) }
+  }
   try { await host.drain() }
   catch (cause) { errors.push(new Error("Runtime drain не подтверждён", { cause })) }
   try { await host.close() }
@@ -46,16 +50,16 @@ export async function main(): Promise<void> {
   })
   await host.start()
   let stopping = false
-  const stop = () => {
+  const stop = (signal: "SIGTERM" | "SIGINT") => {
     if (stopping) return
     stopping = true
-    void shutdownRuntimeHost(host).catch(error => {
+    void shutdownRuntimeHost(host, signal).catch(error => {
       console.error(error instanceof Error ? error.message : String(error))
       process.exitCode = 1
     })
   }
-  process.on("SIGTERM", stop)
-  process.on("SIGINT", stop)
+  process.on("SIGTERM", () => stop("SIGTERM"))
+  process.on("SIGINT", () => stop("SIGINT"))
 }
 
 if (import.meta.main) void main().catch(error => { console.error(error instanceof Error ? error.message : String(error)); process.exitCode = 1 })

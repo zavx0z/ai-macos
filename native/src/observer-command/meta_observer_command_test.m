@@ -34,6 +34,7 @@ typedef struct {
   BOOL mainSucceeds;
   BOOL deferMain;
   BOOL failAfterMain;
+  BOOL failIndex;
   __unsafe_unretained NSMutableArray *deferredMain;
   __unsafe_unretained NSMutableArray *retainedObservers;
   useconds_t indexDelayMicros;
@@ -103,6 +104,7 @@ static MetaObserverCommandBinder *binder(Fixture *fixture) {
                if (fixture->indexDelayMicros > 0) {
                  usleep(fixture->indexDelayMicros);
                }
+               if (fixture->failIndex) return nil;
                MetaObserverTargetIndex *index =
                    [[MetaObserverTargetIndex alloc] init];
                return meta_observer_prepared_index_create(
@@ -206,10 +208,45 @@ static void test_restart_requires_exact_previous_instance(void) {
 static void test_main_failure_and_gap_are_explicit(void) {
   Fixture failed = {.mainSucceeds = NO};
   MetaObserverCommandBinder *unavailable = binder(&failed);
+  [unavailable setIndexFailureProvider:^NSDictionary * {
+    return @{@"reason" : @"Observer index stage=refresh-failed elapsedMs=3500 applications=9 windows=3",
+             @"stage" : @"inventory", @"transient" : @YES};
+  }];
   NSDictionary *response =
       [unavailable handleRequest:request(@"prepare", nil, nil, nil)];
   assert([response[@"ok"] isEqual:@NO]);
   assert([response[@"error"][@"code"] isEqual:@"capability-unavailable"]);
+  assert([response[@"error"][@"message"] containsString:@"main-runloop"]);
+  assert([response[@"prepareFailure"][@"stage"] isEqual:@"main-start"]);
+  assert([response[@"prepareFailure"][@"retryDisposition"]
+      isEqual:@"unknown"]);
+
+  Fixture indexFailed = {.mainSucceeds = YES, .failIndex = YES};
+  MetaObserverCommandBinder *indexUnavailable = binder(&indexFailed);
+  [indexUnavailable setIndexFailureProvider:^NSDictionary * {
+    return @{@"reason" : @"Observer index stage=foreground-receipt-invalid elapsedMs=3210 snapshotRevision=7 snapshotComplete=false applications=42 windows=4 axRecords=2 foregroundPid=99 foregroundBirthMicros=100 foregroundAxStatus=timed-out receiptMatches=false failedWindowIndex=0",
+             @"stage" : @"inventory", @"transient" : @YES};
+  }];
+  NSDictionary *indexResponse = [indexUnavailable
+      handleRequest:request(@"prepare", nil, nil, nil)];
+  assert([indexResponse[@"ok"] isEqual:@NO]);
+  assert([indexResponse[@"error"][@"message"]
+      containsString:@"foregroundAxStatus=timed-out"]);
+  assert([indexResponse[@"prepareFailure"][@"stage"]
+      isEqual:@"inventory"]);
+  assert([indexResponse[@"prepareFailure"][@"retryDisposition"]
+      isEqual:@"clean-no-instance"]);
+  assert([indexResponse[@"prepareFailure"][@"transient"] boolValue]);
+
+  Fixture malformedProvider = {.mainSucceeds = YES, .failIndex = YES};
+  MetaObserverCommandBinder *malformed = binder(&malformedProvider);
+  [malformed setIndexFailureProvider:^NSDictionary * { return @{}; }];
+  NSDictionary *malformedResponse =
+      [malformed handleRequest:request(@"prepare", nil, nil, nil)];
+  assert([malformedResponse[@"ok"] isEqual:@NO]);
+  assert([malformedResponse[@"error"][@"message"]
+      containsString:@"diagnostics недоступны"]);
+  assert(![malformedResponse[@"prepareFailure"][@"transient"] boolValue]);
 
   Fixture overflowFixture = {.mainSucceeds = YES};
   MetaObserverCommandBinder *overflow = binder(&overflowFixture);
@@ -280,6 +317,8 @@ static void test_late_prepare_cannot_create_or_replace_observer(void) {
   assert([failed[@"ok"] isEqual:@NO]);
   assert(fixture.factoryCalls == 0);
   assert(fixture.deferredMain.count == 1);
+  assert([failed[@"prepareFailure"][@"retryDisposition"]
+      isEqual:@"unknown"]);
 
   fixture.deferMain = NO;
   NSDictionary *prepared =
@@ -354,6 +393,9 @@ static void test_foreground_receipt_change_stops_started_candidate(void) {
   assert(fixture.factoryCalls == 1);
   FixtureObserver *candidate = retainedObservers.lastObject;
   assert(candidate != nil && candidate.stopped);
+  assert([failed[@"prepareFailure"][@"stage"] isEqual:@"main-start"]);
+  assert([failed[@"prepareFailure"][@"retryDisposition"]
+      isEqual:@"clean-stopped"]);
   assert(![value activatePushForObserverInstance:@"observer-1"]);
 }
 

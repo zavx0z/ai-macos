@@ -46,3 +46,15 @@ test("prepare/restart не переиспользует прошлый instance"
   expect(nativeObserverRequestSchema.safeParse({ ...request, observerInstanceRef: "observer-instance" }).success).toBe(false)
   expect(nativeObserverRequestSchema.safeParse({ ...base, kind: "observer", command: "events", deadlineAt: timestamp, observerInstanceRef: "instance" }).success).toBe(false)
 })
+
+test("prepare failure содержит typed cleanup proof без text inference", () => {
+  const failure = { ...base, kind: "observer-response", command: "prepare", nativeBuildId: "build", ok: false,
+    error: { code: "capability-unavailable", message: "Detailed diagnostics", stage: "native-observer-command",
+      retryable: false, replayAllowed: false, recoveryAction: "inspect-health" },
+    prepareFailure: { stage: "inventory", retryDisposition: "clean-no-instance", transient: true } }
+  expect(nativeObserverResponseSchema.safeParse(failure).success).toBe(true)
+  expect(nativeObserverResponseSchema.safeParse({ ...failure, prepareFailure: undefined }).success).toBe(false)
+  expect(nativeObserverResponseSchema.safeParse({ ...failure, command: "coverage" }).success).toBe(false)
+  expect(nativeObserverResponseSchema.safeParse({ ...failure,
+    prepareFailure: { stage: "cleanup", retryDisposition: "unknown", transient: true } }).success).toBe(false)
+})

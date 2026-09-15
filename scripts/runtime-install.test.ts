@@ -686,6 +686,101 @@ test("post-grant observer preparation может временно держать
   expect(fixture.runner.doctorCalls).toBe(2)
 })
 
+test("typed observer retry progress получает единый extended deadline", async () => {
+  const fixture = await createFixture()
+  const options = { ...fixture.options, requiredCapabilities: ["input.pointer"] as const, doctorTimeoutMs: 100 }
+  const plan = await planRuntimeInstall(options)
+  const startedAt = Date.now()
+  const deadlineAt = startedAt + 450
+  fixture.runner.observerHealthByBuild.set(plan.release.runtimeBuildId, [
+    observerPreparing(1, startedAt, deadlineAt, startedAt + 50),
+    observerPreparing(2, startedAt, deadlineAt, startedAt + 150),
+    observerPreparing(3, startedAt, deadlineAt),
+    { state: "ready", viewReady: true },
+  ])
+  fixture.runner.sealAdmissionWhileObserverPreparingBuilds.add(plan.release.runtimeBuildId)
+
+  const result = await applyRuntimeInstall(plan, options)
+
+  expect(result.state).toBe("installed")
+  expect(fixture.runner.doctorCalls).toBe(4)
+})
+
+test("observer retry deadline не продлевается при новом deadline и runtime epoch", async () => {
+  const fixture = await createFixture()
+  const options = { ...fixture.options, requiredCapabilities: ["input.pointer"] as const, doctorTimeoutMs: 100 }
+  const plan = await planRuntimeInstall(options)
+  const startedAt = Date.now()
+  const firstDeadline = startedAt + 180
+  fixture.runner.observerHealthByBuild.set(plan.release.runtimeBuildId, [
+    observerPreparing(1, startedAt, firstDeadline, startedAt + 50),
+    observerPreparing(1, startedAt + 100, startedAt + 5_000, startedAt + 200),
+  ])
+  fixture.runner.runtimeEpochsByBuild.set(plan.release.runtimeBuildId, ["runtime:first", "runtime:replacement"])
+  fixture.runner.sealAdmissionWhileObserverPreparingBuilds.add(plan.release.runtimeBuildId)
+  const began = Date.now()
+
+  await expect(applyRuntimeInstall(plan, options)).rejects.toThrow("observer preparation deadline exceeded")
+  expect(Date.now() - began).toBeLessThan(500)
+})
+
+test("observer unavailable после typed retry отклоняется без ожидания remaining deadline", async () => {
+  const fixture = await createFixture()
+  const options = { ...fixture.options, requiredCapabilities: ["input.pointer"] as const, doctorTimeoutMs: 100 }
+  const plan = await planRuntimeInstall(options)
+  const startedAt = Date.now()
+  fixture.runner.observerHealthByBuild.set(plan.release.runtimeBuildId, [
+    observerPreparing(1, startedAt, startedAt + 1_000, startedAt + 50),
+    { state: "unavailable", viewReady: false },
+  ])
+  fixture.runner.sealAdmissionWhileObserverPreparingBuilds.add(plan.release.runtimeBuildId)
+  const began = Date.now()
+
+  await expect(applyRuntimeInstall(plan, options)).rejects.toThrow("admission закрыта")
+  expect(fixture.runner.doctorCalls).toBe(2)
+  expect(Date.now() - began).toBeLessThan(500)
+})
+
+test("malformed или mismatched observer preparation немедленно отклоняется", async () => {
+  const now = Date.now()
+  const cases = [
+    { state: "preparing", viewReady: false, preparation: { attempt: 4, maxAttempts: 3,
+      startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 100).toISOString() } },
+    { state: "preparing", viewReady: false, preparation: { attempt: 1, maxAttempts: 2,
+      startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 100).toISOString() } },
+    { state: "preparing", viewReady: false, preparation: { attempt: "1", maxAttempts: 3,
+      startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 100).toISOString() } },
+    { state: "preparing", viewReady: false, preparation: { attempt: 1, maxAttempts: 3,
+      startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 26_001).toISOString() } },
+    { state: "preparing", viewReady: false, preparation: { attempt: 1, maxAttempts: 3,
+      startedAt: new Date(now + 2_000).toISOString(), deadlineAt: new Date(now + 2_100).toISOString() } },
+    { state: "ready", viewReady: true, preparation: { attempt: 1, maxAttempts: 3,
+      startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 100).toISOString() } },
+    { state: "ready", viewReady: false },
+  ]
+  for (const health of cases) {
+    const fixture = await createFixture()
+    const options = { ...fixture.options, requiredCapabilities: ["input.pointer"] as const }
+    const plan = await planRuntimeInstall(options)
+    fixture.runner.observerHealthByBuild.set(plan.release.runtimeBuildId, [health])
+
+    await expect(applyRuntimeInstall(plan, options)).rejects.toThrow(/Observer (preparation|state)/)
+    expect(fixture.runner.doctorCalls).toBe(1)
+  }
+})
+
+test("legacy observer preparing без progress использует обычный doctor timeout", async () => {
+  const fixture = await createFixture()
+  const options = { ...fixture.options, requiredCapabilities: ["input.pointer"] as const, doctorTimeoutMs: 100 }
+  const plan = await planRuntimeInstall(options)
+  fixture.runner.observerUnavailableCountsByBuild.set(plan.release.runtimeBuildId, 100)
+  fixture.runner.sealAdmissionWhileObserverPreparingBuilds.add(plan.release.runtimeBuildId)
+  const began = Date.now()
+
+  await expect(applyRuntimeInstall(plan, options)).rejects.toThrow("doctor readiness deadline exceeded")
+  expect(Date.now() - began).toBeLessThan(500)
+})
+
 test("foundation без observer capabilities не требует observer/view readiness", async () => {
   const fixture = await createFixture()
   const plan = await planRuntimeInstall(fixture.options)
@@ -695,6 +790,25 @@ test("foundation без observer capabilities не требует observer/view 
 
   expect(result.state).toBe("installed")
   expect(fixture.runner.doctorCalls).toBe(1)
+})
+
+test("legacy nonrequired health без observer сохраняет foundation compatibility", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  fixture.runner.omitObserverForBuild.add(plan.release.runtimeBuildId)
+
+  const result = await applyRuntimeInstall(plan, fixture.options)
+
+  expect(result.state).toBe("installed")
+})
+
+test("required profile без observer health отклоняется", async () => {
+  const fixture = await createFixture()
+  const options = { ...fixture.options, requiredCapabilities: ["input.pointer"] as const }
+  const plan = await planRuntimeInstall(options)
+  fixture.runner.omitObserverForBuild.add(plan.release.runtimeBuildId)
+
+  await expect(applyRuntimeInstall(plan, options)).rejects.toThrow("Observer health отсутствует")
 })
 
 test("permission deadline не обновляется после ready-to-waiting flap", async () => {
@@ -1212,6 +1326,10 @@ class FakeRunner implements CommandRunner {
   readonly startupPermissionStatesByBuild = new Map<string, FakeStartupPermissionState[]>()
   readonly startupPermissionIndexesByBuild = new Map<string, number>()
   readonly observerUnavailableCountsByBuild = new Map<string, number>()
+  readonly observerHealthByBuild = new Map<string, Array<{ state: string, viewReady: boolean, preparation?: unknown }>>()
+  readonly observerHealthIndexesByBuild = new Map<string, number>()
+  readonly runtimeEpochsByBuild = new Map<string, string[]>()
+  readonly omitObserverForBuild = new Set<string>()
   readonly sealAdmissionWhileObserverPreparingBuilds = new Set<string>()
   readonly wrongPermissionIdentityForBuild = new Set<string>()
   readonly legacyDeniedBuilds = new Set<string>()
@@ -1355,9 +1473,19 @@ class FakeRunner implements CommandRunner {
       const permissionState = permissionStates?.[Math.min(permissionIndex, permissionStates.length - 1)] ?? "ready"
       if (permissionStates !== undefined) this.startupPermissionIndexesByBuild.set(runtimeBuildId, permissionIndex + 1)
       const pendingPermissions = ["checking", "requesting", "waiting", "restart-needed"].includes(permissionState)
+      const explicitObserverHealth = this.observerHealthByBuild.get(runtimeBuildId)
+      const observerHealthIndex = this.observerHealthIndexesByBuild.get(runtimeBuildId) ?? 0
+      const observerHealth = explicitObserverHealth?.[
+        Math.min(observerHealthIndex, explicitObserverHealth.length - 1)
+      ]
+      if (explicitObserverHealth !== undefined) {
+        this.observerHealthIndexesByBuild.set(runtimeBuildId, observerHealthIndex + 1)
+      }
       const observerUnavailableCount = this.observerUnavailableCountsByBuild.get(runtimeBuildId) ?? 0
-      const observerReady = !pendingPermissions && observerUnavailableCount === 0
-      if (!pendingPermissions && observerUnavailableCount > 0) {
+      const observerReady = !pendingPermissions && (observerHealth === undefined
+        ? observerUnavailableCount === 0
+        : observerHealth.state === "ready" && observerHealth.viewReady)
+      if (observerHealth === undefined && !pendingPermissions && observerUnavailableCount > 0) {
         this.observerUnavailableCountsByBuild.set(runtimeBuildId, observerUnavailableCount - 1)
       }
       const permissionsGranted = !pendingPermissions && !this.legacyDeniedBuilds.has(runtimeBuildId)
@@ -1373,11 +1501,15 @@ class FakeRunner implements CommandRunner {
       } } }
       const admissionSealed = pendingPermissions
         || (!observerReady && this.sealAdmissionWhileObserverPreparingBuilds.has(runtimeBuildId))
+      const epochs = this.runtimeEpochsByBuild.get(runtimeBuildId)
+      const runtimeEpoch = epochs?.[Math.min(this.doctorCalls - 1, epochs.length - 1)] ?? "runtime:fixture"
       return ok(JSON.stringify({ isError: false, structuredContent: {
-        runtime: { buildId: manifest.builds.runtimeBuildId, draining: false,
+        runtime: { buildId: manifest.builds.runtimeBuildId, runtimeEpoch, draining: false,
           admissionSealed, recoveryOperations: 0,
           recoveryReasons: pendingPermissions ? ["Startup permissions pending"] : [] },
-        observer: { state: observerReady ? "ready" : "preparing", reason: "fixture", viewReady: observerReady },
+        ...(this.omitObserverForBuild.has(runtimeBuildId) ? {} : { observer: observerHealth ?? {
+          state: observerReady ? "ready" : "preparing", reason: "fixture", viewReady: observerReady,
+        } }),
         native: { state: "compatible", buildId: manifest.builds.nativeBuildId },
         permissions: {
           accessibility: { granted: permissionsGranted, helperPath: permissionOwnerPath, cdhash: manifest.artifacts.nativeHelper.cdhash },
@@ -1414,6 +1546,20 @@ class FakeRunner implements CommandRunner {
 function ok(stdout = ""): CommandResult { return { stdout, stderr: "", exitCode: 0 } }
 function fail(stderr: string): CommandResult { return { stdout: "", stderr, exitCode: 1 } }
 function sha256(value: string | Uint8Array): string { return createHash("sha256").update(value).digest("hex") }
+
+function observerPreparing(attempt: 1 | 2 | 3, startedAt: number, deadlineAt: number, nextRetryAt?: number) {
+  return {
+    state: "preparing",
+    viewReady: false,
+    preparation: {
+      attempt,
+      maxAttempts: 3,
+      startedAt: new Date(startedAt).toISOString(),
+      deadlineAt: new Date(deadlineAt).toISOString(),
+      ...(nextRetryAt === undefined ? {} : { nextRetryAt: new Date(nextRetryAt).toISOString() }),
+    },
+  }
+}
 
 async function signatureContentKey(path: string): Promise<string> {
   const info = await lstat(path)

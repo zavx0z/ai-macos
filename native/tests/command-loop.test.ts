@@ -139,6 +139,28 @@ test.each([false, true])("parent EOF: physicalDown=%s, cleanup не ждёт и�
   }
 }, 5000)
 
+test.each([
+  ["--observer-gap", "foreground-subscription-failed"],
+  ["--observer-target-gap", "observer-target-unresolved"],
+] as const)("exit75 %s пишет privacy-safe terminal stage без payload", async (argument, stage) => {
+  const child = Bun.spawn([binary, argument], { stdin: "pipe", stdout: "pipe", stderr: "pipe" })
+  child.stdin.write(encodeNativeFrame({ channel: "handshake", payload: {
+    kind: "handshake", protocolVersion: "1", requestId: "gap-handshake",
+    runtimeEpoch: "runtime", loginSessionId: "login", runtimeBuildId: "runtime-build",
+    expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1",
+  } }))
+  await child.stdin.flush()
+  const [exit, output, errors] = await Promise.all([
+    child.exited,
+    new Response(child.stdout).arrayBuffer(),
+    new Response(child.stderr).text(),
+  ])
+  expect(exit).toBe(75)
+  expect(output.byteLength).toBeGreaterThan(0)
+  expect(errors.trim()).toBe(`{"kind":"native-terminal","exitCode":75,"stage":"${stage}"}`)
+  expect(errors).not.toContain("application")
+})
+
 test("window transition и input используют один native fence high-water", async () => {
   const adapter = createAdapter()
   try {
