@@ -128,3 +128,42 @@ timeout → повторное обнаружение», injected index builder 
 полноценным тестовым backend: этот сценарий ещё требует проверки после
 установки. `CGWindowListCopyWindowInfo` нельзя прервать по deadline; превышение
 времени запрещает публикацию ready, но не обрывает системный вызов.
+
+## Установленный результат
+
+Пользователь подтвердил создание локального сертификата. Сертификат
+`computer-use Local Code Signing` создан в пользовательской Связке ключей,
+доверие ограничено code signing. Приватный ключ не записан в репозиторий;
+временные файлы импорта удалены. Несекретные сведения о сертификате находятся
+в локальном каталоге `Application Support/ai-macos/signing`.
+
+Установлен source commit `c671b7d`, release
+`release-ebb7550473f7a0cb55bfd599`. Настоящий LaunchAgent запускает
+`runtime/computer-use.app/Contents/MacOS/computer-use` внутри пользовательского
+`Application Support/ai-macos`. Helper находится в том же bundle.
+
+Installed doctor подтвердил все четыре права, `missing: []`,
+`requestIssued: false`, `observer.state: ready`, `viewReady: true` и готовность
+профиля `desktop-browser-selected`. Первый bundle с тем же сертификатом ранее
+ожидал ручного включения прав; после подтверждения пользователя сборка с
+иконкой получила их без нового request API. Это одно наблюдаемое успешное
+обновление, а не гарантия поведения всех будущих версий macOS.
+
+Иконка `Contents/Resources/computer-use.icns` установлена: 1473735 bytes,
+digest совпадает с manifest, `CFBundleIconFile` ссылается на неё. Строгая
+проверка подписи bundle и вложенного кода прошла. Выполнена регистрация точного
+приложения в Launch Services. Имя `computer-use` пользователь подтвердил
+скриншотом системных настроек; отображение новой иконки в этих настройках после
+обновления ещё не подтверждено пользователем.
+
+Отдельный диагностический MCP client выполнил только initialize, tools/list
+и passive system_health. Реальный installed launcher вернул каталог
+`ai-macos-runtime-catalog` версии `0.4.0`, включая `get_state`, `observe`,
+`check_input`, `click`, `hover`, `scroll`, `drag` и операции статуса/отмены.
+Никаких desktop-действий диагностический client не выполнял.
+
+В настройках Codex путь ai-macos заменён на `mcp/src/installed-launcher.ts`.
+Уже открытая задача всё ещё использует старое соединение `0.3.0` с PID 70281;
+проверка нового отдельного клиента не обновляет её каталог инструментов.
+Реальные действия через новое direct MCP подключение и удаление legacy sources
+остаются следующими этапами полной приёмки.
