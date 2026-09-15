@@ -154,6 +154,24 @@ export class NativeWindowAdapter implements WindowAdapter {
       ...(response.result.nextCursor === undefined ? {} : { nextCursor: response.result.nextCursor }),
       nodeCount: response.result.nodeCount,
       encodedBytes: response.result.encodedBytes,
+      nodes: response.result.nodes.map(node => {
+        const authority = {
+          ...generation,
+          applicationRef: request.target.ref.applicationRef,
+          snapshotId: response.result.snapshotId,
+        }
+        return {
+          elementRef: { ...authority, elementRef: node.elementRef },
+          ...(node.parentElementRef === undefined ? {} : {
+            parentElementRef: { ...authority, elementRef: node.parentElementRef },
+          }),
+          role: node.role,
+          subrole: node.subrole,
+          title: node.title,
+          ...(node.frame === undefined ? {} : { frame: node.frame }),
+          actions: [...node.actions],
+        }
+      }),
       errors: response.result.errors.map(message => contractError(
         "inventory-incomplete",
         message,
@@ -195,6 +213,19 @@ export class NativeWindowAdapter implements WindowAdapter {
     await Promise.all(displays.map(display => this.#publishDisplayEvidence(raw, display)))
 
     const mappingErrors: ContractError[] = []
+    const publishIdentity = async (target: Extract<import("@meta/shared/contracts").OperationTarget,
+      { kind: "application" | "window" | "surface" }>, process: ApplicationRecord["ref"]) => {
+      const receipt = await this.#native.evidencePublisher.publish({
+        factKind: "native-target-identity", target, process,
+        sourceResponseRef: raw.sourceResponseRef, inventoryId: raw.inventoryId,
+        inventoryRevision: raw.revision, displayLayoutRevision: raw.displayLayoutRevision,
+        observedAt: raw.capturedAt,
+      })
+      await this.services.evidence.issueTargetResolution({ receipt, target })
+    }
+    for (const application of applications) {
+      await publishIdentity({ kind: "application", ref: application.ref }, application.ref)
+    }
     const windows = await Promise.all(raw.windows.map(async (window) => {
       if (window.kind === "cg-only") {
         return {
@@ -237,6 +268,14 @@ export class NativeWindowAdapter implements WindowAdapter {
             error instanceof Error ? error.message : String(error),
             "window-inventory-evidence",
           ))
+        }
+      }
+      const process = applications.find(application => application.ref.applicationRef === window.applicationRef
+        && application.ref.pid === window.ownerPid)?.ref
+      if (process !== undefined) {
+        if (proof === undefined) await publishIdentity(target, process)
+        for (const surface of window.surfaces) {
+          await publishIdentity({ kind: "surface", ref: surfaceRef(surface, generation) }, process)
         }
       }
       return mapWindowRecord(window, target.ref, generation, proof)

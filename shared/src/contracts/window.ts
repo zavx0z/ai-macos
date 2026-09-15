@@ -1,5 +1,6 @@
 import { z } from "zod"
 import type { AdapterHostContext, AdapterResult, AdapterServices } from "./adapters.ts"
+import type { AxInspectionRequest, AxInspectionResult } from "./ax.ts"
 import { contractErrorSchema } from "./errors.ts"
 import {
   applicationRefSchema,
@@ -246,28 +247,16 @@ export const windowTransitionResultSchema = z.strictObject({
 })
 export type WindowTransitionResult = z.infer<typeof windowTransitionResultSchema>
 
-export const axInspectionRequestSchema = z.strictObject({
-  target: z.discriminatedUnion("kind", [
-    z.strictObject({ kind: z.literal("window"), ref: windowRefSchema }),
-    z.strictObject({ kind: z.literal("surface"), ref: surfaceRefSchema }),
-  ]),
-  depth: z.number().int().min(0).max(12),
-  maxNodes: z.number().int().min(1).max(1_500),
-  maxBytes: z.number().int().min(1).max(1024 * 1024),
-  cursor: opaqueIdSchema.optional(),
-})
-export type AxInspectionRequest = z.infer<typeof axInspectionRequestSchema>
-
-export const axInspectionResultSchema = z.strictObject({
-  snapshotId: opaqueIdSchema,
-  target: axInspectionRequestSchema.shape.target,
-  complete: z.boolean(),
-  nextCursor: opaqueIdSchema.optional(),
-  nodeCount: z.number().int().safe().min(0),
-  encodedBytes: z.number().int().safe().min(0).max(1024 * 1024),
-  errors: z.array(contractErrorSchema).max(128),
-})
-export type AxInspectionResult = z.infer<typeof axInspectionResultSchema>
+export {
+  axInspectionNodeSchema,
+  axInspectionRequestSchema,
+  axInspectionResultSchema,
+  axInspectionTargetSchema,
+  type AxInspectionNode,
+  type AxInspectionRequest,
+  type AxInspectionResult,
+  type AxInspectionTarget,
+} from "./ax.ts"
 
 export interface WindowAdapter {
   readonly host: AdapterHostContext

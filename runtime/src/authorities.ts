@@ -314,16 +314,18 @@ export class NativeEvidenceAuthority implements EvidenceIssuer {
   async issueTargetResolution(request: {
     receipt: VerifiedNativeEvidenceReceipt
     target: Parameters<EvidenceIssuer["issueTargetResolution"]>[0]["target"]
-    nativeMapping: NativeTargetMapping
+    nativeMapping?: NativeTargetMapping
   }): Promise<ProofRef> {
-    if (request.nativeMapping.kind === "window") {
+    if (request.nativeMapping?.kind === "window") {
       throw new Error("Window CG/AX mapping требует issueWindowCorrelation")
     }
-    const published = this.#assertReceipt(request.receipt, "target-resolution")
+    const published = this.#assertReceipt(request.receipt,
+      request.nativeMapping === undefined ? "native-target-identity" : "target-resolution")
     if (
-      published.report.factKind !== "target-resolution"
+      (published.report.factKind !== "target-resolution" && published.report.factKind !== "native-target-identity")
       || canonicalJson(published.report.target) !== canonicalJson(request.target)
-      || canonicalJson(published.report.mapping) !== canonicalJson(request.nativeMapping)
+      || (published.report.factKind === "target-resolution"
+        && canonicalJson(published.report.mapping) !== canonicalJson(request.nativeMapping))
     ) {
       throw new Error("Target resolution request не совпадает с verified native facts")
     }

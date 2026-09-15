@@ -144,6 +144,8 @@ function inventoryReports(
   envelope: { runtimeEpoch: string, loginSessionId: string, nativeGeneration: string },
   inventory: ReturnType<typeof nativeInventoryResultSchema.parse>,
 ): NativeEvidenceReport[] {
+  const generation = { runtimeEpoch: envelope.runtimeEpoch, loginSessionId: envelope.loginSessionId,
+    nativeGeneration: envelope.nativeGeneration }
   const displays = inventory.displays.map(display => ({
     nativeDisplayId: display.nativeDisplayId,
     ref: {
@@ -164,6 +166,27 @@ function inventoryReports(
     target: { kind: "display", ref: display.ref },
     mapping: { kind: "display", display },
   }))
+  for (const application of inventory.applications) {
+    const process = { ...generation, applicationRef: application.applicationRef, pid: application.pid,
+      launchedAt: application.launchedAt, registrationNonce: application.registrationNonce }
+    const common = { factKind: "native-target-identity" as const, process,
+      sourceResponseRef: inventory.sourceResponseRef, inventoryId: inventory.inventoryId,
+      inventoryRevision: inventory.revision, displayLayoutRevision: inventory.displayLayoutRevision,
+      observedAt: inventory.capturedAt }
+    reports.push(nativeEvidenceReportSchema.parse({ ...common, target: { kind: "application", ref: process } }))
+    for (const window of inventory.windows) {
+      if (window.kind !== "ax-window" || window.applicationRef !== application.applicationRef
+        || window.ownerPid !== application.pid) continue
+      const identity = { ...generation, applicationRef: application.applicationRef }
+      reports.push(nativeEvidenceReportSchema.parse({ ...common,
+        target: { kind: "window", ref: { ...identity, windowRef: window.windowRef } } }))
+      for (const surface of window.surfaces) {
+        if (surface.applicationRef !== application.applicationRef || surface.ownerWindowRef !== window.windowRef) continue
+        reports.push(nativeEvidenceReportSchema.parse({ ...common,
+          target: { kind: "surface", ref: { ...identity, surfaceRef: surface.surfaceRef, ownerWindowRef: surface.ownerWindowRef } } }))
+      }
+    }
+  }
   for (const window of inventory.windows) {
     if (
       window.kind !== "ax-window"
