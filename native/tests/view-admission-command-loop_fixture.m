@@ -186,7 +186,7 @@ static bool fixture_flags(void *context, uint64_t flags) {
                    ([target[@"kind"] isEqual:@"display"] &&
                     [target[@"ref"][@"displayRef"] isEqual:@"display-1"]);
       return exact &&
-             x >= 0 && x <= 100 && y >= 0 && y <= 100;
+             x >= 0 && x <= 200 && y >= 0 && y <= 200;
     }];
   }
   return self;

@@ -1296,10 +1296,51 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
 - (NSDictionary *)executeInput:(NSDictionary *)request job:(MetaInputJob *)job {
   const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(_windows);
   NSDictionary *operation = job.operation;
-  if (snapshot == NULL || ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
-      [operation[@"inventoryRevision"] unsignedLongLongValue] != snapshot->revision) return nil;
-  if (operation[@"observationRef"] != nil && [operation[@"observationRef"][@"displayLayoutRevision"] unsignedLongLongValue] != snapshot->display_layout_revision) return nil;
   NSDictionary *scope = operation[@"target"], *ref = scope[@"ref"];
+  NSString *targetRef = ref[@"windowRef"] ?: ref[@"surfaceRef"] ?:
+      ref[@"displayRef"] ?: ref[@"layoutRef"];
+  NSDictionary *(^reject)(NSString *, NSString *, NSString *) =
+      ^NSDictionary *(NSString *code, NSString *message, NSString *stage) {
+        if (![targetRef isKindOfClass:NSString.class]) return nil;
+        NSDictionary *execution = [self->_inputExecutor
+            executePrimitive:request
+                         job:job
+                   targetRef:targetRef
+                      verify:^BOOL(__unused NSString *value) { return NO; }
+                      action:^NSDictionary * { return nil; }];
+        NSDictionary *status = execution[@"status"];
+        if (status == nil) return nil;
+        return @{
+          @"nativeError" : @{
+            @"code" : code,
+            @"message" : message,
+            @"stage" : stage,
+            @"retryable" : @NO,
+            @"replayAllowed" : @NO,
+            @"recoveryAction" : [code isEqual:@"observation-stale"]
+                ? @"capture-new-observation"
+                : [code isEqual:@"target-stale"] ? @"refresh-inventory"
+                                                   : @"inspect-health",
+          },
+          @"nativeStatus" : status,
+        };
+      };
+  _activeInputRecoveryDescriptor = nil;
+  if (snapshot == NULL ||
+      ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
+      [operation[@"inventoryRevision"] unsignedLongLongValue] !=
+          snapshot->revision) {
+    return reject(@"target-stale",
+                  @"Current Native inventory не совпадает с input operation",
+                  @"input-native-inventory");
+  }
+  if (operation[@"observationRef"] != nil &&
+      [operation[@"observationRef"][@"displayLayoutRevision"]
+          unsignedLongLongValue] != snapshot->display_layout_revision) {
+    return reject(@"observation-stale",
+                  @"Observation display layout больше не current",
+                  @"input-native-layout");
+  }
   if ([@[@"window", @"surface"] containsObject:scope[@"kind"]]) {
     BOOL surface = [scope[@"kind"] isEqual:@"surface"], matches = NO;
     NSString *targetRef = surface ? ref[@"surfaceRef"] : ref[@"windowRef"];
@@ -1309,10 +1350,18 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
           (surface ? record->surface_kind != META_SURFACE_WINDOW : record->surface_kind == META_SURFACE_WINDOW) &&
           (!surface || [ref[@"ownerWindowRef"] isEqual:@(record->owner_window_ref)])) matches = YES;
     }
-    if (!matches) return nil;
+    if (!matches) {
+      return reject(@"target-stale",
+                    @"Exact window или surface отсутствует в current inventory",
+                    @"input-native-target");
+    }
   }
   _inputLoginSession = operation[@"loginSessionId"];
-  if (![self prepareInputRisk:request]) return nil;
+  if (![self prepareInputRisk:request]) {
+    return reject(@"request-payload-mismatch",
+                  @"Recovery descriptor не совпадает с actual input plan",
+                  @"input-native-recovery-domain");
+  }
   NSString *viewError = nil;
   NSDictionary *viewHead = [_viewAdmissions admitRequest:request proof:request[@"viewAdmission"] error:&viewError];
   __block BOOL admissionRejected = viewHead == nil;

@@ -154,6 +154,24 @@ fi
   -o "$CHECK_DIR/input-bridge-test"
 
 /usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
+  -Inative/src \
+  native/src/executor.c \
+  native/src/ledger.c \
+  native/src/input_bridge.c \
+  native/src/input_job.m \
+  native/src/input_executor.m \
+  native/tests/input_executor_plan_rejection_test.m \
+  -framework Foundation \
+  -o "$CHECK_DIR/input-executor-plan-rejection-test"
+
+/usr/bin/clang \
   -std=c17 \
   -Wall \
   -Wextra \
@@ -384,6 +402,7 @@ fi
 "$CHECK_DIR/executor-test"
 "$CHECK_DIR/ledger-test"
 "$CHECK_DIR/input-bridge-test"
+"$CHECK_DIR/input-executor-plan-rejection-test"
 "$CHECK_DIR/inventory-priority-test"
 "$CHECK_DIR/serialization-test"
 "$CHECK_DIR/capture-router-test"

@@ -58,6 +58,16 @@ static bool prepare_pointer(void *context, const MetaPointerEvent *event) { retu
 static bool prepare_scroll(void *context, const MetaScrollEvent *event) { return [(__bridge MetaInputExecutor *)context prepareScroll:event]; }
 static bool before_dispatch(void *context) { return [(__bridge MetaInputExecutor *)context beforeDispatch]; }
 static bool number(id value) { return [value isKindOfClass:NSNumber.class] && isfinite([value doubleValue]); }
+static bool json_safe_nonnegative_integer(id value) {
+  if (![value isKindOfClass:NSNumber.class] ||
+      CFGetTypeID((__bridge CFTypeRef)value) == CFBooleanGetTypeID()) {
+    return false;
+  }
+  const double number_value = [value doubleValue];
+  return isfinite(number_value) && number_value >= 0 &&
+         number_value <= 9007199254740991.0 &&
+         floor(number_value) == number_value;
+}
 static bool point_value(id value, double *x, double *y) {
   if (![value isKindOfClass:NSDictionary.class] || !number(value[@"x"]) || !number(value[@"y"])) return false;
   *x = [value[@"x"] doubleValue]; *y = [value[@"y"] doubleValue];
@@ -235,12 +245,26 @@ static bool dispatch_external(void *context) {
   MetaFence token = {0};
   NSString *names[] = {@"runtimeEpoch", @"loginSessionId", @"nativeGeneration"};
   char *destinations[] = {token.runtime_epoch, token.login_session_id, token.native_generation};
-  BOOL valid = [fence isKindOfClass:NSDictionary.class] && [action isKindOfClass:NSDictionary.class] && [target isKindOfClass:NSString.class];
+  BOOL outerValid = [request isKindOfClass:NSDictionary.class] &&
+      [operation isKindOfClass:NSDictionary.class] &&
+      [fence isKindOfClass:NSDictionary.class] &&
+      [operation[@"target"] isKindOfClass:NSDictionary.class] &&
+      [ref isKindOfClass:NSDictionary.class] &&
+      [target isKindOfClass:NSString.class] && target.length > 0 &&
+      target.length <= 127 &&
+      [operation[@"operationId"] isKindOfClass:NSString.class] &&
+      [operation[@"operationId"] length] > 0 &&
+      [operation[@"operationId"] length] <= 127 &&
+      [operation[@"deadlineAt"] isEqual:request[@"deadlineAt"]];
+  BOOL planValid = [action isKindOfClass:NSDictionary.class] &&
+      [action[@"kind"] isKindOfClass:NSString.class] &&
+      [@[@"hover", @"click", @"scroll", @"drag", @"text", @"key", @"shortcut"]
+          containsObject:action[@"kind"]];
   BOOL pointerAction = [@[@"hover", @"click", @"scroll", @"drag"] containsObject:action[@"kind"]];
   if (pointerAction) {
     NSDictionary *observation = operation[@"observationRef"];
-    valid = valid && [observation isKindOfClass:NSDictionary.class] &&
-        [observation[@"inventoryRevision"] isEqual:operation[@"inventoryRevision"]] &&
+    planValid = planValid && [observation isKindOfClass:NSDictionary.class] &&
+        json_safe_nonnegative_integer(observation[@"inventoryRevision"]) &&
         [observation[@"observationId"] isKindOfClass:NSString.class] && [observation[@"observationId"] length] > 0 &&
         [observation[@"proofRef"] isKindOfClass:NSString.class] && [observation[@"proofRef"] length] > 0;
     id initialPoint = [action[@"kind"] isEqual:@"scroll"] ? action[@"anchor"] : action[@"point"];
@@ -248,31 +272,54 @@ static bool dispatch_external(void *context) {
       NSArray *trajectory = action[@"trajectory"];
       initialPoint = [trajectory isKindOfClass:NSArray.class] && trajectory.count > 0 && [trajectory[0] isKindOfClass:NSDictionary.class] ? trajectory[0][@"point"] : nil;
     }
-    valid = valid && point_value(initialPoint, &_pointX, &_pointY);
-    _hasPoint = valid;
+    planValid = planValid && point_value(initialPoint, &_pointX, &_pointY);
+    _hasPoint = planValid;
   }
   BOOL windowScope = [@[@"window", @"surface"] containsObject:operation[@"target"][@"kind"]];
   BOOL displayScope = [@[@"display", @"desktop-layout"] containsObject:operation[@"target"][@"kind"]];
-  valid = valid && (windowScope || (pointerAction && displayScope)) &&
+  outerValid = outerValid && (windowScope || displayScope) &&
       [ref[@"runtimeEpoch"] isEqual:operation[@"runtimeEpoch"]] &&
       [ref[@"loginSessionId"] isEqual:operation[@"loginSessionId"]] &&
       [ref[@"nativeGeneration"] isEqual:operation[@"nativeGeneration"]];
-  for (size_t i = 0; valid && i < 3; i += 1) {
+  planValid = planValid && (windowScope || (pointerAction && displayScope));
+  for (size_t i = 0; outerValid && i < 3; i += 1) {
     NSString *value = fence[names[i]];
-    valid = [value isKindOfClass:NSString.class] && [value isEqual:operation[names[i]]] && value.length <= 64;
-    if (valid) snprintf(destinations[i], META_NATIVE_REF_CAPACITY, "%s", value.UTF8String);
+    outerValid = [value isKindOfClass:NSString.class] &&
+        [value isEqual:operation[names[i]]] && value.length > 0 &&
+        value.length <= 64;
+    if (outerValid)
+      snprintf(destinations[i], META_NATIVE_REF_CAPACITY, "%s",
+               value.UTF8String);
   }
-  token.counter = [fence[@"counter"] unsignedLongLongValue];
+  outerValid = outerValid &&
+      json_safe_nonnegative_integer(fence[@"counter"]) &&
+      [fence[@"counter"] unsignedLongLongValue] > 0;
+  token.counter = outerValid ? [fence[@"counter"] unsignedLongLongValue] : 0;
   NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
   formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
-  NSDate *actionDeadline = [formatter dateFromString:request[@"payload"][@"actionDeadlineAt"]];
-  NSDate *outerDeadline = [formatter dateFromString:operation[@"deadlineAt"]];
+  id actionDeadlineValue = request[@"payload"][@"actionDeadlineAt"];
+  id outerDeadlineValue = operation[@"deadlineAt"];
+  NSDate *actionDeadline = [actionDeadlineValue isKindOfClass:NSString.class]
+                               ? [formatter dateFromString:actionDeadlineValue]
+                               : nil;
+  NSDate *outerDeadline = [outerDeadlineValue isKindOfClass:NSString.class]
+                              ? [formatter dateFromString:outerDeadlineValue]
+                              : nil;
   BOOL isText = [action[@"kind"] isEqual:@"text"];
-  NSTimeInterval remaining = actionDeadline.timeIntervalSinceNow * 1000;
-  valid = valid && actionDeadline != nil && outerDeadline != nil && [actionDeadline compare:outerDeadline] != NSOrderedDescending && remaining > 0;
-  uint64_t deadline = clock_now(NULL) + (uint64_t)MAX(0, MIN(remaining, isText ? 30000 : 5000));
+  NSTimeInterval outerRemaining = outerDeadline.timeIntervalSinceNow * 1000;
+  NSTimeInterval actionRemaining = actionDeadline.timeIntervalSinceNow * 1000;
+  BOOL outerDeadlineValid = outerDeadline != nil && outerRemaining > 0;
+  outerValid = outerValid && outerDeadlineValid;
+  BOOL actionDeadlineValid = outerDeadlineValid && actionDeadline != nil &&
+      [actionDeadline compare:outerDeadline] != NSOrderedDescending &&
+      actionRemaining > 0;
+  planValid = planValid && actionDeadlineValid;
+  NSTimeInterval remaining = actionDeadlineValid ? actionRemaining
+                                                  : outerRemaining;
+  uint64_t deadline = clock_now(NULL) +
+      (uint64_t)MAX(1, MIN(remaining, isText ? 30000 : 5000));
   _actionDeadline = deadline;
-  BOOL began = valid && meta_executor_open_runtime_epoch(_executor, token.runtime_epoch, token.login_session_id) &&
+  BOOL began = outerValid && meta_executor_open_runtime_epoch(_executor, token.runtime_epoch, token.login_session_id) &&
     meta_executor_begin(_executor, [operation[@"operationId"] UTF8String], target.UTF8String, token, deadline);
   if (!began) {
     MetaExecutorStatus rejected = meta_executor_status(_executor);
@@ -282,6 +329,21 @@ static bool dispatch_external(void *context) {
     NSDictionary *report = @{@"finished": @NO, @"completedSteps": @0, @"totalSteps": @1,
       @"dispatchAttempts": @(rejected.dispatch_attempts), @"ledgerRevision": @(rejected.ledger_revision),
       @"status": [job statusForRequest:job.requestId]};
+    _job = nil;
+    return report;
+  }
+  if (!planValid) {
+    meta_executor_fail(_executor, "input-plan-rejected");
+    MetaExecutorStatus rejected = meta_executor_status(_executor);
+    [job publishStatus:rejected];
+    NSDictionary *report = @{
+      @"finished" : @NO,
+      @"completedSteps" : @0,
+      @"totalSteps" : @1,
+      @"dispatchAttempts" : @(rejected.dispatch_attempts),
+      @"ledgerRevision" : @(rejected.ledger_revision),
+      @"status" : [job statusForRequest:job.requestId],
+    };
     _job = nil;
     return report;
   }
@@ -389,7 +451,15 @@ static bool dispatch_external(void *context) {
       free(storage); free(schedule);
     }
   }
-  if (began && !finished) meta_executor_cancel(_executor);
+  if (began && !finished) {
+    MetaExecutorStatus unfinished = meta_executor_status(_executor);
+    if (unfinished.execution == META_EXECUTOR_DISPATCHING &&
+        unfinished.dispatch_attempts == 0) {
+      meta_executor_fail(_executor, "input-plan-rejected");
+    } else if (unfinished.execution == META_EXECUTOR_DISPATCHING) {
+      meta_executor_cancel(_executor);
+    }
+  }
   MetaExecutorStatus status = meta_executor_status(_executor);
   [job publishStatus:status];
   NSDictionary *result = @{@"finished": finished ? @YES : @NO, @"completedSteps": @(completed), @"totalSteps": @(total),
