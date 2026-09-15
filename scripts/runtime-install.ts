@@ -955,6 +955,7 @@ type ProcessIncarnation = {
   parentPid: number
   startedAt: string
   command: string
+  state?: string
 }
 
 type OwnedRuntimeProcesses = {
@@ -1329,6 +1330,7 @@ function validProcessIncarnation(value: ProcessIncarnation | undefined): boolean
     && Number.isSafeInteger(value.parentPid) && value.parentPid >= 0
     && typeof value.startedAt === "string" && Number.isFinite(Date.parse(value.startedAt))
     && typeof value.command === "string" && value.command.length > 0 && value.command.length <= 16_384
+    && (value.state === undefined || typeof value.state === "string" && value.state.length > 0 && value.state.length <= 16)
 }
 
 function assertPreviousReleasePath(paths: RuntimeInstallPaths, path: string): void {
@@ -2459,7 +2461,7 @@ async function captureOwnedRuntimeProcesses(
   const helperPath = service.program === stableApplicationRuntimePath(plan.paths)
     ? stableApplicationHelperPath(plan.paths)
     : plan.paths.stableHelperPath
-  const result = await checked(runner, "/bin/ps", ["-axww", "-o", "pid=,ppid=,lstart=,command="],
+  const result = await checked(runner, "/bin/ps", ["-axww", "-o", "pid=,ppid=,lstart=,state=,command="],
     undefined, 5_000, { LC_ALL: "C", LANG: "C" })
   const children = result.stdout.split("\n").flatMap(line => {
     const identity = line.match(/^\s*(\d+)\s+(\d+)\s+/)
@@ -2480,13 +2482,15 @@ async function capturedProcessState(
   if (current === undefined) return "gone"
   if (current.startedAt !== captured.startedAt) return "gone"
   if (current.command !== captured.command) {
-    throw new Error(`Process ${captured.pid} изменил command при том же PID/lstart`)
+    if (current.state?.startsWith("Z") !== true) {
+      throw new Error(`Process ${captured.pid} изменил command при том же PID/lstart вне zombie state`)
+    }
   }
   return current.parentPid === captured.parentPid ? "alive" : "alive-orphan"
 }
 
 async function readProcessIncarnation(runner: CommandRunner, pid: number): Promise<ProcessIncarnation | undefined> {
-  const result = await runner.run("/bin/ps", ["-ww", "-p", String(pid), "-o", "pid=,ppid=,lstart=,command="], {
+  const result = await runner.run("/bin/ps", ["-ww", "-p", String(pid), "-o", "pid=,ppid=,lstart=,state=,command="], {
     timeoutMs: 5_000,
     env: { LC_ALL: "C", LANG: "C" },
   })
@@ -2502,17 +2506,19 @@ async function readProcessIncarnation(runner: CommandRunner, pid: number): Promi
 }
 
 function parseProcessIncarnation(line: string): ProcessIncarnation {
-  const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/)
+  const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(\S+)\s+(.+)$/)
   if (match === null) throw new Error("ps process incarnation не распознан")
   const pid = Number(match[1])
   const parentPid = Number(match[2])
   const startedAt = match[3]!
-  const command = match[4]!.trim()
+  const state = match[4]!
+  const command = match[5]!.trim()
   if (!Number.isSafeInteger(pid) || pid < 1 || !Number.isSafeInteger(parentPid) || parentPid < 0
-    || command.length < 1 || command.length > 16_384 || !Number.isFinite(Date.parse(startedAt))) {
+    || state.length < 1 || state.length > 16 || command.length < 1 || command.length > 16_384
+    || !Number.isFinite(Date.parse(startedAt))) {
     throw new Error("ps process incarnation повреждён")
   }
-  return { pid, parentPid, startedAt, command }
+  return { pid, parentPid, startedAt, state, command }
 }
 
 function commandMatchesPath(command: string, path: string): boolean {

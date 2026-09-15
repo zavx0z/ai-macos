@@ -1338,6 +1338,62 @@ test("exact removing label без PID остаётся pending до not-found", 
   expect(Date.now() - began).toBeGreaterThanOrEqual(100)
 })
 
+test("zombie command mismatch остаётся живым witness до исчезновения PID", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  fixture.runner.commit = "9".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.helperExitPolls = 3
+  fixture.runner.helperZombieAfterBootout = true
+  fixture.runner.helperCommandAfterBootout = "<defunct>"
+  const options = {
+    ...fixture.options,
+    shutdownConvergenceTimeoutMs: 500,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:zombie-helper",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+  const began = Date.now()
+
+  const result = await applyRuntimeInstall(update, options)
+
+  expect(result.state).toBe("installed")
+  expect(Date.now() - began).toBeGreaterThanOrEqual(100)
+})
+
+test("live command mismatch при том же PID/lstart остаётся failclosed", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  fixture.runner.commit = "b".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.helperExitPolls = 100
+  fixture.runner.helperCommandAfterBootout = "/tmp/foreign-live-helper"
+  const options = {
+    ...fixture.options,
+    shutdownConvergenceTimeoutMs: 500,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:live-command-mismatch",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+
+  await expect(applyRuntimeInstall(update, options)).rejects.toThrow("rollback incomplete")
+  expect(fixture.runner.bootstrapCalls).toBe(1)
+})
+
 test("orphan helper timeout сохраняет witness и запрещает rollback bootstrap до resumed exit", async () => {
   const fixture = await createFixture()
   const first = await planRuntimeInstall(fixture.options)
@@ -1375,6 +1431,9 @@ test("orphan helper timeout сохраняет witness и запрещает rol
   const record = JSON.parse(await readFile(join(options.paths.installRoot, "pending-update/record.json"), "utf8"))
   expect(record.shutdownWitness).toMatchObject({ state: "bootout-issued",
     service: { pid: 4242 }, processes: { parent: { pid: 4242 }, helper: { pid: 4243, parentPid: 4242 } } })
+  delete record.shutdownWitness.processes.parent.state
+  delete record.shutdownWitness.processes.helper.state
+  await writeFile(join(options.paths.installRoot, "pending-update/record.json"), JSON.stringify(record))
 
   fixture.runner.helperExitPolls = 0
   await expect(applyRuntimeInstall(update, {
@@ -1660,6 +1719,8 @@ class FakeRunner implements CommandRunner {
   reuseProcessIdsAfterBootout = false
   processIdsReused = false
   processStartedAt = "Mon Sep 15 21:43:56 2026"
+  helperZombieAfterBootout = false
+  helperCommandAfterBootout: string | undefined
   bootstrapCalls = 0
   appearAtPrint: number | undefined
   printCalls = 0
@@ -1740,7 +1801,9 @@ class FakeRunner implements CommandRunner {
         else if (this.removing && !this.processIdsReused && pid === 4243) this.helperPresent = false
         if (pid === 4242 && this.parentPresent) return ok(this.processLine(4242, 1, this.launchProgram))
         if (pid === 4243 && this.helperPresent) {
-          return ok(this.processLine(4243, this.helperOrphaned ? 1 : 4242, this.helperPath()))
+          return ok(this.processLine(4243, this.helperOrphaned ? 1 : 4242,
+            this.removing ? this.helperCommandAfterBootout ?? this.helperPath() : this.helperPath(),
+            this.removing && this.helperZombieAfterBootout ? "Z" : "S"))
         }
         return { stdout: "", stderr: "", exitCode: 1 }
       }
@@ -1920,6 +1983,8 @@ class FakeRunner implements CommandRunner {
       this.helperPresent = true
       this.helperOrphaned = false
       this.processIdsReused = false
+      this.helperZombieAfterBootout = false
+      this.helperCommandAfterBootout = undefined
       const plist = await readFile(args[2]!, "utf8")
       this.launchProgram = plist.match(/<array><string>([^<]+)<\/string><\/array>/)?.[1] ?? this.launchProgram
       return ok()
@@ -1949,8 +2014,8 @@ class FakeRunner implements CommandRunner {
       : join(this.repositoryRoot, "input/bin/meta-input-helper")
   }
 
-  private processLine(pid: number, parentPid: number, command: string): string {
-    return `${pid} ${parentPid} ${this.processStartedAt} ${command}\n`
+  private processLine(pid: number, parentPid: number, command: string, state = "S"): string {
+    return `${pid} ${parentPid} ${this.processStartedAt} ${state} ${command}\n`
   }
 }
 
