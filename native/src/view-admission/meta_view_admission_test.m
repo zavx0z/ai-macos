@@ -310,6 +310,35 @@ static void test_recheck_fails_after_event_or_gap(void) {
   assert(![value recheckOperationId:@"operation-recheck"]);
 }
 
+static void test_global_event_rejects_old_proof_and_allows_new_head(void) {
+  Fixture fixture = {.now =
+      [NSDate dateWithTimeIntervalSince1970:1789466400]};
+  MetaObserverCommandBinder *observer = observer_binder(&fixture);
+  NSDictionary *oldCoverage = prepare_observer(observer)[@"coverage"];
+  NSDate *deadline = [fixture.now dateByAddingTimeInterval:60];
+  NSDictionary *oldOperation = operation(@"operation-old-global",
+                                         @"window-1", deadline);
+  NSDictionary *oldProof = proof(
+      oldOperation, oldCoverage, @"view-old-global",
+      [fixture.now dateByAddingTimeInterval:30]);
+  [fixture.observer recordGlobalWindowStructure];
+  assert([fixture.observer.coverage[@"state"] isEqual:@"ready"]);
+  MetaViewAdmissionController *value = controller(&fixture, observer, 60000, 4);
+  NSString *error = nil;
+  assert([value admitRequest:request(oldOperation, oldProof)
+                        proof:oldProof error:&error] == nil);
+  assert([error containsString:@"событие"]);
+
+  NSDictionary *newCoverage = fixture.observer.coverage;
+  NSDictionary *newOperation = operation(@"operation-new-global",
+                                         @"window-1", deadline);
+  NSDictionary *newProof = proof(
+      newOperation, newCoverage, @"view-new-global",
+      [fixture.now dateByAddingTimeInterval:30]);
+  assert([value admitRequest:request(newOperation, newProof)
+                        proof:newProof error:NULL] != nil);
+}
+
 static void test_ax_press_uses_same_zero_event_gate(void) {
   Fixture fixture = {.now =
       [NSDate dateWithTimeIntervalSince1970:1789466400]};
@@ -502,6 +531,7 @@ int main(void) {
     test_zero_event_admission_head_recheck_and_replay_tombstone();
     test_any_event_since_baseline_rejects_without_stealing_push();
     test_recheck_fails_after_event_or_gap();
+    test_global_event_rejects_old_proof_and_allows_new_head();
     test_ax_press_uses_same_zero_event_gate();
     test_pointer_display_and_layout_use_same_zero_event_gate();
     test_broad_target_rejects_ax_keyboard_and_context_mismatch();

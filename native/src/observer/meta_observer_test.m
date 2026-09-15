@@ -1,8 +1,54 @@
 #include "meta_observer.h"
 
+#import <AppKit/AppKit.h>
+
 #include <assert.h>
 #include <stdio.h>
 #include <unistd.h>
+
+@interface MetaNativeObserver (CallbackTests)
+- (void)handleAXElement:(AXUIElementRef)element
+                    pid:(pid_t)pid
+           notification:(NSString *)notification
+          sourceObserver:(nullable AXObserverRef)sourceObserver;
+- (void)handleActivatedApplication:(NSRunningApplication *)application;
+- (void)handleTerminatedApplication:(NSRunningApplication *)application;
+- (BOOL)subscribeApplication:(NSRunningApplication *)application;
+- (BOOL)subscribeWindow:(AXUIElementRef)window
+                observer:(AXObserverRef)observer
+                     pid:(pid_t)pid;
+- (uint64_t)processBirthForPid:(pid_t)pid;
+@end
+
+@interface MetaObserverCallbackFixture : MetaNativeObserver
+@property(nonatomic) BOOL applicationSubscriptionReady;
+@property(nonatomic) BOOL windowSubscriptionReady;
+@property(nonatomic) uint64_t processBirth;
+@property(nonatomic) NSMutableArray<NSString *> *trace;
+@end
+
+@implementation MetaObserverCallbackFixture
+- (BOOL)subscribeApplication:(__unused NSRunningApplication *)application {
+  [self.trace addObject:@"subscribe-application"];
+  return self.applicationSubscriptionReady;
+}
+- (BOOL)subscribeWindow:(__unused AXUIElementRef)window
+                observer:(__unused AXObserverRef)observer
+                     pid:(__unused pid_t)pid {
+  [self.trace addObject:@"subscribe-window"];
+  return self.windowSubscriptionReady;
+}
+- (uint64_t)processBirthForPid:(__unused pid_t)pid {
+  return self.processBirth;
+}
+@end
+
+@interface MetaRunningApplicationFixture : NSObject
+@property(nonatomic) pid_t processIdentifier;
+@end
+
+@implementation MetaRunningApplicationFixture
+@end
 
 static NSDictionary *generation(void) {
   return @{
@@ -216,12 +262,236 @@ static void test_subscription_budget_is_bounded(void) {
       &budget, 100, META_OBSERVER_MAX_WINDOWS + 1));
 }
 
+static void test_subscribed_application_mapping_miss_is_global_event(void) {
+  MetaRunningApplicationFixture *applicationFixture =
+      [[MetaRunningApplicationFixture alloc] init];
+  applicationFixture.processIdentifier = getpid();
+  NSRunningApplication *application =
+      (NSRunningApplication *)(id)applicationFixture;
+  MetaObserverCallbackFixture *observer =
+      [[MetaObserverCallbackFixture alloc] initWithGeneration:generation()];
+  observer.trace = [NSMutableArray array];
+  observer.applicationSubscriptionReady = YES;
+  observer.processBirth = 42;
+  mark_all_coverage_ready(observer);
+  [observer setValue:[@{@(application.processIdentifier) : @42} mutableCopy]
+              forKey:@"axProcessBirths"];
+  [observer setValue:[@{
+              @(application.processIdentifier) : [[NSObject alloc] init]
+            } mutableCopy]
+              forKey:@"axObservers"];
+  NSMutableArray<NSString *> *trace = observer.trace;
+  [observer setFocusResolver:^NSDictionary *(
+                __unused pid_t pid, __unused AXUIElementRef element,
+                __unused NSString *notification) {
+    [trace addObject:@"resolve"];
+    return nil;
+  }];
+  [observer handleActivatedApplication:application];
+  assert(([observer.trace isEqual:@[
+    @"subscribe-application", @"resolve"
+  ]]));
+  NSArray *events = [observer takeEvents];
+  assert(events.count == 1);
+  assert([events[0][@"kind"] isEqual:@"focus"]);
+  assert([events[0][@"source"] isEqual:@"unknown"]);
+  assert(events[0][@"target"] == nil);
+  assert([observer.coverage[@"state"] isEqual:@"ready"]);
+  assert(![observer.coverage[@"gapDetected"] boolValue]);
+
+  MetaObserverCallbackFixture *failed =
+      [[MetaObserverCallbackFixture alloc] initWithGeneration:generation()];
+  failed.trace = [NSMutableArray array];
+  mark_all_coverage_ready(failed);
+  [failed handleActivatedApplication:application];
+  assert([failed.trace isEqual:@[@"subscribe-application"]]);
+  assert([failed.coverage[@"state"] isEqual:@"unavailable"]);
+  assert([failed.coverage[@"gapDetected"] boolValue]);
+}
+
+static void test_new_window_subscribes_before_mapping(void) {
+  const pid_t pid = getpid();
+  AXUIElementRef element = AXUIElementCreateSystemWide();
+  assert(element != NULL);
+  MetaObserverCallbackFixture *observer =
+      [[MetaObserverCallbackFixture alloc] initWithGeneration:generation()];
+  observer.trace = [NSMutableArray array];
+  observer.windowSubscriptionReady = YES;
+  observer.processBirth = 42;
+  mark_all_coverage_ready(observer);
+  [observer setValue:[@{@(pid) : [[NSObject alloc] init]} mutableCopy]
+              forKey:@"axObservers"];
+  [observer setValue:[@{@(pid) : @42} mutableCopy]
+              forKey:@"axProcessBirths"];
+  NSMutableArray<NSString *> *trace = observer.trace;
+  [observer setFocusResolver:^NSDictionary *(
+                __unused pid_t callbackPid, __unused AXUIElementRef callbackElement,
+                __unused NSString *notification) {
+    [trace addObject:@"resolve"];
+    return nil;
+  }];
+  [observer handleAXElement:element
+                        pid:pid
+               notification:(__bridge NSString *)kAXWindowCreatedNotification
+              sourceObserver:NULL];
+  assert(([observer.trace isEqual:@[@"subscribe-window", @"resolve"]]));
+  NSArray *events = [observer takeEvents];
+  assert(events.count == 1);
+  assert([events[0][@"kind"] isEqual:@"window-structure"]);
+  assert([events[0][@"source"] isEqual:@"unknown"]);
+  assert(events[0][@"target"] == nil);
+  assert([observer.coverage[@"state"] isEqual:@"ready"]);
+  assert(![observer.coverage[@"gapDetected"] boolValue]);
+
+  MetaObserverCallbackFixture *failed =
+      [[MetaObserverCallbackFixture alloc] initWithGeneration:generation()];
+  failed.trace = [NSMutableArray array];
+  failed.processBirth = 42;
+  mark_all_coverage_ready(failed);
+  [failed setValue:[@{@(pid) : [[NSObject alloc] init]} mutableCopy]
+            forKey:@"axObservers"];
+  [failed setValue:[@{@(pid) : @42} mutableCopy]
+            forKey:@"axProcessBirths"];
+  NSMutableArray<NSString *> *failedTrace = failed.trace;
+  [failed setFocusResolver:^NSDictionary *(
+              __unused pid_t callbackPid, __unused AXUIElementRef callbackElement,
+              __unused NSString *notification) {
+    [failedTrace addObject:@"resolve"];
+    return nil;
+  }];
+  [failed handleAXElement:element
+                      pid:pid
+             notification:(__bridge NSString *)kAXWindowCreatedNotification
+            sourceObserver:NULL];
+  assert([failed.trace isEqual:@[@"subscribe-window"]]);
+  assert([failed takeEvents].count == 0);
+  assert([failed.coverage[@"state"] isEqual:@"unavailable"]);
+  assert([failed.coverage[@"gapDetected"] boolValue]);
+
+  MetaObserverCallbackFixture *reused =
+      [[MetaObserverCallbackFixture alloc] initWithGeneration:generation()];
+  reused.trace = [NSMutableArray array];
+  reused.processBirth = 43;
+  reused.windowSubscriptionReady = YES;
+  mark_all_coverage_ready(reused);
+  [reused setValue:[@{@(pid) : [[NSObject alloc] init]} mutableCopy]
+            forKey:@"axObservers"];
+  [reused setValue:[@{@(pid) : @42} mutableCopy]
+            forKey:@"axProcessBirths"];
+  NSMutableArray<NSString *> *reusedTrace = reused.trace;
+  [reused setFocusResolver:^NSDictionary *(
+              __unused pid_t callbackPid, __unused AXUIElementRef callbackElement,
+              __unused NSString *notification) {
+    [reusedTrace addObject:@"resolve"];
+    return nil;
+  }];
+  [reused handleAXElement:element
+                      pid:pid
+             notification:(__bridge NSString *)kAXWindowCreatedNotification
+            sourceObserver:NULL];
+  assert(reused.trace.count == 0);
+  assert([reused takeEvents].count == 0);
+  assert([reused.coverage[@"state"] isEqual:@"unavailable"]);
+  assert([reused.coverage[@"gapDetected"] boolValue]);
+
+  MetaObserverCallbackFixture *foreignSource =
+      [[MetaObserverCallbackFixture alloc] initWithGeneration:generation()];
+  foreignSource.trace = [NSMutableArray array];
+  foreignSource.processBirth = 42;
+  foreignSource.windowSubscriptionReady = YES;
+  mark_all_coverage_ready(foreignSource);
+  NSObject *currentSource = [[NSObject alloc] init];
+  NSObject *staleSource = [[NSObject alloc] init];
+  [foreignSource setValue:[@{@(pid) : currentSource} mutableCopy]
+                   forKey:@"axObservers"];
+  [foreignSource setValue:[@{@(pid) : @42} mutableCopy]
+                   forKey:@"axProcessBirths"];
+  [foreignSource handleAXElement:element
+                             pid:pid
+                    notification:(__bridge NSString *)kAXWindowCreatedNotification
+                   sourceObserver:(__bridge AXObserverRef)staleSource];
+  assert(foreignSource.trace.count == 0);
+  assert([foreignSource takeEvents].count == 0);
+  assert([foreignSource.coverage[@"state"] isEqual:@"unavailable"]);
+  assert([foreignSource.coverage[@"gapDetected"] boolValue]);
+
+  MetaObserverCallbackFixture *unknownNotification =
+      [[MetaObserverCallbackFixture alloc] initWithGeneration:generation()];
+  unknownNotification.trace = [NSMutableArray array];
+  unknownNotification.processBirth = 42;
+  mark_all_coverage_ready(unknownNotification);
+  [unknownNotification setValue:[@{@(pid) : currentSource} mutableCopy]
+                         forKey:@"axObservers"];
+  [unknownNotification setValue:[@{@(pid) : @42} mutableCopy]
+                         forKey:@"axProcessBirths"];
+  [unknownNotification handleAXElement:element
+                                   pid:pid
+                          notification:@"fixture-unsubscribed-notification"
+                         sourceObserver:NULL];
+  assert([unknownNotification takeEvents].count == 0);
+  assert([unknownNotification.coverage[@"state"] isEqual:@"unavailable"]);
+  assert([unknownNotification.coverage[@"gapDetected"] boolValue]);
+  CFRelease(element);
+}
+
+static void test_termination_keeps_new_pid_incarnation(void) {
+  const pid_t pid = getpid();
+  MetaRunningApplicationFixture *applicationFixture =
+      [[MetaRunningApplicationFixture alloc] init];
+  applicationFixture.processIdentifier = pid;
+  NSRunningApplication *application =
+      (NSRunningApplication *)(id)applicationFixture;
+
+  MetaObserverCallbackFixture *owned =
+      [[MetaObserverCallbackFixture alloc] initWithGeneration:generation()];
+  owned.processBirth = 42;
+  mark_all_coverage_ready(owned);
+  [owned setValue:[@{@(pid) : application} mutableCopy]
+            forKey:@"runningApplications"];
+  [owned setValue:[@{@(pid) : @42} mutableCopy]
+            forKey:@"axProcessBirths"];
+  assert([[owned valueForKey:@"runningApplications"] objectForKey:@(pid)] ==
+         application);
+  assert([[[owned valueForKey:@"axProcessBirths"] objectForKey:@(pid)]
+      unsignedLongLongValue] == 42);
+  [owned handleTerminatedApplication:application];
+  assert([owned.coverage[@"state"] isEqual:@"ready"]);
+  NSArray *ownedEvents = [owned takeEvents];
+  assert(ownedEvents.count == 1);
+  assert([ownedEvents[0][@"kind"] isEqual:@"window-structure"]);
+  assert(ownedEvents[0][@"target"] == nil);
+  assert([[owned valueForKey:@"axProcessBirths"] count] == 0);
+
+  MetaObserverCallbackFixture *reused =
+      [[MetaObserverCallbackFixture alloc] initWithGeneration:generation()];
+  reused.processBirth = 43;
+  mark_all_coverage_ready(reused);
+  NSObject *newIncarnation = [[NSObject alloc] init];
+  [reused setValue:[@{@(pid) : newIncarnation} mutableCopy]
+             forKey:@"runningApplications"];
+  [reused setValue:[@{@(pid) : @43} mutableCopy]
+             forKey:@"axProcessBirths"];
+  [reused handleTerminatedApplication:application];
+  assert([reused takeEvents].count == 0);
+  assert([reused.coverage[@"state"] isEqual:@"ready"]);
+  assert([[reused valueForKey:@"runningApplications"] objectForKey:@(pid)] ==
+         newIncarnation);
+
+  reused.processBirth = 44;
+  [reused handleTerminatedApplication:application];
+  assert([reused.coverage[@"state"] isEqual:@"unavailable"]);
+  assert([reused.coverage[@"gapDetected"] boolValue]);
+}
+
 int main(void) {
   @autoreleasepool {
     test_exact_synthetic_ownership_and_focus();
     test_subscription_gap_and_target_generation();
     test_synthetic_identity_conflict_and_buffer_gap();
     test_subscription_budget_is_bounded();
+    test_subscribed_application_mapping_miss_is_global_event();
+    test_new_window_subscribes_before_mapping();
+    test_termination_keeps_new_pid_incarnation();
   }
   puts("observer ingestion tests passed");
   return 0;

@@ -52,8 +52,12 @@ NSTimeInterval meta_observer_subscription_timeout_seconds(
 // Эти методы являются единым ingestion path для platform callbacks и fixtures.
 - (void)recordInputFromPid:(pid_t)pid syntheticTag:(uint64_t)tag;
 - (void)recordFocusTarget:(NSDictionary *)target syntheticTag:(uint64_t)tag;
+// Отсутствующий target означает консервативную глобальную invalidation:
+// callback получен из нашей raw subscription, но immutable index не дал hint.
+- (void)recordGlobalFocus;
 - (void)recordUnresolvedFocus:(NSString *)reason;
 - (void)recordWindowStructureTarget:(NSDictionary *)target;
+- (void)recordGlobalWindowStructure;
 - (void)recordLifecycle:(NSString *)lifecycle
       nextLoginSessionId:(nullable NSString *)nextLoginSessionId;
 - (void)recordCurrentSessionReadiness:(NSDictionary *)readiness;

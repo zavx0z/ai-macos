@@ -238,6 +238,24 @@ static void test_foreign_input_and_lifecycle_stop_continuation(void) {
   [lifecycle stop];
 }
 
+static void test_global_topology_event_cancels_without_coverage_gap(void) {
+  MetaInputObserverFixture fixture = {0};
+  MetaObserverCommandBinder *binder = fixture_binder(&fixture);
+  fixture_prepare(binder);
+  MetaInputObserverBinding *binding = fixture_binding(binder, @"observer-1");
+  assert([binding registerTag:14]);
+  [fixture.observer recordGlobalWindowStructure];
+  assert([binding poll] == MetaInputObserverPollForeignEvent);
+  NSDictionary *push = [binder takePushEnvelopes:10];
+  assert([push[@"events"] count] == 1);
+  assert(push[@"gapReason"] == nil);
+  assert([push[@"events"][0][@"event"][@"kind"]
+      isEqual:@"window-structure"]);
+  assert(push[@"events"][0][@"event"][@"target"] == nil);
+  assert([fixture.observer.coverage[@"state"] isEqual:@"ready"]);
+  [binding stop];
+}
+
 static void test_registration_baseline_keeps_interleaved_foreign_event(void) {
   MetaInputObserverFixture fixture = {0};
   MetaObserverCommandBinder *binder = fixture_binder(&fixture);
@@ -310,6 +328,7 @@ int main(void) {
     test_exact_admission_head_binds_without_stealing_event();
     test_stale_admission_head_clears_binding_fail_closed();
     test_foreign_input_and_lifecycle_stop_continuation();
+    test_global_topology_event_cancels_without_coverage_gap();
     test_registration_baseline_keeps_interleaved_foreign_event();
     test_construction_baseline_keeps_pre_registration_event();
     test_instance_and_gap_invalidation_fail_closed();

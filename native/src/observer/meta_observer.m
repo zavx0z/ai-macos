@@ -2,6 +2,7 @@
 
 #import <AppKit/AppKit.h>
 
+#include <libproc.h>
 #include <unistd.h>
 #include <time.h>
 
@@ -10,6 +11,15 @@ static uint64_t observer_monotonic_millis(void) {
   clock_gettime(CLOCK_MONOTONIC, &value);
   return (uint64_t)value.tv_sec * 1000 +
          (uint64_t)value.tv_nsec / 1000000;
+}
+
+static uint64_t observer_process_start_micros(pid_t pid) {
+  if (pid <= 0) return 0;
+  struct proc_bsdinfo info = {0};
+  const int size = proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, sizeof(info));
+  if (size != sizeof(info)) return 0;
+  return (uint64_t)info.pbi_start_tvsec * 1000000ULL +
+         (uint64_t)info.pbi_start_tvusec;
 }
 
 BOOL meta_observer_subscription_budget_init(
@@ -85,6 +95,24 @@ static NSString *bounded_reason(NSString *reason) {
                                : [reason substringToIndex:1024];
 }
 
+static BOOL observer_window_structure_notification(NSString *notification) {
+  return [@[
+    (__bridge NSString *)kAXWindowCreatedNotification,
+    (__bridge NSString *)kAXMovedNotification,
+    (__bridge NSString *)kAXResizedNotification,
+    (__bridge NSString *)kAXWindowMiniaturizedNotification,
+    (__bridge NSString *)kAXWindowDeminiaturizedNotification,
+    (__bridge NSString *)kAXUIElementDestroyedNotification,
+  ] containsObject:notification];
+}
+
+static BOOL observer_focus_notification(NSString *notification) {
+  return [notification isEqual:@"application-activated"] || [@[
+    (__bridge NSString *)kAXFocusedWindowChangedNotification,
+    (__bridge NSString *)kAXFocusedUIElementChangedNotification,
+  ] containsObject:notification];
+}
+
 static id immutable_json_copy(id value) {
   if (value == nil) return nil;
   NSData *data =
@@ -114,7 +142,11 @@ static CGEventRef observe_input(CGEventTapProxy proxy, CGEventType type,
 @interface MetaNativeObserver ()
 - (void)handleAXElement:(AXUIElementRef)element
                     pid:(pid_t)pid
-           notification:(NSString *)notification;
+           notification:(NSString *)notification
+          sourceObserver:(nullable AXObserverRef)sourceObserver;
+- (void)handleActivatedApplication:(NSRunningApplication *)application;
+- (void)handleTerminatedApplication:(NSRunningApplication *)application;
+- (uint64_t)processBirthForPid:(pid_t)pid;
 - (BOOL)subscribeApplication:(NSRunningApplication *)application;
 - (BOOL)subscribeWindowsForApplication:(AXUIElementRef)application
                                observer:(AXObserverRef)observer
@@ -142,7 +174,8 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   }
   [native handleAXElement:element
                       pid:pid
-             notification:(__bridge NSString *)notification];
+             notification:(__bridge NSString *)notification
+            sourceObserver:observer];
 }
 
 @implementation MetaNativeObserver {
@@ -155,6 +188,8 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   NSMutableArray *_distributedTokens;
   NSMutableDictionary<NSNumber *, id> *_axObservers;
   NSMutableDictionary<NSNumber *, id> *_axApplications;
+  NSMutableDictionary<NSNumber *, NSNumber *> *_axProcessBirths;
+  NSMutableDictionary<NSNumber *, NSRunningApplication *> *_runningApplications;
   NSMutableDictionary<NSNumber *, NSMutableArray<id> *> *_axWindows;
   NSUInteger _axWindowCount;
   MetaObserverFocusResolver _focusResolver;
@@ -201,6 +236,8 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
     _distributedTokens = [NSMutableArray array];
     _axObservers = [NSMutableDictionary dictionary];
     _axApplications = [NSMutableDictionary dictionary];
+    _axProcessBirths = [NSMutableDictionary dictionary];
+    _runningApplications = [NSMutableDictionary dictionary];
     _axWindows = [NSMutableDictionary dictionary];
     _startedAt = observer_time();
     _coveredFrom = _startedAt;
@@ -313,16 +350,7 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                               NSRunningApplication *application =
                                   note.userInfo[NSWorkspaceApplicationKey];
                               if (observer == nil || application == nil) return;
-                              if (![observer subscribeApplication:application]) {
-                                [observer recordUnresolvedFocus:@"AX subscription нового foreground application не удалась"];
-                                return;
-                              }
-                              AXUIElementRef element = AXUIElementCreateApplication(
-                                  application.processIdentifier);
-                              [observer handleAXElement:element
-                                                   pid:application.processIdentifier
-                                          notification:@"application-activated"];
-                              CFRelease(element);
+                              [observer handleActivatedApplication:application];
                             }]];
   [_workspaceTokens
       addObject:[workspaceCenter
@@ -332,8 +360,9 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                             usingBlock:^(NSNotification *note) {
                               NSRunningApplication *application =
                                   note.userInfo[NSWorkspaceApplicationKey];
-                              [weakSelf removeApplicationPid:
-                                            application.processIdentifier];
+                              if (application != nil) {
+                                [weakSelf handleTerminatedApplication:application];
+                              }
                             }]];
 
   NSDictionary *workspaceLifecycle = @{
@@ -453,7 +482,16 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
 - (BOOL)subscribeApplication:(NSRunningApplication *)application {
   const pid_t pid = application.processIdentifier;
   if (pid <= 0) return NO;
-  if (_axObservers[@(pid)] != nil) return YES;
+  const uint64_t processBirth = [self processBirthForPid:pid];
+  if (processBirth == 0) return NO;
+  NSNumber *subscribedBirth = _axProcessBirths[@(pid)];
+  if (_axObservers[@(pid)] != nil &&
+      subscribedBirth.unsignedLongLongValue == processBirth) {
+    return YES;
+  }
+  if (_axObservers[@(pid)] != nil || subscribedBirth != nil) {
+    [self removeApplicationPid:pid];
+  }
   if (_axObservers.count >= META_OBSERVER_MAX_APPLICATIONS) return NO;
   MetaObserverSubscriptionBudget budget = {0};
   if (!meta_observer_subscription_budget_init(
@@ -504,6 +542,9 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                                                    pid:pid
                                                 budget:&budget];
   }
+  if (subscribed && [self processBirthForPid:pid] != processBirth) {
+    subscribed = NO;
+  }
   if (!subscribed) {
     NSUInteger partial = [_axWindows[@(pid)] count];
     [_axWindows removeObjectForKey:@(pid)];
@@ -517,6 +558,8 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                      kCFRunLoopCommonModes);
   _axObservers[@(pid)] = CFBridgingRelease(observer);
   _axApplications[@(pid)] = CFBridgingRelease(app);
+  _axProcessBirths[@(pid)] = @(processBirth);
+  _runningApplications[@(pid)] = application;
   return YES;
 }
 
@@ -634,6 +677,8 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   }
   [_axObservers removeObjectForKey:@(pid)];
   [_axApplications removeObjectForKey:@(pid)];
+  [_axProcessBirths removeObjectForKey:@(pid)];
+  [_runningApplications removeObjectForKey:@(pid)];
   NSUInteger removed = [_axWindows[@(pid)] count];
   [_axWindows removeObjectForKey:@(pid)];
   _axWindowCount = removed > _axWindowCount ? 0 : _axWindowCount - removed;
@@ -641,37 +686,108 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
 
 - (void)handleAXElement:(AXUIElementRef)element
                     pid:(pid_t)pid
-           notification:(NSString *)notification {
+           notification:(NSString *)notification
+          sourceObserver:(AXObserverRef)sourceObserver {
+  id storedObserver = _axObservers[@(pid)];
+  if (storedObserver == nil ||
+      (sourceObserver != NULL &&
+       (__bridge AXObserverRef)storedObserver != sourceObserver)) {
+    [self markUnavailable:
+              @"AX callback не принадлежит current raw subscription"];
+    return;
+  }
+  NSNumber *subscribedBirth = _axProcessBirths[@(pid)];
+  const uint64_t currentBirth = [self processBirthForPid:pid];
+  if (subscribedBirth == nil || currentBirth == 0 ||
+      subscribedBirth.unsignedLongLongValue != currentBirth) {
+    [self markUnavailable:
+              @"AX callback PID incarnation не совпадает с raw subscription"];
+    return;
+  }
+  BOOL windowCreated = [notification
+      isEqual:(__bridge NSString *)kAXWindowCreatedNotification];
+  BOOL windowStructure =
+      observer_window_structure_notification(notification);
+  BOOL focus = observer_focus_notification(notification);
+  if (!windowStructure && !focus) {
+    [self markUnavailable:@"AX callback notification не была подписана"];
+    return;
+  }
+  if (windowCreated) {
+    if (![self subscribeWindow:element
+                      observer:(__bridge AXObserverRef)storedObserver
+                           pid:pid]) {
+      [self recordCoverageKind:@"window-structure"
+                     available:NO
+                        reason:@"Новое AX window не получило полный набор structure subscriptions"];
+      return;
+    }
+  }
   [_lock lock];
   MetaObserverFocusResolver resolver = _focusResolver;
   [_lock unlock];
   NSDictionary *target = resolver == nil ? nil : resolver(pid, element, notification);
   if (![self validTarget:target]) {
-    [self recordUnresolvedFocus:@"AX callback не сопоставлен с exact runtime target"];
+    if (windowStructure) {
+      [self recordGlobalWindowStructure];
+    } else {
+      [self recordGlobalFocus];
+    }
     return;
   }
-  if ([notification isEqual:(__bridge NSString *)kAXWindowCreatedNotification]) {
+  if (windowCreated) {
     [self recordWindowStructureTarget:target];
-    id stored = _axObservers[@(pid)];
-    if (stored == nil ||
-        ![self subscribeWindow:element
-                      observer:(__bridge AXObserverRef)stored
-                           pid:pid]) {
-      [self recordCoverageKind:@"window-structure"
-                     available:NO
-                        reason:@"Новое AX window не получило полный набор structure subscriptions"];
-    }
-  } else if ([@[
-               (__bridge NSString *)kAXMovedNotification,
-               (__bridge NSString *)kAXResizedNotification,
-               (__bridge NSString *)kAXWindowMiniaturizedNotification,
-               (__bridge NSString *)kAXWindowDeminiaturizedNotification,
-               (__bridge NSString *)kAXUIElementDestroyedNotification,
-             ] containsObject:notification]) {
+  } else if (windowStructure) {
     [self recordWindowStructureTarget:target];
   } else {
     [self recordFocusTarget:target syntheticTag:0];
   }
+}
+
+- (void)handleActivatedApplication:(NSRunningApplication *)application {
+  if (![self subscribeApplication:application]) {
+    [self recordUnresolvedFocus:
+              @"AX subscription нового foreground application не удалась"];
+    return;
+  }
+  AXUIElementRef element =
+      AXUIElementCreateApplication(application.processIdentifier);
+  if (element == NULL) {
+    [self markUnavailable:
+              @"AX element нового foreground application недоступен"];
+    return;
+  }
+  [self handleAXElement:element
+                    pid:application.processIdentifier
+           notification:@"application-activated"
+          sourceObserver:NULL];
+  CFRelease(element);
+}
+
+- (void)handleTerminatedApplication:(NSRunningApplication *)application {
+  const pid_t pid = application.processIdentifier;
+  NSRunningApplication *subscribed = _runningApplications[@(pid)];
+  NSNumber *subscribedBirth = _axProcessBirths[@(pid)];
+  if (pid <= 0 || subscribed == nil || subscribedBirth == nil) return;
+  const uint64_t currentBirth = [self processBirthForPid:pid];
+  if (subscribed != application && ![subscribed isEqual:application]) {
+    if (currentBirth == subscribedBirth.unsignedLongLongValue) return;
+    [self markUnavailable:
+              @"Terminate callback не совпадает с raw subscription incarnation"];
+    return;
+  }
+  if (currentBirth != 0 &&
+      currentBirth != subscribedBirth.unsignedLongLongValue) {
+    [self markUnavailable:
+              @"Terminate callback PID уже принадлежит другой incarnation"];
+    return;
+  }
+  [self removeApplicationPid:pid];
+  [self recordGlobalWindowStructure];
+}
+
+- (uint64_t)processBirthForPid:(pid_t)pid {
+  return observer_process_start_micros(pid);
 }
 
 - (BOOL)registerSyntheticTag:(uint64_t)tag
@@ -809,13 +925,17 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
  nextLoginSessionId:nil];
 }
 
-- (void)recordUnresolvedFocus:(NSString *)reason {
+- (void)recordGlobalFocus {
   [self recordKind:@"focus"
              source:@"unknown"
                 tag:0
              target:nil
           lifecycle:nil
  nextLoginSessionId:nil];
+}
+
+- (void)recordUnresolvedFocus:(NSString *)reason {
+  [self recordGlobalFocus];
   [self markUnavailable:reason];
 }
 
@@ -828,6 +948,15 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
              source:@"unknown"
                 tag:0
              target:target
+          lifecycle:nil
+ nextLoginSessionId:nil];
+}
+
+- (void)recordGlobalWindowStructure {
+  [self recordKind:@"window-structure"
+             source:@"unknown"
+                tag:0
+             target:nil
           lifecycle:nil
  nextLoginSessionId:nil];
 }
