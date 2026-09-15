@@ -31,6 +31,10 @@ Startup permission orchestration:
 - Core admission остаётся sealed до всех grants и готового observer/view gate.
   После grants начинается прежняя inventory/observer preparation; active input
   readiness автоматически не запускается. Drain/close отменяют ожидание bounded.
+- Observer prepare сам выполняет единственный authoritative Native inventory/index
+  refresh. Host больше не запускает перед ним второй последовательный inventory:
+  прежняя цепочка могла занять 6+6+1 секунд и не помещалась в post-grant startup
+  окно. Отмена всё ещё проверена на зависшем Native observer prepare.
 - SIGTERM/SIGINT всегда выполняет `close` после попытки `drain`. Ошибка drain
   сохраняется, ошибки close агрегируются, поэтому незавершённый SDK request не
   оставляет UDS/owned child/lock только из-за short-circuit promise chain и не

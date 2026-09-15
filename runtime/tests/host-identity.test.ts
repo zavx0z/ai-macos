@@ -51,6 +51,7 @@ class AuditTransport implements NativeTransport {
   fullView = false
   viewVersion: "1" | undefined
   mutationCalls = 0
+  inventoryCalls = 0
   startupPermissionCommands: string[] = []
   startupPermissionGranted?: boolean
   startupPermissionRequested = false
@@ -59,6 +60,8 @@ class AuditTransport implements NativeTransport {
     this.permissions = { accessibility: true, screenRecording: true, postEvents: true, inputMonitoring: true }
   }
   inventoryStarted?: () => void
+  observerStarted?: () => void
+  hangObserverPrepare = false
   #packet: Promise<NativeTransportPacket>
   #resolve!: (packet: NativeTransportPacket) => void
   #end!: () => void
@@ -77,6 +80,7 @@ class AuditTransport implements NativeTransport {
     }
     if (frame.channel === "request" && frame.payload.intent === "mutation") this.mutationCalls++
     if (this.fullView && frame.channel === "request" && frame.payload.method === "window.inventory") {
+      this.inventoryCalls++
       const request = frame.payload
       this.#resolve({ kind: "message", frame: { channel: "response", payload: {
         kind: "response", protocolVersion: "1", requestId: request.requestId,
@@ -88,6 +92,10 @@ class AuditTransport implements NativeTransport {
       return
     }
     if (this.fullView && frame.channel === "observer") {
+      if (frame.payload.command === "prepare" && this.hangObserverPrepare) {
+        this.observerStarted?.()
+        return
+      }
       const request = frame.payload
       const generation = { runtimeEpoch: request.runtimeEpoch, loginSessionId: request.loginSessionId, nativeGeneration: request.nativeGeneration }
       const now = new Date().toISOString()
@@ -238,6 +246,7 @@ test("startup уже с grants не вызывает request API и активи
     await host.start()
     await host.ready()
     expect(transport.startupPermissionCommands).toEqual(["status"])
+    expect(transport.inventoryCalls).toBe(0)
     expect(host.doctor()).toMatchObject({ startup: { permissions: { state: "ready", requestIssued: false, missing: [] } },
       observer: { state: "ready", viewReady: true }, runtime: { admissionSealed: false } })
     expect(transport.mutationCalls).toBe(0)
@@ -358,14 +367,16 @@ test("host health использует fresh passive grants и signed loaded ide
   } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
 })
 
-test("host close отменяет зависшую background inventory до observer prepare", async () => {
+test("host close отменяет зависший Native observer prepare", async () => {
   const directory = await mkdtemp(join(tmpdir(), "host-preparation-"))
   const session = { verified: true as const, source: "darwin-audit" as const,
     uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 126 }
   const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.hangObserverPrepare = true
   let entered!: () => void
   const preparing = new Promise<void>(resolve => { entered = resolve })
-  transport.inventoryStarted = entered
+  transport.observerStarted = entered
   const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
     runtimeBuildId: "build:host-preparation", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
   try {

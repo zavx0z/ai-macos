@@ -524,17 +524,14 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   beginBackendPreparation = () => {
     if (backendPreparation !== undefined) return backendPreparation
-    if (native === undefined || windowAdapter === undefined) return Promise.resolve()
+    if (native === undefined) return Promise.resolve()
     const source = native
-    const windows = windowAdapter
     observerState = "preparing"
     observerReason = "Подготовка свежего Native AX index"
     refreshCapabilities()
     backendPreparation = (async () => {
       try {
-        const signal = AbortSignal.any([AbortSignal.timeout(6000), preparationAbort.signal])
-        await windows.inventory({ signal, checkpoint() { signal.throwIfAborted() } })
-        signal.throwIfAborted()
+        preparationAbort.signal.throwIfAborted()
         observerBinding = await createNativeObserverBinding({ native: source, signal: preparationAbort.signal, onGap(error) {
           observerState = "unavailable"
           viewReady = false
