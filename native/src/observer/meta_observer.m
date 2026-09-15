@@ -3,6 +3,52 @@
 #import <AppKit/AppKit.h>
 
 #include <unistd.h>
+#include <time.h>
+
+static uint64_t observer_monotonic_millis(void) {
+  struct timespec value = {0};
+  clock_gettime(CLOCK_MONOTONIC, &value);
+  return (uint64_t)value.tv_sec * 1000 +
+         (uint64_t)value.tv_nsec / 1000000;
+}
+
+BOOL meta_observer_subscription_budget_init(
+    MetaObserverSubscriptionBudget *budget,
+    uint64_t now_millis,
+    NSUInteger existing_windows) {
+  if (budget == NULL ||
+      existing_windows > META_OBSERVER_MAX_WINDOWS ||
+      now_millis > UINT64_MAX - META_OBSERVER_SUBSCRIPTION_BUDGET_MILLIS) {
+    return NO;
+  }
+  *budget = (MetaObserverSubscriptionBudget){
+    .deadline_millis =
+        now_millis + META_OBSERVER_SUBSCRIPTION_BUDGET_MILLIS,
+    .remaining_windows = META_OBSERVER_MAX_WINDOWS - existing_windows,
+  };
+  return YES;
+}
+
+BOOL meta_observer_subscription_budget_admit_windows(
+    MetaObserverSubscriptionBudget *budget,
+    uint64_t now_millis,
+    NSUInteger count) {
+  if (budget == NULL || now_millis >= budget->deadline_millis ||
+      count > META_OBSERVER_MAX_WINDOWS_PER_APPLICATION ||
+      count > budget->remaining_windows) {
+    return NO;
+  }
+  budget->remaining_windows -= count;
+  return YES;
+}
+
+NSTimeInterval meta_observer_subscription_timeout_seconds(
+    MetaObserverSubscriptionBudget budget,
+    uint64_t now_millis) {
+  if (now_millis >= budget.deadline_millis) return 0;
+  const uint64_t remaining = budget.deadline_millis - now_millis;
+  return (NSTimeInterval)MIN(remaining, 500) / 1000.0;
+}
 
 static NSString *observer_time(void) {
   NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
@@ -72,10 +118,15 @@ static CGEventRef observe_input(CGEventTapProxy proxy, CGEventType type,
 - (BOOL)subscribeApplication:(NSRunningApplication *)application;
 - (BOOL)subscribeWindowsForApplication:(AXUIElementRef)application
                                observer:(AXObserverRef)observer
-                                    pid:(pid_t)pid;
+                                    pid:(pid_t)pid
+                                 budget:(MetaObserverSubscriptionBudget *)budget;
 - (BOOL)subscribeWindow:(AXUIElementRef)window
                 observer:(AXObserverRef)observer
                      pid:(pid_t)pid;
+- (BOOL)subscribeWindow:(AXUIElementRef)window
+                observer:(AXObserverRef)observer
+                     pid:(pid_t)pid
+                  budget:(MetaObserverSubscriptionBudget *)budget;
 - (void)removeApplicationPid:(pid_t)pid;
 - (BOOL)validTarget:(NSDictionary *)target;
 @end
@@ -105,6 +156,7 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   NSMutableDictionary<NSNumber *, id> *_axObservers;
   NSMutableDictionary<NSNumber *, id> *_axApplications;
   NSMutableDictionary<NSNumber *, NSMutableArray<id> *> *_axWindows;
+  NSUInteger _axWindowCount;
   MetaObserverFocusResolver _focusResolver;
   MetaObserverEventSink _eventSink;
   CFMachPortRef _tap;
@@ -241,6 +293,12 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                     reason:subscriptionsReady
                                ? nil
                                : @"AX window structure coverage неполна"];
+  if (!subscriptionsReady) {
+    [self stop];
+    [self markUnavailable:
+              @"AX subscription budget, window cap или registration недоступны"];
+    return NO;
+  }
 
   NSNotificationCenter *workspaceCenter =
       NSWorkspace.sharedWorkspace.notificationCenter;
@@ -396,12 +454,23 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   const pid_t pid = application.processIdentifier;
   if (pid <= 0) return NO;
   if (_axObservers[@(pid)] != nil) return YES;
+  if (_axObservers.count >= META_OBSERVER_MAX_APPLICATIONS) return NO;
+  MetaObserverSubscriptionBudget budget = {0};
+  if (!meta_observer_subscription_budget_init(
+          &budget, observer_monotonic_millis(), _axWindowCount)) {
+    return NO;
+  }
   AXObserverRef observer = NULL;
   if (AXObserverCreate(pid, observe_ax, &observer) != kAXErrorSuccess ||
-      observer == NULL) {
+      observer == NULL || observer_monotonic_millis() >= budget.deadline_millis) {
+    if (observer != NULL) CFRelease(observer);
     return NO;
   }
   AXUIElementRef app = AXUIElementCreateApplication(pid);
+  if (app == NULL) {
+    CFRelease(observer);
+    return NO;
+  }
   NSArray<NSString *> *notifications = @[
     (__bridge NSString *)kAXFocusedWindowChangedNotification,
     (__bridge NSString *)kAXFocusedUIElementChangedNotification,
@@ -409,9 +478,22 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   ];
   BOOL subscribed = YES;
   for (NSString *name in notifications) {
+    const uint64_t now = observer_monotonic_millis();
+    NSTimeInterval timeout =
+        meta_observer_subscription_timeout_seconds(budget, now);
+    if (timeout <= 0 ||
+        AXUIElementSetMessagingTimeout(app, (float)timeout) !=
+            kAXErrorSuccess) {
+      subscribed = NO;
+      break;
+    }
     AXError error = AXObserverAddNotification(
         observer, app, (__bridge CFStringRef)name, (__bridge void *)self);
     if (error != kAXErrorSuccess && error != kAXErrorNotificationAlreadyRegistered) {
+      subscribed = NO;
+      break;
+    }
+    if (observer_monotonic_millis() >= budget.deadline_millis) {
       subscribed = NO;
       break;
     }
@@ -419,10 +501,14 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   if (subscribed) {
     subscribed = [self subscribeWindowsForApplication:app
                                               observer:observer
-                                                   pid:pid];
+                                                   pid:pid
+                                                budget:&budget];
   }
   if (!subscribed) {
+    NSUInteger partial = [_axWindows[@(pid)] count];
     [_axWindows removeObjectForKey:@(pid)];
+    _axWindowCount = partial > _axWindowCount ? 0
+                                              : _axWindowCount - partial;
     CFRelease(app);
     CFRelease(observer);
     return NO;
@@ -436,19 +522,49 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
 
 - (BOOL)subscribeWindowsForApplication:(AXUIElementRef)application
                                observer:(AXObserverRef)observer
-                                    pid:(pid_t)pid {
-  CFTypeRef value = NULL;
-  AXError error = AXUIElementCopyAttributeValue(application, kAXWindowsAttribute,
-                                                 &value);
-  if (error != kAXErrorSuccess || value == NULL ||
-      CFGetTypeID(value) != CFArrayGetTypeID()) {
-    if (value != NULL) CFRelease(value);
+                                    pid:(pid_t)pid
+                                 budget:(MetaObserverSubscriptionBudget *)budget {
+  const uint64_t countStart = observer_monotonic_millis();
+  NSTimeInterval timeout =
+      meta_observer_subscription_timeout_seconds(*budget, countStart);
+  if (timeout <= 0 ||
+      AXUIElementSetMessagingTimeout(application, (float)timeout) !=
+          kAXErrorSuccess) {
     return NO;
   }
-  NSArray *windows = CFBridgingRelease(value);
+  CFIndex count = 0;
+  AXError error = AXUIElementGetAttributeValueCount(
+      application, kAXWindowsAttribute, &count);
+  if (error != kAXErrorSuccess || count < 0 ||
+      !meta_observer_subscription_budget_admit_windows(
+          budget, observer_monotonic_millis(), (NSUInteger)count)) {
+    return NO;
+  }
+  if (count == 0) return YES;
+  timeout = meta_observer_subscription_timeout_seconds(
+      *budget, observer_monotonic_millis());
+  if (timeout <= 0 ||
+      AXUIElementSetMessagingTimeout(application, (float)timeout) !=
+          kAXErrorSuccess) {
+    return NO;
+  }
+  CFArrayRef copied = NULL;
+  error = AXUIElementCopyAttributeValues(
+      application, kAXWindowsAttribute, 0, count, &copied);
+  if (error != kAXErrorSuccess || copied == NULL ||
+      CFGetTypeID(copied) != CFArrayGetTypeID() ||
+      CFArrayGetCount(copied) != count ||
+      observer_monotonic_millis() >= budget->deadline_millis) {
+    if (copied != NULL) CFRelease(copied);
+    return NO;
+  }
+  NSArray *windows = CFBridgingRelease(copied);
   for (id item in windows) {
     AXUIElementRef window = (__bridge AXUIElementRef)item;
-    if (![self subscribeWindow:window observer:observer pid:pid]) return NO;
+    if (![self subscribeWindow:window
+                       observer:observer
+                            pid:pid
+                         budget:budget]) return NO;
   }
   return YES;
 }
@@ -456,6 +572,26 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
 - (BOOL)subscribeWindow:(AXUIElementRef)window
                 observer:(AXObserverRef)observer
                      pid:(pid_t)pid {
+  MetaObserverSubscriptionBudget budget = {0};
+  if (!meta_observer_subscription_budget_init(
+          &budget, observer_monotonic_millis(), _axWindowCount) ||
+      !meta_observer_subscription_budget_admit_windows(
+          &budget, observer_monotonic_millis(), 1)) {
+    return NO;
+  }
+  return [self subscribeWindow:window
+                      observer:observer
+                           pid:pid
+                        budget:&budget];
+}
+
+- (BOOL)subscribeWindow:(AXUIElementRef)window
+                observer:(AXObserverRef)observer
+                     pid:(pid_t)pid
+                  budget:(MetaObserverSubscriptionBudget *)budget {
+  if (window == NULL || observer == NULL || budget == NULL) return NO;
+  NSMutableArray<id> *stored = _axWindows[@(pid)];
+  if ([stored containsObject:(__bridge id)window]) return YES;
   NSArray<NSString *> *notifications = @[
     (__bridge NSString *)kAXMovedNotification,
     (__bridge NSString *)kAXResizedNotification,
@@ -464,19 +600,28 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
     (__bridge NSString *)kAXUIElementDestroyedNotification,
   ];
   for (NSString *name in notifications) {
+    const uint64_t now = observer_monotonic_millis();
+    NSTimeInterval timeout =
+        meta_observer_subscription_timeout_seconds(*budget, now);
+    if (timeout <= 0 ||
+        AXUIElementSetMessagingTimeout(window, (float)timeout) !=
+            kAXErrorSuccess) {
+      return NO;
+    }
     AXError error = AXObserverAddNotification(
         observer, window, (__bridge CFStringRef)name, (__bridge void *)self);
     if (error != kAXErrorSuccess &&
         error != kAXErrorNotificationAlreadyRegistered) {
       return NO;
     }
+    if (observer_monotonic_millis() >= budget->deadline_millis) return NO;
   }
-  NSMutableArray<id> *stored = _axWindows[@(pid)];
   if (stored == nil) {
     stored = [NSMutableArray array];
     _axWindows[@(pid)] = stored;
   }
   [stored addObject:(__bridge id)window];
+  _axWindowCount += 1;
   return YES;
 }
 
@@ -489,7 +634,9 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   }
   [_axObservers removeObjectForKey:@(pid)];
   [_axApplications removeObjectForKey:@(pid)];
+  NSUInteger removed = [_axWindows[@(pid)] count];
   [_axWindows removeObjectForKey:@(pid)];
+  _axWindowCount = removed > _axWindowCount ? 0 : _axWindowCount - removed;
 }
 
 - (void)handleAXElement:(AXUIElementRef)element

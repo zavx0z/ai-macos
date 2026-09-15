@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <unistd.h>
 
 @interface FixtureObserver : MetaNativeObserver
 @property(nonatomic) BOOL stopped;
@@ -31,6 +32,11 @@ typedef struct {
   size_t readinessCalls;
   size_t idCalls;
   BOOL mainSucceeds;
+  BOOL deferMain;
+  BOOL failAfterMain;
+  __unsafe_unretained NSMutableArray *deferredMain;
+  __unsafe_unretained NSMutableArray *retainedObservers;
+  useconds_t indexDelayMicros;
 } Fixture;
 
 static NSDictionary *generation(void) {
@@ -92,6 +98,9 @@ static MetaObserverCommandBinder *binder(Fixture *fixture) {
            nativeBuildId:@"native-build-1"
              indexBuilder:^MetaObserverPreparedIndex * {
                fixture->indexCalls += 1;
+               if (fixture->indexDelayMicros > 0) {
+                 usleep(fixture->indexDelayMicros);
+               }
                MetaObserverTargetIndex *index =
                    [[MetaObserverTargetIndex alloc] init];
                return meta_observer_prepared_index_create(
@@ -99,7 +108,13 @@ static MetaObserverCommandBinder *binder(Fixture *fixture) {
              }
              mainExecutor:^BOOL(BOOL (^work)(void)) {
                fixture->mainCalls += 1;
-               return fixture->mainSucceeds && work();
+               if (fixture->deferMain) {
+                 [fixture->deferredMain addObject:[work copy]];
+                 return NO;
+               }
+               if (!fixture->mainSucceeds) return NO;
+               BOOL result = work();
+               return fixture->failAfterMain ? NO : result;
              }
                   factory:^MetaNativeObserver *(
                       NSDictionary *generationValue,
@@ -109,6 +124,7 @@ static MetaObserverCommandBinder *binder(Fixture *fixture) {
                         initWithGeneration:generationValue];
                     observer.target = target();
                     fixture->observer = observer;
+                    [fixture->retainedObservers addObject:observer];
                     return observer;
                   }
         readinessProvider:^NSDictionary * {
@@ -242,12 +258,84 @@ static void test_delivered_history_rolls_without_gap(void) {
   assert([stale[@"error"][@"code"] isEqual:@"receipt-expired"]);
 }
 
+static void test_late_prepare_cannot_create_or_replace_observer(void) {
+  Fixture fixture = {
+    .mainSucceeds = YES,
+    .deferMain = YES,
+  };
+  NSMutableArray *deferredMain = [NSMutableArray array];
+  NSMutableArray *retainedObservers = [NSMutableArray array];
+  fixture.deferredMain = deferredMain;
+  fixture.retainedObservers = retainedObservers;
+  MetaObserverCommandBinder *value = binder(&fixture);
+  NSDictionary *failed =
+      [value handleRequest:request(@"prepare", nil, nil, nil)];
+  assert([failed[@"ok"] isEqual:@NO]);
+  assert(fixture.factoryCalls == 0);
+  assert(fixture.deferredMain.count == 1);
+
+  fixture.deferMain = NO;
+  NSDictionary *prepared =
+      [value handleRequest:request(@"prepare", nil, nil, nil)];
+  assert([prepared[@"ok"] isEqual:@YES]);
+  FixtureObserver *current = fixture.observer;
+  BOOL (^late)(void) = fixture.deferredMain.firstObject;
+  assert(!late());
+  assert(fixture.factoryCalls == 1);
+  assert(!current.stopped);
+  assert([value activatePushForObserverInstance:@"observer-2"]);
+}
+
+static void test_started_candidate_is_stopped_after_failed_handoff(void) {
+  Fixture fixture = {
+    .mainSucceeds = YES,
+    .failAfterMain = YES,
+  };
+  NSMutableArray *deferredMain = [NSMutableArray array];
+  NSMutableArray *retainedObservers = [NSMutableArray array];
+  fixture.deferredMain = deferredMain;
+  fixture.retainedObservers = retainedObservers;
+  MetaObserverCommandBinder *value = binder(&fixture);
+  NSDictionary *failed =
+      [value handleRequest:request(@"prepare", nil, nil, nil)];
+  assert([failed[@"ok"] isEqual:@NO]);
+  FixtureObserver *candidate = retainedObservers.lastObject;
+  assert(candidate != nil);
+  assert(candidate.stopped);
+  assert(![value activatePushForObserverInstance:@"observer-1"]);
+  [candidate recordFocusTarget:target() syntheticTag:0];
+  assert([[value takePushEnvelopes:1][@"events"] count] == 0);
+}
+
+static void test_expired_prepare_stops_before_main_start(void) {
+  Fixture fixture = {
+    .mainSucceeds = YES,
+    .indexDelayMicros = 100000,
+  };
+  MetaObserverCommandBinder *value = binder(&fixture);
+  NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+  formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime |
+                            NSISO8601DateFormatWithFractionalSeconds;
+  NSMutableDictionary *expiring =
+      [request(@"prepare", nil, nil, nil) mutableCopy];
+  expiring[@"deadlineAt"] = [formatter
+      stringFromDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+  NSDictionary *failed = [value handleRequest:expiring];
+  assert([failed[@"ok"] isEqual:@NO]);
+  assert(fixture.indexCalls == 1);
+  assert(fixture.mainCalls == 0);
+  assert(fixture.factoryCalls == 0);
+}
+
 int main(void) {
   @autoreleasepool {
     test_prepare_baseline_push_backfill_and_stop();
     test_restart_requires_exact_previous_instance();
     test_main_failure_and_gap_are_explicit();
     test_delivered_history_rolls_without_gap();
+    test_late_prepare_cannot_create_or_replace_observer();
+    test_started_candidate_is_stopped_after_failed_handoff();
+    test_expired_prepare_stops_before_main_start();
   }
   puts("observer command tests passed");
   return 0;

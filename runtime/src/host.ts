@@ -101,6 +101,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   let observerState: "unavailable" | "preparing" | "ready" = "unavailable"
   let observerReason = "Observer не подготовлен"
   let backendPreparation: Promise<void> | undefined
+  const preparationAbort = new AbortController()
   let windowAdapter: NativeWindowAdapter | undefined
   const revokeNative = (reason: string) => {
     nativeError = reason
@@ -330,6 +331,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   const performDrain = async (signal?: AbortSignal) => {
     draining = true
     core.sealAdmission()
+    preparationAbort.abort("Runtime drain отменил preparation")
     if (clientSweep !== undefined) clearInterval(clientSweep)
     await heartbeat?.stop()
     await core.drainOperations()
@@ -372,6 +374,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     closing ??= (async () => {
       rotation?.stop()
       core.sealAdmission()
+      preparationAbort.abort("Runtime close отменил preparation")
       if (clientSweep !== undefined) clearInterval(clientSweep)
       await core.closeClientLifecycle()
       await backendPreparation
@@ -400,13 +403,18 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
           refreshCapabilities()
           backendPreparation = (async () => {
             try {
-              const signal = AbortSignal.timeout(6000)
+              const signal = AbortSignal.any([AbortSignal.timeout(6000), preparationAbort.signal])
               await windows.inventory({ signal, checkpoint() { signal.throwIfAborted() } })
+              signal.throwIfAborted()
               observerBinding = await createNativeObserverBinding({ native: source, onGap(error) {
                 observerState = "unavailable"
                 observerReason = error.message
                 refreshCapabilities()
               } })
+              if (preparationAbort.signal.aborted) {
+                await observerBinding.close()
+                preparationAbort.signal.throwIfAborted()
+              }
               const coverage = await observerBinding.coverage()
               observerState = coverage.state === "ready" ? "ready" : "unavailable"
               observerReason = coverage.reason ?? "Native PUSH coverage подтверждено; session/SecureInput проверяются отдельно"

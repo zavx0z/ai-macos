@@ -197,11 +197,31 @@ static void test_synthetic_identity_conflict_and_buffer_gap(void) {
   assert([overflow takeEvents].count == 1000);
 }
 
+static void test_subscription_budget_is_bounded(void) {
+  MetaObserverSubscriptionBudget budget = {0};
+  assert(meta_observer_subscription_budget_init(&budget, 100, 10));
+  assert(budget.deadline_millis ==
+         100 + META_OBSERVER_SUBSCRIPTION_BUDGET_MILLIS);
+  assert(budget.remaining_windows == META_OBSERVER_MAX_WINDOWS - 10);
+  assert(meta_observer_subscription_timeout_seconds(budget, 100) == 0.5);
+  assert(meta_observer_subscription_budget_admit_windows(
+      &budget, 101, META_OBSERVER_MAX_WINDOWS_PER_APPLICATION));
+  assert(!meta_observer_subscription_budget_admit_windows(
+      &budget, 102, META_OBSERVER_MAX_WINDOWS_PER_APPLICATION + 1));
+  assert(!meta_observer_subscription_budget_admit_windows(
+      &budget, budget.deadline_millis, 1));
+  assert(meta_observer_subscription_timeout_seconds(
+             budget, budget.deadline_millis) == 0);
+  assert(!meta_observer_subscription_budget_init(
+      &budget, 100, META_OBSERVER_MAX_WINDOWS + 1));
+}
+
 int main(void) {
   @autoreleasepool {
     test_exact_synthetic_ownership_and_focus();
     test_subscription_gap_and_target_generation();
     test_synthetic_identity_conflict_and_buffer_gap();
+    test_subscription_budget_is_bounded();
   }
   puts("observer ingestion tests passed");
   return 0;

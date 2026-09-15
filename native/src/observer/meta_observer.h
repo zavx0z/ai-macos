@@ -10,6 +10,28 @@ typedef NSDictionary *_Nullable (^MetaObserverFocusResolver)(
     pid_t pid, AXUIElementRef element, NSString *notification);
 typedef void (^MetaObserverEventSink)(NSDictionary *event);
 
+#define META_OBSERVER_SUBSCRIPTION_BUDGET_MILLIS 1000
+#define META_OBSERVER_MAX_APPLICATIONS 64
+#define META_OBSERVER_MAX_WINDOWS_PER_APPLICATION 256
+#define META_OBSERVER_MAX_WINDOWS 512
+
+typedef struct {
+  uint64_t deadline_millis;
+  NSUInteger remaining_windows;
+} MetaObserverSubscriptionBudget;
+
+BOOL meta_observer_subscription_budget_init(
+    MetaObserverSubscriptionBudget *budget,
+    uint64_t now_millis,
+    NSUInteger existing_windows);
+BOOL meta_observer_subscription_budget_admit_windows(
+    MetaObserverSubscriptionBudget *budget,
+    uint64_t now_millis,
+    NSUInteger count);
+NSTimeInterval meta_observer_subscription_timeout_seconds(
+    MetaObserverSubscriptionBudget budget,
+    uint64_t now_millis);
+
 @interface MetaNativeObserver : NSObject
 - (nullable instancetype)initWithGeneration:(NSDictionary *)generation;
 - (void)setFocusResolver:(MetaObserverFocusResolver)resolver;

@@ -43,6 +43,16 @@ static NSString *bounded_reason(NSString *reason) {
                                : [reason substringToIndex:1024];
 }
 
+static BOOL request_before_deadline(NSDictionary *request) {
+  NSString *value = request[@"deadlineAt"];
+  if (![value isKindOfClass:NSString.class]) return NO;
+  NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+  formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime |
+                            NSISO8601DateFormatWithFractionalSeconds;
+  NSDate *deadline = [formatter dateFromString:value];
+  return deadline != nil && deadline.timeIntervalSinceNow > 0;
+}
+
 @interface MetaObserverPreparedIndex ()
 - (instancetype)initWithIndex:(MetaObserverTargetIndex *)index
                    inventoryId:(NSString *)inventoryId
@@ -94,12 +104,19 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
 @property(nonatomic, copy) MetaObserverFactory factory;
 @property(nonatomic, copy) MetaObserverReadinessProvider readinessProvider;
 @property(nonatomic, copy) MetaObserverInstanceIdProvider instanceIdProvider;
+- (BOOL)prepareTokenIsCurrent:(NSObject *)token;
+- (void)clearPendingObserver:(MetaNativeObserver *)observer
+                       token:(NSObject *)token;
+- (void)scheduleMainThreadStop:(MetaNativeObserver *)observer;
 @end
 
 @implementation MetaObserverCommandBinder {
   NSLock *_lock;
   MetaNativeObserver *_observer;
+  MetaNativeObserver *_pendingObserver;
+  NSMutableArray<MetaNativeObserver *> *_cleanupPendingObservers;
   MetaObserverPreparedIndex *_prepared;
+  NSObject *_prepareToken;
   NSString *_observerInstanceRef;
   NSString *_acceptingInstanceRef;
   NSString *_baselineCursor;
@@ -141,6 +158,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
     _lock = [[NSLock alloc] init];
     _history = [NSMutableArray array];
     _pushQueue = [NSMutableArray array];
+    _cleanupPendingObservers = [NSMutableArray array];
   }
   return self;
 }
@@ -181,7 +199,14 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   NSString *previous = request[@"previousObserverInstanceRef"];
   [_lock lock];
   NSString *current = _observerInstanceRef;
+  BOOL preparePending = _prepareToken != nil;
   [_lock unlock];
+  if (preparePending) {
+    return [self failureResponse:request
+                         command:@"prepare"
+                            code:@"operation-in-progress"
+                          reason:@"Observer prepare уже выполняется"];
+  }
   if ((current == nil && previous != nil) ||
       (current != nil && ![current isEqual:previous])) {
     return [self failureResponse:request
@@ -193,13 +218,23 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   NSString *instance = self.instanceIdProvider();
   NSDictionary *readiness = self.readinessProvider();
   if (prepared == nil || !identifier(instance, 127) ||
-      !dictionary(readiness)) {
+      !dictionary(readiness) || !request_before_deadline(request)) {
     return [self failureResponse:request
                          command:@"prepare"
                             code:@"capability-unavailable"
                           reason:@"Observer index, identity или readiness недоступны"];
   }
+  NSObject *prepareToken = [[NSObject alloc] init];
   [_lock lock];
+  if (_prepareToken != nil) {
+    [_lock unlock];
+    return [self failureResponse:request
+                         command:@"prepare"
+                            code:@"operation-in-progress"
+                          reason:@"Observer prepare уже выполняется"];
+  }
+  _prepareToken = prepareToken;
+  _pendingObserver = nil;
   [_history removeAllObjects];
   [_pushQueue removeAllObjects];
   _historyBytes = 0;
@@ -212,45 +247,136 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   [_lock unlock];
 
   __block MetaNativeObserver *created = nil;
+  __block NSString *baselineCursor = nil;
   __weak MetaObserverCommandBinder *weakSelf = self;
   BOOL executed = self.mainExecutor(^BOOL {
     MetaObserverCommandBinder *binder = weakSelf;
-    if (binder == nil) return NO;
-    if (binder->_observer != nil) {
-      [binder->_observer setEventSink:nil];
-      [binder->_observer stop];
+    if (binder == nil || !request_before_deadline(request) ||
+        ![binder prepareTokenIsCurrent:prepareToken]) {
+      return NO;
     }
+    [binder->_lock lock];
+    MetaNativeObserver *previousObserver = binder->_observer;
+    [binder->_lock unlock];
+    if (previousObserver != nil) {
+      [previousObserver setEventSink:nil];
+      [previousObserver stop];
+      [binder->_lock lock];
+      if (binder->_observer == previousObserver &&
+          binder->_prepareToken == prepareToken) {
+        binder->_observer = nil;
+        binder->_prepared = nil;
+        binder->_observerInstanceRef = nil;
+      }
+      [binder->_lock unlock];
+    }
+    if (!request_before_deadline(request) ||
+        ![binder prepareTokenIsCurrent:prepareToken]) return NO;
     created = binder.factory(binder.generation, prepared.index);
     if (created == nil) return NO;
+    [binder->_lock lock];
+    BOOL accepted = binder->_prepareToken == prepareToken;
+    if (accepted) binder->_pendingObserver = created;
+    [binder->_lock unlock];
+    if (!accepted) return NO;
     [created recordCurrentSessionReadiness:readiness];
-    [created start];
+    if (!request_before_deadline(request) ||
+        ![binder prepareTokenIsCurrent:prepareToken]) return NO;
+    if (![created start]) {
+      [created stop];
+      [binder clearPendingObserver:created token:prepareToken];
+      return NO;
+    }
+    if (!request_before_deadline(request) ||
+        ![binder prepareTokenIsCurrent:prepareToken]) {
+      [created stop];
+      [binder clearPendingObserver:created token:prepareToken];
+      return NO;
+    }
     [created takeEvents];
-    binder->_baselineCursor = created.coverage[@"cursor"];
+    baselineCursor = created.coverage[@"cursor"];
     [created setEventSink:^(NSDictionary *event) {
       [weakSelf acceptEvent:event observerInstanceRef:instance];
     }];
+    if (!request_before_deadline(request) ||
+        ![binder prepareTokenIsCurrent:prepareToken]) {
+      [created setEventSink:nil];
+      [created stop];
+      [binder clearPendingObserver:created token:prepareToken];
+      return NO;
+    }
     return YES;
   });
-  if (!executed || created == nil || !identifier(_baselineCursor, 127)) {
-    [_lock lock];
+  [_lock lock];
+  BOOL accepted = executed && created != nil &&
+                  identifier(baselineCursor, 127) &&
+                  request_before_deadline(request) &&
+                  _prepareToken == prepareToken &&
+                  _pendingObserver == created;
+  if (accepted) {
+    _observer = created;
+    _prepared = prepared;
+    _observerInstanceRef = instance;
+    _baselineCursor = baselineCursor;
+    _pendingObserver = nil;
+    _prepareToken = nil;
+  } else if (_prepareToken == prepareToken) {
+    _prepareToken = nil;
     _acceptingInstanceRef = nil;
     _gapReason = @"Observer main-runloop prepare failed";
-    [_lock unlock];
+  }
+  MetaNativeObserver *pending = _pendingObserver == created ? created : nil;
+  if (pending != nil) _pendingObserver = nil;
+  [_lock unlock];
+  if (!accepted) {
+    if (pending != nil) [self scheduleMainThreadStop:pending];
     return [self failureResponse:request
                          command:@"prepare"
                             code:@"capability-unavailable"
                           reason:@"Observer main-runloop prepare failed"];
   }
-  [_lock lock];
-  _observer = created;
-  _prepared = prepared;
-  _observerInstanceRef = instance;
-  [_lock unlock];
   return [self successResponse:request
                        command:@"prepare"
                       snapshot:[self currentSnapshot]
                         events:nil
                     fromCursor:nil];
+}
+
+- (BOOL)prepareTokenIsCurrent:(NSObject *)token {
+  [_lock lock];
+  BOOL current = _prepareToken == token;
+  [_lock unlock];
+  return current;
+}
+
+- (void)clearPendingObserver:(MetaNativeObserver *)observer
+                       token:(NSObject *)token {
+  [_lock lock];
+  if (_prepareToken == token && _pendingObserver == observer) {
+    _pendingObserver = nil;
+  }
+  [_lock unlock];
+}
+
+- (void)scheduleMainThreadStop:(MetaNativeObserver *)observer {
+  if (observer == nil) return;
+  [_lock lock];
+  if (![_cleanupPendingObservers containsObject:observer]) {
+    [_cleanupPendingObservers addObject:observer];
+  }
+  [_lock unlock];
+  __weak MetaObserverCommandBinder *weakSelf = self;
+  self.mainExecutor(^BOOL {
+    [observer setEventSink:nil];
+    [observer stop];
+    MetaObserverCommandBinder *binder = weakSelf;
+    if (binder != nil) {
+      [binder->_lock lock];
+      [binder->_cleanupPendingObservers removeObjectIdenticalTo:observer];
+      [binder->_lock unlock];
+    }
+    return YES;
+  });
 }
 
 - (NSDictionary *)backfill:(NSDictionary *)request {

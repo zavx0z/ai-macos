@@ -42,12 +42,26 @@ class AuditTransport implements NativeTransport {
   closed = false
   permissions: Partial<NativePermissionsResponse> = {}
   permissionCalls = 0
+  inventoryStarted?: () => void
   #packet: Promise<NativeTransportPacket>
   #resolve!: (packet: NativeTransportPacket) => void
   constructor(readonly session: { verified: true, source: "darwin-audit", uid: number, effectiveUid: number, auditUserId: number, auditSessionId: number }) {
     this.#packet = new Promise(resolve => { this.#resolve = resolve })
   }
   async send(frame: NativeTransportRequestFrame) {
+    if (frame.channel === "heartbeat") {
+      this.#resolve({ kind: "message", frame: { channel: "heartbeat", payload: {
+        requestId: frame.payload.requestId, runtimeEpoch: frame.payload.runtimeEpoch,
+        loginSessionId: frame.payload.loginSessionId, nativeGeneration: frame.payload.nativeGeneration,
+        accepted: true, quarantined: false, acknowledgedAt: new Date().toISOString(),
+      } } })
+      return
+    }
+    if (frame.channel === "request" && frame.payload.method === "window.inventory" && this.inventoryStarted !== undefined) {
+      this.inventoryStarted()
+      await new Promise<void>(() => {})
+      return
+    }
     if (frame.channel === "permissions") {
       this.permissionCalls++
       const { deadlineAt: _, ...identity } = frame.payload
@@ -109,3 +123,26 @@ test("host health использует fresh passive grants и signed loaded ide
     expect(transport.permissionCalls).toBe(4)
   } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
 })
+
+test("host close отменяет зависшую background inventory до observer prepare", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-preparation-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 126 }
+  const transport = new AuditTransport(session)
+  let entered!: () => void
+  const preparing = new Promise<void>(resolve => { entered = resolve })
+  transport.inventoryStarted = entered
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:host-preparation", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+  try {
+    await host.start()
+    await preparing
+    expect(host.doctor().observer.state).toBe("preparing")
+    await host.close()
+    expect(transport.closed).toBe(true)
+    expect(host.doctor().observer.state).toBe("unavailable")
+  } finally {
+    await host.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+}, 1000)
