@@ -2,6 +2,37 @@
 
 Дата проверки: 15 сентября 2026 года.
 
+## Последний live-результат
+
+Установлен `ddbc47a`, release `release-a67256009679ca47e9d55ec0`, runtime/native
+build suffix `8d601ba712326b6fb985481e`. Все четыре права сохранены.
+Новая задача с direct MCP получила все 36 инструментов. A02/A31 подтверждены
+subprocess/security tests; источник этих проверок — `f2a668e` и `6dfd0ae`.
+
+В отдельной AppKit fixture PID 21776 обнаружены два одноимённых окна.
+После исправлений `92339ed`/`a6eb5b3` AX возвращает их разные identifiers,
+исходный текст RU/EN/emoji/composed, значение slider и parent relationships.
+Нулевые размеры невидимых AX-элементов больше не ломают ответ. Ошибки AX
+посторонних приложений не отзывают глобальные права и не запускают rotation.
+
+Проверки target-local geometry, cursor, hit-test и close внесены в `3adf17c`;
+capture теперь не требует полной AX-инвентаризации всех приложений, а отказ
+до создания capture task подтверждается отдельным типизированным признаком.
+Исходная ошибка с номером операции передаётся агенту (`49e01dd`).
+
+Live capture остаётся блокером. Первый допущенный capture не подтвердил
+завершение потока до cancel grace; после managed restart cleanup стал complete.
+Только после этого выполнен один диагностический повтор. Он завершился SIGSEGV
+helper PID 46547, а не успешным кадром. Crash report от 23:42:46 показывает:
+`-[SCStream removeStreamOutput:type:error:]` из
+`-[MetaCaptureSession stoppedWithError:]`, queue `com.meta.capture.state`.
+Исправление teardown проверяется отдельно. Изображение пока не получено;
+pointer, keyboard и active readiness ещё не выполнялись.
+
+Source removal **не разрешён** до успешного live capture/input и проверки
+устойчивости установленного приложения. Ни один из нижних исторических
+checkpoint не заменяет этот последний результат.
+
 Этот документ описывает состояние после installed cutover. Исторические сбои
 и переход к постоянной подписи подробно зафиксированы в
 [`startup-permissions-and-identity.md`](./startup-permissions-and-identity.md).
