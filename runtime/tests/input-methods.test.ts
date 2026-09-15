@@ -14,6 +14,7 @@ import { RuntimeCore } from "../src/core.ts"
 import { MethodRegistry } from "../src/method-registry.ts"
 import {
   INPUT_METHOD_GAPS,
+  INPUT_METHOD_BUDGETS,
   registerInputMethods,
 } from "../src/input-methods.ts"
 
@@ -47,7 +48,7 @@ function readyCapabilities() {
   })
 }
 
-function fixture() {
+function fixture(options: { now?: () => Date } = {}) {
   let lastContext: RuntimeOperationContext<NativeExecutionContext> | undefined
   const native = {
     async status(request: { requestId: string }) {
@@ -148,7 +149,7 @@ function fixture() {
     },
   } as unknown as DesktopInputAdapter
   const registry = new MethodRegistry(core)
-  registerInputMethods(registry, core, input)
+  registerInputMethods(registry, core, input, options)
   return { calls: () => calls, core, input, registry, target }
 }
 
@@ -258,5 +259,59 @@ describe("C3 runtime input method catalogue", () => {
       new AbortController().signal,
     )).rejects.toThrow()
     expect(value.calls()).toBe(0)
+  })
+
+  test("near-max actions получают отдельные operation и method margins без ожидания", async () => {
+    const startedAt = new Date()
+    const value = fixture({ now: () => startedAt })
+    value.core.updateCapabilities(readyCapabilities())
+    const client = value.core.openClient("principal:near-max")
+    const text = await value.registry.dispatch(
+      client.session,
+      "keyboard_type",
+      {
+        clientRequestId: "request:near-max-text",
+        precondition: {
+          target: value.target,
+          inventoryId: "inventory:input-methods",
+          inventoryRevision: 1,
+        },
+        action: { kind: "text", text: "1234567", delayMs: 5_000 },
+      },
+      new AbortController().signal,
+    )
+    const drag = await value.registry.dispatch(
+      client.session,
+      "mouse_drag",
+      {
+        clientRequestId: "request:near-max-drag",
+        precondition: {
+          target: value.target,
+          inventoryId: "inventory:input-methods",
+          inventoryRevision: 1,
+          observationRef: {
+            observationId: "observation:near-max",
+            inventoryRevision: 1,
+            displayLayoutRevision: 1,
+            proofRef: "proof:observation:near-max",
+          },
+        },
+        action: {
+          kind: "drag",
+          points: [{ x: 0, y: 0 }, { x: 10, y: 10 }],
+          durationMs: 5_000,
+          button: "left",
+          modifiers: [],
+        },
+      },
+      new AbortController().signal,
+    )
+
+    const textOperation = text.data.operation as { context: { deadlineAt: string } }
+    const dragOperation = drag.data.operation as { context: { deadlineAt: string } }
+    expect(Date.parse(textOperation.context.deadlineAt) - startedAt.getTime()).toBe(33_000)
+    expect(Date.parse(dragOperation.context.deadlineAt) - startedAt.getTime()).toBe(8_000)
+    expect(INPUT_METHOD_BUDGETS.typing).toEqual({ actionMs: 30_000, operationMs: 33_000, methodMs: 35_000 })
+    expect(INPUT_METHOD_BUDGETS.short).toEqual({ actionMs: 5_000, operationMs: 8_000, methodMs: 10_000 })
   })
 })

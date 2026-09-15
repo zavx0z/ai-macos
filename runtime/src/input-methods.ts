@@ -125,11 +125,22 @@ export const INPUT_METHOD_GAPS = Object.freeze({
   end_interaction: "Требуется conditional restore через ту же Runtime interaction authority",
 })
 
+export const INPUT_METHOD_BUDGETS = Object.freeze({
+  short: Object.freeze({ actionMs: 5_000, operationMs: 8_000, methodMs: 10_000 }),
+  typing: Object.freeze({ actionMs: 30_000, operationMs: 33_000, methodMs: 35_000 }),
+})
+
+export type RegisterInputMethodsOptions = Readonly<{
+  now?: () => Date
+}>
+
 export function registerInputMethods(
   registry: MethodRegistry,
   core: RuntimeCore,
   input: DesktopInputAdapter,
+  options: RegisterInputMethodsOptions = {},
 ): void {
+  const now = options.now ?? (() => new Date())
   registerAction(registry, core, input, {
     name: "mouse_move",
     title: "Навести указатель",
@@ -137,7 +148,9 @@ export function registerInputMethods(
     input: mouseMoveMethodInputSchema,
     capability: "input.pointer",
     resultKind: "hover",
-    timeoutMs: 5_000,
+    operationMs: INPUT_METHOD_BUDGETS.short.operationMs,
+    methodMs: INPUT_METHOD_BUDGETS.short.methodMs,
+    now,
   })
   registerAction(registry, core, input, {
     name: "mouse_click",
@@ -146,7 +159,9 @@ export function registerInputMethods(
     input: mouseClickMethodInputSchema,
     capability: "input.pointer",
     resultKind: "click",
-    timeoutMs: 5_000,
+    operationMs: INPUT_METHOD_BUDGETS.short.operationMs,
+    methodMs: INPUT_METHOD_BUDGETS.short.methodMs,
+    now,
   })
   registerAction(registry, core, input, {
     name: "mouse_scroll",
@@ -155,7 +170,9 @@ export function registerInputMethods(
     input: mouseScrollMethodInputSchema,
     capability: "input.pointer",
     resultKind: "scroll",
-    timeoutMs: 5_000,
+    operationMs: INPUT_METHOD_BUDGETS.short.operationMs,
+    methodMs: INPUT_METHOD_BUDGETS.short.methodMs,
+    now,
   })
   registerAction(registry, core, input, {
     name: "mouse_drag",
@@ -164,7 +181,9 @@ export function registerInputMethods(
     input: mouseDragMethodInputSchema,
     capability: "input.drag",
     resultKind: "drag",
-    timeoutMs: 5_000,
+    operationMs: INPUT_METHOD_BUDGETS.short.operationMs,
+    methodMs: INPUT_METHOD_BUDGETS.short.methodMs,
+    now,
   })
   registerAction(registry, core, input, {
     name: "keyboard_type",
@@ -173,7 +192,9 @@ export function registerInputMethods(
     input: keyboardTypeMethodInputSchema,
     capability: "input.keyboard",
     resultKind: "text",
-    timeoutMs: 30_000,
+    operationMs: INPUT_METHOD_BUDGETS.typing.operationMs,
+    methodMs: INPUT_METHOD_BUDGETS.typing.methodMs,
+    now,
   })
   registerAction(registry, core, input, {
     name: "keyboard_key",
@@ -182,7 +203,9 @@ export function registerInputMethods(
     input: keyboardKeyMethodInputSchema,
     capability: "input.keyboard",
     resultKind: "key",
-    timeoutMs: 5_000,
+    operationMs: INPUT_METHOD_BUDGETS.short.operationMs,
+    methodMs: INPUT_METHOD_BUDGETS.short.methodMs,
+    now,
   })
   registerAction(registry, core, input, {
     name: "keyboard_shortcut",
@@ -191,7 +214,9 @@ export function registerInputMethods(
     input: keyboardShortcutMethodInputSchema,
     capability: "input.keyboard",
     resultKind: "shortcut",
-    timeoutMs: 5_000,
+    operationMs: INPUT_METHOD_BUDGETS.short.operationMs,
+    methodMs: INPUT_METHOD_BUDGETS.short.methodMs,
+    now,
   })
 }
 
@@ -206,7 +231,9 @@ function registerAction(
     input: z.ZodType<InputMethodRequest>
     capability: "input.pointer" | "input.drag" | "input.keyboard"
     resultKind: InputAction["kind"]
-    timeoutMs: number
+    operationMs: number
+    methodMs: number
+    now: () => Date
   },
 ): void {
   const resultSchema = inputActionResultSchema.extend({ kind: z.literal(definition.resultKind) })
@@ -221,12 +248,12 @@ function registerAction(
     output: outputSchema,
     readOnly: false,
     destructive: true,
-    timeoutMs: definition.timeoutMs,
+    timeoutMs: definition.methodMs,
     requiredCapabilities: [definition.capability],
     maxRequestBytes: 1024 * 1024,
     maxResponseBytes: 2 * 1024 * 1024,
     async execute(context, request) {
-      const deadlineAt = new Date(Date.now() + definition.timeoutMs).toISOString()
+      const deadlineAt = new Date(definition.now().getTime() + definition.operationMs).toISOString()
       const intent = runtimeOperationIntentSchema.parse({
         intent: "mutation",
         clientRequestId: request.clientRequestId,
