@@ -383,6 +383,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
     this.#pruneRequestTombstones()
     if (this.#seenRequestIds.has(requestId)) throw new Error(`Native requestId уже использован: ${requestId}`)
     if (this.#seenRequestIds.size >= 10_000 && frame.channel !== "drain") throw new Error("Native session exhausted: разрешён только runtime drain")
+    if (this.#seenRequestIds.size >= 10_128) throw new Error("Native session exhausted: reserve drain requests исчерпан, требуется runtime quarantine")
     if (this.#pending.size >= 128) throw new Error("Native concurrent request limit исчерпан")
     if (this.#pending.has(key)) throw new Error(`Native request уже ожидается: ${requestId}`)
     this.#seenRequestIds.set(requestId, Date.now() + 24 * 60 * 60 * 1000)

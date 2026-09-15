@@ -32,6 +32,10 @@ export class NativeSessionLifecycle {
         throw new Error("Native rotation получила новые pending resources во время drain")
       }
       await this.authority.retainAndAuthorize(current, ack)
+      const retainedState = current.sessionState
+      if (retainedState.pendingRequests || retainedState.pendingBinaries || retainedState.pendingLedgerWrites) {
+        throw new Error("Native rotation получила pending resources до сохранения terminal receipts")
+      }
       await current.close()
       replacement = await this.authority.createReplacement(previous, loadedBuildId)
       const next = replacement.generation

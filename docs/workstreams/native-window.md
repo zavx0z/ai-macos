@@ -237,6 +237,26 @@ sh native/scripts/build.sh /tmp/meta-native-build.*/libmeta-native.dylib
 
 ## Следующий шаг
 
+### Проверенный checkpoint после resume
+
+`native/src/session-lifecycle.ts` проверен через настоящий `NativeBrokerAdapter`
+с injected framed transport. После 9 000 запросов health состояния session
+сообщает `rotation-required`; runtime сохраняет terminal receipts после
+коррелированного complete drain, закрывает старый transport, создаёт новый
+handshaken instance/generation и выполняет invalidation/reinventory. Unknown
+drain и pending binary запрещают replacement. Последние 128 drain IDs имеют
+отдельный hard bound; callback authority не создаётся внутри adapter.
+
+Проверки этого небольшого checkpoint:
+
+- `bun test --cwd native tests/session-lifecycle.test.ts tests/adapter.test.ts`
+  — 10 pass, 29 assertions, включая pre-aborted no-send/no-waiter.
+- Targeted `tsc` для этих implementation/test files — pass.
+- `git diff --check` — pass.
+
+Ещё требуется production C quiescence/rotation path и его wiring в runtime
+factory; этот checkpoint не объявляет завершение всего retention lifecycle.
+
 Ведущий принимает C2 diff и определяет cutover production broker executable.
 После него native-owner связывает общий command/event loop с уже проверенными
 `MetaBrokerCore`/registry/input/capture modules, затем ведущий выполняет C3 live
