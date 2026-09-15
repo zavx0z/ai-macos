@@ -7,9 +7,11 @@ import { CAPABILITY_IDS } from "../shared/src/contracts/index.ts"
 import {
   HELPER_SIGNING_IDENTIFIER,
   RUNTIME_SERVICE_LABEL,
+  RUNTIME_SIGNING_IDENTIFIER,
   applyRuntimeInstall,
   planRuntimeInstall,
   readinessProfileFromArguments,
+  signingFromArguments,
   type CommandResult,
   type CommandRunner,
   type RuntimeAdmin,
@@ -46,8 +48,10 @@ test("dry-run строит reviewable plan без login identity и execute пу
   expect(manifest).toMatchObject({
     format: "meta-ai-macos-runtime-release-v1",
     builds: { runtimeBuildId: plan.release.runtimeBuildId, nativeBuildId: plan.release.nativeBuildId },
-    artifacts: { runtime: { path: "computer-use" }, nativeHelper: { signingIdentifier: HELPER_SIGNING_IDENTIFIER,
-      designatedRequirement: `designated => cdhash H"${"c".repeat(40)}"` } },
+    signing: { mode: "adhoc" },
+    artifacts: { runtime: { path: "computer-use", signingIdentifier: RUNTIME_SIGNING_IDENTIFIER },
+      nativeHelper: { signingIdentifier: HELPER_SIGNING_IDENTIFIER,
+        designatedRequirement: expect.stringContaining("designated => cdhash") } },
     entrypoint: { source: "scripts/runtime-entry.ts", modes: ["runtime", "doctor", "mcp"], mcpTransport: "stdio" },
   })
   expect((await lstat(plan.release.releasePath)).mode & 0o777).toBe(0o555)
@@ -62,6 +66,170 @@ test("dry-run строит reviewable plan без login identity и execute пу
   expect(plist).toContain("META_RUNTIME_MANAGED")
   expect(plist).not.toContain("META_LOGIN_SESSION_ID")
   expect(await readFile(fixture.options.paths.stableHelperPath, "utf8")).toContain(plan.release.nativeBuildId)
+})
+
+test("explicit identity мигрирует ad-hoc и сохраняет certificate DR между source updates", async () => {
+  const fixture = await createFixture()
+  const certificateSha1 = "1".repeat(40)
+  fixture.runner.availableSigningIdentities.add(certificateSha1)
+  const adhocPlan = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(adhocPlan, fixture.options)
+
+  fixture.runner.loaded = true
+  const migrationOptions = {
+    ...fixture.options,
+    signing: { mode: "identity" as const, certificateSha1 },
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:adhoc",
+      runtimeBuildId: adhocPlan.release.runtimeBuildId,
+      nativeBuildId: adhocPlan.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const migrationPlan = await planRuntimeInstall(migrationOptions)
+  expect(migrationPlan.release.releaseId).not.toBe(adhocPlan.release.releaseId)
+  expect(migrationPlan.release.runtimeBuildId).toBe(adhocPlan.release.runtimeBuildId)
+  expect(migrationPlan.release.nativeBuildId).toBe(adhocPlan.release.nativeBuildId)
+  const migrated = await applyRuntimeInstall(migrationPlan, migrationOptions)
+  const migratedManifest = JSON.parse(await readFile(join(migrationPlan.release.releasePath, "manifest.json"), "utf8"))
+
+  expect(migrated.state).toBe("installed")
+  expect(migrationPlan.signing).toEqual({ mode: "identity", certificateSha1, identityAvailable: true })
+  expect(migratedManifest.signing).toEqual({ mode: "identity", certificateSha1 })
+  expect(migratedManifest.artifacts.runtime.signingIdentifier).toBe(RUNTIME_SIGNING_IDENTIFIER)
+  expect(migratedManifest.artifacts.nativeHelper.signingIdentifier).toBe(HELPER_SIGNING_IDENTIFIER)
+  expect(migratedManifest.artifacts.runtime.designatedRequirement).toContain(certificateSha1)
+  expect(migratedManifest.artifacts.nativeHelper.designatedRequirement).toContain(certificateSha1)
+  expect(migratedManifest.artifacts.runtime.designatedRequirement)
+    .not.toBe(migratedManifest.artifacts.nativeHelper.designatedRequirement)
+
+  fixture.runner.commit = "b".repeat(40)
+  fixture.runner.loaded = true
+  const updateOptions = {
+    ...migrationOptions,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:identity",
+      runtimeBuildId: migrationPlan.release.runtimeBuildId,
+      nativeBuildId: migrationPlan.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const updatePlan = await planRuntimeInstall(updateOptions)
+  await applyRuntimeInstall(updatePlan, updateOptions)
+  const updateManifest = JSON.parse(await readFile(join(updatePlan.release.releasePath, "manifest.json"), "utf8"))
+
+  expect(updateManifest.artifacts.nativeHelper.cdhash)
+    .not.toBe(migratedManifest.artifacts.nativeHelper.cdhash)
+  expect(updateManifest.artifacts.nativeHelper.designatedRequirement)
+    .toBe(migratedManifest.artifacts.nativeHelper.designatedRequirement)
+  expect(updateManifest.artifacts.runtime.designatedRequirement)
+    .toBe(migratedManifest.artifacts.runtime.designatedRequirement)
+  expect(fixture.runner.testRequirementCalls).toBeGreaterThanOrEqual(4)
+})
+
+test("missing identity блокирует apply без ad-hoc fallback", async () => {
+  const fixture = await createFixture()
+  const options = {
+    ...fixture.options,
+    signing: { mode: "identity" as const, certificateSha1: "2".repeat(40) },
+  }
+  const plan = await planRuntimeInstall(options)
+
+  expect(plan.gates.signingIdentityAvailable).toBe(false)
+  expect(fixture.runner.mutations).toBe(0)
+  await expect(applyRuntimeInstall(plan, options)).rejects.toThrow("ad-hoc fallback запрещён")
+  expect(fixture.runner.mutations).toBe(0)
+})
+
+test("certificate signer нельзя молча ротировать или понизить до ad-hoc", async () => {
+  const fixture = await createFixture()
+  const firstCertificate = "3".repeat(40)
+  const otherCertificate = "4".repeat(40)
+  fixture.runner.availableSigningIdentities.add(firstCertificate)
+  fixture.runner.availableSigningIdentities.add(otherCertificate)
+  const signedOptions = {
+    ...fixture.options,
+    signing: { mode: "identity" as const, certificateSha1: firstCertificate },
+  }
+  const signedPlan = await planRuntimeInstall(signedOptions)
+  await applyRuntimeInstall(signedPlan, signedOptions)
+  fixture.runner.loaded = true
+  const mutations = fixture.runner.mutations
+
+  const rotationOptions = {
+    ...fixture.options,
+    signing: { mode: "identity" as const, certificateSha1: otherCertificate },
+  }
+  const rotationPlan = await planRuntimeInstall(rotationOptions)
+  await expect(applyRuntimeInstall(rotationPlan, rotationOptions))
+    .rejects.toThrow("signer continuity не подтверждена")
+  expect(fixture.runner.mutations).toBe(mutations)
+
+  const adhocPlan = await planRuntimeInstall(fixture.options)
+  await expect(applyRuntimeInstall(adhocPlan, fixture.options))
+    .rejects.toThrow("нельзя молча заменить ad-hoc")
+  expect(fixture.runner.mutations).toBe(mutations)
+})
+
+test("identity signing отклоняет weak и wrong embedded DR при успешном external requirement", async () => {
+  const certificateSha1 = "5".repeat(40)
+  const cases = [
+    [RUNTIME_SIGNING_IDENTIFIER, `designated => identifier "${RUNTIME_SIGNING_IDENTIFIER}"`],
+    [HELPER_SIGNING_IDENTIFIER,
+      `designated => certificate leaf = H"${"9".repeat(40)}" and identifier "${HELPER_SIGNING_IDENTIFIER}"`],
+  ] as const
+  for (const [identifier, designatedRequirement] of cases) {
+    const fixture = await createFixture()
+    fixture.runner.availableSigningIdentities.add(certificateSha1)
+    fixture.runner.embeddedRequirementOverrides.set(identifier, designatedRequirement)
+    const options = {
+      ...fixture.options,
+      signing: { mode: "identity" as const, certificateSha1 },
+    }
+    const plan = await planRuntimeInstall(options)
+
+    await expect(applyRuntimeInstall(plan, options))
+      .rejects.toThrow("Embedded designated requirement")
+    expect(fixture.runner.testRequirementCalls).toBeGreaterThanOrEqual(1)
+  }
+})
+
+test("embedded DR normalization принимает uppercase hash и обратный порядок conjuncts", async () => {
+  const fixture = await createFixture()
+  const certificateSha1 = "a".repeat(40)
+  fixture.runner.availableSigningIdentities.add(certificateSha1)
+  fixture.runner.embeddedRequirementOverrides.set(RUNTIME_SIGNING_IDENTIFIER,
+    `designated => identifier = "${RUNTIME_SIGNING_IDENTIFIER}" and certificate 0 = H"${certificateSha1.toUpperCase()}"`)
+  const options = {
+    ...fixture.options,
+    signing: { mode: "identity" as const, certificateSha1 },
+  }
+  const plan = await planRuntimeInstall(options)
+
+  const result = await applyRuntimeInstall(plan, options)
+
+  expect(result.state).toBe("installed")
+})
+
+test("CLI принимает только exact signing identity и absolute keychain path", () => {
+  const certificateSha1 = "A".repeat(40)
+  expect(signingFromArguments(["bun"])).toEqual({ mode: "adhoc" })
+  expect(signingFromArguments(["bun", "--signing-identity-sha1", certificateSha1,
+    "--signing-keychain", "/Users/tester/Library/Keychains/login.keychain-db"])).toEqual({
+    mode: "identity",
+    certificateSha1: certificateSha1.toLowerCase(),
+    keychainPath: "/Users/tester/Library/Keychains/login.keychain-db",
+  })
+  expect(() => signingFromArguments(["bun", "--signing-identity-sha1", "Meta AI macOS Local Code Signing"]))
+    .toThrow("exact certificate SHA-1")
+  expect(() => signingFromArguments(["bun", "--signing-keychain", "/tmp/login.keychain-db"]))
+    .toThrow("требует --signing-identity-sha1")
+  expect(() => signingFromArguments(["bun", "--signing-identity-sha1", certificateSha1,
+    "--signing-keychain", "relative.keychain-db"])).toThrow("абсолютным")
 })
 
 test("immutable release отклоняет plist cdhash, не совпадающий с signed helper", async () => {
@@ -237,6 +405,10 @@ test("rollback принимает старый manifest и plist без META_NAT
   await rename(computerUsePath, legacyRuntimePath)
   manifest.artifacts.runtime.path = "runtime"
   manifest.tcc.requiredPassiveChecks = ["accessibility", "screen-recording"]
+  delete manifest.signing
+  delete manifest.artifacts.runtime.signingIdentifier
+  delete manifest.artifacts.runtime.designatedRequirement
+  delete manifest.artifacts.runtime.cdhash
   manifest.launchAgent.sha256 = sha256(legacyPlist)
   await chmod(manifestPath, 0o600)
   await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
@@ -691,6 +863,7 @@ class FakeRunner implements CommandRunner {
   doctorUnavailableCount = 0
   doctorCalls = 0
   permissionUiRequests = 0
+  testRequirementCalls = 0
   auditSessionId = 1
   readonly unavailableCapabilities = new Set<string>()
   readonly startupPermissionStatesByBuild = new Map<string, FakeStartupPermissionState[]>()
@@ -699,6 +872,15 @@ class FakeRunner implements CommandRunner {
   readonly sealAdmissionWhileObserverPreparingBuilds = new Set<string>()
   readonly wrongPermissionIdentityForBuild = new Set<string>()
   readonly legacyDeniedBuilds = new Set<string>()
+  readonly availableSigningIdentities = new Set<string>()
+  readonly embeddedRequirementOverrides = new Map<string, string>()
+  readonly signaturesByContent = new Map<string, {
+    identifier: string
+    cdhash: string
+    designatedRequirement: string
+    adhoc: boolean
+    certificateSha1?: string
+  }>()
   launchProgram = ""
   launchPlist = ""
 
@@ -711,6 +893,11 @@ class FakeRunner implements CommandRunner {
     }
     if (file === "git" && args[0] === "rev-parse") return ok(`${this.commit}\n`)
     if (file === "git" && args[0] === "status") return ok("")
+    if (file === "/usr/bin/security" && args[0] === "find-identity") {
+      return ok([...this.availableSigningIdentities]
+        .map((identity, index) => `  ${index + 1}) ${identity.toUpperCase()} "Meta AI macOS Local Code Signing"`)
+        .join("\n"))
+    }
     if (file === "/bin/launchctl" && args[0] === "print") {
       this.printCalls++
       if (this.appearAtPrint === this.printCalls) this.loaded = true
@@ -734,15 +921,48 @@ class FakeRunner implements CommandRunner {
       await chmod(args[1]!, 0o755)
       return ok()
     }
+    if (file === "/usr/bin/codesign" && args.includes("--sign")) {
+      this.mutations++
+      const target = args.at(-1)!
+      const identity = args[args.indexOf("--sign") + 1]!
+      const identifier = args[args.indexOf("--identifier") + 1]!
+      const content = await readFile(target)
+      const cdhash = createHash("sha1").update(content).digest("hex")
+      const certificateSha1 = identity === "-" ? undefined : identity.toLowerCase()
+      this.signaturesByContent.set(sha256(content), {
+        identifier,
+        cdhash,
+        designatedRequirement: this.embeddedRequirementOverrides.get(identifier) ?? (certificateSha1 === undefined
+          ? `designated => cdhash H"${cdhash}"`
+          : `designated => certificate leaf = H"${certificateSha1}" and identifier "${identifier}"`),
+        adhoc: certificateSha1 === undefined,
+        ...(certificateSha1 === undefined ? {} : { certificateSha1 }),
+      })
+      return ok()
+    }
     if (file === "/usr/bin/codesign" && args.includes("--display")) {
       const target = args.at(-1)!
+      const recorded = this.signaturesByContent.get(sha256(await readFile(target)))
       const identifier = this.foreignStableHelper && target.endsWith("input/bin/meta-input-helper")
         ? "foreign.helper"
-        : HELPER_SIGNING_IDENTIFIER
-      const requirement = this.implicitRequirement
-        ? `# designated => cdhash H"${"c".repeat(40)}"`
-        : `designated => identifier "${identifier}" and anchor apple generic`
-      return { stdout: "", stderr: `Identifier=${identifier}\nCDHash=${"c".repeat(40)}\n${requirement}\nSignature=adhoc\n`, exitCode: 0 }
+        : recorded?.identifier ?? HELPER_SIGNING_IDENTIFIER
+      const cdhash = recorded?.cdhash ?? "c".repeat(40)
+      const requirement = this.implicitRequirement && recorded?.adhoc !== false
+        ? `# designated => cdhash H"${cdhash}"`
+        : recorded?.designatedRequirement ?? `designated => identifier "${identifier}" and anchor apple generic`
+      const signature = recorded?.adhoc === false ? "Authority=Meta AI macOS Local Code Signing" : "Signature=adhoc"
+      return { stdout: "", stderr: `Identifier=${identifier}\nCDHash=${cdhash}\n${requirement}\n${signature}\n`, exitCode: 0 }
+    }
+    if (file === "/usr/bin/codesign" && args.includes("--test-requirement")) {
+      this.testRequirementCalls++
+      const target = args.at(-1)!
+      const recorded = this.signaturesByContent.get(sha256(await readFile(target)))
+      const requirement = args[args.indexOf("--test-requirement") + 1]!
+      return recorded?.adhoc === false
+        && requirement.includes(recorded.certificateSha1!)
+        && requirement.includes(`identifier "${recorded.identifier}"`)
+        ? ok()
+        : fail("explicit requirement failed")
     }
     if (file === "/usr/bin/codesign" || file === "/usr/bin/plutil") {
       this.mutations++
@@ -832,4 +1052,4 @@ class FakeRunner implements CommandRunner {
 
 function ok(stdout = ""): CommandResult { return { stdout, stderr: "", exitCode: 0 } }
 function fail(stderr: string): CommandResult { return { stdout: "", stderr, exitCode: 1 } }
-function sha256(value: string): string { return createHash("sha256").update(value).digest("hex") }
+function sha256(value: string | Uint8Array): string { return createHash("sha256").update(value).digest("hex") }

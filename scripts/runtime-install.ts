@@ -25,6 +25,7 @@ import { CAPABILITY_IDS, type CapabilityId } from "../shared/src/contracts/index
 const execFileAsync = promisify(execFile)
 
 export const RUNTIME_SERVICE_LABEL = "com.meta.ai-macos.runtime"
+export const RUNTIME_SIGNING_IDENTIFIER = "com.meta.ai-macos.runtime"
 export const HELPER_SIGNING_IDENTIFIER = "com.meta.input.helper"
 const RELEASE_FORMAT = "meta-ai-macos-runtime-release-v1"
 const RUNTIME_ARTIFACT_NAMES = ["computer-use", "runtime"] as const
@@ -38,6 +39,14 @@ const OBSERVER_REQUIRED_CAPABILITIES = new Set<CapabilityId>([
   "runtime.user-interference", "input.keyboard", "input.pointer", "input.drag", "input.interaction",
 ])
 export type RuntimeReadinessProfile = "full" | "foundation" | "desktop-browser-selected"
+
+export type RuntimeSigningOptions =
+  | { mode: "adhoc" }
+  | { mode: "identity", certificateSha1: string, keychainPath?: string }
+
+export type RuntimeSigningPlan = RuntimeSigningOptions & {
+  identityAvailable: boolean
+}
 
 export type DeferredCapability = {
   id: CapabilityId
@@ -109,6 +118,7 @@ export type RuntimeInstallOptions = {
   browserConfig?: string
   readinessProfile?: RuntimeReadinessProfile
   requiredCapabilities?: readonly CapabilityId[]
+  signing?: RuntimeSigningOptions
   failpoint?: (stage: InstallFailpoint) => void | Promise<void>
 }
 
@@ -159,6 +169,7 @@ export type RuntimeInstallPlan = {
     requiredCapabilities: CapabilityId[]
     deferredCapabilities: DeferredCapability[]
   }
+  signing: RuntimeSigningPlan
   paths: RuntimeInstallPaths
   service: {
     label: string
@@ -173,6 +184,7 @@ export type RuntimeInstallPlan = {
     permissionsRequested: false
     liveDesktopProbe: false
     requiredConfigurationPresent: boolean
+    signingIdentityAvailable: boolean
   }
   steps: InstallPlanStep[]
   legacyRetirement: LegacyRetirementCandidate[]
@@ -185,7 +197,14 @@ export type ReleaseManifest = {
   source: { repositoryRoot: string, commit: string, clean: true }
   builds: { runtimeBuildId: string, nativeBuildId: string }
   artifacts: {
-    runtime: { path: RuntimeArtifactName, sha256: string, bytes: number }
+    runtime: {
+      path: RuntimeArtifactName
+      sha256: string
+      bytes: number
+      signingIdentifier?: typeof RUNTIME_SIGNING_IDENTIFIER
+      designatedRequirement?: string
+      cdhash?: string
+    }
     nativeHelper: {
       path: "native-helper"
       sha256: string
@@ -196,6 +215,9 @@ export type ReleaseManifest = {
       auditSession: NativeAuditIdentity
     }
   }
+  signing?:
+    | { mode: "adhoc" }
+    | { mode: "identity", certificateSha1: string }
   launchAgent: { label: typeof RUNTIME_SERVICE_LABEL, sha256: string }
   entrypoint: {
     source: "scripts/runtime-entry.ts"
@@ -269,8 +291,10 @@ export async function planRuntimeInstall(options: RuntimeInstallOptions): Promis
   const status = await checked(options.runner, "git", ["status", "--porcelain=v1", "-z"], paths.repositoryRoot)
   const clean = status.stdout.length === 0
   const configuration = installConfiguration(options)
+  const signing = await planSigning(options)
   const sourceKey = sha256(`${commit}\n${RELEASE_FORMAT}`).slice(0, 24)
-  const releaseKey = sha256(`${commit}\n${RELEASE_FORMAT}\n${stableJson(configuration)}`).slice(0, 24)
+  const signingReleaseSuffix = signing.mode === "adhoc" ? "" : `\n${stableJson(signingReleaseIdentity(signing))}`
+  const releaseKey = sha256(`${commit}\n${RELEASE_FORMAT}\n${stableJson(configuration)}${signingReleaseSuffix}`).slice(0, 24)
   const releaseId = `release-${releaseKey}`
   const runtimeBuildId = `runtime-${sourceKey}`
   const nativeBuildId = `native-${sourceKey}`
@@ -292,6 +316,7 @@ export async function planRuntimeInstall(options: RuntimeInstallOptions): Promis
       alreadyInstalled: false,
     },
     configuration,
+    signing,
     paths,
     service: { label: RUNTIME_SERVICE_LABEL, domain, loaded },
     gates: {
@@ -302,6 +327,7 @@ export async function planRuntimeInstall(options: RuntimeInstallOptions): Promis
       permissionsRequested: false,
       liveDesktopProbe: false,
       requiredConfigurationPresent: requiredConfigurationPresent(configuration),
+      signingIdentityAvailable: signing.identityAvailable,
     },
     steps: installSteps(paths, releaseId, runtimeBuildId, nativeBuildId, domain),
     legacyRetirement: legacyCandidates(paths.repositoryRoot),
@@ -318,12 +344,58 @@ export async function planRuntimeInstall(options: RuntimeInstallOptions): Promis
     description: "Остановиться: выбранный readiness profile требует explicit Chrome/Android configuration",
     mutates: false,
   })
+  if (!plan.gates.signingIdentityAvailable) plan.steps.unshift({
+    id: "signing-identity-block",
+    description: "Остановиться: configured signing identity недоступна в выбранном keychain",
+    mutates: false,
+  })
   if (plan.gates.existingRuntimeRequiresDrain && options.runtimeAdmin === undefined) plan.steps.unshift({
     id: "drain-api-block",
     description: "Остановиться: loaded runtime нельзя заменять без exact admin drain API",
     mutates: false,
   })
   return plan
+}
+
+async function planSigning(options: RuntimeInstallOptions): Promise<RuntimeSigningPlan> {
+  const signing = normalizeSigningOptions(options.signing)
+  if (signing.mode === "adhoc") return { ...signing, identityAvailable: true }
+  return { ...signing, identityAvailable: await signingIdentityAvailable(options.runner, signing) }
+}
+
+function normalizeSigningOptions(value: RuntimeSigningOptions | undefined): RuntimeSigningOptions {
+  if (value === undefined || value.mode === "adhoc") return { mode: "adhoc" }
+  const certificateSha1 = value.certificateSha1.toLowerCase()
+  if (!/^[a-f0-9]{40}$/.test(certificateSha1)) throw new Error("Signing identity должна быть exact certificate SHA-1")
+  if (value.keychainPath !== undefined && !isAbsolute(value.keychainPath)) {
+    throw new Error("Signing keychain path должен быть абсолютным")
+  }
+  return {
+    mode: "identity",
+    certificateSha1,
+    ...(value.keychainPath === undefined ? {} : { keychainPath: resolve(value.keychainPath) }),
+  }
+}
+
+function signingReleaseIdentity(signing: RuntimeSigningOptions): { mode: "adhoc" } | { mode: "identity", certificateSha1: string } {
+  return signing.mode === "adhoc"
+    ? { mode: "adhoc" }
+    : { mode: "identity", certificateSha1: signing.certificateSha1 }
+}
+
+async function signingIdentityAvailable(
+  runner: CommandRunner,
+  signing: Extract<RuntimeSigningOptions, { mode: "identity" }>,
+): Promise<boolean> {
+  const args = ["find-identity", "-v", "-p", "codesigning"]
+  if (signing.keychainPath !== undefined) args.push(signing.keychainPath)
+  const result = await runner.run("/usr/bin/security", args, { timeoutMs: 5_000 })
+  if (result.exitCode !== 0) return false
+  const identities = `${result.stdout}\n${result.stderr}`.split("\n").flatMap(line => {
+    const match = line.match(/^\s*\d+\)\s+([a-fA-F0-9]{40})\s+/)
+    return match === null ? [] : [match[1]!.toLowerCase()]
+  })
+  return identities.filter(identity => identity === signing.certificateSha1).length === 1
 }
 
 function installConfiguration(options: RuntimeInstallOptions): RuntimeInstallPlan["configuration"] {
@@ -414,6 +486,7 @@ export async function applyRuntimeInstall(
   assertPlanMatchesOptions(plan, paths, options)
   if (!plan.source.clean) throw new Error("Dirty checkout нельзя устанавливать как immutable release")
   if (!plan.gates.requiredConfigurationPresent) throw new Error("Readiness profile required configuration отсутствует")
+  if (!plan.gates.signingIdentityAvailable) throw new Error("Configured signing identity недоступна; ad-hoc fallback запрещён")
   if (!plan.gates.exactHostname || hostname() !== options.expectedHostname
     || plan.machine.expectedHostname !== options.expectedHostname || plan.machine.observedHostname !== hostname()) {
     throw new Error("Hostname не совпадает с install plan")
@@ -423,12 +496,13 @@ export async function applyRuntimeInstall(
   if (currentCommit !== plan.source.commit || currentStatus.stdout.length > 0) {
     throw new Error("Checkout изменился после формирования install plan")
   }
+  await assertSigningIdentityAvailable(options.runner, plan.signing)
 
   await assertPrivateDirectoryRoot(paths.installRoot)
   await assertPrivateDirectoryRoot(paths.runRoot)
   await assertLaunchAgentDirectory(dirname(paths.launchAgentPath))
   await assertStableHelperParent(paths.stableHelperPath, paths.repositoryRoot)
-  await verifyExistingHelperIdentity(paths.stableHelperPath, options.runner)
+  await verifyExistingHelperIdentity(paths.stableHelperPath, options.runner, plan.signing)
   const releaseInstallerLock = await acquireInstallerLock(paths)
   try { return await applyRuntimeInstallLocked(plan, options, paths) }
   finally { await releaseInstallerLock() }
@@ -442,6 +516,7 @@ async function applyRuntimeInstallLocked(
   await options.failpoint?.("after-installer-lock")
   const release = await ensureRelease(plan, options)
   const { plist } = release
+  await assertSignerContinuity(plan, release.manifest)
   await assertNativeBuildStableAcrossConfiguration(plan, release.manifest)
   await assertSourceUnchanged(plan, options)
   if (await exists(pendingUpdatePath(paths))) {
@@ -562,7 +637,7 @@ function installSteps(
       command: { file: process.execPath, args: ["build", "scripts/runtime-entry.ts", "--compile", "--outfile", `${releasePath}.staging/${CURRENT_RUNTIME_ARTIFACT_NAME}`] } },
     { id: "build-native", description: `Собрать native helper ${nativeBuildId} во временный release`, mutates: true,
       command: { file: "/bin/sh", args: [join(paths.repositoryRoot, "native/scripts/build-broker.sh"), `${releasePath}.staging/native-helper`, nativeBuildId] } },
-    { id: "verify-candidate", description: `Подписать ${HELPER_SIGNING_IDENTIFIER}, проверить signature, metadata, build IDs и digests`, mutates: true },
+    { id: "verify-candidate", description: "Подписать runtime и helper configured identity, проверить signer continuity, metadata, build IDs и digests", mutates: true },
     { id: "publish-release", description: "Опубликовать immutable manifest и release атомарным rename", mutates: true },
     { id: "drain", description: "Для loaded runtime получить exact complete drain receipt до bootout", mutates: false },
     { id: "switch", description: "Атомарно переключить stable helper, current release symlink и LaunchAgent plist", mutates: true },
@@ -611,19 +686,10 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
       nativeHelperPath,
       plan.release.nativeBuildId,
     ], plan.paths.repositoryRoot, 120_000)
-    await checked(options.runner, "/usr/bin/codesign", [
-      "--force",
-      "--sign",
-      "-",
-      "--identifier",
-      HELPER_SIGNING_IDENTIFIER,
-      nativeHelperPath,
-    ])
-    await checked(options.runner, "/usr/bin/codesign", ["--verify", "--strict", nativeHelperPath])
-    const signature = await inspectCodeSignature(options.runner, nativeHelperPath)
-    if (signature.identifier !== HELPER_SIGNING_IDENTIFIER) {
-      throw new Error("Native candidate имеет другой codesign identifier")
-    }
+    const runtimeSignature = await signArtifact(options.runner, runtimePath,
+      RUNTIME_SIGNING_IDENTIFIER, plan.signing)
+    const signature = await signArtifact(options.runner, nativeHelperPath,
+      HELPER_SIGNING_IDENTIFIER, plan.signing)
     const architectures = await checked(options.runner, "/usr/bin/lipo", ["-archs", nativeHelperPath])
     if (!architectures.stdout.split(/\s+/).includes("x86_64")) throw new Error("Native candidate не содержит x86_64")
     const metadataResult = await checked(options.runner, nativeHelperPath, ["--metadata"], undefined, 5_000)
@@ -645,11 +711,15 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
       source: { repositoryRoot: plan.source.repositoryRoot, commit: plan.source.commit, clean: true },
       builds: { runtimeBuildId: plan.release.runtimeBuildId, nativeBuildId: plan.release.nativeBuildId },
       artifacts: {
-        runtime: { path: CURRENT_RUNTIME_ARTIFACT_NAME, ...runtimeArtifact },
+        runtime: { path: CURRENT_RUNTIME_ARTIFACT_NAME, ...runtimeArtifact,
+          signingIdentifier: RUNTIME_SIGNING_IDENTIFIER,
+          designatedRequirement: runtimeSignature.designatedRequirement,
+          cdhash: runtimeSignature.cdhash },
         nativeHelper: { path: "native-helper", ...nativeArtifact, signingIdentifier: HELPER_SIGNING_IDENTIFIER,
           designatedRequirement: signature.designatedRequirement, cdhash: signature.cdhash,
           auditSession: metadata.session },
       },
+      signing: signingReleaseIdentity(plan.signing),
       launchAgent: { label: RUNTIME_SERVICE_LABEL, sha256: sha256(plist) },
       entrypoint: { source: "scripts/runtime-entry.ts", modes: ["runtime", "doctor", "mcp"], mcpTransport: "stdio" },
       configuration: plan.configuration,
@@ -691,12 +761,23 @@ async function verifyReleaseArtifacts(
     || stableJson(helperArtifact) !== stableJson({ sha256: manifest.artifacts.nativeHelper.sha256, bytes: manifest.artifacts.nativeHelper.bytes })) {
     throw new Error("Immutable release artifact digest mismatch")
   }
+  if (manifest.signing !== undefined) {
+    await verifyManifestArtifactSignature(runner, runtimePath, manifest.artifacts.runtime,
+      RUNTIME_SIGNING_IDENTIFIER, manifest.signing)
+  }
   await checked(runner, "/usr/bin/codesign", ["--verify", "--strict", helperPath])
   const signature = await inspectCodeSignature(runner, helperPath)
   if (signature.identifier !== manifest.artifacts.nativeHelper.signingIdentifier
     || signature.cdhash !== manifest.artifacts.nativeHelper.cdhash
-    || signature.designatedRequirement !== manifest.artifacts.nativeHelper.designatedRequirement) {
+    || signature.designatedRequirement !== manifest.artifacts.nativeHelper.designatedRequirement
+    || manifest.signing !== undefined && signature.adhoc !== (manifest.signing.mode === "adhoc")) {
     throw new Error("Immutable release codesign identity не совпадает с manifest")
+  }
+  if (manifest.signing?.mode === "identity") {
+    await verifyCertificateRequirement(runner, helperPath, HELPER_SIGNING_IDENTIFIER,
+      manifest.signing.certificateSha1)
+    assertEmbeddedCertificateRequirement(signature.designatedRequirement,
+      HELPER_SIGNING_IDENTIFIER, manifest.signing.certificateSha1)
   }
   const metadata = parseNativeMetadata((await checked(runner, helperPath, ["--metadata"], undefined, 5_000)).stdout)
   if (metadata.nativeBuildId !== manifest.builds.nativeBuildId || metadata.installRoot !== plan.paths.repositoryRoot
@@ -921,10 +1002,30 @@ async function assertNativeBuildStableAcrossConfiguration(plan: RuntimeInstallPl
   assertPreviousReleasePath(plan.paths, current)
   const manifest = parseManifest(JSON.parse(await readFile(join(current, "manifest.json"), "utf8")))
   if (manifest.builds.nativeBuildId !== candidate.builds.nativeBuildId) return
-  if (manifest.artifacts.nativeHelper.sha256 !== candidate.artifacts.nativeHelper.sha256
+  if (candidate.signing?.mode === "identity" && manifest.signing?.mode !== "identity") return
+  const certificateSigned = manifest.signing?.mode === "identity" && candidate.signing?.mode === "identity"
+  if ((!certificateSigned && manifest.artifacts.nativeHelper.sha256 !== candidate.artifacts.nativeHelper.sha256)
     || manifest.artifacts.nativeHelper.cdhash !== candidate.artifacts.nativeHelper.cdhash
     || manifest.artifacts.nativeHelper.designatedRequirement !== candidate.artifacts.nativeHelper.designatedRequirement) {
     throw new Error("Один source native build ID получил другой helper identity при смене runtime configuration")
+  }
+}
+
+async function assertSignerContinuity(plan: RuntimeInstallPlan, candidate: ReleaseManifest): Promise<void> {
+  if (!manifestSigningMatchesPlan(candidate, plan.signing)) {
+    throw new Error("Candidate release имеет другую signing identity")
+  }
+  const current = await readLinkIfPresent(join(plan.paths.installRoot, "current"))
+  if (current === undefined || current === plan.release.releasePath) return
+  assertPreviousReleasePath(plan.paths, current)
+  const manifest = parseManifest(JSON.parse(await readFile(join(current, "manifest.json"), "utf8")))
+  if (manifest.signing?.mode === "identity") {
+    if (plan.signing.mode !== "identity") {
+      throw new Error("Certificate-signed runtime нельзя молча заменить ad-hoc release")
+    }
+    if (manifest.signing.certificateSha1 !== plan.signing.certificateSha1) {
+      throw new Error("Signing certificate rotation требует отдельного explicit migration")
+    }
   }
 }
 
@@ -1191,11 +1292,120 @@ async function assertCanonicalRepository(path: string, allowTestRoot: boolean): 
   await assertNoSymlink(path)
 }
 
-async function verifyExistingHelperIdentity(path: string, runner: CommandRunner): Promise<void> {
+async function verifyExistingHelperIdentity(
+  path: string,
+  runner: CommandRunner,
+  signing: RuntimeSigningPlan,
+): Promise<void> {
   if (!await exists(path)) return
   const signature = await inspectCodeSignature(runner, path)
   if (signature.identifier !== HELPER_SIGNING_IDENTIFIER) {
     throw new Error("Installed stable helper имеет другой codesign identifier; TCC identity migration требует отдельного решения")
+  }
+  if (signing.mode === "adhoc") {
+    if (!signature.adhoc) throw new Error("Certificate-signed helper нельзя молча заменить ad-hoc release")
+    return
+  }
+  if (!signature.adhoc) {
+    await verifyCertificateRequirement(runner, path, HELPER_SIGNING_IDENTIFIER, signing.certificateSha1)
+    assertEmbeddedCertificateRequirement(signature.designatedRequirement,
+      HELPER_SIGNING_IDENTIFIER, signing.certificateSha1)
+  }
+}
+
+async function signArtifact(
+  runner: CommandRunner,
+  path: string,
+  identifier: typeof RUNTIME_SIGNING_IDENTIFIER | typeof HELPER_SIGNING_IDENTIFIER,
+  signing: RuntimeSigningPlan,
+) {
+  const args = ["--force", "--sign", signing.mode === "adhoc" ? "-" : signing.certificateSha1,
+    "--identifier", identifier]
+  if (signing.mode === "identity") {
+    args.push("--requirements", `=designated => ${certificateRequirement(identifier, signing.certificateSha1)}`)
+    if (signing.keychainPath !== undefined) args.push("--keychain", signing.keychainPath)
+  }
+  args.push(path)
+  await checked(runner, "/usr/bin/codesign", args)
+  await checked(runner, "/usr/bin/codesign", ["--verify", "--strict", path])
+  if (signing.mode === "identity") {
+    await verifyCertificateRequirement(runner, path, identifier, signing.certificateSha1)
+  }
+  const signature = await inspectCodeSignature(runner, path)
+  if (signature.identifier !== identifier || signature.adhoc !== (signing.mode === "adhoc")) {
+    throw new Error("Signed artifact не подтвердил configured signing identity")
+  }
+  if (signing.mode === "identity") {
+    assertEmbeddedCertificateRequirement(signature.designatedRequirement,
+      identifier, signing.certificateSha1)
+  }
+  return signature
+}
+
+async function verifyManifestArtifactSignature(
+  runner: CommandRunner,
+  path: string,
+  artifact: ReleaseManifest["artifacts"]["runtime"],
+  identifier: typeof RUNTIME_SIGNING_IDENTIFIER,
+  signing: NonNullable<ReleaseManifest["signing"]>,
+): Promise<void> {
+  await checked(runner, "/usr/bin/codesign", ["--verify", "--strict", path])
+  const signature = await inspectCodeSignature(runner, path)
+  if (artifact.signingIdentifier !== identifier || signature.identifier !== identifier
+    || artifact.cdhash !== signature.cdhash
+    || artifact.designatedRequirement !== signature.designatedRequirement
+    || signature.adhoc !== (signing.mode === "adhoc")) {
+    throw new Error("Immutable runtime codesign identity не совпадает с manifest")
+  }
+  if (signing.mode === "identity") {
+    await verifyCertificateRequirement(runner, path, identifier, signing.certificateSha1)
+    assertEmbeddedCertificateRequirement(signature.designatedRequirement,
+      identifier, signing.certificateSha1)
+  }
+}
+
+async function verifyCertificateRequirement(
+  runner: CommandRunner,
+  path: string,
+  identifier: typeof RUNTIME_SIGNING_IDENTIFIER | typeof HELPER_SIGNING_IDENTIFIER,
+  certificateSha1: string,
+): Promise<void> {
+  const result = await runner.run("/usr/bin/codesign", ["--verify", "--strict", "--test-requirement",
+    `=${certificateRequirement(identifier, certificateSha1)}`, path], { timeoutMs: 30_000 })
+  if (result.exitCode !== 0) {
+    throw new Error(`Codesign signer continuity не подтверждена: ${result.stderr.trim()}`)
+  }
+}
+
+function certificateRequirement(
+  identifier: typeof RUNTIME_SIGNING_IDENTIFIER | typeof HELPER_SIGNING_IDENTIFIER,
+  certificateSha1: string,
+): string {
+  return `certificate leaf = H"${certificateSha1}" and identifier "${identifier}"`
+}
+
+function assertEmbeddedCertificateRequirement(
+  designatedRequirement: string,
+  identifier: typeof RUNTIME_SIGNING_IDENTIFIER | typeof HELPER_SIGNING_IDENTIFIER,
+  certificateSha1: string,
+): void {
+  const expression = designatedRequirement.replace(/^#\s*/, "").replace(/^designated\s*=>\s*/i, "")
+    .replace(/\s+/g, " ").trim()
+  const clauses = expression.split(/\s+and\s+/i).map(clause => clause.trim())
+  const expectedCertificate = certificateSha1.toLowerCase()
+  let certificateMatches = false
+  let identifierMatches = false
+  for (const clause of clauses) {
+    const certificate = clause.match(/^certificate\s+(?:leaf|0)\s*=\s*H"([a-fA-F0-9]{40})"$/i)
+    if (certificate !== null) {
+      certificateMatches = certificate[1]!.toLowerCase() === expectedCertificate
+      continue
+    }
+    const signingIdentifier = clause.match(/^identifier\s*(?:=\s*)?"([^"]+)"$/i)
+    if (signingIdentifier !== null) identifierMatches = signingIdentifier[1] === identifier
+  }
+  if (clauses.length !== 2 || !certificateMatches || !identifierMatches) {
+    throw new Error("Embedded designated requirement не равен exact certificate+identifier contract")
   }
 }
 
@@ -1209,7 +1419,7 @@ async function inspectCodeSignature(runner: CommandRunner, path: string) {
     .find(line => line.startsWith("designated =>"))
   if (identifier === undefined || cdhash === undefined || !/^[a-f0-9]{40,64}$/.test(cdhash)
     || designatedRequirement === undefined) throw new Error("Codesign metadata не содержит identifier/cdhash/designated requirement")
-  return { identifier, cdhash, designatedRequirement }
+  return { identifier, cdhash, designatedRequirement, adhoc: lines.includes("Signature=adhoc") }
 }
 
 async function assertPrivateDirectoryRoot(path: string): Promise<void> {
@@ -1269,6 +1479,17 @@ function assertPlanMatchesOptions(plan: RuntimeInstallPlan, paths: RuntimeInstal
   if (plan.service.domain !== `gui/${options.uid}` || plan.service.label !== RUNTIME_SERVICE_LABEL) throw new Error("Install plan относится к другому user service")
   if (plan.source.repositoryRoot !== paths.repositoryRoot) throw new Error("Install plan относится к другому checkout")
   if (stableJson(plan.configuration) !== stableJson(installConfiguration(options))) throw new Error("Install plan содержит другую runtime configuration")
+  const signing = normalizeSigningOptions(options.signing)
+  const plannedSigning = { ...plan.signing }
+  delete (plannedSigning as Partial<RuntimeSigningPlan>).identityAvailable
+  if (stableJson(plannedSigning) !== stableJson(signing)) throw new Error("Install plan содержит другую signing configuration")
+}
+
+async function assertSigningIdentityAvailable(runner: CommandRunner, signing: RuntimeSigningPlan): Promise<void> {
+  if (signing.mode === "adhoc") return
+  if (!await signingIdentityAvailable(runner, signing)) {
+    throw new Error("Configured signing identity исчезла после install plan; ad-hoc fallback запрещён")
+  }
 }
 
 function assertDrainReceipt(expected: RuntimeInspection, receipt: RuntimeDrainReceipt): void {
@@ -1283,7 +1504,8 @@ function assertManifestMatchesPlan(manifest: ReleaseManifest, plan: RuntimeInsta
   if (manifest.releaseId !== plan.release.releaseId || manifest.source.commit !== plan.source.commit
     || manifest.builds.runtimeBuildId !== plan.release.runtimeBuildId || manifest.builds.nativeBuildId !== plan.release.nativeBuildId
     || manifest.launchAgent.sha256 !== plistSha256 || manifest.tcc.subjectPath !== plan.paths.stableHelperPath
-    || stableJson(manifest.configuration) !== stableJson(plan.configuration)) {
+    || stableJson(manifest.configuration) !== stableJson(plan.configuration)
+    || !manifestSigningMatchesPlan(manifest, plan.signing)) {
     throw new Error("Existing immutable release конфликтует с install plan")
   }
 }
@@ -1313,10 +1535,31 @@ function parseManifest(value: unknown): ReleaseManifest {
     || manifest.entrypoint?.source !== "scripts/runtime-entry.ts"
     || stableJson(manifest.entrypoint.modes) !== stableJson(["runtime", "doctor", "mcp"])
     || manifest.entrypoint.mcpTransport !== "stdio"
-    || !validManifestConfiguration(manifest.configuration)) {
+    || !validManifestConfiguration(manifest.configuration)
+    || !validManifestSigning(manifest)) {
     throw new Error("Release manifest не соответствует strict format")
   }
   return manifest
+}
+
+function manifestSigningMatchesPlan(manifest: ReleaseManifest, signing: RuntimeSigningOptions): boolean {
+  if (signing.mode === "adhoc") return manifest.signing === undefined || manifest.signing.mode === "adhoc"
+  return manifest.signing?.mode === "identity"
+    && manifest.signing.certificateSha1 === signing.certificateSha1
+}
+
+function validManifestSigning(manifest: ReleaseManifest): boolean {
+  if (manifest.signing === undefined) return manifest.artifacts.runtime.signingIdentifier === undefined
+    && manifest.artifacts.runtime.designatedRequirement === undefined
+    && manifest.artifacts.runtime.cdhash === undefined
+  if (manifest.signing.mode !== "adhoc" && manifest.signing.mode !== "identity") return false
+  if (manifest.signing.mode === "identity" && !/^[a-f0-9]{40}$/.test(manifest.signing.certificateSha1)) return false
+  const runtime = manifest.artifacts.runtime
+  return runtime.signingIdentifier === RUNTIME_SIGNING_IDENTIFIER
+    && typeof runtime.designatedRequirement === "string"
+    && runtime.designatedRequirement.startsWith("designated =>")
+    && typeof runtime.cdhash === "string"
+    && /^[a-f0-9]{40,64}$/.test(runtime.cdhash)
 }
 
 async function assertSourceUnchanged(plan: RuntimeInstallPlan, options: RuntimeInstallOptions): Promise<void> {
@@ -1579,6 +1822,7 @@ async function cli(): Promise<void> {
     uid: process.getuid?.() ?? (() => { throw new Error("UID недоступен") })(),
     ...(browserConfig === undefined ? {} : { browserConfig }),
     readinessProfile: readinessProfileFromArguments(process.argv),
+    signing: signingFromArguments(process.argv),
   }
   let plan = await planRuntimeInstall(options)
   if (execute && plan.service.loaded && !plan.release.alreadyInstalled) {
@@ -1599,6 +1843,26 @@ export function readinessProfileFromArguments(argv: readonly string[]): RuntimeR
     throw new Error("--foundation и --desktop-browser-selected взаимоисключающие")
   }
   return foundation ? "foundation" : selected ? "desktop-browser-selected" : "full"
+}
+
+export function signingFromArguments(argv: readonly string[]): RuntimeSigningOptions {
+  const certificateSha1 = argumentValue(argv, "--signing-identity-sha1")
+  const keychainPath = argumentValue(argv, "--signing-keychain")
+  if (certificateSha1 === undefined) {
+    if (keychainPath !== undefined) throw new Error("--signing-keychain требует --signing-identity-sha1")
+    return { mode: "adhoc" }
+  }
+  return normalizeSigningOptions({ mode: "identity", certificateSha1,
+    ...(keychainPath === undefined ? {} : { keychainPath }) })
+}
+
+function argumentValue(argv: readonly string[], name: string): string | undefined {
+  const indexes = argv.flatMap((value, index) => value === name ? [index] : [])
+  if (indexes.length > 1) throw new Error(`${name} нельзя указывать повторно`)
+  if (indexes.length === 0) return undefined
+  const value = argv[indexes[0]! + 1]
+  if (value === undefined || value.startsWith("--")) throw new Error(`${name} требует значение`)
+  return value
 }
 
 async function readBrowserConfigFile(path: string): Promise<string> {
