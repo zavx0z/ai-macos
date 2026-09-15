@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { CdpTarget } from "@meta/shared"
-import { newTab, selectCreatedTarget, type AndroidTargetCreationDeps } from "../src/android.ts"
+import { newTab, type AndroidTargetCreationDeps } from "../src/android.ts"
+import { selectCreatedTarget } from "../src/target-identity.ts"
 
 function target(id: string, url = "https://same.test"): CdpTarget {
   return {

@@ -42,7 +42,7 @@ import {
   type AdbDevice,
   type AdbForwardRecord,
 } from "./adb.ts"
-import { selectCreatedTarget } from "./android.ts"
+import { selectCreatedTarget } from "./target-identity.ts"
 
 export type DeviceDriverCapture = {
   bytes: Uint8Array

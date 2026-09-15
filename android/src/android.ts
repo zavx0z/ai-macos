@@ -5,6 +5,9 @@ import { spawn } from "bun"
 import { logCaption } from "@meta/shared"
 import { CdpHttp, withSession, type CdpTarget } from "./cdp.ts"
 import { adbForward, adbOpenUrl, DEFAULT_DEBUG_PORT } from "./adb.ts"
+import { selectCreatedTarget } from "./target-identity.ts"
+
+export { selectCreatedTarget } from "./target-identity.ts"
 
 const cdp = new CdpHttp("localhost", DEFAULT_DEBUG_PORT)
 
@@ -64,19 +67,6 @@ export async function newTab(
     await deps.delay(50)
   }
   throw new Error(`Android target creation timed out for serial=${serial}`)
-}
-
-export function selectCreatedTarget(
-  previousTargetIds: ReadonlySet<string>,
-  currentTargets: readonly CdpTarget[],
-): CdpTarget | null {
-  const created = currentTargets.filter(
-    (target) => target.type === "page" && !previousTargetIds.has(target.id),
-  )
-  if (created.length > 1) {
-    throw new Error(`Android target creation is ambiguous: ${created.map((target) => target.id).join(", ")}`)
-  }
-  return created[0] ?? null
 }
 
 export async function closeTab(id: string): Promise<void> {
