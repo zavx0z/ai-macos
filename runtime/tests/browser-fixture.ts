@@ -34,6 +34,7 @@ export function browserFixture(options: { ttlMs?: number } = {}) {
     async verifyCompletion() {
       if (driver.verifierGate !== undefined) await driver.verifierGate
     },
+    async recoverRemoval() { await driver.disconnect() },
   }
   runtime.browserLifetime.configure("browser", { domain: "browser", adapter, verifier })
   const register = (instance: typeof initial, revision: number) => runtime.targets.register(

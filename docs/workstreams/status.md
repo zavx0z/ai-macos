@@ -12,7 +12,7 @@
 
 | Задача | Что принято | Что остаётся |
 | --- | --- | --- |
-| Computer use: runtime, контракты и MCP | C2 core/evidence/continuation, thin UDS, automatic browser coordinator и enforced admission | Quarantine recovery/Android composition и production MCP tools/frame/catalog |
+| Computer use: runtime, контракты и MCP | C2 core/evidence/continuation, thin UDS, coordinator, exact recovery и injected Android composition | Production host, MCP tools/frame/catalog и live profiles |
 | Computer use: native broker и окна | C0 native core, ABI v2 subset, identity/extractor и часть C2 integration | На Astra/high исправляет concurrent task lifetime, tombstone horizon, capture outcome schema и memory bounds; затем command-loop/live |
 | Computer use: ввод и interaction | C2 adapter/authorization/status/compiler, injected clipboard; text bridge до C executor с fake sink | Остальные native actions, runtime wiring, versioned clipboard backend, live |
 | Computer use: снимки и координаты | C2 adapter/protocol driver, late reconciliation/ACK tombstones/taskRef protection и pixel orientation | Dropped-start production cancel/drain wiring, installed helper и live capture/mixed displays |
@@ -42,11 +42,10 @@
 2. Native связывает production command loop с operation-level cancel/drain;
    dropped-start C core test не заменяет проверку этого общего пути.
 3. Runtime исправляет замечания UDS/MCP и реализует lifetime Android reservation;
-   thin transport fixes приняты. Reservation candidate не принят: caller-owned
-   connect record/verifier, отсутствие exclusion до reconnect, session freshness
-   и external-generation tuple. Требуется automatic Runtime coordinator.
+   thin transport и coordinator/recovery checkpoints приняты. Root35tests /
+   196assertions pass; recovery использует private stored cleanup authority.
    Workspace связи Runtime→Chrome/Android установлены для concrete composition.
-   Старые reservation 3 tests / 21 assertions не покрывали эти defects.
+   Production host/catalogue и exposure recovery через UDS ещё впереди.
 4. QA проверяет реальные межпакетные цепочки, затем ведущий проводит общий
    integration/cutover gate и отдельно живые сценарии.
 

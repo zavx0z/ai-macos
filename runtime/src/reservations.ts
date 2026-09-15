@@ -8,6 +8,7 @@ import {
   deviceBrowserOperationResources,
   deviceBrowserOperationResultSchema,
   lifetimeReservationHandleSchema,
+  operationOutcomeSchema,
   reservationCleanupReceiptSchema,
   structurallyEqual,
   type AdapterResult,
@@ -39,6 +40,7 @@ type Result = BrowserOperationResult | DeviceBrowserOperationResult
 type InstanceTarget = LifetimeReservationHandle["target"]
 
 export type CoordinatedLifecycle = {
+  admission?: "stored-cleanup"
   before(context: RuntimeOperationContext): Promise<void>
   stage(record: OperationRecord, result: AdapterResult<unknown>): Promise<() => void>
   failed(adapterStarted: boolean): void
@@ -57,6 +59,7 @@ export interface BrowserLifetimeVerifier {
   verifyConnected(target: InstanceTarget, signal: AbortSignal): Promise<void>
   verifyRemoved(target: InstanceTarget, signal: AbortSignal): Promise<void>
   verifyCompletion(request: Request, result: AdapterResult<Result>, signal: AbortSignal): Promise<void>
+  recoverRemoval(target: InstanceTarget, signal: AbortSignal): Promise<void>
 }
 
 type Binding = {
@@ -75,6 +78,7 @@ type Slot = {
   receipt?: ReservationCleanupReceipt
   children: Set<string>
   disconnecting?: string
+  operationIds: Set<string>
 }
 
 export class BrowserLifetimeCoordinator {
@@ -88,6 +92,7 @@ export class BrowserLifetimeCoordinator {
   readonly #slots = new Map<string, Slot>()
   readonly #byId = new Map<string, Slot>()
   readonly #ttlMs: number
+  readonly #stageRecovered: (operationIds: readonly string[]) => () => void
   readonly authority: LifetimeReservationAuthority & {
     resume(session: RuntimeClientSession, reservationId: string): Promise<LifetimeReservationHandle>
     inspect(session: RuntimeClientSession, target: OperationTarget): Promise<LifetimeReservationHandle | undefined>
@@ -101,6 +106,7 @@ export class BrowserLifetimeCoordinator {
     clock?: RuntimeClock
     ids?: RuntimeIdSource
     ttlMs?: number
+    stageRecovered: (operationIds: readonly string[]) => () => void
   }) {
     this.#generation = options.generation
     this.#clients = options.clients
@@ -109,6 +115,7 @@ export class BrowserLifetimeCoordinator {
     this.#clock = options.clock ?? systemClock
     this.#ids = options.ids ?? randomIdSource
     this.#ttlMs = options.ttlMs ?? 120_000
+    this.#stageRecovered = options.stageRecovered
     if (!Number.isSafeInteger(this.#ttlMs) || this.#ttlMs < 1 || this.#ttlMs > 86_400_000) throw new Error("Reservation TTL вне допустимого диапазона")
     this.authority = Object.freeze({
       assertChild: (request: ReservationChildRequest) => this.#assertChild(request),
@@ -127,6 +134,7 @@ export class BrowserLifetimeCoordinator {
         verifyConnected: binding.verifier.verifyConnected.bind(binding.verifier),
         verifyRemoved: binding.verifier.verifyRemoved.bind(binding.verifier),
         verifyCompletion: binding.verifier.verifyCompletion.bind(binding.verifier),
+        recoverRemoval: binding.verifier.recoverRemoval.bind(binding.verifier),
       }),
     })
   }
@@ -168,6 +176,7 @@ export class BrowserLifetimeCoordinator {
             state: "connecting",
             bindingId,
             children: new Set(),
+            operationIds: new Set([received.wire.operationId]),
           }
           this.#slots.set(key, slot)
         } else {
@@ -181,6 +190,7 @@ export class BrowserLifetimeCoordinator {
             existing.disconnecting = received.wire.operationId
           }
           existing.children.add(received.wire.operationId)
+          existing.operationIds.add(received.wire.operationId)
           slot = existing
         }
       },
@@ -198,7 +208,11 @@ export class BrowserLifetimeCoordinator {
           else assertDeviceBrowserResultMatchesRequest(request as DeviceBrowserOperationRequest, parsed.value as DeviceBrowserOperationResult)
         }
         await binding.verifier.verifyCompletion(request, parsed as AdapterResult<Result>, context.control.signal)
-        if (!parsed.ok) return () => this.#quarantine(slot!)
+        if (!parsed.ok) return () => {
+          slot!.children.delete(record.context.operationId)
+          delete slot!.disconnecting
+          this.#quarantine(slot!)
+        }
         if (request.kind === "connect-instance") {
           if (parsed.value.value.kind !== "instance-connected") throw new Error("Connect не вернул actual instance")
           const actual = instanceTarget({
@@ -282,6 +296,72 @@ export class BrowserLifetimeCoordinator {
       || slot.lineageId !== this.#clients.lineage(request.session)
       || !structurallyEqual(slot.target, target)) throw new Error("Child не допущен runtime lifetime coordinator")
     return structuredClone(slot.handle)
+  }
+
+  async recover(
+    session: RuntimeClientSession,
+    bindingId: string,
+    intent: RuntimeOperationIntent,
+  ): Promise<RuntimeExecution<Result>> {
+    await this.#clients.assertActive(session, this.#clock.now())
+    const target = instanceTarget(intent.precondition.target)
+    const key = stableKey(target)
+    const binding = this.#bindings.get(bindingId)
+    if (binding === undefined || intent.intent !== "admin" || intent.requestedResources.length !== 0) {
+      throw new Error("Recovery требует configured binding и cleanup-only admin intent")
+    }
+    const request = { kind: "disconnect-instance", instance: target.ref } as Request
+    let slot: Slot | undefined
+    let context: RuntimeOperationContext | undefined
+    return this.#run(session, intent, request, async received => {
+      await binding.verifier.recoverRemoval(target, received.control.signal)
+      return {
+        ok: true,
+        value: { value: { kind: "instance-disconnected", instance: target.ref }, cleanup: { scope: "none", state: "complete", resources: [] } } as Result,
+        outcome: operationOutcomeSchema.parse({
+          dispatch: "finished", targetVerified: "verified", userInterference: "unknown",
+          observation: "unavailable", effect: { state: "unverified", proofRefs: [] },
+          cleanup: { scope: "none", state: "complete", resources: [] },
+          restoration: "not-applicable", dispatchAttempts: 1,
+        }),
+      }
+    }, {
+      admission: "stored-cleanup",
+      before: async received => {
+        context = received
+        await this.#clients.assertActive(session, this.#clock.now())
+        const existing = this.#slots.get(key)
+        if (existing !== undefined) this.#expire(existing)
+        if (existing === undefined || existing.state !== "quarantined" || existing.bindingId !== bindingId
+          || existing.lineageId !== this.#clients.lineage(session) || !structurallyEqual(existing.target, target)
+          || existing.children.size > 0 || existing.disconnecting !== undefined) {
+          throw new Error("Recovery не имеет exact quarantined reservation без active children")
+        }
+        existing.disconnecting = received.wire.operationId
+        slot = existing
+      },
+      stage: async (record, result) => {
+        if (slot === undefined || context === undefined || !result.ok) throw new Error("Recovery не завершено")
+        await binding.verifier.verifyRemoved(target, context.control.signal)
+        await this.#clients.assertActive(session, this.#clock.now())
+        const commitPrevious = this.#stageRecovered([...slot.operationIds])
+        return () => {
+          commitPrevious()
+          slot!.state = "released"
+          if (slot!.handle !== undefined) {
+            slot!.handle = { ...slot!.handle, state: "released", statusRevision: slot!.handle.statusRevision + 1 }
+            slot!.receipt = reservationCleanupReceiptSchema.parse({
+              receiptId: this.#ids.next("reservation-recovery"), reservationId: slot!.handle.reservationId,
+              reservationGeneration: slot!.handle.reservationGeneration, externalGeneration: slot!.handle.externalGeneration,
+              statusRevision: slot!.handle.statusRevision, cleanupEvidenceRef: record.context.operationId,
+              issuedAt: this.#clock.now().toISOString(), state: "released",
+            })
+          }
+          delete slot!.disconnecting
+        }
+      },
+      failed: () => { if (slot !== undefined) { delete slot.disconnecting; this.#quarantine(slot) } },
+    })
   }
 
   async #resume(session: RuntimeClientSession, id: string): Promise<LifetimeReservationHandle> {

@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { lifetimeReservationHandleSchema } from "@meta/shared/contracts"
+import { lifetimeReservationHandleSchema, runtimeOperationIntentSchema } from "@meta/shared/contracts"
 import { browserFixture } from "./browser-fixture.ts"
 
 test("reservation mutations не принимают caller journal/verifier и binding immutable", () => {
@@ -30,6 +30,13 @@ test("expiry quarantines reservation; resume требует active session то�
   const reconnect = await invoke(resumed.session, "reconnect:expired", { kind: "connect-instance", instance }, 2)
   expect(reconnect.operation.state).toBe("rejected")
   expect(driver.connectCalls).toBe(1)
+  advance(6000)
+  const recovery = await runtime.browserLifetime.recover(resumed.session, "browser", runtimeOperationIntentSchema.parse({
+    intent: "admin", clientRequestId: "recover:expiry", precondition: { target, inventoryId: "inventory:2", inventoryRevision: 2 },
+    deadlineAt: new Date(Date.now() + 10000).toISOString(), requestedResources: [],
+  }))
+  expect(recovery.operation.state).toBe("completed")
+  expect(driver.connected).toBe(false)
   runtime.clients.revokePrincipal(resumed.session.principalId)
   await expect(runtime.reservations.inspect(resumed.session, target)).rejects.toThrow("отозвана")
 })
@@ -48,6 +55,31 @@ test("failed child operation quarantines lifetime connection", async () => {
   }, 2)
   expect(failed.result.ok).toBe(false)
   expect((await runtime.reservations.inspect(credential.session, { kind: "browser-instance", ref: instance }))?.state).toBe("quarantined")
+  const recoveryIntent = runtimeOperationIntentSchema.parse({
+    intent: "admin", clientRequestId: "recover:1",
+    precondition: { target: { kind: "browser-instance", ref: instance }, inventoryId: "inventory:2", inventoryRevision: 2 },
+    deadlineAt: new Date(Date.now() + 5000).toISOString(), requestedResources: [],
+  })
+  const recovered = await runtime.browserLifetime.recover(credential.session, "browser", recoveryIntent)
+  expect(recovered.operation.state).toBe("completed")
+  expect(driver.connected).toBe(false)
+  expect((await runtime.reservations.inspect(credential.session, { kind: "browser-instance", ref: instance }))?.state).toBe("released")
+  expect(runtime.resources.handlesForOperation(failed.operation.context.operationId)).toHaveLength(0)
+  expect((await runtime.getOperation(credential.session, failed.operation.context.operationId))?.outcome.cleanup.state).toBe("complete")
+  const repeated = await runtime.browserLifetime.recover(credential.session, "browser", recoveryIntent)
+  expect(repeated.operation.context.operationId).toBe(recovered.operation.context.operationId)
+  expect(driver.disconnectCalls).toBe(1)
+  const reconnected = await invoke(credential.session, "connect:new-generation", { kind: "connect-instance", instance }, 2)
+  expect(reconnected.operation.state).toBe("completed")
+  if (!reconnected.result.ok || reconnected.result.value.value.kind !== "instance-connected") throw new Error("reconnect failed")
+  const next = reconnected.result.value.value.instance.ref
+  if ("deviceRef" in next) throw new Error("browser expected")
+  const staleRecovery = await runtime.browserLifetime.recover(credential.session, "browser", {
+    ...recoveryIntent, clientRequestId: "recover:stale-generation",
+  })
+  expect(staleRecovery.operation.state).toBe("rejected")
+  expect(driver.disconnectCalls).toBe(1)
+  expect((await runtime.reservations.inspect(credential.session, { kind: "browser-instance", ref: next }))?.state).toBe("active")
 })
 
 test("device transport generations остаются отдельными полями при colon и maximum length", () => {

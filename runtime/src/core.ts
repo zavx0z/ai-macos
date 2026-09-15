@@ -144,6 +144,7 @@ export class RuntimeCore implements RuntimeAdapter {
       ids: this.#ids,
       ttlMs: options.reservationTtlMs,
       lookup: id => this.#journal.get(id)?.record,
+      stageRecovered: ids => this.#stageLifetimeRecovery(ids),
       run: (session, intent, request, execute, lifecycle) => this.#runOperation(session, intent, request, execute, lifecycle),
     })
     this.reservations = this.browserLifetime.authority
@@ -258,15 +259,17 @@ export class RuntimeCore implements RuntimeAdapter {
     }
 
     this.#assertIntentAuthority(session, intent, now)
-    await this.targets.resolve({
-      target: intent.precondition.target,
-      inventoryId: intent.precondition.inventoryId,
-      inventoryRevision: intent.precondition.inventoryRevision,
-      runtimeEpoch: session.runtimeEpoch,
-      loginSessionId: session.loginSessionId,
-      ...(this.#nativeGeneration === undefined ? {} : { nativeGeneration: this.#nativeGeneration }),
-      deadlineAt: intent.deadlineAt,
-    })
+    if (lifecycle?.admission !== "stored-cleanup") {
+      await this.targets.resolve({
+        target: intent.precondition.target,
+        inventoryId: intent.precondition.inventoryId,
+        inventoryRevision: intent.precondition.inventoryRevision,
+        runtimeEpoch: session.runtimeEpoch,
+        loginSessionId: session.loginSessionId,
+        ...(this.#nativeGeneration === undefined ? {} : { nativeGeneration: this.#nativeGeneration }),
+        deadlineAt: intent.deadlineAt,
+      })
+    }
 
     const operationId = this.#ids.next("operation")
     const wire = this.#createWireContext(operationId, session, intent)
@@ -438,6 +441,37 @@ export class RuntimeCore implements RuntimeAdapter {
 
   activeOperationCount(): number {
     return [...this.#journal.values()].filter(entry => !isTerminal(entry.record)).length
+  }
+
+  #stageLifetimeRecovery(operationIds: readonly string[]): () => void {
+    const staged = operationIds.flatMap(id => {
+      const entry = this.#journal.get(id)
+      if (entry === undefined || !entry.settled) throw new Error("Recovery journal entry отсутствует или active")
+      if (entry.record.outcome.cleanup.state === "complete") return []
+      const handles = entry.record.resources
+      for (const handle of handles) {
+        const current = this.resources.handleByLeaseId(handle.leaseId)
+        if (current === undefined || current.operationId !== id || current.leaseGeneration !== handle.leaseGeneration
+          || current.state !== "quarantined") throw new Error("Recovery resource generation не совпадает")
+      }
+      const cleanup = releasedCleanup(handles)
+      const record = operationRecordSchema.parse({
+        ...entry.record,
+        outcome: { ...entry.record.outcome, cleanup },
+        updatedAt: this.#clock.now().toISOString(),
+      })
+      return [{ entry, record, handles, cleanup }]
+    })
+    return () => {
+      for (const { entry, record, handles, cleanup } of staged) {
+        this.resources.reconcileCleanup(record.context.operationId, handles, cleanup)
+        entry.record = record
+        if (entry.result !== undefined) entry.result = {
+          operation: record,
+          result: { ...entry.result.result, outcome: record.outcome },
+        }
+      }
+    }
   }
 
   async #execute<TRequest, TResult>(

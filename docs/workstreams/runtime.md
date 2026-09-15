@@ -5,7 +5,33 @@
 Статус: C1 принят. C2 runtime core/evidence/continuation принят scoped ведущим.
 C3 lifetime coordinator связан с RuntimeCore; текущий атомарный checkpoint
 компилируется и проходит 34 runtime tests. Transport foundation принят scoped;
-production catalog/cutover и полная lifetime recovery composition ещё впереди.
+production catalog/cutover ещё впереди. Следующий checkpoint закрывает
+quarantined/expired recovery и actual Android adapter composition.
+
+## Checkpoint recovery и Android
+
+- `BrowserLifetimeCoordinator.recover(session,bindingId,intent)` допускает только
+  cleanup-only admin intent с exact quarantined reservation и active lineage.
+  Registered host `recoverRemoval` выполняет физический cleanup, `verifyRemoved`
+  подтверждает его в том же bounded lifecycle.
+- Cleanup использует сохранённую reservation identity даже после expiry старой
+  inventory. Public raw browser/device admission остаётся закрытым; разрешение
+  stored-cleanup передаётся только private coordinator lifecycle.
+- Runtime подготавливает старые unresolved journal records и exact quarantined
+  leases до synchronous commit; после verified removal выпускаются cleanup
+  receipts, сохраняется unknown effect и освобождаются старые resources.
+- Replay прежнего recovery возвращает тот же результат. Новый запрос со старой
+  target generation не снимает active reservation нового подключения.
+- Actual `RuntimeDeviceBrowserAdapter` + `ForwardOwnedDeviceBrowserDriver` +
+  `OwnedAdbForward` проверены на fake ADB/CDP dependencies: connect → reservation
+  → second-connect rejection → child → failure/quarantine → exact forward
+  removal/recovery. Системные ADB/CDP вызовы тест не выполняет.
+- `bun test runtime/tests`: **35 pass / 196 assertions**.
+- Root `bunx --no-install tsc --noEmit`: **exit 0**; `git diff --check`: **pass**.
+
+Эти изменения готовы к scoped приёмке/коммиту. Следующий scope — production
+MethodRegistry/server/adapter composition и journal persistence; полный релиз
+этим checkpoint не объявляется.
 
 ## Checkpoint после resume Git
 
