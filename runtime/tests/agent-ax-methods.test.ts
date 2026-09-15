@@ -183,7 +183,7 @@ function createFixture() {
   const views = new AgentViewBindings(core, guard)
   const authorizeView = core.bindNativeViewAdmission(views.authorizeNative)
   const windows = new FixtureWindows(core, native, authorizeView)
-  registerWindowMethods(registry, core, windows)
+  registerWindowMethods(registry, core, windows, { internalAgentMethods: true })
   const methods = registerAgentMethods(registry, core, targets, { views })
   registerAgentAxMethods(registry, core, targets, methods)
   return { core, guard, methods, native, registry, targets, windows }
