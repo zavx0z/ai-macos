@@ -22,6 +22,8 @@ export type AcceptanceSutEvidence =
   | "native-window-adapter"
   | "native-command-loop"
   | "runtime-core"
+  | "runtime-process-startup"
+  | "runtime-transport-security"
   | "runtime-host-mcp"
 
 // Это реестр приёмки, а не production API и не доказательство полной готовности сценария.
@@ -77,6 +79,7 @@ export const acceptanceSutEvidence: Partial<
   Record<AcceptanceScenario["id"], AcceptanceSutEvidence[]>
 > = {
   A01: ["contract-parser"],
+  A02: ["runtime-process-startup"],
   A03: ["runtime-core"],
   A04: ["native-c"],
   A05: ["runtime-core"],
@@ -88,6 +91,7 @@ export const acceptanceSutEvidence: Partial<
   A11: ["contract-parser", "runtime-core"],
   A16: ["native-c"],
   A18: ["native-window-adapter"],
+  A31: ["runtime-transport-security"],
   A38: ["contract-parser", "runtime-host-mcp"],
   A41: ["runtime-host-mcp"],
   A42: ["runtime-core", "runtime-host-mcp"],

@@ -5,7 +5,7 @@
   "scope": "repository-source-only",
   "preconditions": [
     "Актуальные consumers из docs/legacy-callers.md мигрированы либо имеют явный blocker.",
-    "A02 проверен отдельными runtime/MCP subprocesses, A31 проверен на private socket peer/token boundary.",
+    "A02 подтвержден tests/computer-use/process-startup-sut.test.ts с двумя actual MCP subprocesses и одним RuntimeHost/Native start boundary; A31 подтвержден runtime/tests/transport.test.ts на private socket modes, forged bearer до executor и lineage isolation.",
     "A43 повторно проверен из свежей Codex задачи после исправления observer recovery: installed catalog 0.4.0 содержит все 36 tools после самостоятельного restart.",
     "LegacyServiceRetirementCoordinator подтвердил exact ownership и завершение собственных listeners 7878-7882.",
     "Chrome CDP LaunchAgent инвентаризирован и остановлен только при подтвержденном ownership.",
@@ -438,7 +438,8 @@
         "mcp/tests/catalog-server.test.ts",
         "mcp/tests/runtime-mcp.test.ts",
         "tests/computer-use/host-mcp-sut.test.ts",
-        "A02 subprocess test pending; A43 reached installed runtime but full catalog recovery pending"
+        "tests/computer-use/process-startup-sut.test.ts",
+        "A43 reached installed runtime but full catalog recovery pending"
       ]
     }
   ],

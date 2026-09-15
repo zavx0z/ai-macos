@@ -35,9 +35,9 @@ describe("computer use acceptance matrix", () => {
     expect(actual).toEqual(nativeSutIds)
   })
 
-  test("A02/A31 не получают evidence от in-process substitutes", () => {
-    expect(acceptanceSutEvidence.A02).toBeUndefined()
-    expect(acceptanceSutEvidence.A31).toBeUndefined()
+  test("A02/A31 получают только actual process/transport evidence", () => {
+    expect(acceptanceSutEvidence.A02).toEqual(["runtime-process-startup"])
+    expect(acceptanceSutEvidence.A31).toEqual(["runtime-transport-security"])
   })
 
   test("live-сценарии сохраняют явную live prerequisite", () => {

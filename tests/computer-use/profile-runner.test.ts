@@ -25,7 +25,7 @@ describe("acceptance profile runner", () => {
       .map((scenario) => scenario.id)
 
     expect(profile.scenarios).toHaveLength(45)
-    expect(passed).toEqual(["A03", "A06", "A08", "A09", "A10", "A11", "A38", "A45"])
+    expect(passed).toEqual(["A02", "A03", "A06", "A08", "A09", "A10", "A11", "A31", "A38", "A45"])
     expect(profile.scenarios.find((scenario) => scenario.id === "A01")).toMatchObject({
       status: "not-run",
       missingEvidence: ["live"]

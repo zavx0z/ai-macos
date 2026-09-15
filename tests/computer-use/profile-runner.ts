@@ -13,6 +13,8 @@ export type AcceptanceProbeId =
   | "native-window"
   | "native-command-loop"
   | "runtime"
+  | "runtime-process-startup"
+  | "runtime-transport-security"
   | "host-mcp"
 
 export interface AcceptanceTestSummary {
@@ -51,6 +53,8 @@ export const acceptanceProfileProbes: Array<{
   { probeId: "native-window", path: "native/tests/window-adapter.test.ts", timeoutMs: 15_000, maxOutputBytes: 256 * 1024 },
   { probeId: "native-command-loop", path: "native/tests/command-loop.test.ts", timeoutMs: 30_000, maxOutputBytes: 256 * 1024 },
   { probeId: "runtime", path: "tests/computer-use/runtime-sut.test.ts", timeoutMs: 10_000, maxOutputBytes: 128 * 1024 },
+  { probeId: "runtime-process-startup", path: "tests/computer-use/process-startup-sut.test.ts", timeoutMs: 20_000, maxOutputBytes: 256 * 1024 },
+  { probeId: "runtime-transport-security", path: "runtime/tests/transport.test.ts", timeoutMs: 15_000, maxOutputBytes: 256 * 1024 },
   { probeId: "host-mcp", path: "tests/computer-use/host-mcp-sut.test.ts", timeoutMs: 15_000, maxOutputBytes: 256 * 1024 }
 ]
 
@@ -73,6 +77,8 @@ const scenarioProbeLinks: ScenarioProbeLink[] = [
   { probeId: "runtime", scenarioId: "A05", evidenceRef: "runtime-sut.test.ts#A05", satisfies: [], note: "Runtime deadline/cancel ACK; actual UDS caller timeout открыт" },
   { probeId: "runtime", scenarioId: "A11", evidenceRef: "runtime-sut.test.ts#A11", satisfies: [], note: "Resumption/dedup дополняет contract evidence" },
   { probeId: "runtime", scenarioId: "A42", evidenceRef: "runtime-sut.test.ts#A42", satisfies: [], note: "Quarantine проверен; durable retention/restart открыт" },
+  { probeId: "runtime-process-startup", scenarioId: "A02", evidenceRef: "process-startup-sut.test.ts#A02", satisfies: ["integration"], note: "Два actual MCP subprocess, один RuntimeHost/Native start boundary; foreign UDS не заменяется" },
+  { probeId: "runtime-transport-security", scenarioId: "A31", evidenceRef: "runtime/tests/transport.test.ts#private-UDS-auth", satisfies: ["integration"], note: "Private 0700/0600 UDS, forged bearer отклонён до executor, foreign lineage изолирована" },
   { probeId: "host-mcp", scenarioId: "A31", evidenceRef: "host-mcp-sut.test.ts#unavailable-dispatch", satisfies: [], note: "Capability gate проверен; forged peer/socket auth открыт" },
   { probeId: "host-mcp", scenarioId: "A38", evidenceRef: "host-mcp-sut.test.ts#core-without-native", satisfies: ["integration"], note: "RuntimeHost и MCP работают без native optional capabilities" },
   { probeId: "host-mcp", scenarioId: "A41", evidenceRef: "host-mcp-sut.test.ts#frame-lineage", satisfies: [], note: "Frame lineage isolation; action/latest contract открыт" },
