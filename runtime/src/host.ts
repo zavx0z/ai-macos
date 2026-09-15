@@ -28,6 +28,7 @@ import { createBrowserHostComposition, type BrowserHostConfig } from "./browser-
 import { registerBrowserMethods } from "./browser-methods.ts"
 import { registerInputMethods } from "./input-methods.ts"
 import { registerReadinessMethods } from "./readiness-methods.ts"
+import { registerCheckInputMethod } from "./check-input.ts"
 import { registerCaptureMethods } from "./capture-methods.ts"
 import { DesktopInputAdapter } from "@meta/input/adapter"
 import { RuntimeScreenAdapter } from "@meta/screen/adapter"
@@ -146,6 +147,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
         kind: "handshake", protocolVersion: "1", requestId: `handshake:${crypto.randomUUID()}`,
         ...generation, runtimeBuildId: options.runtimeBuildId, expectedNativeBuildId: options.expectedNativeBuildId,
         capabilitySchemaVersion: "1",
+        ...(options.helperPath === undefined ? {} : { requiredRecoveryDomainVersion: "1" }),
       })
       handshake = await native.handshake(request, AbortSignal.timeout(5000))
       const mismatch = nativeHandshakeCompatibility(request, handshake)
@@ -184,11 +186,13 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     } },
     ...(native === undefined || handshake === undefined ? {} : {
       native, nativeGeneration: handshake.nativeGeneration, nativeDelivery: native.mutationDelivery,
+      ...(handshake.recoveryDomainVersion === "1" ? { nativeRecovery: { policyVersion: "1", nativeBuildId: handshake.nativeBuildId } } : {}),
       nativeSourceIdentity: { adapterInstanceRef, backendBuildId: handshake.nativeBuildId, nativeGeneration: handshake.nativeGeneration },
     }),
   })
   await runtime.initializeRecovery()
   if (native !== undefined && handshake !== undefined) {
+    if (handshake.recoveryDomainVersion === "1") native.configureRecoveryAuthority((wire, descriptor) => runtime!.authorizeNativeMutation(wire, descriptor))
     runtime.bindPointEvidenceProvider(new RuntimeNativePointHitProvider({ native }).provide)
     runtime.evidence.registerSourceExtractor({ adapterInstanceRef, backendBuildId: handshake.nativeBuildId, nativeGeneration: handshake.nativeGeneration }, extractNativeEvidenceReports)
     clipboard = new RuntimeClipboardHandler(runtime, native)
@@ -303,9 +307,13 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   if (native !== undefined) {
     const windows = new NativeWindowAdapter({ native, services: core.services })
     windowAdapter = windows
+    if (handshake?.capabilities.capabilities.some(capability => capability.id === "input.readiness" && capability.state === "ready")) {
+      registerCheckInputMethod(catalog, { native, windows })
+    }
     registerWindowMethods(catalog, core, {
       host: windows.host, services: windows.services, capabilities: windows.capabilities,
       transition: windows.transition.bind(windows), inspect: windows.inspect.bind(windows),
+      press: windows.press.bind(windows),
       async inventory(control) {
         try {
           const inventory = await windows.inventory(control)
