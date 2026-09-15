@@ -18,7 +18,7 @@ async function command(file: string, args: string[]) {
   })
 }
 
-async function installedHelper() {
+async function legacyHelperArtifact() {
   const path = join(root, "input/bin/meta-input-helper")
   try {
     const metadata = await stat(path)
@@ -54,11 +54,11 @@ async function installedHelper() {
 }
 
 export async function inspectSource() {
-  const [canonicalRoot, head, tree, helper] = await Promise.all([
+  const [canonicalRoot, head, tree, legacyHelper] = await Promise.all([
     realpath(root),
     command("git", ["rev-parse", "HEAD"]),
     command("git", ["status", "--porcelain=v1", "-z"]),
-    installedHelper(),
+    legacyHelperArtifact(),
   ])
   const dependencies = [
     ["@meta/shared/contracts", "mcp"],
@@ -87,7 +87,7 @@ export async function inspectSource() {
     },
     checkout: { root: canonicalRoot, head: head.stdout.trim(), clean: tree.stdout.length === 0 },
     dependencies,
-    helper,
+    legacyHelper,
     liveProbesPerformed: false,
     runtimeReadinessVerified: false,
   }

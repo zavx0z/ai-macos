@@ -149,6 +149,97 @@ test("dry-run строит reviewable plan без login identity и execute пу
   await expect(lstat(fixture.options.paths.stableHelperPath)).rejects.toThrow()
 })
 
+test("v2 fresh checkout устанавливается без legacy input/bin и не создаёт его", async () => {
+  const fixture = await createFixture({ legacyHelperParent: false })
+  const plan = await planRuntimeInstall(fixture.options)
+
+  const result = await applyRuntimeInstall(plan, fixture.options)
+
+  expect(result.state).toBe("installed")
+  await expect(lstat(join(fixture.options.paths.repositoryRoot, "input"))).rejects.toThrow()
+  await expect(lstat(fixture.options.paths.stableHelperPath)).rejects.toThrow()
+  expect(await readFile(join(fixture.options.paths.installRoot,
+    "computer-use.app/Contents/Helpers/meta-input-helper"), "utf8")).toContain(plan.release.nativeBuildId)
+})
+
+test("v1 pending recovery сохраняет existing legacy helper через strict parent", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  await writeFile(fixture.options.paths.stableHelperPath, "partial-legacy-helper")
+  const pending = join(fixture.options.paths.installRoot, "pending-update")
+  await mkdir(pending, { recursive: true, mode: 0o700 })
+  await writeFile(join(pending, "helper"), "restored-legacy-helper", { mode: 0o600 })
+  await writeFile(join(pending, "record.json"), JSON.stringify({
+    format: "meta-runtime-pending-update-v1",
+    releaseId: plan.release.releaseId,
+    previousCurrentRelease: null,
+    helperPresent: true,
+    plistPresent: false,
+    serviceLoaded: false,
+  }), { mode: 0o600 })
+
+  await applyRuntimeInstall(plan, fixture.options)
+
+  expect(await readFile(fixture.options.paths.stableHelperPath, "utf8")).toBe("restored-legacy-helper")
+})
+
+test("v1 pending recovery с absent helper и parent не создаёт legacy path", async () => {
+  const fixture = await createFixture({ legacyHelperParent: false })
+  const plan = await planRuntimeInstall(fixture.options)
+  const pending = join(fixture.options.paths.installRoot, "pending-update")
+  await mkdir(pending, { recursive: true, mode: 0o700 })
+  await writeFile(join(pending, "record.json"), JSON.stringify({
+    format: "meta-runtime-pending-update-v1",
+    releaseId: plan.release.releaseId,
+    previousCurrentRelease: null,
+    helperPresent: false,
+    plistPresent: false,
+    serviceLoaded: false,
+  }), { mode: 0o600 })
+
+  await applyRuntimeInstall(plan, fixture.options)
+
+  await expect(lstat(fixture.options.paths.stableHelperPath)).rejects.toThrow()
+  await expect(lstat(join(fixture.options.paths.repositoryRoot, "input"))).rejects.toThrow()
+})
+
+test("v1 pending helper payload без trusted parent остаётся failclosed в journal", async () => {
+  const fixture = await createFixture({ legacyHelperParent: false })
+  const plan = await planRuntimeInstall(fixture.options)
+  const pending = join(fixture.options.paths.installRoot, "pending-update")
+  await mkdir(pending, { recursive: true, mode: 0o700 })
+  await writeFile(join(pending, "helper"), "legacy-helper-backup", { mode: 0o600 })
+  await writeFile(join(pending, "record.json"), JSON.stringify({
+    format: "meta-runtime-pending-update-v1",
+    releaseId: plan.release.releaseId,
+    previousCurrentRelease: null,
+    helperPresent: true,
+    plistPresent: false,
+    serviceLoaded: false,
+  }), { mode: 0o600 })
+
+  await expect(applyRuntimeInstall(plan, fixture.options)).rejects.toThrow("parent отсутствует")
+
+  expect(await readFile(join(pending, "helper"), "utf8")).toBe("legacy-helper-backup")
+  expect(JSON.parse(await readFile(join(pending, "record.json"), "utf8"))).toMatchObject({ helperPresent: true })
+  expect(fixture.runner.bootstrapCalls).toBe(0)
+  await expect(lstat(fixture.options.paths.stableHelperPath)).rejects.toThrow()
+})
+
+test("existing legacy helper через symlink parent отклоняется", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  const inputRoot = join(fixture.options.paths.repositoryRoot, "input")
+  const foreignBin = join(fixture.root, "foreign-bin")
+  await rm(join(inputRoot, "bin"), { recursive: true })
+  await mkdir(foreignBin)
+  await writeFile(join(foreignBin, "meta-input-helper"), "foreign-helper")
+  await symlink(foreignBin, join(inputRoot, "bin"))
+
+  await expect(applyRuntimeInstall(plan, fixture.options)).rejects.toThrow("parent небезопасен")
+  expect(fixture.runner.mutations).toBe(0)
+})
+
 test("generated v2 release и stable app запускаются реальным installed launcher contract", async () => {
   const fixture = await createFixture()
   const plan = await planRuntimeInstall(fixture.options)
@@ -1511,7 +1602,7 @@ function successfulAdmin(inspection: RuntimeInspection): RuntimeAdmin {
   }
 }
 
-async function createFixture() {
+async function createFixture(fixtureOptions: { legacyHelperParent?: boolean } = {}) {
   const root = await realpath(await mkdtemp("/tmp/runtime-installer-"))
   roots.push(root)
   const repositoryPath = join(root, "repozitarium", "ai-macos")
@@ -1519,7 +1610,7 @@ async function createFixture() {
   await mkdir(join(repositoryPath, "native", "scripts"), { recursive: true })
   await mkdir(join(repositoryPath, "runtime", "src"), { recursive: true })
   await mkdir(join(repositoryPath, "runtime", "assets"), { recursive: true })
-  await mkdir(join(repositoryPath, "input", "bin"), { recursive: true })
+  if (fixtureOptions.legacyHelperParent !== false) await mkdir(join(repositoryPath, "input", "bin"), { recursive: true })
   const repositoryRoot = await realpath(repositoryPath)
   await mkdir(join(home, "Library", "LaunchAgents"), { recursive: true })
   await writeFile(join(repositoryRoot, "native", "scripts", "build-broker.sh"), "fixture")

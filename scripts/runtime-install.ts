@@ -535,7 +535,7 @@ export async function applyRuntimeInstall(
   await assertPrivateDirectoryRoot(paths.installRoot)
   await assertPrivateDirectoryRoot(paths.runRoot)
   await assertLaunchAgentDirectory(dirname(paths.launchAgentPath))
-  await assertStableHelperParent(paths.stableHelperPath, paths.repositoryRoot)
+  await assertLegacyHelperPathIfPresent(paths.stableHelperPath, paths.repositoryRoot)
   await verifyExistingHelperIdentity(paths.stableHelperPath, options.runner, plan.signing)
   const releaseInstallerLock = await acquireInstallerLock(paths)
   try { return await applyRuntimeInstallLocked(plan, options, paths) }
@@ -624,6 +624,7 @@ async function applyRuntimeInstallLocked(
     if (release.manifest.format === RELEASE_FORMAT) {
       await promoteNextStableApplication(paths, options.failpoint)
     } else if (await hashIfPresent(paths.stableHelperPath) !== release.manifest.artifacts.nativeHelper.sha256) {
+      await assertLegacyHelperWriteTarget(paths.stableHelperPath, paths.repositoryRoot)
       await atomicCopy(release.nativeHelperPath, paths.stableHelperPath, 0o755)
     }
     await options.failpoint?.("after-helper-switch")
@@ -1040,8 +1041,15 @@ async function recoverPendingUpdate(
     await restoreStableApplication(plan.paths, record, options.failpoint)
   }
   if (record.format === "meta-runtime-pending-update-v1") {
-    if (helper === undefined) await rm(plan.paths.stableHelperPath, { force: true })
-    else await atomicBytes(plan.paths.stableHelperPath, helper, 0o755)
+    if (helper === undefined) {
+      if (await exists(plan.paths.stableHelperPath)) {
+        await assertLegacyHelperWriteTarget(plan.paths.stableHelperPath, plan.paths.repositoryRoot)
+        await rm(plan.paths.stableHelperPath)
+      }
+    } else {
+      await assertLegacyHelperWriteTarget(plan.paths.stableHelperPath, plan.paths.repositoryRoot)
+      await atomicBytes(plan.paths.stableHelperPath, helper, 0o755)
+    }
   }
   const current = join(plan.paths.installRoot, "current")
   if (record.previousCurrentRelease === null) await rm(current, { force: true })
@@ -2071,12 +2079,29 @@ async function ensureDirectoryDurably(path: string, mode: number): Promise<void>
   }
 }
 
-async function assertStableHelperParent(path: string, repositoryRoot: string): Promise<void> {
+async function assertLegacyHelperPathIfPresent(path: string, repositoryRoot: string): Promise<void> {
   if (relative(repositoryRoot, path).startsWith("..")) throw new Error("Stable helper находится вне canonical repository")
-  await assertNoSymlink(dirname(path))
-  if (await exists(path)) {
-    const info = await lstat(path)
-    if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error("Stable helper path небезопасен")
+  if (!await exists(path)) return
+  await assertLegacyHelperWriteTarget(path, repositoryRoot)
+}
+
+async function assertLegacyHelperWriteTarget(path: string, repositoryRoot: string): Promise<void> {
+  if (relative(repositoryRoot, path).startsWith("..")) throw new Error("Stable helper находится вне canonical repository")
+  const parent = dirname(path)
+  let parentInfo
+  try { parentInfo = await lstat(parent) }
+  catch (error) {
+    if (isMissing(error)) throw new Error("Legacy stable helper parent отсутствует")
+    throw error
+  }
+  if (!parentInfo.isDirectory() || parentInfo.isSymbolicLink() || parentInfo.uid !== process.getuid?.()
+    || (parentInfo.mode & 0o022) !== 0 || await realpath(parent) !== parent) {
+    throw new Error("Legacy stable helper parent небезопасен")
+  }
+  if (!await exists(path)) return
+  const info = await lstat(path)
+  if (!info.isFile() || info.isSymbolicLink() || info.uid !== process.getuid?.()) {
+    throw new Error("Stable helper path небезопасен")
   }
 }
 
