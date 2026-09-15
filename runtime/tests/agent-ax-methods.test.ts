@@ -11,12 +11,16 @@ import {
   type NativeCancelRequest,
   type NativeExecutionContext,
   type NativeStatusRequest,
+  type ObservedEvent,
+  type ObserverCoverage,
   type RuntimeOperationContext,
   type RuntimeResourceHandle,
 } from "@meta/shared/contracts"
 import { registerAgentAxMethods } from "../src/agent-ax-methods.ts"
 import { registerAgentMethods } from "../src/agent-methods.ts"
 import { AgentTargetRegistry } from "../src/agent-targets.ts"
+import { AgentViewBindings } from "../src/agent-view-bindings.ts"
+import { AgentViewGuard, type AgentViewObserver } from "../src/agent-view-guard.ts"
 import { RuntimeCore } from "../src/core.ts"
 import { MethodRegistry } from "../src/method-registry.ts"
 import { registerWindowMethods, type RuntimeWindowAdapter } from "../src/window-methods.ts"
@@ -42,6 +46,8 @@ test("click выполняет exact AXPress и публикует только 
   expect(JSON.stringify(clicked.data)).not.toContain("elementRef")
   expect(status.recent).toMatchObject([{ action: "ax-press", operationId: clicked.data.operationId }])
   expect(fixture.windows.inspections).toBe(1)
+  expect(fixture.windows.admissions).toBe(1)
+  await fixture.guard.close()
 })
 
 test("старый snapshot element и foreign target отклоняются до AX backend", async () => {
@@ -83,6 +89,7 @@ test("старый snapshot element и foreign target отклоняются д�
     point: [10, 20],
   }, new AbortController().signal)).rejects.toThrow()
   expect(fixture.windows.presses).toHaveLength(0)
+  await fixture.guard.close()
 })
 
 test("cancel exact AXPress сохраняет authoritative cancelled cleanup", async () => {
@@ -102,6 +109,8 @@ test("cancel exact AXPress сохраняет authoritative cancelled cleanup", 
   expect(cancelled).toMatchObject({ active: [], recent: [{ action: "ax-press", phase: "terminal",
     outcome: { state: "cancelled", cleanup: "complete" } }] })
   expect(fixture.native.cancelCalls).toBe(1)
+  expect(fixture.windows.admissions).toBe(1)
+  await fixture.guard.close()
 })
 
 function createFixture() {
@@ -125,12 +134,20 @@ function createFixture() {
     readOnly: true,
     execute: async () => ({ machine: { matchesExpected: true }, runtime: { draining: false, admissionSealed: false } }),
   })
-  const windows = new FixtureWindows(core, native)
-  registerWindowMethods(registry, core, windows)
   const targets = new AgentTargetRegistry({ generation })
-  const methods = registerAgentMethods(registry, core, targets)
+  const observer = new FixtureObserver()
+  const guard = new AgentViewGuard({
+    generation: { ...generation, nativeGeneration },
+    observer,
+    resolveTarget: (lineageId, targetId) => targets.forLineage(lineageId).resolveAction(targetId),
+  })
+  const views = new AgentViewBindings(core, guard)
+  const authorizeView = core.bindNativeViewAdmission(views.authorizeNative)
+  const windows = new FixtureWindows(core, native, authorizeView)
+  registerWindowMethods(registry, core, windows)
+  const methods = registerAgentMethods(registry, core, targets, { views })
   registerAgentAxMethods(registry, core, targets, methods)
-  return { core, methods, native, registry, targets, windows }
+  return { core, guard, methods, native, registry, targets, windows }
 }
 
 async function observeButton(
@@ -164,12 +181,17 @@ class FixtureWindows implements RuntimeWindowAdapter {
   readonly capabilities = ["desktop.ax"] as const
   readonly presses: Array<{ target: unknown, request: unknown }> = []
   cancelMode = false
+  admissions = 0
   #snapshot = 0
   inspections = 0
   #started!: () => void
   started = new Promise<void>(resolve => { this.#started = resolve })
 
-  constructor(core: RuntimeCore, private readonly native: FixtureNative) {
+  constructor(
+    core: RuntimeCore,
+    private readonly native: FixtureNative,
+    private readonly authorizeView: ReturnType<RuntimeCore["bindNativeViewAdmission"]>,
+  ) {
     this.host = native.host
     this.services = core.services
   }
@@ -208,6 +230,8 @@ class FixtureWindows implements RuntimeWindowAdapter {
     context: RuntimeOperationContext<NativeExecutionContext>,
     request: Parameters<NonNullable<RuntimeWindowAdapter["press"]>>[1],
   ): Promise<AdapterResult<AxPressResult>> {
+    await this.authorizeView(context.wire, { method: "ax.press" })
+    this.admissions++
     this.presses.push({ target: structuredClone(context.wire.target), request: structuredClone(request) })
     this.#started()
     if (this.cancelMode) {
@@ -232,6 +256,44 @@ class FixtureWindows implements RuntimeWindowAdapter {
       value: { element: request.element, action: "AXPress", performed: true },
       outcome: outcome(context.resources, "finished", "completed"),
       nativeStatus: status,
+    }
+  }
+}
+
+class FixtureObserver implements AgentViewObserver {
+  readonly observerInstanceRef = "observer:agent-ax"
+  readonly #coverage: ObserverCoverage
+
+  constructor() {
+    const now = new Date().toISOString()
+    this.#coverage = {
+      state: "ready",
+      ...generation,
+      nativeGeneration,
+      coverageStartCursor: "cursor:agent-ax:start",
+      cursor: "cursor:agent-ax:start",
+      nextSequence: 1,
+      startedAt: now,
+      coveredFrom: now,
+      coveredThrough: now,
+      heartbeatAt: now,
+      coveredKinds: ["input", "focus", "window-structure", "lifecycle"],
+      droppedEvents: 0,
+      gapDetected: false,
+    }
+  }
+
+  async coverage(): Promise<ObserverCoverage> {
+    return structuredClone(this.#coverage)
+  }
+
+  subscribe(options: { signal?: AbortSignal, afterCursor?: string } = {}): AsyncIterable<ObservedEvent> {
+    if (options.afterCursor !== this.#coverage.cursor) throw new Error("Fixture observer cursor mismatch")
+    return {
+      async *[Symbol.asyncIterator]() {
+        if (options.signal?.aborted) return
+        await new Promise<void>(resolve => options.signal?.addEventListener("abort", () => resolve(), { once: true }))
+      },
     }
   }
 }

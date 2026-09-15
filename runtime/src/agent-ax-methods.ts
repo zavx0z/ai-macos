@@ -12,6 +12,7 @@ import type { AgentTargetRegistry } from "./agent-targets.ts"
 import type { RuntimeCore } from "./core.ts"
 import type { MethodRegistry, RuntimeMethodResponse } from "./method-registry.ts"
 import type { AxPressMethodOutput } from "./window-methods.ts"
+import type { AgentImagePoint, AgentPointClickHandler, AgentPointClickOptions } from "./agent-pointer-methods.ts"
 
 const actionOutcomeSchema = z.strictObject({
   state: z.enum(OPERATION_STATES),
@@ -28,7 +29,10 @@ const clickResultSchema = z.strictObject({
   outcome: actionOutcomeSchema,
 })
 
-/** Регистрирует только semantic AXPress по snapshot-bound elementId. */
+const imagePointSchema = z.tuple([z.number().finite(), z.number().finite()])
+type AgentClickInput = AgentPointClickOptions & { targetId: string, elementId?: string, point?: AgentImagePoint }
+
+/** Регистрирует AXPress по elementId и явно выбранный клик по точке снимка. */
 export class RuntimeAgentAxMethods {
   constructor(
     private readonly registry: MethodRegistry,
@@ -36,13 +40,32 @@ export class RuntimeAgentAxMethods {
     private readonly targets: AgentTargetRegistry,
     private readonly methods: RuntimeAgentMethods,
     private readonly operations: AgentOperations = methods.operations,
+    private readonly pointer?: AgentPointClickHandler,
   ) {}
 
   register(): void {
+    const input: z.ZodType<AgentClickInput> = this.pointer === undefined
+      ? z.strictObject({ targetId: agentTargetIdSchema, elementId: agentTargetIdSchema }) as z.ZodType<AgentClickInput>
+      : z.strictObject({
+          targetId: agentTargetIdSchema,
+          elementId: agentTargetIdSchema.optional(),
+          point: imagePointSchema.optional(),
+          button: z.enum(["left", "right", "middle"]).optional(),
+          count: z.union([z.literal(1), z.literal(2), z.literal(3)]).optional(),
+        }).superRefine((value, context) => {
+          if ((value.elementId === undefined) === (value.point === undefined)) {
+            context.addIssue({ code: "custom", message: "click требует ровно один elementId или point" })
+          }
+          if (value.elementId !== undefined && (value.button !== undefined || value.count !== undefined)) {
+            context.addIssue({ code: "custom", message: "AX element click не принимает pointer button/count" })
+          }
+        }) as z.ZodType<AgentClickInput>
     this.registry.register("click", {
-      title: "Нажать AX element",
-      description: "Выполняет AXPress ранее выданного elementId; координатный fallback отсутствует.",
-      input: z.strictObject({ targetId: agentTargetIdSchema, elementId: agentTargetIdSchema }),
+      title: "Нажать element или точку снимка",
+      description: this.pointer === undefined
+        ? "Выполняет AXPress ранее выданного elementId; координатный fallback отсутствует."
+        : "Выполняет AXPress по elementId либо pointer click по точке исходного observation.",
+      input,
       output: clickResultSchema,
       readOnly: false,
       destructive: true,
@@ -55,14 +78,20 @@ export class RuntimeAgentAxMethods {
         "desktop.window.identity",
         "desktop.displays",
         "desktop.ax",
+        "runtime.user-interference",
+        ...(this.pointer === undefined ? [] : ["capture.observation", "input.pointer", "input.readiness"] as const),
         "runtime.operations",
       ],
-      execute: (context, input) => this.#click(
-        context.session,
-        input.targetId,
-        input.elementId,
-        context.signal,
-      ),
+      execute: (context, input) => {
+        if (input.point !== undefined) {
+          return this.pointer!.clickPoint(context.session, input.targetId, input.point, {
+            ...(input.button === undefined ? {} : { button: input.button }),
+            ...(input.count === undefined ? {} : { count: input.count }),
+          }, context.signal)
+        }
+        if (input.elementId === undefined) throw new Error("click elementId отсутствует")
+        return this.#click(context.session, input.targetId, input.elementId, context.signal)
+      },
     })
   }
 
@@ -95,15 +124,21 @@ export class RuntimeAgentAxMethods {
           throw new Error("AX element не принадлежит exact parent window")
         }
         const request = { element: element.elementRef }
-        const response = await this.#dispatch(session, "press_accessibility", {
-          clientRequestId: context.clientRequestId,
-          precondition: {
-            target: binding.target,
-            inventoryId: binding.inventoryId,
-            inventoryRevision: binding.inventoryRevision,
-          },
-          request,
-        }, context.signal)
+        const response = await this.methods.withViewAction(
+          session,
+          targetId,
+          context.clientRequestId,
+          "ui-action",
+          () => this.#dispatch(session, "press_accessibility", {
+            clientRequestId: context.clientRequestId,
+            precondition: {
+              target: binding.target,
+              inventoryId: binding.inventoryId,
+              inventoryRevision: binding.inventoryRevision,
+            },
+            request,
+          }, context.signal),
+        )
         const output = response.data as AxPressMethodOutput
         if (
           output.operation.context.clientRequestId !== context.clientRequestId
@@ -132,7 +167,7 @@ export class RuntimeAgentAxMethods {
     signal: AbortSignal,
   ): Promise<RuntimeMethodResponse> {
     signal.throwIfAborted()
-    const response = await this.registry.dispatch(session, name, input, signal)
+    const response = await this.registry.internal.dispatch(session, name, input, signal)
     if (response.isError) throw new Error(`Internal runtime method ${name} failed`)
     return response
   }
@@ -144,8 +179,9 @@ export function registerAgentAxMethods(
   targets: AgentTargetRegistry,
   methods: RuntimeAgentMethods,
   operations: AgentOperations = methods.operations,
+  pointer?: AgentPointClickHandler,
 ): RuntimeAgentAxMethods {
-  const ax = new RuntimeAgentAxMethods(registry, core, targets, methods, operations)
+  const ax = new RuntimeAgentAxMethods(registry, core, targets, methods, operations, pointer)
   ax.register()
   return ax
 }
