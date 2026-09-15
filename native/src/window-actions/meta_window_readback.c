@@ -15,24 +15,34 @@ void meta_window_classify_close(const MetaInventorySnapshot *snapshot,
   result->modal_or_sheet_observed = false;
   result->new_surface_ref[0] = '\0';
   result->status = META_TRANSITION_PARTIAL;
-  if (snapshot == NULL || original == NULL || !snapshot->complete || !process_matches) return;
-  bool application_matches = false;
+  if (snapshot == NULL || original == NULL || !process_matches ||
+      snapshot->application_count == 0 || snapshot->applications == NULL ||
+      (snapshot->window_count > 0 && snapshot->windows == NULL)) return;
+  const MetaApplicationRecord *application = NULL;
+  size_t application_matches = 0;
   for (size_t index = 0; index < snapshot->application_count; index += 1) {
-    const MetaApplicationRecord *application = &snapshot->applications[index];
-    if (strcmp(application->application_ref, original->application_ref) == 0 &&
-        application->pid == original->pid && application->launch_time_micros == launch_time_micros &&
-        (application->ax_status == META_AX_READY || application->ax_status == META_AX_NO_WINDOWS)) {
-      application_matches = true;
-      break;
+    const MetaApplicationRecord *candidate = &snapshot->applications[index];
+    if (strcmp(candidate->application_ref, original->application_ref) == 0 &&
+        candidate->pid == original->pid) {
+      application = candidate;
+      application_matches += 1;
     }
   }
-  if (!application_matches) return;
+  if (application_matches != 1 ||
+      application->launch_time_micros != launch_time_micros ||
+      (application->ax_status != META_AX_READY &&
+       application->ax_status != META_AX_NO_WINDOWS)) return;
   const MetaWindowRecord *actual = NULL;
+  size_t actual_matches = 0;
   for (size_t index = 0; index < snapshot->window_count; index += 1) {
     const MetaWindowRecord *candidate = &snapshot->windows[index];
     if (candidate->surface_kind == META_SURFACE_WINDOW && strcmp(candidate->window_ref, original->window_ref) == 0 &&
-        strcmp(candidate->application_ref, original->application_ref) == 0 && candidate->pid == original->pid) actual = candidate;
+        strcmp(candidate->application_ref, original->application_ref) == 0 && candidate->pid == original->pid) {
+      actual = candidate;
+      actual_matches += 1;
+    }
   }
+  if (actual_matches > 1) return;
   if (actual == NULL) {
     if (!close_dispatched) return;
     result->presence = META_WINDOW_PRESENCE_CLOSED;

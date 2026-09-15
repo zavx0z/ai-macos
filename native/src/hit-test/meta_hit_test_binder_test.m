@@ -301,6 +301,77 @@ static void test_exact_window_owner(void) {
   release_fixture(&fixture);
 }
 
+static void test_partial_unrelated_inventory_uses_domain_local_proofs(void) {
+  Fixture window;
+  prepare_fixture(&window, window_target(), true);
+  MetaApplicationRecord applications[2] = {window.application, {0}};
+  applications[1] = (MetaApplicationRecord){
+      .pid = 99,
+      .launch_time_micros = 200,
+      .ax_status = META_AX_DENIED,
+  };
+  snprintf(applications[1].application_ref,
+           sizeof(applications[1].application_ref), "%s",
+           "application-unrelated");
+  window.snapshot.complete = false;
+  window.snapshot.applications = applications;
+  window.snapshot.application_count = 2;
+  NSDictionary *result =
+      [binder(&window) handleRequest:request(window_target())];
+  assert([result[@"status"] isEqual:@"confirmed"]);
+  assert(window.window_calls == 1);
+  release_fixture(&window);
+
+  Fixture display;
+  prepare_fixture(&display, display_target(), false);
+  display.snapshot.complete = false;
+  result = [binder(&display) handleRequest:request(display_target())];
+  assert([result[@"status"] isEqual:@"confirmed"]);
+  assert(display.topology_calls == 1);
+  release_fixture(&display);
+}
+
+static void test_missing_display_owner_identity_and_ambiguous_target_reject(void) {
+  Fixture missing_display;
+  prepare_fixture(&missing_display, window_target(), true);
+  missing_display.snapshot.complete = false;
+  missing_display.snapshot.display_count = 0;
+  NSDictionary *result =
+      [binder(&missing_display) handleRequest:request(window_target())];
+  assert([result[@"status"] isEqual:@"inventory-stale"]);
+  assert(missing_display.window_calls == 0);
+  release_fixture(&missing_display);
+
+  Fixture owner_partial;
+  prepare_fixture(&owner_partial, window_target(), true);
+  owner_partial.snapshot.complete = false;
+  owner_partial.application.ax_status = META_AX_DENIED;
+  result = [binder(&owner_partial) handleRequest:request(window_target())];
+  assert([result[@"status"] isEqual:@"confirmed"]);
+  assert(owner_partial.window_calls == 1);
+  release_fixture(&owner_partial);
+
+  Fixture missing_owner;
+  prepare_fixture(&missing_owner, window_target(), true);
+  missing_owner.snapshot.complete = false;
+  missing_owner.snapshot.application_count = 0;
+  result = [binder(&missing_owner) handleRequest:request(window_target())];
+  assert([result[@"status"] isEqual:@"target-mismatch"]);
+  assert(missing_owner.window_calls == 0);
+  release_fixture(&missing_owner);
+
+  Fixture ambiguous;
+  prepare_fixture(&ambiguous, window_target(), true);
+  MetaWindowRecord windows[2] = {ambiguous.window, ambiguous.window};
+  ambiguous.snapshot.complete = false;
+  ambiguous.snapshot.windows = windows;
+  ambiguous.snapshot.window_count = 2;
+  result = [binder(&ambiguous) handleRequest:request(window_target())];
+  assert([result[@"status"] isEqual:@"target-mismatch"]);
+  assert(ambiguous.window_calls == 0);
+  release_fixture(&ambiguous);
+}
+
 static void test_explicit_display_and_layout_never_call_window_probe(void) {
   Fixture display_fixture;
   prepare_fixture(&display_fixture, display_target(), false);
@@ -470,6 +541,8 @@ static void test_post_probe_fence_and_session_revocation_emit_no_source(void) {
 int main(void) {
   @autoreleasepool {
     test_exact_window_owner();
+    test_partial_unrelated_inventory_uses_domain_local_proofs();
+    test_missing_display_owner_identity_and_ambiguous_target_reject();
     test_explicit_display_and_layout_never_call_window_probe();
     test_stale_frame_and_pending_fence_stop_early();
     test_moved_window_and_topology_change_fail();

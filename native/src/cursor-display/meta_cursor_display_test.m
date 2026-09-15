@@ -189,6 +189,34 @@ static void test_negative_origin_and_mixed_scale_use_logical_bounds(void) {
   assert(fixture.snapshotCalls == 2);
 }
 
+static void test_partial_unrelated_inventory_keeps_display_proof(void) {
+  MetaCursorDisplayFixture fixture;
+  fixture_prepare(&fixture);
+  fixture.snapshot.complete = false;
+  fixture.cursorX = -640;
+  fixture.cursorY = 512;
+  NSDictionary *result = fixture_read(&fixture);
+  assert([result[@"status"] isEqual:@"resolved"]);
+  assert([result[@"displayRef"][@"displayRef"]
+      isEqual:@"display-left"]);
+
+  MetaCursorDisplayFixture missing;
+  fixture_prepare(&missing);
+  missing.snapshot.complete = false;
+  missing.snapshot.display_count = 0;
+  result = fixture_read(&missing);
+  assert([result[@"status"] isEqual:@"unavailable"]);
+  assert(missing.cursorCalls == 0 && missing.topologyCalls == 0);
+
+  MetaCursorDisplayFixture duplicate;
+  fixture_prepare(&duplicate);
+  duplicate.snapshot.complete = false;
+  duplicate.displays[1].display_id = duplicate.displays[0].display_id;
+  result = fixture_read(&duplicate);
+  assert([result[@"status"] isEqual:@"unavailable"]);
+  assert(duplicate.cursorCalls == 0 && duplicate.topologyCalls == 0);
+}
+
 static void test_overlap_is_ambiguous(void) {
   MetaCursorDisplayFixture fixture;
   fixture_prepare(&fixture);
@@ -264,6 +292,7 @@ static void test_unavailable_sources_and_final_snapshot_fail_closed(void) {
 int main(void) {
   @autoreleasepool {
     test_negative_origin_and_mixed_scale_use_logical_bounds();
+    test_partial_unrelated_inventory_keeps_display_proof();
     test_overlap_is_ambiguous();
     test_display_gap_is_unavailable();
     test_stale_revision_and_epoch_fail_as_stale();

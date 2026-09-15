@@ -37,17 +37,44 @@ static NSDictionary *inventory_value(const MetaInventorySnapshot *snapshot,
 
 static const MetaWindowRecord *current_window(
     const MetaInventorySnapshot *snapshot,
-    const MetaWindowRecord *original) {
+    const MetaWindowRecord *original,
+    BOOL *ambiguous) {
+  const MetaWindowRecord *match = NULL;
+  *ambiguous = NO;
   for (size_t index = 0; index < snapshot->window_count; index += 1) {
     const MetaWindowRecord *candidate = &snapshot->windows[index];
     if (candidate->surface_kind == META_SURFACE_WINDOW &&
         candidate->pid == original->pid &&
         strcmp(candidate->window_ref, original->window_ref) == 0 &&
         strcmp(candidate->application_ref, original->application_ref) == 0) {
-      return candidate;
+      if (match != NULL) {
+        *ambiguous = YES;
+        return NULL;
+      }
+      match = candidate;
     }
   }
-  return NULL;
+  return match;
+}
+
+static BOOL owner_application_complete(
+    const MetaInventorySnapshot *snapshot,
+    const MetaWindowRecord *original) {
+  if (snapshot->application_count == 0 || snapshot->applications == NULL) {
+    return NO;
+  }
+  const MetaApplicationRecord *match = NULL;
+  for (size_t index = 0; index < snapshot->application_count; index += 1) {
+    const MetaApplicationRecord *candidate = &snapshot->applications[index];
+    if (candidate->pid == original->pid &&
+        strcmp(candidate->application_ref, original->application_ref) == 0) {
+      if (match != NULL) return NO;
+      match = candidate;
+    }
+  }
+  return match != NULL && match->launch_time_micros != 0 &&
+         (match->ax_status == META_AX_READY ||
+          match->ax_status == META_AX_NO_WINDOWS);
 }
 
 static NSDictionary *serialized_window(NSDictionary *inventory,
@@ -157,14 +184,17 @@ NSDictionary *meta_window_transition_value(
     return nil;
   }
 
-  const MetaWindowRecord *actual_record = current_window(snapshot, original);
+  BOOL ambiguous_window = NO;
+  const MetaWindowRecord *actual_record =
+      current_window(snapshot, original, &ambiguous_window);
   NSDictionary *actual = nil;
   NSDictionary *new_surface = nil;
   BOOL changed = NO;
   BOOL partial = NO;
   NSArray *errors = @[];
   if (transition->presence == META_WINDOW_PRESENCE_CLOSED) {
-    if (!snapshot->complete || !transition->close_succeeded ||
+    if (!owner_application_complete(snapshot, original) ||
+        ambiguous_window || !transition->close_succeeded ||
         actual_record != NULL || transition->new_surface_ref[0] != '\0') {
       return nil;
     }

@@ -2,6 +2,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 typedef struct {
@@ -34,12 +35,22 @@ typedef struct {
 } BackendFixture;
 
 typedef struct {
+  MetaApplicationRecord applications[2];
   MetaWindowRecord target;
+  MetaWindowRecord windows[2];
   MetaDisplayRecord displays[2];
   MetaInventorySnapshot snapshot;
   MetaAXTargetBorrow borrow;
   BackendFixture backend;
 } Fixture;
+
+// Продакшен-обёртка линкуется, но fixture backend её не вызывает.
+bool meta_macos_display_topology_epoch(const MetaMacOSBackend *backend,
+                                       uint64_t *epoch) {
+  (void)backend;
+  (void)epoch;
+  abort();
+}
 
 static bool clock_value(void *context, uint64_t *monotonic_millis,
                         uint64_t *unix_micros) {
@@ -162,6 +173,14 @@ static MetaDisplayRecord display(uint32_t display_id, double x,
 
 static void prepare_fixture(Fixture *fixture) {
   memset(fixture, 0, sizeof(*fixture));
+  fixture->applications[0] = (MetaApplicationRecord){
+      .pid = 42,
+      .launch_time_micros = 100,
+      .ax_status = META_AX_READY,
+  };
+  snprintf(fixture->applications[0].application_ref,
+           sizeof(fixture->applications[0].application_ref), "%s",
+           "native-1:application:1");
   fixture->target = (MetaWindowRecord){
       .pid = 42,
       .surface_kind = META_SURFACE_WINDOW,
@@ -174,6 +193,7 @@ static void prepare_fixture(Fixture *fixture) {
   snprintf(fixture->target.application_ref,
            sizeof(fixture->target.application_ref), "%s",
            "native-1:application:1");
+  fixture->windows[0] = fixture->target;
   fixture->displays[0] = display(1, 0, 1, true);
   fixture->displays[1] = display(2, 1920, 2, false);
   fixture->snapshot = (MetaInventorySnapshot){
@@ -181,7 +201,9 @@ static void prepare_fixture(Fixture *fixture) {
       .display_layout_revision = 3,
       .display_topology_epoch = 1,
       .complete = true,
-      .windows = &fixture->target,
+      .applications = fixture->applications,
+      .application_count = 1,
+      .windows = fixture->windows,
       .window_count = 1,
       .displays = fixture->displays,
       .display_count = 2,
@@ -195,6 +217,7 @@ static void prepare_fixture(Fixture *fixture) {
   fixture->borrow = (MetaAXTargetBorrow){
       .element = (AXUIElementRef)0x1,
       .target = fixture->target,
+      .launch_time_micros = 100,
       .inventory_revision = 7,
   };
   snprintf(fixture->borrow.inventory_id,
@@ -214,6 +237,68 @@ static void prepare_fixture(Fixture *fixture) {
   };
   memcpy(fixture->backend.displays, fixture->displays,
          sizeof(fixture->displays));
+}
+
+static MetaBorrowedGeometryProbe run(Fixture *fixture, bool *ok);
+static MetaTopologyProbe run_topology(Fixture *fixture, bool *ok);
+
+static void test_partial_unrelated_application_keeps_exact_proofs(void) {
+  Fixture fixture;
+  prepare_fixture(&fixture);
+  fixture.snapshot.complete = false;
+  fixture.applications[1] = (MetaApplicationRecord){
+      .pid = 99,
+      .launch_time_micros = 200,
+      .ax_status = META_AX_DENIED,
+  };
+  snprintf(fixture.applications[1].application_ref,
+           sizeof(fixture.applications[1].application_ref), "%s",
+           "native-1:application:unrelated");
+  fixture.snapshot.application_count = 2;
+  bool ok = false;
+  MetaBorrowedGeometryProbe geometry = run(&fixture, &ok);
+  assert(ok);
+  assert(geometry.frame_unchanged);
+  assert(geometry.topology_unchanged);
+
+  prepare_fixture(&fixture);
+  fixture.snapshot.complete = false;
+  MetaTopologyProbe topology = run_topology(&fixture, &ok);
+  assert(ok);
+  assert(topology.topology_unchanged);
+}
+
+static void test_owner_partial_keeps_exact_geometry_but_identity_gaps_reject(void) {
+  Fixture owner_partial;
+  prepare_fixture(&owner_partial);
+  owner_partial.snapshot.complete = false;
+  owner_partial.applications[0].ax_status = META_AX_DENIED;
+  bool ok = false;
+  MetaBorrowedGeometryProbe geometry = run(&owner_partial, &ok);
+  assert(ok);
+  assert(geometry.frame_unchanged);
+
+  Fixture missing_owner;
+  prepare_fixture(&missing_owner);
+  missing_owner.snapshot.application_count = 0;
+  run(&missing_owner, &ok);
+  assert(!ok);
+  assert(missing_owner.backend.frame_calls == 0);
+
+  Fixture stale_birth;
+  prepare_fixture(&stale_birth);
+  stale_birth.applications[0].launch_time_micros = 101;
+  run(&stale_birth, &ok);
+  assert(!ok);
+  assert(stale_birth.backend.frame_calls == 0);
+
+  Fixture ambiguous;
+  prepare_fixture(&ambiguous);
+  ambiguous.windows[1] = ambiguous.windows[0];
+  ambiguous.snapshot.window_count = 2;
+  run(&ambiguous, &ok);
+  assert(!ok);
+  assert(ambiguous.backend.frame_calls == 0);
 }
 
 static MetaBorrowedGeometryProbe run(Fixture *fixture, bool *ok) {
@@ -510,6 +595,8 @@ static void test_topology_epoch_change_rejects_same_display_metadata(void) {
 
 int main(void) {
   test_unchanged_geometry();
+  test_partial_unrelated_application_keeps_exact_proofs();
+  test_owner_partial_keeps_exact_geometry_but_identity_gaps_reject();
   test_window_move_and_resize_are_changes();
   test_topology_geometry_and_scale_changes();
   test_missing_and_different_display_count_are_changes();

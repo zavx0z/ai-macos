@@ -221,6 +221,86 @@ fi
   -Wall \
   -Wextra \
   -Werror \
+  -Inative/include \
+  -Inative/src/input-target \
+  native/src/input-target/meta_geometry_probe.m \
+  native/src/input-target/meta_geometry_probe_test.m \
+  -framework Foundation \
+  -framework AppKit \
+  -framework ApplicationServices \
+  -framework CoreGraphics \
+  -o "$CHECK_DIR/geometry-probe-test"
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
+  -Inative/src/input-target \
+  -Inative/src/cursor-display \
+  native/src/cursor-display/meta_cursor_display.m \
+  native/src/cursor-display/meta_cursor_display_test.m \
+  -framework Foundation \
+  -framework AppKit \
+  -framework ApplicationServices \
+  -framework CoreGraphics \
+  -o "$CHECK_DIR/cursor-display-test"
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
+  -Inative/src/hit-test \
+  native/src/hit-test/meta_hit_test_binder.m \
+  native/src/hit-test/meta_hit_test_binder_test.m \
+  -framework Foundation \
+  -framework AppKit \
+  -framework ApplicationServices \
+  -o "$CHECK_DIR/hit-test-binder-test"
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
+  -Inative/src/window-actions \
+  native/src/window-actions/meta_window_readback.c \
+  native/src/window-actions/meta_window_readback_test.m \
+  -framework Foundation \
+  -o "$CHECK_DIR/window-readback-test"
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
+  -Inative/src/window-actions \
+  native/src/serialization.m \
+  native/src/window-actions/meta_window_result.m \
+  native/src/window-actions/meta_window_result_test.m \
+  -framework Foundation \
+  -o "$CHECK_DIR/window-result-test"
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
   -Inative/src/permissions-request \
   native/src/permissions-request/meta_permissions_request.m \
   native/src/permissions-request/meta_permissions_request_test.m \
@@ -238,6 +318,11 @@ fi
 "$CHECK_DIR/capture-router-test"
 "$CHECK_DIR/broker-core-test"
 "$CHECK_DIR/ax-inspector-test"
+"$CHECK_DIR/geometry-probe-test"
+"$CHECK_DIR/cursor-display-test"
+"$CHECK_DIR/hit-test-binder-test"
+"$CHECK_DIR/window-readback-test"
+"$CHECK_DIR/window-result-test"
 "$CHECK_DIR/permissions-request-test"
 
 /usr/bin/clang \

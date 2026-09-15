@@ -68,6 +68,7 @@ static bool deadline_open(MetaGeometryProbeBackend backend,
 static const MetaWindowRecord *bound_target(
     const MetaAXTargetBorrow *borrow,
     const MetaInventorySnapshot *snapshot) {
+  const MetaWindowRecord *match = NULL;
   for (size_t index = 0; index < snapshot->window_count; index += 1) {
     const MetaWindowRecord *candidate = &snapshot->windows[index];
     const bool same_window =
@@ -84,16 +85,35 @@ static const MetaWindowRecord *bound_target(
         strcmp(candidate->target_ref, borrow->target.target_ref) == 0 &&
         candidate->pid == borrow->target.pid &&
         strcmp(candidate->application_ref,
-               borrow->target.application_ref) == 0 &&
-        same_rect(candidate->frame, borrow->target.frame)) {
-      return candidate;
+               borrow->target.application_ref) == 0) {
+      if (match != NULL) return NULL;
+      match = candidate;
     }
   }
-  return NULL;
+  return match != NULL && same_rect(match->frame, borrow->target.frame)
+             ? match
+             : NULL;
+}
+
+static bool bound_application_identity(
+    const MetaAXTargetBorrow *borrow,
+    const MetaInventorySnapshot *snapshot) {
+  const MetaApplicationRecord *match = NULL;
+  for (size_t index = 0; index < snapshot->application_count; index += 1) {
+    const MetaApplicationRecord *candidate = &snapshot->applications[index];
+    if (candidate->pid == borrow->target.pid &&
+        strcmp(candidate->application_ref,
+               borrow->target.application_ref) == 0) {
+      if (match != NULL) return false;
+      match = candidate;
+    }
+  }
+  return match != NULL &&
+         match->launch_time_micros == borrow->launch_time_micros;
 }
 
 static bool unique_displays(const MetaDisplayRecord *displays, size_t count) {
-  if (count > 0 && displays == NULL) return false;
+  if (count == 0 || displays == NULL) return false;
   for (size_t index = 0; index < count; index += 1) {
     if (displays[index].display_id == 0 ||
         !valid_rect(displays[index].bounds) ||
@@ -224,10 +244,12 @@ bool meta_macos_probe_borrowed_geometry_with_backend(
   if (output == NULL) return false;
   *output = (MetaBorrowedGeometryProbe){0};
   if (borrow == NULL || borrow->element == NULL || bound_snapshot == NULL ||
-      !bound_snapshot->complete || !valid_backend(backend) ||
+      borrow->launch_time_micros == 0 ||
+      !valid_backend(backend) ||
       bound_snapshot->display_count > META_GEOMETRY_PROBE_MAX_DISPLAYS ||
-      (bound_snapshot->display_count > 0 &&
-       bound_snapshot->displays == NULL) ||
+      bound_snapshot->displays == NULL ||
+      (bound_snapshot->application_count > 0 &&
+       bound_snapshot->applications == NULL) ||
       (bound_snapshot->window_count > 0 && bound_snapshot->windows == NULL) ||
       strcmp(borrow->inventory_id, bound_snapshot->inventory_id) != 0 ||
       borrow->inventory_revision != bound_snapshot->revision ||
@@ -235,6 +257,7 @@ bool meta_macos_probe_borrowed_geometry_with_backend(
              bound_snapshot->native_generation) != 0 ||
       !topology_epoch_matches(backend,
                               bound_snapshot->display_topology_epoch) ||
+      !bound_application_identity(borrow, bound_snapshot) ||
       (borrow->target.surface_kind != META_SURFACE_WINDOW &&
        borrow->target.surface_kind != META_SURFACE_SHEET)) {
     return false;
@@ -279,11 +302,9 @@ bool meta_macos_probe_topology_with_backend(
     MetaGeometryProbeBackend backend) {
   if (output == NULL) return false;
   *output = (MetaTopologyProbe){0};
-  if (bound_snapshot == NULL || !bound_snapshot->complete ||
-      !valid_topology_backend(backend) ||
+  if (bound_snapshot == NULL || !valid_topology_backend(backend) ||
       bound_snapshot->display_count > META_GEOMETRY_PROBE_MAX_DISPLAYS ||
-      (bound_snapshot->display_count > 0 &&
-       bound_snapshot->displays == NULL) ||
+      bound_snapshot->displays == NULL ||
       !unique_displays(bound_snapshot->displays,
                        bound_snapshot->display_count) ||
       !topology_epoch_matches(backend,

@@ -3,6 +3,8 @@
 #include <math.h>
 #include <string.h>
 
+#define META_HIT_TEST_MAX_DISPLAYS 64
+
 static NSDictionary *failure(NSString *status, NSString *reason) {
   return @{@"status" : status, @"reason" : reason};
 }
@@ -101,6 +103,43 @@ static BOOL same_point(double left_x, double left_y,
          fabs(left_y - right_y) <= 1e-9;
 }
 
+static BOOL valid_native_rect(MetaRect value) {
+  return isfinite(value.x) && isfinite(value.y) &&
+         isfinite(value.width) && isfinite(value.height) &&
+         value.width > 0 && value.height > 0;
+}
+
+static BOOL valid_snapshot_displays(const MetaInventorySnapshot *snapshot) {
+  if (snapshot == NULL || snapshot->display_count == 0 ||
+      snapshot->display_count > META_HIT_TEST_MAX_DISPLAYS ||
+      snapshot->displays == NULL) {
+    return NO;
+  }
+  for (size_t index = 0; index < snapshot->display_count; index += 1) {
+    const MetaDisplayRecord *display = &snapshot->displays[index];
+    if (display->display_id == 0 || display->display_ref[0] == '\0' ||
+        strnlen(display->display_ref, META_NATIVE_REF_CAPACITY) >=
+            META_NATIVE_REF_CAPACITY ||
+        !valid_native_rect(display->bounds) ||
+        !valid_native_rect(display->usable_bounds) ||
+        !isfinite(display->scale) || display->scale <= 0 ||
+        !isfinite(display->rotation_degrees) ||
+        display->rotation_degrees < 0 ||
+        display->rotation_degrees >= 360) {
+      return NO;
+    }
+    for (size_t other = index + 1; other < snapshot->display_count;
+         other += 1) {
+      if (display->display_id == snapshot->displays[other].display_id ||
+          strcmp(display->display_ref,
+                 snapshot->displays[other].display_ref) == 0) {
+        return NO;
+      }
+    }
+  }
+  return YES;
+}
+
 static const MetaDisplayRecord *snapshot_display(
     const MetaInventorySnapshot *snapshot,
     NSDictionary *display_ref,
@@ -135,8 +174,10 @@ static const MetaDisplayRecord *snapshot_display(
 static const MetaWindowRecord *snapshot_target(
     const MetaInventorySnapshot *snapshot,
     NSDictionary *target) {
+  if (snapshot->window_count > 0 && snapshot->windows == NULL) return NULL;
   NSDictionary *reference = target[@"ref"];
   NSString *kind = target[@"kind"];
+  const MetaWindowRecord *match = NULL;
   for (size_t index = 0; index < snapshot->window_count; index += 1) {
     const MetaWindowRecord *candidate = &snapshot->windows[index];
     if (candidate->pid <= 0 ||
@@ -147,17 +188,19 @@ static const MetaWindowRecord *snapshot_target(
     if ([kind isEqual:@"window"] &&
         candidate->surface_kind == META_SURFACE_WINDOW &&
         [reference[@"windowRef"] isEqual:@(candidate->window_ref)]) {
-      return candidate;
+      if (match != NULL) return NULL;
+      match = candidate;
     }
     if ([kind isEqual:@"surface"] &&
         candidate->surface_kind != META_SURFACE_WINDOW &&
         [reference[@"surfaceRef"] isEqual:@(candidate->surface_ref)] &&
         [reference[@"ownerWindowRef"]
             isEqual:@(candidate->owner_window_ref)]) {
-      return candidate;
+      if (match != NULL) return NULL;
+      match = candidate;
     }
   }
-  return NULL;
+  return match;
 }
 
 static const MetaWindowRecord *snapshot_owner_window(
@@ -165,16 +208,36 @@ static const MetaWindowRecord *snapshot_owner_window(
     NSDictionary *target,
     const MetaWindowRecord *resolved) {
   if ([target[@"kind"] isEqual:@"window"]) return resolved;
+  const MetaWindowRecord *match = NULL;
   for (size_t index = 0; index < snapshot->window_count; index += 1) {
     const MetaWindowRecord *candidate = &snapshot->windows[index];
     if (candidate->surface_kind == META_SURFACE_WINDOW &&
         candidate->pid == resolved->pid &&
         strcmp(candidate->application_ref, resolved->application_ref) == 0 &&
         strcmp(candidate->window_ref, resolved->owner_window_ref) == 0) {
-      return candidate;
+      if (match != NULL) return NULL;
+      match = candidate;
     }
   }
-  return NULL;
+  return match;
+}
+
+static BOOL snapshot_application_identity(
+    const MetaInventorySnapshot *snapshot,
+    const MetaWindowRecord *target) {
+  if (snapshot->application_count == 0 || snapshot->applications == NULL) {
+    return NO;
+  }
+  const MetaApplicationRecord *match = NULL;
+  for (size_t index = 0; index < snapshot->application_count; index += 1) {
+    const MetaApplicationRecord *candidate = &snapshot->applications[index];
+    if (candidate->pid == target->pid &&
+        strcmp(candidate->application_ref, target->application_ref) == 0) {
+      if (match != NULL) return NO;
+      match = candidate;
+    }
+  }
+  return match != NULL && match->launch_time_micros != 0;
 }
 
 static BOOL same_logical_frame(NSDictionary *value,
@@ -271,7 +334,7 @@ static BOOL same_logical_frame(NSDictionary *value,
   const MetaInventorySnapshot *snapshot = self.snapshotProvider();
   uint64_t operation_revision = 0;
   uint64_t observation_revision = 0;
-  if (snapshot == NULL || !snapshot->complete ||
+  if (snapshot == NULL ||
       !integer(operation[@"inventoryRevision"], 9007199254740991ULL,
                &operation_revision) ||
       !integer(observation_ref[@"inventoryRevision"],
@@ -282,6 +345,10 @@ static BOOL same_logical_frame(NSDictionary *value,
           isEqual:@(snapshot->native_generation)]) {
     return failure(@"inventory-stale",
                    @"Bound inventory больше не совпадает с operation");
+  }
+  if (!valid_snapshot_displays(snapshot)) {
+    return failure(@"inventory-stale",
+                   @"Bound inventory не содержит полный unique display set");
   }
 
   NSString *frame_ref = payload[@"frameRef"];
@@ -464,9 +531,10 @@ static BOOL same_logical_frame(NSDictionary *value,
 
   if (window_scope) {
     const MetaWindowRecord *resolved = snapshot_target(snapshot, target);
-    if (resolved == NULL) {
+    if (resolved == NULL ||
+        !snapshot_application_identity(snapshot, resolved)) {
       return failure(@"target-mismatch",
-                     @"Window или surface отсутствует в bound snapshot");
+                     @"Window, surface или exact AX owner неполны в bound snapshot");
     }
     NSDictionary *captured_window = geometry[@"capturedWindow"];
     if (captured_window != nil) {

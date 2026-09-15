@@ -197,6 +197,28 @@ static void test_confirmed_close_has_no_fake_window(void) {
   assert(result[@"newSurface"] == nil);
 }
 
+static void test_partial_unrelated_inventory_keeps_owner_close_proof(void) {
+  Fixture value;
+  prepare_fixture(&value);
+  value.snapshot.complete = false;
+  value.snapshot.window_count = 0;
+  value.application.ax_status = META_AX_NO_WINDOWS;
+  MetaWindowTransition input = transition(
+      &value, META_WINDOW_PRESENCE_CLOSED, META_TRANSITION_SUCCEEDED);
+  input.close_attempted = true;
+  input.close_succeeded = true;
+  NSDictionary *result = meta_window_transition_value(
+      &value.snapshot, &value.original, &input, status(), @"response:partial");
+  assert(result != nil);
+  assert([result[@"actual"][@"kind"] isEqual:@"closed"]);
+  assert([result[@"partial"] isEqual:@NO]);
+
+  value.application.ax_status = META_AX_DENIED;
+  assert(meta_window_transition_value(
+      &value.snapshot, &value.original, &input, status(),
+      @"response:owner-partial") == nil);
+}
+
 static void test_unknown_is_partial_with_reason(void) {
   Fixture value;
   prepare_fixture(&value);
@@ -272,6 +294,7 @@ int main(void) {
   @autoreleasepool {
     test_existing_state_uses_fresh_snapshot();
     test_confirmed_close_has_no_fake_window();
+    test_partial_unrelated_inventory_keeps_owner_close_proof();
     test_unknown_is_partial_with_reason();
     test_exact_owned_sheet_is_new_surface();
     test_attempt_flag_alone_does_not_claim_change();

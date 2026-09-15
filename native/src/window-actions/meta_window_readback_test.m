@@ -77,15 +77,22 @@ static void test_full_fresh_ax_absence_is_closed(void) {
   assert(result.status == META_TRANSITION_SUCCEEDED);
 }
 
-static void test_incomplete_denied_and_process_reuse_are_unknown(void) {
+static void test_partial_unrelated_is_closed_but_owner_gaps_are_unknown(void) {
   MetaWindowRecord original = window_record();
-  MetaApplicationRecord ready = application(META_AX_READY, 100);
-  MetaInventorySnapshot incomplete = snapshot(&ready, 1, NULL, 0, false);
+  MetaApplicationRecord applications[] = {
+      application(META_AX_NO_WINDOWS, 100),
+      application(META_AX_DENIED, 200),
+  };
+  applications[1].pid = 99;
+  snprintf(applications[1].application_ref,
+           sizeof(applications[1].application_ref), "%s",
+           "native-1:application:unrelated");
+  MetaInventorySnapshot incomplete = snapshot(applications, 2, NULL, 0, false);
   MetaWindowTransition result = transition();
   meta_window_classify_close(&incomplete, &original, 100, true, true, &result);
   assert(result.inventory_refreshed);
-  assert(result.presence == META_WINDOW_PRESENCE_UNKNOWN);
-  assert(!result.close_succeeded);
+  assert(result.presence == META_WINDOW_PRESENCE_CLOSED);
+  assert(result.close_succeeded);
 
   MetaApplicationRecord denied = application(META_AX_DENIED, 100);
   MetaInventorySnapshot denied_snapshot = snapshot(&denied, 1, NULL, 0, true);
@@ -104,6 +111,24 @@ static void test_incomplete_denied_and_process_reuse_are_unknown(void) {
   assert(result.presence == META_WINDOW_PRESENCE_UNKNOWN);
   meta_window_classify_close(NULL, &original, 100, true, true, &result);
   assert(!result.inventory_refreshed);
+  assert(result.presence == META_WINDOW_PRESENCE_UNKNOWN);
+
+  MetaApplicationRecord duplicate_apps[] = {
+      application(META_AX_NO_WINDOWS, 100),
+      application(META_AX_NO_WINDOWS, 100),
+  };
+  MetaInventorySnapshot ambiguous_app =
+      snapshot(duplicate_apps, 2, NULL, 0, false);
+  meta_window_classify_close(&ambiguous_app, &original, 100, true, true,
+                             &result);
+  assert(result.presence == META_WINDOW_PRESENCE_UNKNOWN);
+
+  MetaApplicationRecord ready = application(META_AX_READY, 100);
+  MetaWindowRecord duplicate_windows[] = {original, original};
+  MetaInventorySnapshot ambiguous_window =
+      snapshot(&ready, 1, duplicate_windows, 2, false);
+  meta_window_classify_close(&ambiguous_window, &original, 100, true, true,
+                             &result);
   assert(result.presence == META_WINDOW_PRESENCE_UNKNOWN);
 }
 
@@ -153,7 +178,7 @@ static void test_absence_without_dispatch_is_not_closed(void) {
 
 int main(void) {
   test_full_fresh_ax_absence_is_closed();
-  test_incomplete_denied_and_process_reuse_are_unknown();
+  test_partial_unrelated_is_closed_but_owner_gaps_are_unknown();
   test_only_exact_owner_sheet_is_reported();
   test_foreign_sheet_is_not_reported();
   test_absence_without_dispatch_is_not_closed();

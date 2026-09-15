@@ -175,9 +175,9 @@ NSDictionary *meta_cursor_display_read_with_backend(
   NSString *sourceResponseRef = [@"cursor-display-response-"
       stringByAppendingString:NSUUID.UUID.UUIDString];
   const MetaInventorySnapshot *snapshot = backend.snapshot(backend.context);
-  if (snapshot == NULL || !snapshot->complete) {
+  if (snapshot == NULL) {
     return cursor_failure(sourceResponseRef, @"unavailable",
-                          @"Current complete inventory недоступен");
+                          @"Current inventory недоступен");
   }
   if (!snapshot_matches_request(snapshot, trustedGeneration, inventoryId,
                                 inventoryRevision,
@@ -239,9 +239,9 @@ NSDictionary *meta_cursor_display_read_with_backend(
     return cursor_failure(sourceResponseRef, @"stale-inventory",
                           @"Inventory изменилась во время cursor read");
   }
-  if (!current->complete || !valid_displays(current)) {
+  if (!valid_displays(current)) {
     return cursor_failure(sourceResponseRef, @"unavailable",
-                          @"Inventory continuity стала неполной");
+                          @"Display inventory continuity стала неполной");
   }
   const MetaDisplayRecord *retainedCurrent = NULL;
   for (size_t index = 0; index < current->display_count; index += 1) {
