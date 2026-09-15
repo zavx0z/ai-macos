@@ -1,8 +1,9 @@
 import {
-  adapterResultSchema, axInspectionRequestSchema, axInspectionResultSchema,
+  adapterResultSchema, axInspectionRequestSchema, axInspectionResultSchema, axPressRequestSchema, axPressResultSchema,
   desktopInventorySnapshotSchema, opaqueIdSchema, operationRecordSchema,
-  runtimeOperationIntentSchema, windowTransitionRequestSchema, windowTransitionResultSchema, z,
-  type WindowAdapter,
+  runtimeOperationIntentSchema, windowRefSchema, windowTransitionRequestSchema, windowTransitionResultSchema, z,
+  type AdapterResult, type AxPressRequest, type AxPressResult, type NativeExecutionContext,
+  type RuntimeOperationContext, type WindowAdapter,
 } from "@meta/shared/contracts"
 import type { RuntimeCore } from "./core.ts"
 import type { MethodRegistry } from "./method-registry.ts"
@@ -16,8 +17,43 @@ const transitionOutput = z.strictObject({
   result: adapterResultSchema(windowTransitionResultSchema),
 })
 
+export const axPressMethodInputSchema = z.strictObject({
+  clientRequestId: opaqueIdSchema,
+  precondition: z.strictObject({
+    target: z.strictObject({ kind: z.literal("window"), ref: windowRefSchema }),
+    inventoryId: opaqueIdSchema,
+    inventoryRevision: z.number().int().safe().min(0),
+  }),
+  request: axPressRequestSchema,
+}).superRefine((input, context) => {
+  const window = input.precondition.target.ref
+  const element = input.request.element
+  if (
+    element.runtimeEpoch !== window.runtimeEpoch
+    || element.loginSessionId !== window.loginSessionId
+    || element.nativeGeneration !== window.nativeGeneration
+    || element.applicationRef !== window.applicationRef
+  ) {
+    context.addIssue({ code: "custom", path: ["request", "element"], message: "AX element не принадлежит exact parent window" })
+  }
+})
+
+export const axPressExecutionSchema = z.strictObject({
+  operation: operationRecordSchema,
+  result: adapterResultSchema(axPressResultSchema),
+})
+
+export type AxPressMethodOutput = z.infer<typeof axPressExecutionSchema>
+
+export type RuntimeWindowAdapter = WindowAdapter & {
+  press?(
+    context: RuntimeOperationContext<NativeExecutionContext>,
+    request: AxPressRequest,
+  ): Promise<AdapterResult<AxPressResult>>
+}
+
 /** Каталог использует точные refs из inventory; resources и fence выдаёт runtime. */
-export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCore, windows: WindowAdapter): void {
+export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCore, windows: RuntimeWindowAdapter): void {
   registry.register("list_windows", {
     title: "Окна и приложения",
     description: "Полная инвентаризация AX и CG-only окон, включая скрытые и свёрнутые. app — точное системное имя; pid различает одноимённые процессы.",
@@ -79,6 +115,33 @@ export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCor
       const result = await windows.inspect(input.request, control(context.signal))
       return axInspectionResultSchema.parse(result)
     },
+  })
+
+  if (windows.press === undefined) return
+  const press = windows.press.bind(windows)
+  registry.register("press_accessibility", {
+    title: "Выполнить AXPress",
+    description: "Выполняет semantic AXPress точного ElementRef из retained snapshot без координатного fallback.",
+    input: axPressMethodInputSchema,
+    output: axPressExecutionSchema,
+    readOnly: false,
+    destructive: true,
+    timeoutMs: 10_000,
+    requiredCapabilities: ["desktop.window.identity", "desktop.ax", "runtime.operations"],
+    async execute(context, input) {
+      const intent = runtimeOperationIntentSchema.parse({
+        intent: "mutation",
+        clientRequestId: input.clientRequestId,
+        precondition: input.precondition,
+        deadlineAt: new Date(Date.now() + 8_000).toISOString(),
+        requestedResources: [{ kind: "desktop-input", resourceRef: "desktop" }],
+      })
+      return core.runOperation(context.session, intent, input.request, (operation, request) => {
+        if (operation.wire.kind !== "native") throw new Error("AXPress требует native context")
+        return press({ ...operation, wire: operation.wire }, request)
+      }, context.signal)
+    },
+    isError: output => !output.result.ok,
   })
 }
 

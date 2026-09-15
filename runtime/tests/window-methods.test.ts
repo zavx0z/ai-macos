@@ -1,9 +1,9 @@
 import { expect, test } from "bun:test"
 import { NativeBrokerAdapter } from "@meta/native/adapter"
-import { CAPABILITY_IDS, type WindowAdapter, type RuntimeResourceHandle } from "@meta/shared/contracts"
+import { CAPABILITY_IDS, type RuntimeResourceHandle } from "@meta/shared/contracts"
 import { RuntimeCore } from "../src/core.ts"
 import { MethodRegistry } from "../src/method-registry.ts"
-import { registerWindowMethods } from "../src/window-methods.ts"
+import { registerWindowMethods, type RuntimeWindowAdapter } from "../src/window-methods.ts"
 
 const generation = { runtimeEpoch: "runtime:window-methods", loginSessionId: "login:window-methods", nativeGeneration: "native:window-methods" }
 const target = { ...generation, applicationRef: "app:1", windowRef: "window:1" }
@@ -22,8 +22,9 @@ function fixture() {
   core.targets.register({ kind: "window", ref: target }, "inventory:1", 1, "resolution:1", "proof:identity", 1)
   let calls = 0
   let inspected = 0
+  let presses = 0
   let resources: readonly RuntimeResourceHandle[] = []
-  const windows: WindowAdapter = {
+  const windows: RuntimeWindowAdapter = {
     host: native.host, services: core.services, capabilities: [],
     async inventory() {
       const now = new Date().toISOString()
@@ -39,11 +40,13 @@ function fixture() {
     async transition(context) { calls++; resources = context.resources; throw new Error("Ответ после возможного dispatch потерян") },
     async inspect(request) { inspected++; return { target: request.target, snapshotId: "snapshot:1", complete: true,
       nodes: [], nodeCount: 0, encodedBytes: 2, errors: [] } },
+    async press(context) { presses++; resources = context.resources; throw new Error("Ответ AXPress потерян") },
   }
   const registry = new MethodRegistry(core)
   registerWindowMethods(registry, core, windows)
   const session = core.openClient("principal:fixture").session
-  return { core, registry, session, calls: () => calls, inspected: () => inspected, resources: () => resources }
+  return { core, registry, session, calls: () => calls, inspected: () => inspected,
+    presses: () => presses, resources: () => resources }
 }
 
 test("фильтр PID различает два одноимённых Chrome без подмены окна", async () => {
@@ -76,4 +79,33 @@ test("stale AX inventory и чужой target не доходят до backend",
   expect(f.inspected()).toBe(0)
   const result = await f.registry.dispatch(f.session, "inspect_accessibility", input, new AbortController().signal)
   expect(result.data.snapshotId).toBe("snapshot:1")
+})
+
+test("AXPress связывает retained element с exact parent и сохраняет unknown operation без replay", async () => {
+  const f = fixture()
+  const element = { ...generation, applicationRef: target.applicationRef,
+    snapshotId: "snapshot:1", elementRef: "element:save" }
+  const input = {
+    clientRequestId: "request:ax-press",
+    precondition: { target: { kind: "window", ref: target }, inventoryId: "inventory:1", inventoryRevision: 1 },
+    request: { element },
+  } as const
+  await expect(f.registry.dispatch(f.session, "press_accessibility", {
+    ...input,
+    request: { element: { ...element, applicationRef: "app:other" } },
+  }, new AbortController().signal)).rejects.toThrow("exact parent window")
+  await expect(f.registry.dispatch(f.session, "press_accessibility", {
+    ...input,
+    precondition: { ...input.precondition, inventoryRevision: 0 },
+  }, new AbortController().signal)).rejects.toThrow("stale")
+  const first = await f.registry.dispatch(f.session, "press_accessibility", input, new AbortController().signal)
+  const repeated = await f.registry.dispatch(f.session, "press_accessibility", input, new AbortController().signal)
+  expect(first).toMatchObject({ isError: true, data: { operation: {
+    state: "interrupted-unknown",
+    context: { target: { kind: "window", ref: target } },
+    outcome: { cleanup: { state: "unknown" } },
+  } } })
+  expect(repeated.data).toEqual(first.data)
+  expect(f.presses()).toBe(1)
+  expect(f.resources()).toMatchObject([{ kind: "desktop-input", resourceRef: "desktop" }])
 })
