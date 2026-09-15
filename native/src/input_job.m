@@ -1,11 +1,20 @@
 #include "meta_input_job.h"
 #include <stdatomic.h>
+#include <time.h>
+
+static uint64_t job_millis(void) {
+  struct timespec now = {0};
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
 
 @implementation MetaInputJob {
   NSDictionary *_operation;
   NSString *_requestId;
   MetaInputJobEmitter _emitter;
   atomic_bool _cancel;
+  atomic_bool _heartbeatExpired;
+  atomic_uint_fast64_t _lastHeartbeat;
   NSCondition *_condition;
   NSString *_awaitedLedger;
   NSDictionary *_ledgerAck;
@@ -20,12 +29,37 @@
     _emitter = [emitter copy];
     _condition = [[NSCondition alloc] init];
     atomic_init(&_cancel, false);
+    atomic_init(&_heartbeatExpired, false);
+    atomic_init(&_lastHeartbeat, job_millis());
   }
   return self;
 }
 - (NSDictionary *)operation { return _operation; }
 - (NSString *)requestId { return _requestId; }
-- (BOOL)cancelRequested { return atomic_load(&_cancel); }
+- (BOOL)heartbeatExpired {
+  [_condition lock];
+  uint64_t last = atomic_load(&_lastHeartbeat), now = job_millis();
+  if (now < last || now - last >= 1000) {
+    atomic_store(&_heartbeatExpired, true);
+    atomic_store(&_cancel, true);
+  }
+  BOOL expired = atomic_load(&_heartbeatExpired);
+  [_condition unlock];
+  return expired;
+}
+- (BOOL)cancelRequested { return [self heartbeatExpired] || atomic_load(&_cancel); }
+- (BOOL)noteHeartbeat {
+  [_condition lock];
+  uint64_t last = atomic_load(&_lastHeartbeat), now = job_millis();
+  if (now < last || now - last >= 1000) {
+    atomic_store(&_heartbeatExpired, true);
+    atomic_store(&_cancel, true);
+  }
+  BOOL accepted = !atomic_load(&_heartbeatExpired);
+  if (accepted) atomic_store(&_lastHeartbeat, now);
+  [_condition unlock];
+  return accepted;
+}
 - (void)requestCancel {
   atomic_store(&_cancel, true);
   [_condition lock];

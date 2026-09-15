@@ -2,12 +2,15 @@
 #include "meta_input_bridge.h"
 #include <time.h>
 #include <unistd.h>
+#include <math.h>
 
 @interface MetaInputExecutor ()
 - (BOOL)verify:(const char *)target;
 - (BOOL)cancelled;
 - (BOOL)persist:(const MetaLedgerPersistenceRequest *)request ack:(MetaLedgerPersistenceAck *)ack;
 - (MetaExecutorBackend)sink;
+- (BOOL)postPointer:(const MetaPointerEvent *)event tag:(uint64_t)tag;
+- (BOOL)postScroll:(const MetaScrollEvent *)event tag:(uint64_t)tag;
 @end
 
 static uint64_t clock_now(void *context) {
@@ -42,6 +45,14 @@ static bool flags(void *context, uint64_t value) {
   return sink.set_event_flags != NULL && sink.set_event_flags(sink.context, value);
 }
 static bool wait_bool(void *context, uint64_t until) { return wait_until(context, until); }
+static bool pointer(void *context, const MetaPointerEvent *event, uint64_t tag) { return [(__bridge MetaInputExecutor *)context postPointer:event tag:tag]; }
+static bool scroll(void *context, const MetaScrollEvent *event, uint64_t tag) { return [(__bridge MetaInputExecutor *)context postScroll:event tag:tag]; }
+static bool number(id value) { return [value isKindOfClass:NSNumber.class] && isfinite([value doubleValue]); }
+static bool point_value(id value, double *x, double *y) {
+  if (![value isKindOfClass:NSDictionary.class] || !number(value[@"x"]) || !number(value[@"y"])) return false;
+  *x = [value[@"x"] doubleValue]; *y = [value[@"y"] doubleValue];
+  return true;
+}
 static bool dispatch_external(void *context) {
   BOOL (^action)(void) = (__bridge BOOL (^)(void))context;
   return action();
@@ -52,6 +63,10 @@ static bool dispatch_external(void *context) {
   MetaExecutorBackend _sink;
   BOOL (^_verify)(NSString *);
   BOOL (^_externalVerify)(NSString *);
+  BOOL (^_pointVerify)(NSString *, double, double);
+  BOOL _hasPoint;
+  double _pointX;
+  double _pointY;
   MetaInputJob *_job;
 }
 - (instancetype)initWithGeneration:(NSString *)generation sink:(MetaExecutorBackend)sink verify:(BOOL (^)(NSString *))targetVerify {
@@ -60,7 +75,8 @@ static bool dispatch_external(void *context) {
     _sink = sink;
     _verify = [targetVerify copy];
     MetaExecutorBackend backend = {.context = (__bridge void *)self, .monotonic_millis = clock_now, .verify_target = verify,
-      .persist_ledger = persist, .post_held_event = post, .post_text_cluster = text, .set_event_flags = flags, .should_cancel = cancelled};
+      .persist_ledger = persist, .post_held_event = post, .post_text_cluster = text, .set_event_flags = flags,
+      .post_pointer_event = pointer, .post_scroll_event = scroll, .should_cancel = cancelled};
     _executor = meta_executor_create(generation.UTF8String, 1000, backend);
     if (_executor == NULL) return nil;
   }
@@ -71,7 +87,20 @@ static bool dispatch_external(void *context) {
 - (BOOL)cancelled { return [_job cancelRequested]; }
 - (BOOL)verify:(const char *)target {
   [_job publishStatus:meta_executor_status(_executor)];
-  return _externalVerify != nil ? _externalVerify(@(target)) : _verify(@(target));
+  if (_externalVerify != nil) return _externalVerify(@(target));
+  return _verify(@(target)) && (!_hasPoint || (_pointVerify != nil && _pointVerify(@(target), _pointX, _pointY)));
+}
+- (void)setPointVerifier:(BOOL (^)(NSString *, double, double))verify { _pointVerify = [verify copy]; }
+- (BOOL)postPointer:(const MetaPointerEvent *)event tag:(uint64_t)tag {
+  NSString *target = _job.operation[@"target"][@"ref"][@"windowRef"] ?: _job.operation[@"target"][@"ref"][@"surfaceRef"];
+  if (event == NULL || _pointVerify == nil || !_pointVerify(target, event->x, event->y) || [self cancelled] || _sink.post_pointer_event == NULL) return NO;
+  _hasPoint = YES; _pointX = event->x; _pointY = event->y;
+  return _sink.post_pointer_event(_sink.context, event, tag);
+}
+- (BOOL)postScroll:(const MetaScrollEvent *)event tag:(uint64_t)tag {
+  NSString *target = _job.operation[@"target"][@"ref"][@"windowRef"] ?: _job.operation[@"target"][@"ref"][@"surfaceRef"];
+  if (event == NULL || _pointVerify == nil || !_pointVerify(target, event->x, event->y) || [self cancelled] || _sink.post_scroll_event == NULL) return NO;
+  return _sink.post_scroll_event(_sink.context, event, tag);
 }
 - (BOOL)persist:(const MetaLedgerPersistenceRequest *)request ack:(MetaLedgerPersistenceAck *)ack {
   [_job publishStatus:meta_executor_status(_executor)];
@@ -127,6 +156,7 @@ static bool dispatch_external(void *context) {
 
 - (NSDictionary *)execute:(NSDictionary *)request job:(MetaInputJob *)job {
   _job = job;
+  _hasPoint = NO;
   NSDictionary *operation = job.operation;
   NSDictionary *fence = operation[@"fence"];
   NSDictionary *action = request[@"payload"][@"action"];
@@ -136,6 +166,21 @@ static bool dispatch_external(void *context) {
   NSString *names[] = {@"runtimeEpoch", @"loginSessionId", @"nativeGeneration"};
   char *destinations[] = {token.runtime_epoch, token.login_session_id, token.native_generation};
   BOOL valid = [fence isKindOfClass:NSDictionary.class] && [action isKindOfClass:NSDictionary.class] && [target isKindOfClass:NSString.class];
+  BOOL pointerAction = [@[@"hover", @"click", @"scroll", @"drag"] containsObject:action[@"kind"]];
+  if (pointerAction) {
+    NSDictionary *observation = operation[@"observationRef"];
+    valid = valid && [observation isKindOfClass:NSDictionary.class] &&
+        [observation[@"inventoryRevision"] isEqual:operation[@"inventoryRevision"]] &&
+        [observation[@"observationId"] isKindOfClass:NSString.class] && [observation[@"observationId"] length] > 0 &&
+        [observation[@"proofRef"] isKindOfClass:NSString.class] && [observation[@"proofRef"] length] > 0;
+    id initialPoint = [action[@"kind"] isEqual:@"scroll"] ? action[@"anchor"] : action[@"point"];
+    if ([action[@"kind"] isEqual:@"drag"]) {
+      NSArray *trajectory = action[@"trajectory"];
+      initialPoint = [trajectory isKindOfClass:NSArray.class] && trajectory.count > 0 && [trajectory[0] isKindOfClass:NSDictionary.class] ? trajectory[0][@"point"] : nil;
+    }
+    valid = valid && point_value(initialPoint, &_pointX, &_pointY);
+    _hasPoint = valid;
+  }
   valid = valid && [@[@"window", @"surface"] containsObject:operation[@"target"][@"kind"]] &&
       [ref[@"runtimeEpoch"] isEqual:operation[@"runtimeEpoch"]] &&
       [ref[@"loginSessionId"] isEqual:operation[@"loginSessionId"]] &&
@@ -176,6 +221,50 @@ static bool dispatch_external(void *context) {
     if ([code isKindOfClass:NSNumber.class] && code.longLongValue >= 0 && code.longLongValue <= UINT16_MAX && [modifiers isKindOfClass:NSNumber.class]) {
       finished = meta_input_execute_key(_executor, code.unsignedIntValue, modifiers.unsignedLongLongValue);
       completed = finished ? 1 : 0;
+    }
+  } else if (began && pointerAction) {
+    NSDictionary *modifiers = action[@"modifiers"];
+    NSNumber *modifierFlags = [modifiers isKindOfClass:NSDictionary.class] ? modifiers[@"flags"] : nil;
+    BOOL parsed = number(modifierFlags) && modifierFlags.doubleValue == modifierFlags.longLongValue && modifierFlags.longLongValue >= 0;
+    uint64_t pointerFlags = modifierFlags.unsignedLongLongValue;
+    MetaPointerButton button = META_POINTER_LEFT;
+    if ([action[@"button"] isEqual:@"right"]) button = META_POINTER_RIGHT;
+    else if ([action[@"button"] isEqual:@"middle"]) button = META_POINTER_MIDDLE;
+    else if (action[@"button"] != nil && ![action[@"button"] isEqual:@"left"]) parsed = NO;
+    if (parsed && [action[@"kind"] isEqual:@"hover"]) {
+      finished = meta_input_execute_hover(_executor, _pointX, _pointY, pointerFlags);
+      completed = finished ? 1 : 0;
+    } else if (parsed && [action[@"kind"] isEqual:@"click"]) {
+      NSNumber *count = action[@"count"];
+      if (number(count) && count.doubleValue == count.longLongValue && count.longLongValue >= 1 && count.longLongValue <= 3) {
+        finished = meta_input_execute_click(_executor, _pointX, _pointY, button, count.unsignedIntValue, pointerFlags);
+        completed = finished ? 1 : 0;
+      }
+    } else if (parsed && [action[@"kind"] isEqual:@"scroll"]) {
+      if (number(action[@"dx"]) && number(action[@"dy"]) && [@[@"line", @"pixel"] containsObject:action[@"unit"]]) {
+        MetaScrollEvent event = {_pointX, _pointY, [action[@"dx"] doubleValue], [action[@"dy"] doubleValue],
+          [action[@"unit"] isEqual:@"pixel"] ? META_SCROLL_PIXEL : META_SCROLL_LINE, pointerFlags};
+        finished = meta_input_execute_scroll(_executor, event);
+        completed = finished ? 1 : 0;
+      }
+    } else if (parsed && [action[@"kind"] isEqual:@"drag"]) {
+      NSArray *points = action[@"trajectory"];
+      if ([points isKindOfClass:NSArray.class] && points.count >= 2 && points.count <= 512) {
+        total = points.count;
+        MetaTimedPointerPoint trajectory[512] = {0};
+        for (size_t index = 0; parsed && index < total; index += 1) {
+          NSDictionary *entry = points[index];
+          if (![entry isKindOfClass:NSDictionary.class] || !point_value(entry[@"point"], &trajectory[index].x, &trajectory[index].y) ||
+              !number(entry[@"atMs"]) || [entry[@"atMs"] doubleValue] != [entry[@"atMs"] longLongValue] ||
+              [entry[@"atMs"] longLongValue] < 0 || [entry[@"atMs"] longLongValue] > 5000) { parsed = NO; break; }
+          trajectory[index].offset_millis = [entry[@"atMs"] unsignedLongLongValue];
+        }
+        NSNumber *duration = action[@"durationMs"];
+        parsed = parsed && number(duration) && duration.doubleValue == duration.longLongValue && duration.longLongValue > 0 && duration.longLongValue <= 5000 &&
+            trajectory[total - 1].offset_millis == duration.unsignedLongLongValue;
+        MetaInputBridgeClock clock = {.context = (__bridge void *)self, .monotonic_millis = clock_now, .wait_until = wait_bool};
+        if (parsed) finished = meta_input_execute_drag(_executor, trajectory, total, button, pointerFlags, deadline, clock, &completed);
+      }
     }
   } else if (began && [action[@"kind"] isEqual:@"shortcut"]) {
     NSArray *strokes = action[@"strokes"];

@@ -12,6 +12,8 @@ static bool fixtureText(void *context, const uint16_t *text, size_t length, uint
   (void)context; (void)text; (void)length; (void)tag; return true;
 }
 static bool fixtureFlags(void *context, uint64_t flags) { (void)context; (void)flags; return true; }
+static bool fixturePointer(void *context, const MetaPointerEvent *event, uint64_t tag) { (void)context; (void)event; (void)tag; return true; }
+static bool fixtureScroll(void *context, const MetaScrollEvent *event, uint64_t tag) { (void)context; (void)event; (void)tag; return true; }
 @implementation FixtureCommandBackend {
   MetaInputExecutor *_input;
   NSString *_clipboardValue;
@@ -26,9 +28,13 @@ static bool fixtureFlags(void *context, uint64_t flags) { (void)context; (void)f
   if (self) {
     _clipboardValue = @"";
     _clipboardVersion = 7;
-    MetaExecutorBackend sink = {.post_held_event = fixturePost, .post_text_cluster = fixtureText, .set_event_flags = fixtureFlags};
+    MetaExecutorBackend sink = {.post_held_event = fixturePost, .post_text_cluster = fixtureText, .set_event_flags = fixtureFlags,
+      .post_pointer_event = fixturePointer, .post_scroll_event = fixtureScroll};
     _input = [[MetaInputExecutor alloc] initWithGeneration:@"native-command-fixture" sink:sink verify:^BOOL(NSString *target) {
       return [target isEqual:focusedSheet ? @"sheet-fixture" : @"window-fixture"];
+    }];
+    [_input setPointVerifier:^BOOL(NSString *target, double x, double y) {
+      return [target isEqual:focusedSheet ? @"sheet-fixture" : @"window-fixture"] && x >= 0 && x <= 100 && y >= 0 && y <= 100;
     }];
   }
   return self;

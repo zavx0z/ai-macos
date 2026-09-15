@@ -170,6 +170,33 @@ test("shortcut проводит последовательность через 
   } finally { await adapter.close() }
 })
 
+test.each([false, true])("job heartbeat watchdog: keepalive=%s", async keepalive => {
+  const adapter = createAdapter()
+  try {
+    await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "handshake", runtimeEpoch: "runtime", loginSessionId: "login",
+      runtimeBuildId: "runtime-build", expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" })
+    const request = inputRequest({ kind: "text", utf16Units: 2,
+      clusters: [{ text: "A", utf16Units: 1, atMs: 0 }, { text: "B", utf16Units: 1, atMs: 1400 }] })
+    const control = { signal: new AbortController().signal, checkpoint: () => undefined }
+    const running = adapter.request(nativeInputExecutionRequestSchema, request, nativeInputExecutionResponseSchema, control)
+    if (keepalive) {
+      for (let index = 0; index < 6; index += 1) {
+        await Bun.sleep(200)
+        const heartbeat = await adapter.heartbeat({ requestId: `keepalive-${index}`, ...adapter.generation!, deadlineAt: request.deadlineAt }, control)
+        expect(heartbeat.accepted).toBe(true)
+      }
+    }
+    const result = await running
+    expect(result.ok).toBe(keepalive)
+    if (!result.ok) {
+      expect(result.nativeStatus?.execution).toBe("cancelled")
+      expect(result.nativeStatus?.dispatchAttempts).toBe(1)
+      const late = await adapter.heartbeat({ requestId: "late-heartbeat", ...adapter.generation!, deadlineAt: request.deadlineAt }, control)
+      expect(late.accepted).toBe(false)
+    }
+  } finally { await adapter.close() }
+})
+
 test("ledger ACK wait не блокирует control heartbeat и cancel до event post", async () => {
   let releaseAck!: () => void
   let notifyPending!: () => void

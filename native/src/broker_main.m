@@ -12,6 +12,7 @@
 #include "code-identity/meta_code_identity.h"
 #include "window-actions/meta_window_actions.h"
 #include "window-actions/meta_window_result.h"
+#include "input-target/meta_point_target.h"
 #include <time.h>
 #include <math.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -52,6 +53,12 @@ static bool verify_window_borrow(void *context, const MetaAXTargetBorrow *borrow
       strcmp(original->window_ref, borrow->target.window_ref) == 0;
 }
 
+typedef struct { double x; double y; } MetaPointCheck;
+static bool verify_point_borrow(void *context, const MetaAXTargetBorrow *borrow) {
+  const MetaPointCheck *point = context;
+  return meta_point_matches_borrow(borrow, point->x, point->y);
+}
+
 @implementation MetaSystemCommandBackend {
   MetaMacOSBackend *_windows;
   MetaCaptureRouter *_captures;
@@ -67,10 +74,18 @@ static bool verify_window_borrow(void *context, const MetaAXTargetBorrow *borrow
     _captures = meta_capture_router_create(generation.UTF8String, meta_capture_router_default_backend());
     _input = meta_macos_input_create();
     MetaExecutorBackend sink = {.context = _input, .post_held_event = meta_macos_input_post_held,
-      .post_text_cluster = meta_macos_input_post_text, .set_event_flags = meta_macos_input_set_flags};
+      .post_text_cluster = meta_macos_input_post_text, .set_event_flags = meta_macos_input_set_flags,
+      .post_pointer_event = meta_macos_input_post_pointer, .post_scroll_event = meta_macos_input_post_scroll};
     MetaMacOSBackend *windows = _windows;
     _inputExecutor = [[MetaInputExecutor alloc] initWithGeneration:generation sink:sink verify:^BOOL(NSString *target) {
       return meta_macos_input_preflight() && meta_macos_target_is_focused(windows, target.UTF8String);
+    }];
+    [_inputExecutor setPointVerifier:^BOOL(NSString *target, double x, double y) {
+      const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(windows);
+      if (snapshot == NULL) return NO;
+      MetaPointCheck point = {x, y};
+      return meta_macos_with_ax_target(windows, target.UTF8String, snapshot->inventory_id, snapshot->revision,
+          snapshot->native_generation, verify_point_borrow, &point) == META_AX_BORROW_OK;
     }];
     if (_windows == NULL || _captures == NULL) return nil;
   }
@@ -228,6 +243,7 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
   NSDictionary *operation = job.operation;
   if (snapshot == NULL || ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
       [operation[@"inventoryRevision"] unsignedLongLongValue] != snapshot->revision) return nil;
+  if (operation[@"observationRef"] != nil && [operation[@"observationRef"][@"displayLayoutRevision"] unsignedLongLongValue] != snapshot->display_layout_revision) return nil;
   return [_inputExecutor execute:request job:job];
 }
 

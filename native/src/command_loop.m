@@ -74,6 +74,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   dispatch_queue_t _control;
   dispatch_queue_t _actions;
   NSMutableSet<NSString *> *_requestIds;
+  NSMutableDictionary<NSString *, NSNumber *> *_heartbeatIds;
   BOOL _admitted;
   BOOL _sealed;
   BOOL _busy;
@@ -95,6 +96,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     _control = control;
     _actions = dispatch_queue_create("meta.native.actions", DISPATCH_QUEUE_SERIAL);
     _requestIds = [NSMutableSet set];
+    _heartbeatIds = [NSMutableDictionary dictionary];
     _startedAt = timestamp();
     _nonce = NSUUID.UUID.UUIDString;
     atomic_init(&_exitCode, -1);
@@ -135,9 +137,16 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     [_job deliverLedgerAck:payload];
     return;
   }
-  if (!identifier(requestId, 127) || [_requestIds containsObject:requestId]) { [self shutdown:65]; return; }
-  if (_requestIds.count >= 10128 || (_requestIds.count >= 10000 && ![channel isEqual:@"drain"])) { [self shutdown:75]; return; }
-  [_requestIds addObject:requestId];
+  double now = NSProcessInfo.processInfo.systemUptime;
+  for (NSString *key in _heartbeatIds.allKeys) if ([_heartbeatIds[key] doubleValue] <= now) [_heartbeatIds removeObjectForKey:key];
+  if (!identifier(requestId, 127) || [_requestIds containsObject:requestId] || _heartbeatIds[requestId] != nil) { [self shutdown:65]; return; }
+  if ([channel isEqual:@"heartbeat"]) {
+    if (_heartbeatIds.count >= 128) { [self shutdown:75]; return; }
+    _heartbeatIds[requestId] = @(now + 5);
+  } else {
+    if (_requestIds.count >= 10128 || (_requestIds.count >= 10000 && ![channel isEqual:@"drain"])) { [self shutdown:75]; return; }
+    [_requestIds addObject:requestId];
+  }
   if ([channel isEqual:@"handshake"]) {
     if (_runtimeEpoch != nil || !identifier(payload[@"runtimeEpoch"], 64) || !identifier(payload[@"loginSessionId"], 64)) { [self shutdown:65]; return; }
     _runtimeEpoch = payload[@"runtimeEpoch"];
@@ -200,8 +209,11 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     return;
   }
   if ([channel isEqual:@"heartbeat"]) {
+    BOOL activeJob = _busy && _activeOperation != nil && [_activeOperation isEqual:_job.operation[@"operationId"]];
+    if (activeJob && ![_job noteHeartbeat]) _sealed = YES;
+    BOOL quarantined = [[_job statusForRequest:requestId][@"quarantined"] boolValue];
     NSMutableDictionary *ack = [identity mutableCopy];
-    [ack addEntriesFromDictionary:@{@"accepted": _sealed ? @NO : @YES, @"acknowledgedAt": timestamp(), @"quarantined": @NO}];
+    [ack addEntriesFromDictionary:@{@"accepted": _sealed || quarantined ? @NO : @YES, @"acknowledgedAt": timestamp(), @"quarantined": quarantined ? @YES : @NO}];
     [self send:channel payload:ack];
     return;
   }
@@ -283,6 +295,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
             inspection ? [self->_backend inspect:payload] : [self->_backend inventory];
       }
       dispatch_async(self->_control, ^{
+        if ((input || window) && [job heartbeatExpired]) self->_sealed = YES;
         self->_busy = NO;
         self->_activeOperation = nil;
         if (self->_requestedExit >= 0) { atomic_store(&self->_exitCode, self->_requestedExit); return; }

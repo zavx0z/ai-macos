@@ -7,6 +7,7 @@
                               sink:(MetaExecutorBackend)sink
                             verify:(BOOL (^)(NSString *target))verify;
 - (NSDictionary *)execute:(NSDictionary *)request job:(MetaInputJob *)job;
+- (void)setPointVerifier:(BOOL (^)(NSString *target, double x, double y))verify;
 // Общий native mutation gate использует тот же executor/fence, что и input.
 // verify проверяет точный target либо подтверждённое postcondition после action.
 - (NSDictionary *)executeExternal:(NSDictionary *)request

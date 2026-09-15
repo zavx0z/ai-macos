@@ -38,6 +38,7 @@ mkdir -p "$(dirname -- "$CANDIDATE_OUTPUT")"
   native/src/window-actions/meta_window_actions.c native/src/window-actions/meta_window_actions_macos.m \
   native/src/window-actions/meta_window_result.m \
   native/src/code-identity/meta_code_identity.m \
+  native/src/input-target/meta_point_target.m \
   -framework Foundation -framework AppKit -framework ApplicationServices \
   -framework CoreGraphics -framework CoreImage -framework CoreMedia \
   -framework CoreVideo -framework ImageIO -framework ScreenCaptureKit \

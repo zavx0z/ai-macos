@@ -10,6 +10,8 @@ typedef BOOL (^MetaInputJobEmitter)(NSDictionary *frame);
 @property(nonatomic, readonly) NSString *requestId;
 - (instancetype)initWithRequest:(NSDictionary *)request emitter:(MetaInputJobEmitter)emitter;
 - (BOOL)cancelRequested;
+- (BOOL)noteHeartbeat;
+- (BOOL)heartbeatExpired;
 - (void)requestCancel;
 - (BOOL)deliverLedgerAck:(NSDictionary *)ack;
 - (BOOL)persistLedger:(const MetaLedgerPersistenceRequest *)request ack:(MetaLedgerPersistenceAck *)ack;
