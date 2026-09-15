@@ -245,8 +245,24 @@ export const nativeAxInspectionResultSchema = z.strictObject({
     role: z.string().max(128),
     subrole: z.string().max(128),
     title: z.string().max(4_096),
+    identifier: z.string().max(4_096).optional(),
+    description: z.string().max(4_096).optional(),
+    value: z.union([
+      z.string().max(4_096),
+      z.number().finite(),
+      z.boolean(),
+    ]).optional(),
+    valueRedacted: z.literal(true).optional(),
     frame: nativeRectSchema.optional(),
     actions: z.array(z.string().min(1).max(128)).max(64),
+  }).superRefine((node, context) => {
+    if (node.valueRedacted && node.value !== undefined) {
+      context.addIssue({
+        code: "custom",
+        path: ["value"],
+        message: "Redacted AX value не публикуется вместе с value",
+      })
+    }
   })).max(1_500),
   errors: z.array(z.string().min(1).max(2_048)).max(128),
 })
@@ -688,7 +704,28 @@ export const nativeCaptureStartRequestSchema = createNativeMutationRequestEnvelo
   "capture.start",
   nativeCaptureStartPayloadSchema,
 )
-export const nativeCaptureStartResponseSchema = createNativeResponseEnvelopeSchema(nativeCaptureStartResultSchema)
+export const nativeCaptureStartResponseSchema = z.discriminatedUnion("ok", [
+  nativeResponseBaseSchema.extend({
+    ok: z.literal(true),
+    result: nativeCaptureStartResultSchema,
+  }).strict(),
+  nativeResponseBaseSchema.extend({
+    ok: z.literal(false),
+    error: contractErrorSchema,
+    nativeStatus: nativeOperationStatusSchema.optional(),
+  }).strict(),
+]).superRefine((response, context) => {
+  if (!response.ok && response.nativeStatus !== undefined && (
+    response.operationId === undefined
+    || response.nativeStatus.requestId !== response.requestId
+    || response.nativeStatus.operationId !== response.operationId
+    || response.nativeStatus.runtimeEpoch !== response.runtimeEpoch
+    || response.nativeStatus.loginSessionId !== response.loginSessionId
+    || response.nativeStatus.nativeGeneration !== response.nativeGeneration
+  )) {
+    context.addIssue({ code: "custom", path: ["nativeStatus"], message: "Capture start failure status относится к другой operation" })
+  }
+})
 export const nativeCaptureExecutionRequestSchema = nativeCaptureStartRequestSchema
 export const nativeCaptureExecutionResponseSchema = nativeCaptureStartResponseSchema
 

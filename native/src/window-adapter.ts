@@ -224,6 +224,10 @@ export class NativeWindowAdapter implements WindowAdapter {
           role: node.role,
           subrole: node.subrole,
           title: node.title,
+          ...(node.identifier === undefined ? {} : { identifier: node.identifier }),
+          ...(node.description === undefined ? {} : { description: node.description }),
+          ...(node.value === undefined ? {} : { value: node.value }),
+          ...(node.valueRedacted === undefined ? {} : { valueRedacted: node.valueRedacted }),
           ...(node.frame === undefined ? {} : { frame: node.frame }),
           actions: [...node.actions],
         }

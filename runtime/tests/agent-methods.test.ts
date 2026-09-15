@@ -23,6 +23,7 @@ import {
   windowTransitionResultSchema,
   windowRecordSchema,
   z,
+  type AxInspectionResult,
   type BrowserInstanceRecord,
   type BrowserOperationRequest,
   type NativeAdapter,
@@ -33,7 +34,7 @@ import {
   type WindowRecord,
 } from "@meta/shared/contracts"
 import { AgentTargetRegistry } from "../src/agent-targets.ts"
-import { registerAgentMethods } from "../src/agent-methods.ts"
+import { agentObservedStateSchema, registerAgentMethods } from "../src/agent-methods.ts"
 import { captureDesktopMethodInputSchema, captureExecutionSchema, captureWindowMethodInputSchema } from "../src/capture-methods.ts"
 import { RuntimeCore } from "../src/core.ts"
 import { MethodRegistry } from "../src/method-registry.ts"
@@ -297,6 +298,44 @@ test("show_window делает exact show/focus, refresh и возвращает
   expect(new Set(status.recent.map(operation => operation.operationId)).size).toBe(2)
 })
 
+test("AX facade сохраняет static text value, zero frame, redaction и opaque parent lineage", async () => {
+  const fixture = createFixture()
+  const desktop = registerDesktop(fixture)
+  const snapshotId = "snapshot:agent:1"
+  const ref = (elementRef: string) => ({ ...generation, nativeGeneration, applicationRef: appRef.applicationRef, snapshotId, elementRef })
+  desktop.setInspectionNodes([
+    { elementRef: ref("element:root"), role: "AXWindow", subrole: "AXStandardWindow", title: "Документ",
+      identifier: "main-window", description: "Главное окно", frame: { x: 10, y: 20, width: 800, height: 600 }, actions: [] },
+    { elementRef: ref("element:static"), parentElementRef: ref("element:root"), role: "AXStaticText", subrole: "", title: "",
+      value: "Состояние готово", frame: { x: 20, y: 40, width: 0, height: 0 }, actions: [] },
+    { elementRef: ref("element:progress"), parentElementRef: ref("element:root"), role: "AXProgressIndicator", subrole: "", title: "",
+      value: 0.5, actions: [] },
+    { elementRef: ref("element:secure"), parentElementRef: ref("element:root"), role: "AXTextField", subrole: "AXSecureTextField",
+      title: "Пароль", valueRedacted: true, actions: [] },
+  ])
+  registerBrowsers(fixture)
+  registerAgentMethods(fixture.registry, fixture.core, fixture.targets, { ids: sequenceIds() })
+  const client = fixture.core.openClient("principal:ax-metadata")
+  const state = await fixture.registry.dispatch(client.session, "get_state", { kind: "window" }, new AbortController().signal)
+  const targetId = (state.data.windows as Array<{ targetId: string }>)[0]!.targetId
+  const observed = await fixture.registry.dispatch(client.session, "observe", { targetId, mode: "ax" }, new AbortController().signal)
+  const elements = observed.data.elements as Array<Record<string, unknown>>
+  expect(elements).toMatchObject([
+    { role: "AXWindow", title: "Документ", identifier: "main-window", description: "Главное окно" },
+    { parentElementId: elements[0]!.elementId, role: "AXStaticText", title: "", value: "Состояние готово", frame: { width: 0, height: 0 } },
+    { parentElementId: elements[0]!.elementId, role: "AXProgressIndicator", value: 0.5 },
+    { parentElementId: elements[0]!.elementId, role: "AXTextField", valueRedacted: true },
+  ])
+  expect(String(observed.data.state)).toContain('title="" value="Состояние готово"')
+  expect(String(observed.data.state)).toContain("value=0.5")
+  expect(String(observed.data.state)).toContain("valueRedacted=true")
+  expect(desktop.inspectionRequests).toMatchObject([{ maxBytes: 128 * 1024 }])
+  expect(JSON.stringify(observed.data)).not.toContain("element:root")
+  expect(JSON.stringify(observed.data)).not.toContain("parentElementRef")
+  expect(agentObservedStateSchema.safeParse({ ...observed.data,
+    elements: elements.map((element, index) => index === 1 ? { ...element, parentElementId: "agent-element:not-returned" } : element) }).success).toBe(false)
+})
+
 test("closed exact window tombstones old handle и не выбирает replacement с тем же title", async () => {
   const fixture = createFixture()
   const desktop = registerDesktop(fixture)
@@ -437,6 +476,15 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
   const transitions: Array<{ request: z.infer<typeof windowTransitionRequestSchema> }> = []
   const captureRequests: Array<z.infer<typeof captureWindowMethodInputSchema>> = []
   const desktopCaptureRequests: Array<z.infer<typeof captureDesktopMethodInputSchema>> = []
+  const inspectionRequests: Array<z.infer<typeof axInspectionRequestSchema>> = []
+  let inspectionNodes: AxInspectionResult["nodes"] = [{
+    elementRef: { ...generation, nativeGeneration, applicationRef: appRef.applicationRef,
+      snapshotId: "snapshot:agent:1", elementRef: "element:save" },
+    role: "AXButton",
+    subrole: "",
+    title: "Save",
+    actions: ["AXPress"],
+  }]
   let inventoryCalls = 0
   fixture.core.targets.register(
     { kind: "window", ref: windowRef },
@@ -492,22 +540,18 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     operation: operationRecordSchema,
     result: adapterResultSchema(windowTransitionResultSchema),
   })))
-  fixture.registry.register("inspect_accessibility", method(async (_context, input) => ({
-    snapshotId: "snapshot:agent:1",
-    target: input.request.target,
-    complete: true,
-    nodeCount: 1,
-    encodedBytes: 100,
-    nodes: [{
-      elementRef: { ...generation, nativeGeneration, applicationRef: appRef.applicationRef,
-        snapshotId: "snapshot:agent:1", elementRef: "element:save" },
-      role: "AXButton",
-      subrole: "",
-      title: "Save",
-      actions: ["AXPress"],
-    }],
-    errors: [],
-  }), z.strictObject({
+  fixture.registry.register("inspect_accessibility", method(async (_context, input) => {
+    inspectionRequests.push(structuredClone(input.request))
+    return {
+      snapshotId: "snapshot:agent:1",
+      target: input.request.target,
+      complete: true,
+      nodeCount: inspectionNodes.length,
+      encodedBytes: 100,
+      nodes: structuredClone(inspectionNodes),
+      errors: [],
+    }
+  }, z.strictObject({
     inventoryId: z.string(),
     inventoryRevision: z.number().int(),
     request: axInspectionRequestSchema,
@@ -543,7 +587,9 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     transitions,
     captureRequests,
     desktopCaptureRequests,
+    inspectionRequests,
     inventoryCalls: () => inventoryCalls,
+    setInspectionNodes(nodes: AxInspectionResult["nodes"]) { inspectionNodes = structuredClone(nodes) },
   }
 }
 

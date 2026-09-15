@@ -206,6 +206,21 @@ fi
   -Wall \
   -Wextra \
   -Werror \
+  -Inative/src/accessibility \
+  native/src/accessibility/meta_ax_inspector.m \
+  native/src/accessibility/meta_ax_inspector_test.m \
+  -framework Foundation \
+  -framework AppKit \
+  -framework ApplicationServices \
+  -o "$CHECK_DIR/ax-inspector-test"
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
   -Inative/src/permissions-request \
   native/src/permissions-request/meta_permissions_request.m \
   native/src/permissions-request/meta_permissions_request_test.m \
@@ -222,6 +237,7 @@ fi
 "$CHECK_DIR/serialization-test"
 "$CHECK_DIR/capture-router-test"
 "$CHECK_DIR/broker-core-test"
+"$CHECK_DIR/ax-inspector-test"
 "$CHECK_DIR/permissions-request-test"
 
 /usr/bin/clang \

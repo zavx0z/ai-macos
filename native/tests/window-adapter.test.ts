@@ -11,7 +11,7 @@ import type {
   NativeTransportPacket,
   NativeTransportRequestFrame,
 } from "../src/protocol.ts"
-import { nativeInventoryResultSchema } from "../src/protocol.ts"
+import { nativeAxInspectionResultSchema, nativeInventoryResultSchema } from "../src/protocol.ts"
 import { NativeWindowAdapter } from "../src/window-adapter.ts"
 import { extractNativeEvidenceReports } from "../src/evidence-extractor.ts"
 import { createRuntimeNativeEvidenceBinder } from "../src/evidence-extractor.ts"
@@ -23,6 +23,35 @@ const generation = {
   nativeGeneration: "native-1",
 }
 const capturedAt = new Date().toISOString()
+
+test("Native AX wire принимает только bounded scalar и отдельную redaction", () => {
+  const result = {
+    snapshotId: "snapshot-1",
+    complete: true,
+    nodeCount: 1,
+    encodedBytes: 128,
+    nodes: [{
+      elementRef: "ax-node:1",
+      role: "AXTextField",
+      subrole: "AXSecureTextField",
+      title: "Пароль",
+      actions: [],
+    }],
+    errors: [],
+  }
+  expect(nativeAxInspectionResultSchema.safeParse({
+    ...result,
+    nodes: [{ ...result.nodes[0], valueRedacted: true }],
+  }).success).toBe(true)
+  expect([
+    { value: { raw: "forbidden" } },
+    { value: Number.NaN },
+    { value: "forbidden", valueRedacted: true },
+  ].every(fields => !nativeAxInspectionResultSchema.safeParse({
+    ...result,
+    nodes: [{ ...result.nodes[0], ...fields }],
+  }).success)).toBe(true)
+})
 
 class InventoryTransport implements NativeTransport {
   constructor(readonly hidden = false) {}
@@ -148,6 +177,48 @@ class InventoryTransport implements NativeTransport {
                 rotationDegrees: 0,
                 main: false,
               }],
+            },
+          },
+        },
+      })
+      return
+    }
+    if (frame.channel === "request" && frame.payload.method === "ax.inspect") {
+      this.push({
+        kind: "message",
+        frame: {
+          channel: "response",
+          payload: {
+            kind: "response",
+            protocolVersion: "1",
+            requestId: frame.payload.requestId,
+            ...generation,
+            ok: true,
+            result: {
+              snapshotId: "snapshot-1",
+              complete: true,
+              nodeCount: 2,
+              encodedBytes: 512,
+              nodes: [{
+                elementRef: "ax-node:1",
+                role: "AXWindow",
+                subrole: "AXStandardWindow",
+                title: "Документ",
+                identifier: "document-window",
+                description: "Основное окно",
+                value: 42,
+                frame: { x: 10, y: 20, width: 0, height: 0 },
+                actions: [],
+              }, {
+                elementRef: "ax-node:2",
+                parentElementRef: "ax-node:1",
+                role: "AXTextField",
+                subrole: "AXSecureTextField",
+                title: "Пароль",
+                valueRedacted: true,
+                actions: [],
+              }],
+              errors: [],
             },
           },
         },
@@ -358,6 +429,28 @@ describe("NativeWindowAdapter", () => {
       throw new Error("ожидался window mapping report")
     }
     expect(windowReport.mapping.displays.map(display => display.nativeDisplayId)).toEqual([100, 101])
+    const inspected = await adapter.inspect({
+      target: { kind: "window", ref: window.ref },
+      depth: 2,
+      maxNodes: 10,
+      maxBytes: 4096,
+    }, {
+      signal: new AbortController().signal,
+      checkpoint: () => undefined,
+    })
+    expect(inspected.nodes[0]).toMatchObject({
+      identifier: "document-window",
+      description: "Основное окно",
+      value: 42,
+      frame: { x: 10, y: 20, width: 0, height: 0 },
+    })
+    expect(inspected.nodes[1]).toMatchObject({
+      valueRedacted: true,
+      parentElementRef: {
+        snapshotId: "snapshot-1",
+        elementRef: "ax-node:1",
+      },
+    })
     await native.close()
   })
 

@@ -35,9 +35,15 @@ export type AgentTargetHandle = {
 
 export type AgentElementHandle = {
   elementId: string
+  parentElementId?: string
   role: string
   subrole: string
   title: string
+  identifier?: string
+  description?: string
+  value?: string | number | boolean
+  valueRedacted?: true
+  frame?: { x: number, y: number, width: number, height: number }
   actions: string[]
 }
 
@@ -363,9 +369,11 @@ export class AgentTargetRegistry {
     const parent = this.#ownTarget(lineageId, targetId)
     const expiresAtMs = Math.min(parent.actionExpiresAtMs, this.#clock.now().getTime() + this.#elementTtlMs)
     const pendingIds = new Set<string>()
+    const elementIdsByRef = new Map<string, string>()
     const pending = result.nodes.map(node => {
       const elementId = this.#uniqueId("agent-element", id => this.#elements.has(id) || pendingIds.has(id))
       pendingIds.add(elementId)
+      elementIdsByRef.set(node.elementRef.elementRef, elementId)
       const entry: ElementEntry = {
         elementId,
         targetId,
@@ -375,33 +383,46 @@ export class AgentTargetRegistry {
         expiresAtMs,
         bytes: 0,
       }
-      entry.bytes = elementBytes(entry, node.role, node.subrole, node.title)
       return { entry, node }
     })
+    const prepared = pending.map(({ entry, node }) => {
+      const parentElementId = node.parentElementRef === undefined
+        ? undefined
+        : elementIdsByRef.get(node.parentElementRef.elementRef)
+      const handle: AgentElementHandle = {
+        elementId: entry.elementId,
+        ...(parentElementId === undefined ? {} : { parentElementId }),
+        role: node.role,
+        subrole: node.subrole,
+        title: node.title,
+        ...(node.identifier === undefined ? {} : { identifier: node.identifier }),
+        ...(node.description === undefined ? {} : { description: node.description }),
+        ...(node.value === undefined ? {} : { value: node.value }),
+        ...(node.valueRedacted === undefined ? {} : { valueRedacted: node.valueRedacted }),
+        ...(node.frame === undefined ? {} : { frame: structuredClone(node.frame) }),
+        actions: [...node.actions],
+      }
+      entry.bytes = elementBytes(entry, handle)
+      return { entry, handle: Object.freeze(handle) }
+    })
     const oldBytes = [...parent.elementIds].reduce((sum, id) => sum + (this.#elements.get(id)?.bytes ?? 0), 0)
-    const newBytes = pending.reduce((sum, item) => sum + item.entry.bytes, 0)
+    const newBytes = prepared.reduce((sum, item) => sum + item.entry.bytes, 0)
     const nextParentBytes = targetBytes({ ...parent, latestSnapshotId: result.snapshotId })
     this.#assertCapacity(
       0,
-      pending.length - parent.elementIds.size,
+      prepared.length - parent.elementIds.size,
       newBytes - oldBytes + nextParentBytes - parent.bytes,
     )
     this.#deleteElements(parent)
     this.#bytes += nextParentBytes - parent.bytes
     parent.bytes = nextParentBytes
     parent.latestSnapshotId = result.snapshotId
-    for (const { entry } of pending) {
+    for (const { entry } of prepared) {
       this.#elements.set(entry.elementId, entry)
       parent.elementIds.add(entry.elementId)
       this.#bytes += entry.bytes
     }
-    return pending.map(({ entry, node }) => Object.freeze({
-      elementId: entry.elementId,
-      role: node.role,
-      subrole: node.subrole,
-      title: node.title,
-      actions: [...node.actions],
-    }))
+    return prepared.map(({ handle }) => handle)
   }
 
   #resolveElement(
@@ -535,16 +556,14 @@ function targetBytes(entry: TargetEntry): number {
   })) + [...entry.controlOwners].reduce((sum, value) => sum + textBytes(value) + 8, 0)
 }
 
-function elementBytes(entry: ElementEntry, role: string, subrole: string, title: string): number {
+function elementBytes(entry: ElementEntry, handle: AgentElementHandle): number {
   return textBytes(canonicalJson({
     elementId: entry.elementId,
     targetId: entry.targetId,
     snapshotId: entry.snapshotId,
     elementRef: entry.elementRef,
     actions: entry.actions,
-    role,
-    subrole,
-    title,
+    publicMetadata: handle,
   }))
 }
 

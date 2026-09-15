@@ -7,7 +7,21 @@ import {
   windowRefSchema,
   type ElementRef,
 } from "./identities.ts"
-import { rectSchema } from "./observations.ts"
+
+// AX может честно сообщать точку или линию с нулевой шириной/высотой.
+// Capture geometry сохраняет отдельный положительный rect contract.
+const axFrameSchema = z.strictObject({
+  x: z.number().finite(),
+  y: z.number().finite(),
+  width: z.number().finite().min(0),
+  height: z.number().finite().min(0),
+}).describe("Read-only AX bounds в глобальных macOS points; это не image pixels, не click authority, а нулевой размер не создаёт pointer target")
+
+const axValueSchema = z.union([
+  z.string().max(4_096),
+  z.number().finite(),
+  z.boolean(),
+])
 
 export const axInspectionTargetSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("window"), ref: windowRefSchema }),
@@ -30,7 +44,11 @@ export const axInspectionNodeSchema = z.strictObject({
   role: z.string().max(128),
   subrole: z.string().max(128),
   title: z.string().max(4_096),
-  frame: rectSchema.optional(),
+  identifier: z.string().max(4_096).optional(),
+  description: z.string().max(4_096).optional(),
+  value: axValueSchema.optional(),
+  valueRedacted: z.literal(true).optional(),
+  frame: axFrameSchema.optional(),
   actions: z.array(z.string().min(1).max(128)).max(64),
 }).superRefine((node, context) => {
   if (new Set(node.actions).size !== node.actions.length) {
@@ -47,6 +65,9 @@ export const axInspectionNodeSchema = z.strictObject({
     && node.parentElementRef.elementRef === node.elementRef.elementRef
   ) {
     context.addIssue({ code: "custom", path: ["parentElementRef"], message: "AX node не может быть собственным parent" })
+  }
+  if (node.valueRedacted && node.value !== undefined) {
+    context.addIssue({ code: "custom", path: ["value"], message: "Redacted AX value не публикуется вместе с value" })
   }
 })
 export type AxInspectionNode = z.infer<typeof axInspectionNodeSchema>

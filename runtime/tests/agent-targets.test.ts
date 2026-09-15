@@ -117,6 +117,31 @@ test("новый AX snapshot атомарно инвалидирует стар�
   expect(() => scope.resolveElement(target.targetId, currentElement!.elementId)).toThrow("latest target snapshot")
 })
 
+test("AX metadata и parent публикуются только opaque handles того же snapshot и учитываются в byte budget", () => {
+  const value = fixture()
+  const owner = value.registry.forLineage("lineage:ax-metadata")
+  const foreign = value.registry.forLineage("lineage:ax-metadata-foreign")
+  const target = owner.registerTarget(windowTarget("window:ax-metadata"), authority(1))
+  const result = inspection("window:ax-metadata", "snapshot:metadata", "element:root", "element:static", "element:orphan")
+  const rootRef = result.nodes[0]!.elementRef
+  result.nodes[0] = { ...result.nodes[0]!, role: "AXWindow", title: "Документ", identifier: "main-window",
+    description: "x".repeat(4_096), frame: { x: 10, y: 20, width: 800, height: 600 } }
+  result.nodes[1] = { ...result.nodes[1]!, parentElementRef: rootRef, role: "AXStaticText", title: "",
+    value: "Состояние готово", frame: { x: 20, y: 40, width: 0, height: 0 }, actions: [] }
+  result.nodes[2] = { ...result.nodes[2]!, parentElementRef: { ...rootRef, elementRef: "element:not-returned" },
+    role: "AXTextField", title: "Пароль", valueRedacted: true, actions: [] }
+  const handles = owner.registerElements(target.targetId, result)
+  expect(handles).toMatchObject([
+    { role: "AXWindow", identifier: "main-window", frame: { width: 800, height: 600 } },
+    { parentElementId: handles[0]!.elementId, role: "AXStaticText", title: "", value: "Состояние готово", frame: { width: 0, height: 0 } },
+    { role: "AXTextField", valueRedacted: true },
+  ])
+  expect(handles[2]).not.toHaveProperty("parentElementId")
+  expect(JSON.stringify(handles)).not.toContain("element:root")
+  expect(value.registry.stats().bytes).toBeGreaterThan(4_096)
+  expect(() => foreign.resolveElement(target.targetId, handles[1]!.elementId)).toThrow("client lineage")
+})
+
 test("foreign AX parent отклоняется без потери latest valid handles", () => {
   const value = fixture()
   const scope = value.registry.forLineage("lineage:ax-parent")

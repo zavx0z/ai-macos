@@ -1,6 +1,7 @@
 #include "meta_ax_inspector.h"
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 
 @interface FixtureNode : NSObject
@@ -8,6 +9,9 @@
 @property(nonatomic, copy) NSString *role;
 @property(nonatomic, copy) NSString *subrole;
 @property(nonatomic, copy) NSString *title;
+@property(nonatomic, copy) NSString *identifier;
+@property(nonatomic, copy) NSString *axDescription;
+@property(nonatomic, strong) id value;
 @property(nonatomic) CGRect frame;
 @property(nonatomic, copy) NSArray<NSString *> *actions;
 @property(nonatomic, strong) NSMutableArray<FixtureNode *> *children;
@@ -21,13 +25,19 @@
 @property(nonatomic) uint64_t step;
 @property(nonatomic) NSUInteger largestBatch;
 @property(nonatomic, strong) NSMutableSet<NSString *> *readAttributes;
+@property(nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *attributeStatuses;
+@property(nonatomic) MetaAXReadStatus valueStatus;
 @end
 
 @implementation FixtureBackend
 
 - (instancetype)init {
   self = [super init];
-  if (self) _readAttributes = [NSMutableSet set];
+  if (self) {
+    _readAttributes = [NSMutableSet set];
+    _attributeStatuses = [NSMutableDictionary dictionary];
+    _valueStatus = META_AX_READ_OK;
+  }
   return self;
 }
 
@@ -46,10 +56,24 @@
                               value:(NSString **)value {
   [self advance];
   [_readAttributes addObject:attribute];
+  NSNumber *configured = _attributeStatuses[attribute];
+  if (configured != nil && configured.integerValue != META_AX_READ_OK) {
+    return (MetaAXReadStatus)configured.integerValue;
+  }
   if ([attribute isEqual:@"role"]) *value = element.role;
   else if ([attribute isEqual:@"subrole"]) *value = element.subrole;
   else if ([attribute isEqual:@"title"]) *value = element.title;
+  else if ([attribute isEqual:@"identifier"]) *value = element.identifier;
+  else if ([attribute isEqual:@"description"]) *value = element.axDescription;
   else return META_AX_READ_FAILED;
+  return *value == nil ? META_AX_READ_ABSENT : META_AX_READ_OK;
+}
+
+- (MetaAXReadStatus)valueForElement:(FixtureNode *)element value:(id *)value {
+  [self advance];
+  [_readAttributes addObject:@"value"];
+  if (_valueStatus != META_AX_READ_OK) return _valueStatus;
+  *value = element.value;
   return *value == nil ? META_AX_READ_ABSENT : META_AX_READ_OK;
 }
 
@@ -94,6 +118,9 @@ static FixtureNode *node(NSString *role, NSString *title) {
   value.role = role;
   value.subrole = @"";
   value.title = title;
+  value.identifier = nil;
+  value.axDescription = nil;
+  value.value = nil;
   value.frame = CGRectMake(10, 20, 300, 200);
   value.actions = @[@"AXPress"];
   value.children = [NSMutableArray array];
@@ -141,7 +168,7 @@ static void test_bounded_tree(void) {
   assert([result[@"complete"] boolValue]);
   assert([result[@"nodeCount"] unsignedIntegerValue] == 71);
   assert(backend.largestBatch == 32);
-  assert(![backend.readAttributes containsObject:@"value"]);
+  assert([backend.readAttributes containsObject:@"value"]);
   NSArray *nodes = result[@"nodes"];
   assert([nodes[1][@"parentElementRef"] isEqual:@"ax-node:1"]);
   assert_encoded_bytes(result);
@@ -276,6 +303,116 @@ static void test_rejected_retention_removes_actionability(void) {
                                 @"AX node retention observer rejected element"]);
 }
 
+static void test_optional_metadata_and_scalar_values(void) {
+  for (id scalar in @[@"Подпись", @42.5, @YES]) {
+    FixtureNode *root = node(@"AXStaticText", @"");
+    root.identifier = @"field-1";
+    root.axDescription = @"Читаемое описание";
+    root.value = scalar;
+    FixtureBackend *backend = [[FixtureBackend alloc] init];
+    NSDictionary *result = meta_ax_inspect_with_backend(
+        root, context(1000, 10, 1024 * 1024), backend);
+    assert([result[@"complete"] boolValue]);
+    NSDictionary *inspected = result[@"nodes"][0];
+    assert([inspected[@"identifier"] isEqual:@"field-1"]);
+    assert([inspected[@"description"] isEqual:@"Читаемое описание"]);
+    assert([inspected[@"value"] isEqual:scalar]);
+    assert(inspected[@"valueRedacted"] == nil);
+  }
+}
+
+static void test_absent_and_failed_optional_metadata_are_distinct(void) {
+  FixtureNode *absent = node(@"AXStaticText", @"");
+  FixtureBackend *absentBackend = [[FixtureBackend alloc] init];
+  NSDictionary *absentResult = meta_ax_inspect_with_backend(
+      absent, context(1000, 10, 1024 * 1024), absentBackend);
+  assert([absentResult[@"complete"] boolValue]);
+  assert(absentResult[@"nodes"][0][@"identifier"] == nil);
+  assert(absentResult[@"nodes"][0][@"description"] == nil);
+  assert(absentResult[@"nodes"][0][@"value"] == nil);
+
+  FixtureNode *failed = node(@"AXStaticText", @"");
+  failed.identifier = @"не должен выйти";
+  failed.axDescription = @"не должна выйти";
+  failed.value = @"не должно выйти";
+  FixtureBackend *failedBackend = [[FixtureBackend alloc] init];
+  failedBackend.attributeStatuses[@"identifier"] = @(META_AX_READ_FAILED);
+  failedBackend.attributeStatuses[@"description"] =
+      @(META_AX_READ_TIMED_OUT);
+  failedBackend.valueStatus = META_AX_READ_FAILED;
+  NSDictionary *failedResult = meta_ax_inspect_with_backend(
+      failed, context(1000, 10, 1024 * 1024), failedBackend);
+  assert(![failedResult[@"complete"] boolValue]);
+  assert(failedResult[@"nodes"][0][@"identifier"] == nil);
+  assert(failedResult[@"nodes"][0][@"description"] == nil);
+  assert(failedResult[@"nodes"][0][@"value"] == nil);
+  NSString *errors = [failedResult[@"errors"] componentsJoinedByString:@" "];
+  assert([errors containsString:@"identifier failed"]);
+  assert([errors containsString:@"description timed out"]);
+  assert([errors containsString:@"value failed"]);
+  assert(![errors containsString:@"не должен"]);
+}
+
+static void test_secure_and_uncertain_text_never_read_value(void) {
+  FixtureNode *secure = node(@"AXTextField", @"Пароль");
+  secure.subrole = @"AXSecureTextField";
+  secure.value = @"секрет";
+  FixtureBackend *secureBackend = [[FixtureBackend alloc] init];
+  NSDictionary *secureResult = meta_ax_inspect_with_backend(
+      secure, context(1000, 10, 1024 * 1024), secureBackend);
+  assert([secureResult[@"complete"] boolValue]);
+  assert([secureResult[@"nodes"][0][@"valueRedacted"] boolValue]);
+  assert(secureResult[@"nodes"][0][@"value"] == nil);
+  assert(![secureBackend.readAttributes containsObject:@"value"]);
+
+  FixtureNode *uncertain = node(@"AXTextField", @"Поле");
+  uncertain.value = @"тоже секрет";
+  FixtureBackend *uncertainBackend = [[FixtureBackend alloc] init];
+  uncertainBackend.attributeStatuses[@"subrole"] =
+      @(META_AX_READ_TIMED_OUT);
+  NSDictionary *uncertainResult = meta_ax_inspect_with_backend(
+      uncertain, context(1000, 10, 1024 * 1024), uncertainBackend);
+  assert(![uncertainResult[@"complete"] boolValue]);
+  assert([uncertainResult[@"nodes"][0][@"valueRedacted"] boolValue]);
+  assert(uncertainResult[@"nodes"][0][@"value"] == nil);
+  assert(![uncertainBackend.readAttributes containsObject:@"value"]);
+}
+
+static void test_value_type_and_output_limits_fail_closed(void) {
+  FixtureNode *unsupported = node(@"AXStaticText", @"");
+  unsupported.value = @[@"не scalar"];
+  FixtureBackend *unsupportedBackend = [[FixtureBackend alloc] init];
+  NSDictionary *unsupportedResult = meta_ax_inspect_with_backend(
+      unsupported, context(1000, 10, 1024 * 1024), unsupportedBackend);
+  assert(![unsupportedResult[@"complete"] boolValue]);
+  assert(unsupportedResult[@"nodes"][0][@"value"] == nil);
+
+  FixtureNode *nonfinite = node(@"AXSlider", @"");
+  nonfinite.value = @(NAN);
+  FixtureBackend *nonfiniteBackend = [[FixtureBackend alloc] init];
+  NSDictionary *nonfiniteResult = meta_ax_inspect_with_backend(
+      nonfinite, context(1000, 10, 1024 * 1024), nonfiniteBackend);
+  assert(![nonfiniteResult[@"complete"] boolValue]);
+  assert(nonfiniteResult[@"nodes"][0][@"value"] == nil);
+
+  NSString *large = [@"я" stringByPaddingToLength:5000
+                                          withString:@"я"
+                                     startingAtIndex:0];
+  FixtureNode *bounded = node(@"AXStaticText", @"");
+  bounded.identifier = large;
+  bounded.axDescription = large;
+  bounded.value = large;
+  FixtureBackend *boundedBackend = [[FixtureBackend alloc] init];
+  NSDictionary *boundedResult = meta_ax_inspect_with_backend(
+      bounded, context(1000, 10, 1024 * 1024), boundedBackend);
+  NSDictionary *boundedNode = boundedResult[@"nodes"][0];
+  assert(![boundedResult[@"complete"] boolValue]);
+  assert([boundedNode[@"identifier"] length] <= 4096);
+  assert([boundedNode[@"description"] length] <= 4096);
+  assert([boundedNode[@"value"] length] <= 4096);
+  assert_encoded_bytes(boundedResult);
+}
+
 int main(void) {
   @autoreleasepool {
     test_bounded_tree();
@@ -288,6 +425,10 @@ int main(void) {
     test_owner_mismatch_fails_closed();
     test_retention_observer_sees_exact_added_nodes();
     test_rejected_retention_removes_actionability();
+    test_optional_metadata_and_scalar_values();
+    test_absent_and_failed_optional_metadata_are_distinct();
+    test_secure_and_uncertain_text_never_read_value();
+    test_value_type_and_output_limits_fail_closed();
     puts("AX inspector tests passed");
   }
   return 0;

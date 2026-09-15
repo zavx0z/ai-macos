@@ -34,6 +34,7 @@ typedef struct {
 - (MetaAXReadStatus)stringAttribute:(NSString *)attribute
                          forElement:(id)element
                               value:(NSString **)value;
+- (MetaAXReadStatus)valueForElement:(id)element value:(id *)value;
 - (MetaAXReadStatus)frameForElement:(id)element value:(CGRect *)value;
 - (MetaAXReadStatus)actionsForElement:(id)element value:(NSArray<NSString *> **)value;
 - (MetaAXReadStatus)childCountForElement:(id)element value:(NSUInteger *)value;

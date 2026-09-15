@@ -23,19 +23,34 @@ import {
 import type { RuntimeCore } from "./core.ts"
 import type { MethodRegistry, RuntimeMethodResponse } from "./method-registry.ts"
 import { AgentOperations, type AgentMutationContext } from "./agent-operations.ts"
-import { AgentTargetRegistry, type AgentTargetActionResolution, type AgentTargetScope } from "./agent-targets.ts"
+import { AgentTargetRegistry, type AgentElementHandle, type AgentTargetActionResolution, type AgentTargetScope } from "./agent-targets.ts"
 import { canonicalJson } from "./primitives.ts"
 import type { AgentViewBindings } from "./agent-view-bindings.ts"
 
 export const agentTargetIdSchema = z.string().min(1).max(127)
 const targetId = agentTargetIdSchema
 const errorSchema = z.strictObject({ stage: z.string(), message: z.string() })
+// AX metadata одновременно входит в elements и текстовый state, а затем ещё
+// раз экранируется общим JSON response. Оставляем запас внутри method 1 MiB.
+const AGENT_AX_INSPECTION_MAX_BYTES = 128 * 1024
 const elementSchema = z.strictObject({
   elementId: targetId,
-  role: z.string(),
-  subrole: z.string(),
-  title: z.string(),
-  actions: z.array(z.string()),
+  parentElementId: targetId.optional(),
+  role: z.string().max(128),
+  subrole: z.string().max(128),
+  title: z.string().max(4_096),
+  identifier: z.string().max(4_096).optional(),
+  description: z.string().max(4_096).optional(),
+  value: z.union([z.string().max(4_096), z.number().finite(), z.boolean()]).optional(),
+  valueRedacted: z.literal(true).optional(),
+  frame: z.strictObject({ x: z.number().finite(), y: z.number().finite(),
+    width: z.number().finite().min(0), height: z.number().finite().min(0) })
+    .describe("Read-only AX bounds в глобальных macOS points; не image pixels и не authority для click(point)").optional(),
+  actions: z.array(z.string().min(1).max(128)).max(64),
+}).superRefine((element, context) => {
+  if (element.valueRedacted && element.value !== undefined) {
+    context.addIssue({ code: "custom", path: ["value"], message: "Redacted AX value не публикуется вместе с value" })
+  }
 })
 const windowSchema = z.strictObject({
   targetId,
@@ -122,7 +137,7 @@ const tabsOutputSchema = z.strictObject({
     actionExpiresAt: z.string(),
   })),
 })
-export const agentObservedStateSchema = z.strictObject({
+const agentObservedStateBaseSchema = z.strictObject({
   targetId,
   state: z.string(),
   complete: z.boolean(),
@@ -132,7 +147,26 @@ export const agentObservedStateSchema = z.strictObject({
   width: z.number().int().positive().optional(),
   height: z.number().int().positive().optional(),
 })
+
+function validateElementParents(
+  state: Pick<z.infer<typeof agentObservedStateBaseSchema>, "elements">,
+  context: z.RefinementCtx,
+): void {
+  const elementIds = new Set(state.elements.map(element => element.elementId))
+  for (const [index, element] of state.elements.entries()) {
+    if (element.parentElementId === undefined) continue
+    if (element.parentElementId === element.elementId || !elementIds.has(element.parentElementId)) {
+      context.addIssue({ code: "custom", path: ["elements", index, "parentElementId"],
+        message: "AX parentElementId должен ссылаться на другой element того же returned snapshot" })
+    }
+  }
+}
+
+export const agentObservedStateSchema = agentObservedStateBaseSchema.superRefine(validateElementParents)
 const observedStateSchema = agentObservedStateSchema
+const shownWindowStateSchema = agentObservedStateBaseSchema
+  .omit({ imageId: true, width: true, height: true })
+  .superRefine(validateElementParents)
 
 type BrowserExecution = { result: AdapterResult<BrowserOperationResult> }
 type BrowserCapturePublicRequest = {
@@ -210,7 +244,7 @@ export class RuntimeAgentMethods {
       title: "Показать точное окно",
       description: "Показывает и фокусирует существующее окно без запуска приложения, затем возвращает fresh AX state.",
       input: z.strictObject({ targetId: targetId }),
-      output: observedStateSchema.omit({ imageId: true, width: true, height: true }),
+      output: shownWindowStateSchema,
       readOnly: false,
       destructive: false,
       requiredCapabilities: ["desktop.window.show", "desktop.ax", "runtime.operations"],
@@ -732,7 +766,7 @@ export class RuntimeAgentMethods {
     const response = await this.#dispatch(session, "inspect_accessibility", {
       inventoryId: selected.inventoryId,
       inventoryRevision: selected.inventoryRevision,
-      request: { target: selected.target, depth: 12, maxNodes: 1_500, maxBytes: 1024 * 1024 },
+      request: { target: selected.target, depth: 12, maxNodes: 1_500, maxBytes: AGENT_AX_INSPECTION_MAX_BYTES },
     }, signal)
     const inspection = response.data as AxInspectionResult
     const elements = scope.registerElements(targetIdValue, inspection)
@@ -962,11 +996,23 @@ export function registerAgentMethods(
   return methods
 }
 
-function formatAxState(inspection: AxInspectionResult, elements: Array<{ elementId: string, role: string, subrole: string, title: string, actions: string[] }>): string {
+function formatAxState(inspection: AxInspectionResult, elements: AgentElementHandle[]): string {
   const header = `AX tree complete=${inspection.complete === true}`
   return [header, ...elements.map(element => {
-    const title = element.title === "" ? "" : ` title=${JSON.stringify(element.title)}`
-    return `[${element.elementId}] role=${element.role} subrole=${element.subrole}${title} actions=${JSON.stringify(element.actions)}`
+    const fields = [
+      `[${element.elementId}]`,
+      ...(element.parentElementId === undefined ? [] : [`parent=${element.parentElementId}`]),
+      `role=${element.role}`,
+      `subrole=${element.subrole}`,
+      `title=${JSON.stringify(element.title)}`,
+      ...(element.identifier === undefined ? [] : [`identifier=${JSON.stringify(element.identifier)}`]),
+      ...(element.description === undefined ? [] : [`description=${JSON.stringify(element.description)}`]),
+      ...(element.value === undefined ? [] : [`value=${JSON.stringify(element.value)}`]),
+      ...(element.valueRedacted === undefined ? [] : ["valueRedacted=true"]),
+      ...(element.frame === undefined ? [] : [`frame=${JSON.stringify(element.frame)}`]),
+      `actions=${JSON.stringify(element.actions)}`,
+    ]
+    return fields.join(" ")
   })].join("\n")
 }
 

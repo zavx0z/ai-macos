@@ -59,10 +59,12 @@ static NSString *read_string(id<MetaAXInspectionBackend> backend,
                              NSString *attribute,
                              NSUInteger maximum,
                              BOOL required,
+                             MetaAXReadStatus *readStatus,
                              BOOL *complete,
                              NSMutableArray<NSString *> *errors,
                              MetaAXInspectionContext context) {
   if (deadline_reached(backend, context)) {
+    if (readStatus != NULL) *readStatus = META_AX_READ_TIMED_OUT;
     *complete = NO;
     add_error(errors, @"AX total deadline exceeded");
     return @"";
@@ -72,6 +74,7 @@ static NSString *read_string(id<MetaAXInspectionBackend> backend,
                                           forElement:element
                                                value:&value];
   if (deadline_reached(backend, context)) status = META_AX_READ_TIMED_OUT;
+  if (readStatus != NULL) *readStatus = status;
   if (status == META_AX_READ_OK && [value isKindOfClass:NSString.class]) {
     if (value.length > maximum) {
       *complete = NO;
@@ -84,6 +87,69 @@ static NSString *read_string(id<MetaAXInspectionBackend> backend,
     add_error(errors, [NSString stringWithFormat:@"AX %@ %@", attribute, status_name(status)]);
   }
   return @"";
+}
+
+static id read_value(id<MetaAXInspectionBackend> backend,
+                     id element,
+                     BOOL *complete,
+                     NSMutableArray<NSString *> *errors,
+                     MetaAXInspectionContext context) {
+  if (deadline_reached(backend, context)) {
+    *complete = NO;
+    add_error(errors, @"AX total deadline exceeded");
+    return nil;
+  }
+  id value = nil;
+  MetaAXReadStatus status = [backend valueForElement:element value:&value];
+  if (deadline_reached(backend, context)) status = META_AX_READ_TIMED_OUT;
+  if (status == META_AX_READ_ABSENT) return nil;
+  if (status != META_AX_READ_OK || value == nil) {
+    *complete = NO;
+    add_error(errors, [NSString stringWithFormat:@"AX value %@",
+                                                 status_name(status)]);
+    return nil;
+  }
+  CFTypeID type = CFGetTypeID((__bridge CFTypeRef)value);
+  if (type == CFStringGetTypeID()) {
+    NSString *text = value;
+    if (text.length > 4096) {
+      *complete = NO;
+      add_error(errors, @"AX value exceeded output limit");
+    }
+    return bounded_string(text, 4096);
+  }
+  if (type == CFBooleanGetTypeID()) return @([value boolValue]);
+  if (type == CFNumberGetTypeID() && isfinite([value doubleValue])) {
+    return [value copy];
+  }
+  *complete = NO;
+  add_error(errors, @"AX value contained unsupported scalar type");
+  return nil;
+}
+
+static BOOL value_must_be_redacted(NSString *role,
+                                   MetaAXReadStatus roleStatus,
+                                   NSString *subrole,
+                                   MetaAXReadStatus subroleStatus,
+                                   BOOL *uncertain) {
+  *uncertain = NO;
+  if (subroleStatus == META_AX_READ_OK &&
+      [subrole isEqual:(__bridge NSString *)kAXSecureTextFieldSubrole]) {
+    return YES;
+  }
+  if (roleStatus != META_AX_READ_OK || role.length == 0) {
+    *uncertain = YES;
+    return YES;
+  }
+  BOOL textField =
+      [role isEqual:(__bridge NSString *)kAXTextFieldRole] ||
+      [role isEqual:(__bridge NSString *)kAXTextAreaRole];
+  if (textField && subroleStatus != META_AX_READ_OK &&
+      subroleStatus != META_AX_READ_ABSENT) {
+    *uncertain = YES;
+    return YES;
+  }
+  return NO;
 }
 
 static NSArray<NSString *> *read_actions(
@@ -253,12 +319,22 @@ NSDictionary *meta_ax_inspect_with_backend_and_observer(
     id element = item[@"element"];
     NSString *elementRef = item[@"elementRef"];
     NSUInteger depth = [item[@"depth"] unsignedIntegerValue];
+    MetaAXReadStatus roleStatus = META_AX_READ_FAILED;
+    MetaAXReadStatus subroleStatus = META_AX_READ_FAILED;
+    MetaAXReadStatus identifierStatus = META_AX_READ_FAILED;
+    MetaAXReadStatus descriptionStatus = META_AX_READ_FAILED;
     NSString *role = read_string(backend, element, @"role", 128, YES,
-                                 &complete, errors, context);
+                                 &roleStatus, &complete, errors, context);
     NSString *subrole = read_string(backend, element, @"subrole", 128, NO,
-                                    &complete, errors, context);
+                                    &subroleStatus, &complete, errors, context);
     NSString *title = read_string(backend, element, @"title", 4096, NO,
-                                  &complete, errors, context);
+                                  NULL, &complete, errors, context);
+    NSString *nodeIdentifier = read_string(
+        backend, element, @"identifier", 4096, NO, &identifierStatus,
+        &complete, errors, context);
+    NSString *nodeDescription = read_string(
+        backend, element, @"description", 4096, NO, &descriptionStatus,
+        &complete, errors, context);
     NSArray<NSString *> *actions = read_actions(backend, element, &complete,
                                                 errors, context);
     NSMutableDictionary *node = [@{
@@ -270,6 +346,25 @@ NSDictionary *meta_ax_inspect_with_backend_and_observer(
     } mutableCopy];
     if (item[@"parentElementRef"] != nil) {
       node[@"parentElementRef"] = item[@"parentElementRef"];
+    }
+    if (identifierStatus == META_AX_READ_OK) {
+      node[@"identifier"] = nodeIdentifier;
+    }
+    if (descriptionStatus == META_AX_READ_OK) {
+      node[@"description"] = nodeDescription;
+    }
+    BOOL redactionUncertain = NO;
+    if (value_must_be_redacted(role, roleStatus, subrole, subroleStatus,
+                               &redactionUncertain)) {
+      node[@"valueRedacted"] = @YES;
+      if (redactionUncertain) {
+        complete = NO;
+        add_error(errors,
+                  @"AX value omitted because secure text classification failed");
+      }
+    } else {
+      id value = read_value(backend, element, &complete, errors, context);
+      if (value != nil) node[@"value"] = value;
     }
     CGRect frame = CGRectZero;
     MetaAXReadStatus frameStatus = deadline_reached(backend, context)
@@ -445,6 +540,8 @@ NSDictionary *meta_ax_inspect_with_backend_and_observer(
     @"role": (__bridge NSString *)kAXRoleAttribute,
     @"subrole": (__bridge NSString *)kAXSubroleAttribute,
     @"title": (__bridge NSString *)kAXTitleAttribute,
+    @"identifier": (__bridge NSString *)kAXIdentifierAttribute,
+    @"description": (__bridge NSString *)kAXDescriptionAttribute,
   };
   NSString *name = attributes[attribute];
   if (name == nil) return META_AX_READ_FAILED;
@@ -458,6 +555,29 @@ NSDictionary *meta_ax_inspect_with_backend_and_observer(
   if (status == META_AX_READ_OK && copied != NULL &&
       CFGetTypeID(copied) == CFStringGetTypeID()) {
     *value = [(__bridge NSString *)copied copy];
+  } else if (status == META_AX_READ_OK) {
+    status = META_AX_READ_FAILED;
+  }
+  if (copied != NULL) CFRelease(copied);
+  return status;
+}
+
+- (MetaAXReadStatus)valueForElement:(id)element value:(id *)value {
+  AXUIElementRef prepared = NULL;
+  MetaAXReadStatus status = [self prepare:element value:&prepared];
+  if (status != META_AX_READ_OK) return status;
+  CFTypeRef copied = NULL;
+  AXError error = AXUIElementCopyAttributeValue(
+      prepared, kAXValueAttribute, &copied);
+  status = [self statusForError:error];
+  if (status == META_AX_READ_OK && copied != NULL) {
+    CFTypeID type = CFGetTypeID(copied);
+    if (type == CFStringGetTypeID() || type == CFBooleanGetTypeID() ||
+        type == CFNumberGetTypeID()) {
+      *value = [(__bridge id)copied copy];
+    } else {
+      status = META_AX_READ_FAILED;
+    }
   } else if (status == META_AX_READ_OK) {
     status = META_AX_READ_FAILED;
   }
