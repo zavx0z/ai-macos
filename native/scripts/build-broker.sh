@@ -55,6 +55,7 @@ mkdir -p "$(dirname -- "$CANDIDATE_OUTPUT")"
   native/src/observer/meta_observer.m \
   native/src/observer-index/meta_observer_target_index.m \
   native/src/observer-command/meta_observer_command.m \
+  native/src/input-observer/meta_input_observer_binding.m \
   -framework Foundation -framework AppKit -framework ApplicationServices \
   -framework CoreGraphics -framework CoreImage -framework CoreMedia \
   -framework CoreVideo -framework ImageIO -framework ScreenCaptureKit \

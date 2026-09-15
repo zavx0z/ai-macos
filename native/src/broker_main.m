@@ -21,6 +21,7 @@
 #include "observer-command/meta_observer_command.h"
 #include "recovery-probe/meta_recovery_probe.h"
 #include "readiness-command/meta_readiness_system.h"
+#include "input-observer/meta_input_observer_binding.h"
 #include <time.h>
 #include <math.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -237,12 +238,9 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
   NSMutableArray *capabilities = [NSMutableArray array];
   for (NSString *identifier in @[@"runtime.identity", @"runtime.transport", @"desktop.applications",
       @"desktop.windows.all", @"desktop.window.identity", @"desktop.window.show", @"desktop.window.lifecycle",
-      @"desktop.displays", @"desktop.ax", @"capture.window", @"capture.observation", @"input.clipboard", @"input.readiness"]) {
+      @"desktop.displays", @"desktop.ax", @"capture.window", @"capture.observation", @"input.clipboard", @"input.readiness",
+      @"input.pointer", @"input.drag", @"input.keyboard", @"runtime.user-interference"]) {
     [capabilities addObject:@{@"id": identifier, @"state": @"ready"}];
-  }
-  for (NSString *identifier in @[@"input.pointer", @"input.drag", @"input.keyboard", @"runtime.user-interference"]) {
-    [capabilities addObject:@{@"id": identifier, @"state": @"degraded",
-      @"reason": @"Native dispatch и observer stream подключены; общий operation tag lifecycle ещё не завершён"}];
   }
   [capabilities addObject:@{@"id": @"capture.desktop", @"state": @"degraded",
     @"reason": @"Одиночный display подключён; aggregate desktop-layout capture пока не реализован"}];
@@ -875,7 +873,23 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
     if (!matches) return nil;
   }
   _inputLoginSession = operation[@"loginSessionId"];
-  return [_inputExecutor execute:request job:job];
+  MetaInputObserverBinding *binding = [[MetaInputObserverBinding alloc] initWithObserver:_observerCommands
+    observerInstanceRef:_observerInstance operationId:operation[@"operationId"] target:scope interactionId:nil];
+  [job setObserverCoverageProvider:^NSDictionary * { return [binding currentCoverage]; }];
+  MetaExecutor *executor = [_inputExecutor executorOnActionWorker];
+  meta_executor_set_observer_state(executor, [binding currentCoverage] != nil ? META_OBSERVER_READY : META_OBSERVER_UNAVAILABLE);
+  [_inputExecutor setInputObserverAfterBegin:^BOOL(MetaExecutor *accepted, MetaInputJob *current) {
+    return current == job && accepted == executor && [binding registerTag:meta_executor_synthetic_tag(accepted)];
+  } poll:^MetaInputObserverDecision {
+    MetaInputObserverPollResult decision = [binding poll];
+    return decision == MetaInputObserverPollContinue ? MetaInputObserverContinue :
+        decision == MetaInputObserverPollForeignEvent ? MetaInputObserverForeignEvent : MetaInputObserverUnavailable;
+  }];
+  NSDictionary *result = [_inputExecutor execute:request job:job];
+  [binding stop];
+  [_inputExecutor setInputObserverAfterBegin:nil poll:nil];
+  meta_executor_set_observer_state(executor, META_OBSERVER_UNAVAILABLE);
+  return result;
 }
 
 - (NSDictionary *)executeWindow:(NSDictionary *)request job:(MetaInputJob *)job {

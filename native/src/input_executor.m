@@ -74,6 +74,9 @@ static bool dispatch_external(void *context) {
   double _pointY;
   uint64_t _actionDeadline;
   MetaInputJob *_job;
+  BOOL (^_observerAfterBegin)(MetaExecutor *, MetaInputJob *);
+  MetaInputObserverDecision (^_observerPoll)(void);
+  BOOL _observerAttached;
 }
 - (instancetype)initWithGeneration:(NSString *)generation sink:(MetaExecutorBackend)sink verify:(BOOL (^)(NSString *))targetVerify {
   self = [super init];
@@ -90,7 +93,26 @@ static bool dispatch_external(void *context) {
 }
 - (void)dealloc { meta_executor_destroy(_executor); }
 - (MetaExecutorBackend)sink { return _sink; }
-- (BOOL)cancelled { return [_job cancelRequested]; }
+- (void)setInputObserverAfterBegin:(BOOL (^)(MetaExecutor *, MetaInputJob *))afterBegin
+                              poll:(MetaInputObserverDecision (^)(void))poll {
+  _observerAfterBegin = [afterBegin copy];
+  _observerPoll = [poll copy];
+  _observerAttached = NO;
+}
+- (BOOL)cancelled {
+  BOOL requested = [_job cancelRequested];
+  if (!_observerAttached || _observerPoll == nil) return requested;
+  MetaInputObserverDecision decision = _observerPoll();
+  if (decision == MetaInputObserverContinue) return requested;
+  _observerAttached = NO;
+  if (decision == MetaInputObserverForeignEvent) {
+    meta_executor_note_observed_event(_executor, 0);
+  } else {
+    meta_executor_set_observer_state(_executor, META_OBSERVER_UNAVAILABLE);
+    [_job requestCancel];
+  }
+  return YES;
+}
 - (BOOL)verify:(const char *)target {
   [_job publishStatus:meta_executor_status(_executor)];
   if (_externalVerify != nil) return _externalVerify(@(target));
@@ -189,6 +211,7 @@ static bool dispatch_external(void *context) {
 
 - (NSDictionary *)execute:(NSDictionary *)request job:(MetaInputJob *)job {
   _job = job;
+  _observerAttached = NO;
   _hasPoint = NO;
   NSDictionary *operation = job.operation;
   NSDictionary *fence = operation[@"fence"];
@@ -247,6 +270,13 @@ static bool dispatch_external(void *context) {
       @"status": [job statusForRequest:job.requestId]};
     _job = nil;
     return report;
+  }
+  if (_observerAfterBegin != nil) {
+    _observerAttached = _observerAfterBegin(_executor, job);
+    if (!_observerAttached) {
+      meta_executor_set_observer_state(_executor, META_OBSERVER_UNAVAILABLE);
+      meta_executor_fail(_executor, "observer-registration-unavailable");
+    }
   }
   [job publishStatus:meta_executor_status(_executor)];
   BOOL finished = NO;
@@ -350,6 +380,7 @@ static bool dispatch_external(void *context) {
   [job publishStatus:status];
   NSDictionary *result = @{@"finished": finished ? @YES : @NO, @"completedSteps": @(completed), @"totalSteps": @(total),
     @"dispatchAttempts": @(status.dispatch_attempts), @"ledgerRevision": @(status.ledger_revision), @"status": [job statusForRequest:job.requestId]};
+  _observerAttached = NO;
   _job = nil;
   return result;
 }
