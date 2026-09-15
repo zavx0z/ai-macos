@@ -69,6 +69,7 @@ class InventoryTransport implements NativeTransport {
             result: {
               sourceResponseRef: "inventory-response-1",
               inventoryId: "inventory-1",
+              layoutRef: "native-1:layout:1",
               revision: 1,
               displayLayoutRevision: 1,
               capturedAt,
@@ -330,7 +331,21 @@ describe("NativeWindowAdapter", () => {
     expect(unresolved?.kind).toBe("cg-only")
     if (unresolved?.kind !== "cg-only") throw new Error("ожидалось CG-only window")
     expect(unresolved.cgWindowId).toBe(901)
+    expect(inventory.desktopLayout).toMatchObject({
+      kind: "desktop-layout",
+      target: {
+        kind: "desktop-layout",
+        ref: { layoutRef: "native-1:layout:1", displayLayoutRevision: 1 },
+      },
+    })
+    expect(inventory.desktopLayout?.displays.map(display => display.nativeDisplayId)).toEqual([100, 101])
+    expect(inventory.desktopLayout?.mappingEvidence.state).toBe("confirmed")
+    if (inventory.desktopLayout?.mappingEvidence.state !== "confirmed") {
+      throw new Error("ожидался authoritative desktop layout proof")
+    }
+    expect(inventory.desktopLayout.mappingEvidence.proof.kind).toBe("target-resolution")
     expect(reports.map(report => report.factKind)).toEqual([
+      "target-resolution",
       "target-resolution",
       "target-resolution",
       "native-target-identity",
@@ -389,6 +404,24 @@ describe("NativeWindowAdapter", () => {
     const inventory = await new NativeWindowAdapter({ native, services: runtime.services }).inventory({
       signal: new AbortController().signal,
       checkpoint: () => undefined,
+    })
+    expect(inventory.desktopLayout?.mappingEvidence.state).toBe("confirmed")
+    if (inventory.desktopLayout === undefined) throw new Error("Authoritative desktop layout отсутствует")
+    const layoutResolution = await runtime.targets.resolve({
+      target: inventory.desktopLayout.target,
+      inventoryId: inventory.inventoryId,
+      inventoryRevision: inventory.revision,
+      runtimeEpoch: generation.runtimeEpoch,
+      loginSessionId: generation.loginSessionId,
+      nativeGeneration: generation.nativeGeneration,
+      deadlineAt: new Date(Date.now() + 1_000).toISOString(),
+    })
+    expect(layoutResolution.nativeMapping).toEqual({
+      kind: "desktop-layout",
+      displays: inventory.desktopLayout.displays.map(display => ({
+        nativeDisplayId: display.nativeDisplayId,
+        ref: display.target.ref,
+      })),
     })
     const window = inventory.windows.find(entry => entry.kind === "ax-window")
     expect(window?.kind).toBe("ax-window")

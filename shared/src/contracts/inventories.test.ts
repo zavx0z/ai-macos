@@ -91,12 +91,57 @@ describe("C1 desktop inventory and window surfaces", () => {
         rotationDegrees: 0,
         main: true,
       }],
+      desktopLayout: {
+        kind: "desktop-layout",
+        target: {
+          kind: "desktop-layout",
+          ref: {
+            runtimeEpoch,
+            loginSessionId,
+            nativeGeneration,
+            layoutRef: "layout:1",
+            displayLayoutRevision: 3,
+          },
+        },
+        mappingEvidence: {
+          state: "confirmed",
+          claim: "desktop-layout-resolved",
+          source: "native-registry",
+          proof: proof("target-resolution", {
+            kind: "desktop-layout",
+            ref: {
+              runtimeEpoch,
+              loginSessionId,
+              nativeGeneration,
+              layoutRef: "layout:1",
+              displayLayoutRevision: 3,
+            },
+          }),
+        },
+        displays: [{
+          kind: "display",
+          target: { kind: "display", ref: displayRef },
+          nativeDisplayId: 1,
+          mappingEvidence: {
+            state: "confirmed",
+            claim: "native-display-resolved",
+            source: "native-registry",
+            proof: proof("target-resolution", { kind: "display", ref: displayRef }),
+          },
+        }],
+      },
     })
     expect(snapshot.windows[0]?.kind === "ax-window" ? snapshot.windows[0].ref.windowRef : undefined).toBe("window:1")
     expect(desktopInventorySnapshotSchema.safeParse({ ...snapshot, complete: false, errors: [] }).success).toBe(false)
     expect(desktopInventorySnapshotSchema.safeParse({
       ...snapshot,
       windows: [{ ...windowRecord, ref: { ...windowRef, nativeGeneration: "native:foreign" } }],
+    }).success).toBe(false)
+    const { desktopLayout: _, ...withoutLayout } = snapshot
+    expect(desktopInventorySnapshotSchema.safeParse(withoutLayout).success).toBe(false)
+    expect(desktopInventorySnapshotSchema.safeParse({
+      ...snapshot,
+      desktopLayout: { ...snapshot.desktopLayout, displays: [] },
     }).success).toBe(false)
   })
 

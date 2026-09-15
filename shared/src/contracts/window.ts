@@ -12,6 +12,7 @@ import {
 } from "./identities.ts"
 import { type AdapterControl, type NativeExecutionContext, type RuntimeOperationContext } from "./operations.ts"
 import { proofRefSchema, rectSchema } from "./observations.ts"
+import { desktopLayoutCaptureTargetSchema } from "./capture.ts"
 import { isoTimestampSchema, structurallyEqual } from "./schema.ts"
 
 export const triStateSchema = z.enum(["true", "false", "unknown"])
@@ -167,6 +168,7 @@ export const desktopInventorySnapshotSchema = z.strictObject({
   applications: z.array(applicationRecordSchema).max(4_096),
   windows: z.array(desktopWindowEntrySchema).max(16_384),
   displays: z.array(displayRecordSchema).max(64),
+  desktopLayout: desktopLayoutCaptureTargetSchema.optional(),
 }).superRefine((snapshot, context) => {
   if (!snapshot.complete && snapshot.errors.length === 0) {
     context.addIssue({ code: "custom", path: ["errors"], message: "incomplete inventory требует причину" })
@@ -185,6 +187,37 @@ export const desktopInventorySnapshotSchema = z.strictObject({
   }
   if (snapshot.displays.some(display => display.ref.displayLayoutRevision !== snapshot.displayLayoutRevision)) {
     context.addIssue({ code: "custom", path: ["displays"], message: "display ref содержит другую topology revision" })
+  }
+  if (snapshot.displays.length > 0 && snapshot.desktopLayout === undefined) {
+    context.addIssue({ code: "custom", path: ["desktopLayout"], message: "inventory с displays требует authoritative desktop layout" })
+  }
+  if (snapshot.displays.length === 0 && snapshot.desktopLayout !== undefined) {
+    context.addIssue({ code: "custom", path: ["desktopLayout"], message: "пустой inventory не объявляет desktop layout" })
+  }
+  if (snapshot.desktopLayout !== undefined) {
+    const layout = snapshot.desktopLayout
+    const expectedDisplays = new Map(snapshot.displays.map(display => [display.ref.displayRef, display]))
+    if (
+      layout.target.ref.runtimeEpoch !== snapshot.runtimeEpoch
+      || layout.target.ref.loginSessionId !== snapshot.loginSessionId
+      || layout.target.ref.nativeGeneration !== snapshot.nativeGeneration
+      || layout.target.ref.displayLayoutRevision !== snapshot.displayLayoutRevision
+      || layout.mappingEvidence.state !== "confirmed"
+      || layout.mappingEvidence.proof.inventoryRevision !== snapshot.revision
+      || layout.mappingEvidence.proof.displayLayoutRevision !== snapshot.displayLayoutRevision
+      || layout.displays.length !== snapshot.displays.length
+      || layout.displays.some(mapping => {
+        const display = expectedDisplays.get(mapping.target.ref.displayRef)
+        return display === undefined
+          || mapping.nativeDisplayId !== display.nativeDisplayId
+          || !structurallyEqual(mapping.target.ref, display.ref)
+          || mapping.mappingEvidence.state !== "confirmed"
+          || mapping.mappingEvidence.proof.inventoryRevision !== snapshot.revision
+          || mapping.mappingEvidence.proof.displayLayoutRevision !== snapshot.displayLayoutRevision
+      })
+    ) {
+      context.addIssue({ code: "custom", path: ["desktopLayout"], message: "desktop layout не совпадает с exact inventory topology/evidence" })
+    }
   }
   for (const window of snapshot.windows) {
     if (window.kind === "cg-only") continue
@@ -220,7 +253,11 @@ export type WindowTransitionRequest = z.infer<typeof windowTransitionRequestSche
 export const windowTransitionResultSchema = z.strictObject({
   target: windowRefSchema,
   requested: windowTransitionRequestSchema,
-  actual: windowRecordSchema,
+  actual: z.discriminatedUnion("kind", [
+    windowRecordSchema,
+    z.strictObject({ kind: z.literal("closed"), ref: windowRefSchema, absence: z.literal("confirmed") }),
+    z.strictObject({ kind: z.literal("unknown"), ref: windowRefSchema, reason: z.string().min(1).max(1024) }),
+  ]),
   changed: z.boolean(),
   partial: z.boolean(),
   newSurface: surfaceRefSchema.optional(),
@@ -234,6 +271,14 @@ export const windowTransitionResultSchema = z.strictObject({
   }
   if (result.partial && result.errors.length === 0) {
     context.addIssue({ code: "custom", path: ["errors"], message: "partial transition требует причину" })
+  }
+  if (result.actual.kind === "closed" && (result.requested.kind !== "close" || result.partial
+    || !result.changed || result.errors.length > 0 || result.newSurface !== undefined)) {
+    context.addIssue({ code: "custom", path: ["actual"], message: "Подтверждённое закрытие требует полного close result без нового sheet" })
+  }
+  if ((result.actual.kind === "unknown" || (result.requested.kind === "close" && result.actual.kind === "ax-window"))
+    && !result.partial) {
+    context.addIssue({ code: "custom", path: ["partial"], message: "Неизвестный результат или оставшееся окно после close требует partial" })
   }
   if (result.newSurface !== undefined && (
     result.newSurface.runtimeEpoch !== result.target.runtimeEpoch

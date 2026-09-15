@@ -81,6 +81,69 @@ static void test_closed_output_with_default_sigpipe(void) {
   close(input[0]); close(input[1]); close(output[1]);
 }
 
+static void read_exact(int descriptor, void *buffer, size_t length) {
+  size_t offset = 0;
+  while (offset < length) {
+    ssize_t received = read(descriptor, (uint8_t *)buffer + offset, MIN(length - offset, 997));
+    assert(received > 0);
+    offset += (size_t)received;
+  }
+}
+
+static NSDictionary *read_json_frame(int descriptor) {
+  uint32_t header = 0;
+  read_exact(descriptor, &header, sizeof(header));
+  NSUInteger length = ntohl(header);
+  assert(length > 0 && length <= 1024 * 1024);
+  NSMutableData *payload = [NSMutableData dataWithLength:length];
+  read_exact(descriptor, payload.mutableBytes, length);
+  return [NSJSONSerialization JSONObjectWithData:payload options:0 error:NULL];
+}
+
+static void test_atomic_binary_queue(void) {
+  int input[2], output[2];
+  assert(pipe(input) == 0 && pipe(output) == 0);
+  dispatch_queue_t callbacks = dispatch_queue_create("fixture.binary", DISPATCH_QUEUE_SERIAL);
+  MetaBrokerTransport *transport = [[MetaBrokerTransport alloc] initWithInput:input[0] output:output[1] callbackQueue:callbacks
+    onMessage:^(__unused NSDictionary *frame) { assert(false); }
+    onFailure:^(__unused NSString *reason) {}];
+  NSMutableData *bytes = [NSMutableData dataWithLength:5 * 1024 * 1024];
+  memset(bytes.mutableBytes, 0xab, bytes.length);
+  NSDictionary *binary = @{@"channel": @"binary", @"payload": @{@"binaryToken": @"binary-fixture", @"byteLength": @(bytes.length)}};
+  assert(![transport enqueueFrame:binary]);
+  assert(![transport enqueueBinaryFrame:binary bytes:[NSData dataWithBytes:"x" length:1]]);
+  assert([transport enqueueBinaryFrame:binary bytes:bytes]);
+  memset(bytes.mutableBytes, 0xcd, bytes.length);
+  assert(([transport enqueueFrame:@{@"channel": @"heartbeat", @"payload": @{@"after": @YES}}]));
+  [transport start];
+  NSDictionary *header = read_json_frame(output[0]);
+  assert([header isEqual:binary]);
+  NSMutableData *received = [NSMutableData dataWithLength:bytes.length];
+  read_exact(output[0], received.mutableBytes, received.length);
+  for (NSUInteger index = 0; index < received.length; index += 1) assert(((uint8_t *)received.bytes)[index] == 0xab);
+  assert([read_json_frame(output[0])[@"channel"] isEqual:@"heartbeat"]);
+  [transport close];
+  assert(![transport enqueueBinaryFrame:binary bytes:bytes]);
+  close(input[0]); close(input[1]); close(output[0]); close(output[1]);
+}
+
+static void test_binary_queue_budget(void) {
+  int input[2], output[2];
+  assert(pipe(input) == 0 && pipe(output) == 0);
+  dispatch_queue_t callbacks = dispatch_queue_create("fixture.binary-budget", DISPATCH_QUEUE_SERIAL);
+  dispatch_semaphore_t failed = dispatch_semaphore_create(0);
+  MetaBrokerTransport *transport = [[MetaBrokerTransport alloc] initWithInput:input[0] output:output[1] callbackQueue:callbacks
+    onMessage:^(__unused NSDictionary *frame) { assert(false); }
+    onFailure:^(NSString *reason) { assert([reason containsString:@"binary writer queue overflow"]); dispatch_semaphore_signal(failed); }];
+  NSData *bytes = [NSData dataWithBytes:"x" length:1];
+  NSDictionary *header = @{@"channel": @"binary", @"payload": @{@"binaryToken": @"fixture", @"byteLength": @1}};
+  for (size_t index = 0; index < 4; index += 1) assert([transport enqueueBinaryFrame:header bytes:bytes]);
+  assert([transport enqueueFrame:@{@"channel": @"heartbeat"}]);
+  assert(![transport enqueueBinaryFrame:header bytes:bytes]);
+  assert(dispatch_semaphore_wait(failed, dispatch_time(DISPATCH_TIME_NOW, 1000000000)) == 0);
+  close(input[0]); close(input[1]); close(output[0]); close(output[1]);
+}
+
 int main(void) {
   @autoreleasepool {
     signal(SIGPIPE, SIG_DFL);
@@ -88,6 +151,8 @@ int main(void) {
     test_queued_messages_after_close(1);
     test_queued_messages_after_close(2);
     test_closed_output_with_default_sigpipe();
+    test_atomic_binary_queue();
+    test_binary_queue_budget();
     int input[2], output[2];
     assert(pipe(input) == 0 && pipe(output) == 0);
     dispatch_queue_t control = dispatch_queue_create("fixture.control", DISPATCH_QUEUE_SERIAL);

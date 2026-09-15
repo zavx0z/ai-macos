@@ -166,6 +166,26 @@ function inventoryReports(
     target: { kind: "display", ref: display.ref },
     mapping: { kind: "display", display },
   }))
+  if (displays.length > 0) {
+    const layoutTarget = {
+      kind: "desktop-layout" as const,
+      ref: {
+        ...generation,
+        layoutRef: inventory.layoutRef,
+        displayLayoutRevision: inventory.displayLayoutRevision,
+      },
+    }
+    reports.push(nativeEvidenceReportSchema.parse({
+      factKind: "target-resolution",
+      sourceResponseRef: inventory.sourceResponseRef,
+      inventoryId: inventory.inventoryId,
+      inventoryRevision: inventory.revision,
+      displayLayoutRevision: inventory.displayLayoutRevision,
+      observedAt: inventory.capturedAt,
+      target: layoutTarget,
+      mapping: { kind: "desktop-layout", displays },
+    }))
+  }
   for (const application of inventory.applications) {
     const process = { ...generation, applicationRef: application.applicationRef, pid: application.pid,
       launchedAt: application.launchedAt, registrationNonce: application.registrationNonce }
@@ -239,7 +259,8 @@ function transitionReports(
 ): NativeEvidenceReport[] {
   const window = transition.actual
   if (
-    window.mapping !== "corroborated"
+    window.kind !== "ax-window"
+    || window.mapping !== "corroborated"
     || window.cgWindowId === undefined
     || window.axSnapshotRef === undefined
     || window.cgInventoryRef === undefined

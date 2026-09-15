@@ -259,6 +259,9 @@ static void test_sheet_owner_ax_only_and_displays(void) {
                 snapshot->windows[0].window_ref) == 0);
   assert(snapshot->display_count == 2);
   assert(snapshot->display_layout_revision == 1);
+  char layout_ref[META_NATIVE_REF_CAPACITY];
+  snprintf(layout_ref, sizeof(layout_ref), "%s", snapshot->layout_ref);
+  assert(strstr(layout_ref, ":layout:1") != NULL);
   assert(snapshot->displays[0].bounds.x == -1920);
   assert(snapshot->displays[1].bounds.y == -1200);
   assert(snapshot->displays[1].scale == 2);
@@ -266,10 +269,15 @@ static void test_sheet_owner_ax_only_and_displays(void) {
   assert(meta_registry_refresh(registry, &input));
   snapshot = meta_registry_snapshot(registry);
   assert(snapshot->display_layout_revision == 1);
+  assert(strcmp(layout_ref, snapshot->layout_ref) == 0);
   displays[1].rotation_degrees = 0;
   assert(meta_registry_refresh(registry, &input));
   snapshot = meta_registry_snapshot(registry);
   assert(snapshot->display_layout_revision == 2);
+  assert(strcmp(layout_ref, snapshot->layout_ref) != 0);
+  displays[1].bounds.x += 1;
+  assert(meta_registry_refresh(registry, &input));
+  assert(meta_registry_snapshot(registry)->display_layout_revision == 3);
   meta_registry_destroy(registry);
 }
 

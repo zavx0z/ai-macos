@@ -170,6 +170,7 @@ typedef struct {
 
 typedef struct {
   char inventory_id[META_NATIVE_REF_CAPACITY];
+  char layout_ref[META_NATIVE_REF_CAPACITY];
   char native_generation[META_NATIVE_REF_CAPACITY];
   uint64_t revision;
   uint64_t display_layout_revision;

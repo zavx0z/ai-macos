@@ -10,6 +10,8 @@ static const NSUInteger clipboardMessageLimit = 8 * 1024 * 1024;
 static const uint32_t clipboardFrameFlag = 0x80000000u;
 static const NSUInteger queuedByteLimit = 4 * 1024 * 1024;
 static const NSUInteger queuedMessageLimit = 128;
+static const NSUInteger binaryLimit = 64 * 1024 * 1024;
+static const NSUInteger queuedBinaryLimit = 128 * 1024 * 1024 + 4 * (1024 * 1024 + 4);
 
 static uint64_t monotonic_millis(void) {
   struct timespec time = {0};
@@ -40,6 +42,8 @@ static uint64_t monotonic_millis(void) {
   NSUInteger _writeOffset;
   NSUInteger _queuedBytes;
   NSUInteger _queuedClipboardBytes;
+  NSUInteger _queuedBinaryBytes;
+  NSUInteger _queuedBinaries;
   NSUInteger _pendingMessages;
   NSUInteger _pendingBytes;
   NSUInteger _pendingClipboardBytes;
@@ -103,6 +107,8 @@ static uint64_t monotonic_millis(void) {
   _payload = nil;
   _queuedBytes = 0;
   _queuedClipboardBytes = 0;
+  _queuedBinaryBytes = 0;
+  _queuedBinaries = 0;
 }
 
 - (void)start {
@@ -200,6 +206,7 @@ static uint64_t monotonic_millis(void) {
 }
 
 - (BOOL)enqueueFrame:(NSDictionary *)frame {
+  if ([frame[@"channel"] isEqual:@"binary"]) return NO;
   BOOL clipboard = [frame[@"channel"] isEqual:@"clipboard"];
   NSUInteger limit = clipboard ? clipboardMessageLimit : messageLimit;
   NSData *payload = [NSJSONSerialization dataWithJSONObject:frame options:0 error:NULL];
@@ -208,7 +215,7 @@ static uint64_t monotonic_millis(void) {
   dispatch_sync(_io, ^{
     if (self->_closed) return;
     NSUInteger length = payload.length + 4;
-    NSUInteger queued = clipboard ? self->_queuedClipboardBytes : self->_queuedBytes - self->_queuedClipboardBytes;
+    NSUInteger queued = clipboard ? self->_queuedClipboardBytes : self->_queuedBytes - self->_queuedClipboardBytes - self->_queuedBinaryBytes;
     NSUInteger queueLimit = clipboard ? clipboardMessageLimit + 4 : queuedByteLimit;
     if (self->_writes.count >= queuedMessageLimit || queued > queueLimit || length > queueLimit - queued) {
       [self fail:@"Native writer queue overflow"];
@@ -232,6 +239,45 @@ static uint64_t monotonic_millis(void) {
   return accepted;
 }
 
+- (BOOL)enqueueBinaryFrame:(NSDictionary *)frame bytes:(NSData *)bytes {
+  if (![frame isKindOfClass:NSDictionary.class] || ![frame[@"channel"] isEqual:@"binary"] ||
+      ![frame[@"payload"] isKindOfClass:NSDictionary.class] ||
+      ![bytes isKindOfClass:NSData.class] || bytes.length == 0 || bytes.length > binaryLimit) return NO;
+  NSDictionary *metadata = frame[@"payload"];
+  NSNumber *declared = metadata[@"byteLength"];
+  if (![metadata[@"binaryToken"] isKindOfClass:NSString.class] || [metadata[@"binaryToken"] length] == 0 ||
+      ![declared isKindOfClass:NSNumber.class] || declared.doubleValue != (double)bytes.length) return NO;
+  NSData *payload = [NSJSONSerialization dataWithJSONObject:frame options:0 error:NULL];
+  if (payload == nil || payload.length == 0 || payload.length > messageLimit) return NO;
+  __block BOOL accepted = NO;
+  dispatch_sync(_io, ^{
+    if (self->_closed) return;
+    NSUInteger length = payload.length + 4 + bytes.length;
+    if (self->_writes.count >= queuedMessageLimit || self->_queuedBinaries >= 4 ||
+        self->_queuedBinaryBytes > queuedBinaryLimit || length > queuedBinaryLimit - self->_queuedBinaryBytes) {
+      [self fail:@"Native binary writer queue overflow"];
+      return;
+    }
+    NSMutableData *encoded = [NSMutableData dataWithLength:4];
+    uint32_t header = htonl((uint32_t)payload.length);
+    memcpy(encoded.mutableBytes, &header, sizeof(header));
+    [encoded appendData:payload];
+    [encoded appendData:bytes];
+    if (self->_writes.count == 0) self->_lastWriteProgress = monotonic_millis();
+    [self->_writes addObject:encoded];
+    [self->_writeProfiles addObject:@2];
+    self->_queuedBytes += length;
+    self->_queuedBinaryBytes += length;
+    self->_queuedBinaries += 1;
+    accepted = YES;
+    if (self->_started && self->_writerSuspended) {
+      self->_writerSuspended = NO;
+      dispatch_resume(self->_writer);
+    }
+  });
+  return accepted;
+}
+
 - (void)writeAvailable {
   NSUInteger writeBudget = 256 * 1024;
   while (!_closed && _writes.count > 0 && writeBudget > 0) {
@@ -244,9 +290,12 @@ static uint64_t monotonic_millis(void) {
     _writeOffset += (NSUInteger)sent;
     _lastWriteProgress = monotonic_millis();
     _queuedBytes -= (NSUInteger)sent;
-    if ([_writeProfiles[0] boolValue]) _queuedClipboardBytes -= (NSUInteger)sent;
+    NSUInteger profile = [_writeProfiles[0] unsignedIntegerValue];
+    if (profile == 1) _queuedClipboardBytes -= (NSUInteger)sent;
+    if (profile == 2) _queuedBinaryBytes -= (NSUInteger)sent;
     writeBudget -= (NSUInteger)sent;
     if (_writeOffset == data.length) {
+      if (profile == 2) _queuedBinaries -= 1;
       [_writes removeObjectAtIndex:0];
       [_writeProfiles removeObjectAtIndex:0];
       _writeOffset = 0;

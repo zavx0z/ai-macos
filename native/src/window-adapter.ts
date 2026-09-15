@@ -10,9 +10,12 @@ import {
   type ApplicationRecord,
   type ContractError,
   type DesktopInventorySnapshot,
+  type DesktopLayoutCaptureTarget,
+  type DisplayCaptureTarget,
   type DisplayRecord,
   type NativeAdapter,
   type NativeExecutionContext,
+  type NativeGeneration,
   type NativeOperationStatus,
   type OperationOutcome,
   type ProofRef,
@@ -210,7 +213,23 @@ export class NativeWindowAdapter implements WindowAdapter {
       rotationDegrees: display.rotationDegrees,
       main: display.main,
     }))
-    await Promise.all(displays.map(display => this.#publishDisplayEvidence(raw, display)))
+    const displayProofs = await Promise.all(
+      displays.map(display => this.#publishDisplayEvidence(raw, display)),
+    )
+    const displayTargets: DisplayCaptureTarget[] = displays.map((display, index) => ({
+      kind: "display",
+      target: { kind: "display", ref: display.ref },
+      nativeDisplayId: display.nativeDisplayId,
+      mappingEvidence: {
+        state: "confirmed",
+        claim: "native-display-resolved",
+        source: "runtime-native-evidence",
+        proof: displayProofs[index]!,
+      },
+    }))
+    const desktopLayout = displays.length === 0
+      ? undefined
+      : await this.#publishDesktopLayoutEvidence(raw, generation, displayTargets)
 
     const mappingErrors: ContractError[] = []
     const publishIdentity = async (target: Extract<import("@meta/shared/contracts").OperationTarget,
@@ -295,10 +314,11 @@ export class NativeWindowAdapter implements WindowAdapter {
       applications,
       windows,
       displays,
+      ...(desktopLayout === undefined ? {} : { desktopLayout }),
     })
   }
 
-  async #publishDisplayEvidence(raw: NativeInventoryResult, display: DisplayRecord): Promise<void> {
+  async #publishDisplayEvidence(raw: NativeInventoryResult, display: DisplayRecord): Promise<ProofRef> {
     const target = { kind: "display" as const, ref: display.ref }
     const mapping = {
       kind: "display" as const,
@@ -314,7 +334,55 @@ export class NativeWindowAdapter implements WindowAdapter {
       target,
       mapping,
     })
-    await this.services.evidence.issueTargetResolution({ receipt, target, nativeMapping: mapping })
+    return await this.services.evidence.issueTargetResolution({ receipt, target, nativeMapping: mapping })
+  }
+
+  async #publishDesktopLayoutEvidence(
+    raw: NativeInventoryResult,
+    generation: NativeGeneration,
+    displays: DisplayCaptureTarget[],
+  ): Promise<DesktopLayoutCaptureTarget> {
+    const target = {
+      kind: "desktop-layout" as const,
+      ref: {
+        ...generation,
+        layoutRef: raw.layoutRef,
+        displayLayoutRevision: raw.displayLayoutRevision,
+      },
+    }
+    const mapping = {
+      kind: "desktop-layout" as const,
+      displays: displays.map(display => ({
+        nativeDisplayId: display.nativeDisplayId,
+        ref: display.target.ref,
+      })),
+    }
+    const receipt = await this.#native.evidencePublisher.publish({
+      factKind: "target-resolution",
+      sourceResponseRef: raw.sourceResponseRef,
+      inventoryId: raw.inventoryId,
+      inventoryRevision: raw.revision,
+      displayLayoutRevision: raw.displayLayoutRevision,
+      observedAt: raw.capturedAt,
+      target,
+      mapping,
+    })
+    const proof = await this.services.evidence.issueTargetResolution({
+      receipt,
+      target,
+      nativeMapping: mapping,
+    })
+    return {
+      kind: "desktop-layout",
+      target,
+      mappingEvidence: {
+        state: "confirmed",
+        claim: "desktop-layout-resolved",
+        source: "runtime-native-evidence",
+        proof,
+      },
+      displays,
+    }
   }
 
   async #publishWindowEvidence(
@@ -364,10 +432,14 @@ export class NativeWindowAdapter implements WindowAdapter {
   ): Promise<WindowTransitionResult> {
     const generation = this.#generation()
     const target = request.target
+    if (raw.actual.applicationRef !== target.applicationRef || raw.actual.windowRef !== target.windowRef) {
+      throw new Error("Window transition вернул другую application/window identity")
+    }
     let proof: ProofRef | undefined
     const inventory = this.#lastInventory
     if (
-      inventory !== undefined
+      raw.actual.kind === "ax-window"
+      && inventory !== undefined
       && raw.actual.mapping === "corroborated"
       && raw.actual.cgWindowId !== undefined
       && raw.inventoryId === inventory.inventoryId
@@ -400,7 +472,9 @@ export class NativeWindowAdapter implements WindowAdapter {
         displays,
       )
     }
-    const actual = mapWindowRecord(raw.actual, target, generation, proof)
+    const actual = raw.actual.kind === "ax-window" ? mapWindowRecord(raw.actual, target, generation, proof)
+      : raw.actual.kind === "closed" ? { kind: "closed" as const, ref: target, absence: "confirmed" as const }
+        : { kind: "unknown" as const, ref: target, reason: raw.actual.reason }
     const value = {
       target,
       requested: request,

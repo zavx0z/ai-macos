@@ -35,6 +35,8 @@ import {
 } from "@meta/shared/contracts"
 import { nativeClipboardRequestSchema, nativeClipboardResponseSchema, NATIVE_CLIPBOARD_WIRE_BYTES } from "./clipboard-protocol.ts"
 export * from "./clipboard-protocol.ts"
+import { nativePermissionsRequestSchema, nativePermissionsResponseSchema } from "./permissions-protocol.ts"
+export * from "./permissions-protocol.ts"
 
 export const NATIVE_FRAME_HEADER_BYTES = 4
 export const NATIVE_CLIPBOARD_FRAME_FLAG = 0x80000000
@@ -159,6 +161,7 @@ export const nativeDisplayRecordSchema = z.strictObject({
 export const nativeInventoryResultSchema = z.strictObject({
   sourceResponseRef: opaqueIdSchema,
   inventoryId: opaqueIdSchema,
+  layoutRef: opaqueIdSchema,
   revision: z.number().int().safe().min(0),
   displayLayoutRevision: z.number().int().safe().min(0),
   capturedAt: z.iso.datetime({ offset: true }),
@@ -181,7 +184,13 @@ export const nativeWindowTransitionResultSchema = z.strictObject({
   observedAt: z.iso.datetime({ offset: true }),
   displays: z.array(nativeDisplayRecordSchema).max(64),
   targetRef: opaqueIdSchema,
-  actual: nativeAXWindowRecordSchema,
+  actual: z.discriminatedUnion("kind", [
+    nativeAXWindowRecordSchema,
+    z.strictObject({ kind: z.literal("closed"), windowRef: opaqueIdSchema, applicationRef: opaqueIdSchema,
+      ownerPid: z.number().int().min(1).max(0x7fffffff), absence: z.literal("confirmed") }),
+    z.strictObject({ kind: z.literal("unknown"), windowRef: opaqueIdSchema, applicationRef: opaqueIdSchema,
+      ownerPid: z.number().int().min(1).max(0x7fffffff), reason: z.string().min(1).max(1024) }),
+  ]),
   changed: z.boolean(),
   partial: z.boolean(),
   newSurface: nativeSurfaceRecordSchema.optional(),
@@ -190,6 +199,12 @@ export const nativeWindowTransitionResultSchema = z.strictObject({
 }).superRefine((result, context) => {
   if (result.targetRef !== result.actual.windowRef) {
     context.addIssue({ code: "custom", path: ["actual"], message: "transition вернул другой target" })
+  }
+  if (result.actual.kind === "closed" && (result.partial || !result.changed || result.errors.length > 0 || result.newSurface !== undefined)) {
+    context.addIssue({ code: "custom", path: ["actual"], message: "Закрытое окно требует подтверждённого полного результата без sheet" })
+  }
+  if (result.actual.kind === "unknown" && !result.partial) {
+    context.addIssue({ code: "custom", path: ["partial"], message: "Unknown window readback требует partial" })
   }
   if (result.partial && result.errors.length === 0) {
     context.addIssue({ code: "custom", path: ["errors"], message: "partial transition требует reason" })
@@ -704,6 +719,7 @@ export const nativeMethodResponseSchema = z.union([
 ])
 
 export const nativeTransportRequestFrameSchema = z.discriminatedUnion("channel", [
+  z.strictObject({ channel: z.literal("permissions"), payload: nativePermissionsRequestSchema }),
   z.strictObject({ channel: z.literal("clipboard"), payload: nativeClipboardRequestSchema }),
   z.strictObject({ channel: z.literal("handshake"), payload: nativeHandshakeRequestSchema }),
   z.strictObject({ channel: z.literal("request"), payload: nativeMethodRequestSchema }),
@@ -716,6 +732,7 @@ export const nativeTransportRequestFrameSchema = z.discriminatedUnion("channel",
 ])
 
 export const nativeTransportResponseFrameSchema = z.discriminatedUnion("channel", [
+  z.strictObject({ channel: z.literal("permissions"), payload: nativePermissionsResponseSchema }),
   z.strictObject({ channel: z.literal("clipboard"), payload: nativeClipboardResponseSchema }),
   z.strictObject({ channel: z.literal("handshake"), payload: nativeHandshakeResponseSchema }),
   z.strictObject({ channel: z.literal("response"), payload: nativeMethodResponseSchema }),
