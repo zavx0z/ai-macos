@@ -1,6 +1,6 @@
 import { afterEach, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises"
+import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { hostname } from "node:os"
 import { join } from "node:path"
 import { CAPABILITY_IDS } from "../shared/src/contracts/index.ts"
@@ -33,6 +33,8 @@ test("dry-run строит reviewable plan без login identity и execute пу
   fixture.runner.implicitRequirement = true
   const plan = await planRuntimeInstall(fixture.options)
   expect(plan.gates).toMatchObject({ sourceClean: true, exactHostname: true, permissionsRequested: false, liveDesktopProbe: false })
+  expect(plan.steps.some(step => step.id === "build-runtime"
+    && step.command?.args.at(-1)?.endsWith(".staging/computer-use"))).toBe(true)
   expect(plan.steps.some(step => step.id === "build-native" && step.command?.args[2] === plan.release.nativeBuildId)).toBe(true)
   expect(plan.legacyRetirement.every(candidate => candidate.disposition === "inspect-only")).toBe(true)
   expect(fixture.runner.mutations).toBe(0)
@@ -44,13 +46,14 @@ test("dry-run строит reviewable plan без login identity и execute пу
   expect(manifest).toMatchObject({
     format: "meta-ai-macos-runtime-release-v1",
     builds: { runtimeBuildId: plan.release.runtimeBuildId, nativeBuildId: plan.release.nativeBuildId },
-    artifacts: { nativeHelper: { signingIdentifier: HELPER_SIGNING_IDENTIFIER,
+    artifacts: { runtime: { path: "computer-use" }, nativeHelper: { signingIdentifier: HELPER_SIGNING_IDENTIFIER,
       designatedRequirement: `designated => cdhash H"${"c".repeat(40)}"` } },
     entrypoint: { source: "scripts/runtime-entry.ts", modes: ["runtime", "doctor", "mcp"], mcpTransport: "stdio" },
   })
   expect((await lstat(plan.release.releasePath)).mode & 0o777).toBe(0o555)
   const plist = await readFile(fixture.options.paths.launchAgentPath, "utf8")
   expect(plist).toContain(`<string>${RUNTIME_SERVICE_LABEL}</string>`)
+  expect(plist).toContain(`${join(fixture.options.paths.installRoot, "current", "computer-use")}</string>`)
   expect(plist).toContain("META_NATIVE_HELPER")
   expect(plist).toContain("META_NATIVE_CDHASH")
   expect(plist).toContain(`<string>${manifest.artifacts.nativeHelper.cdhash}</string>`)
@@ -82,6 +85,23 @@ test("immutable release отклоняет plist cdhash, не совпадающ
 
   await expect(applyRuntimeInstall(repeated, fixture.options))
     .rejects.toThrow("codesign identity не совпадает с manifest")
+})
+
+test("manifest runtime artifact принимает только exact computer-use или legacy runtime", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(plan, fixture.options)
+  const manifestPath = join(plan.release.releasePath, "manifest.json")
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
+  manifest.artifacts.runtime.path = "bin/computer-use"
+  await chmod(plan.release.releasePath, 0o700)
+  await chmod(manifestPath, 0o600)
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
+  await chmod(manifestPath, 0o444)
+  await chmod(plan.release.releasePath, 0o555)
+
+  const repeated = await planRuntimeInstall(fixture.options)
+  await expect(applyRuntimeInstall(repeated, fixture.options)).rejects.toThrow("strict format")
 })
 
 test("loaded update требует exact drain, повтор того же release идемпотентен", async () => {
@@ -159,25 +179,71 @@ test("failed doctor атомарно возвращает previous helper, relea
   expect(await readFile(options.paths.launchAgentPath)).toEqual(firstPlist)
 })
 
+test("loaded LaunchAgent со старым runtime program мигрирует на computer-use", async () => {
+  const fixture = await createFixture()
+  const firstPlan = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(firstPlan, fixture.options)
+  const manifestPath = join(firstPlan.release.releasePath, "manifest.json")
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
+  const computerUsePath = join(firstPlan.release.releasePath, "computer-use")
+  const legacyRuntimePath = join(firstPlan.release.releasePath, "runtime")
+  const currentPlist = await readFile(fixture.options.paths.launchAgentPath, "utf8")
+  const legacyPlist = currentPlist.replace("/current/computer-use", "/current/runtime")
+  await chmod(firstPlan.release.releasePath, 0o700)
+  await rename(computerUsePath, legacyRuntimePath)
+  manifest.artifacts.runtime.path = "runtime"
+  manifest.launchAgent.sha256 = sha256(legacyPlist)
+  await chmod(manifestPath, 0o600)
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
+  await chmod(manifestPath, 0o444)
+  await chmod(firstPlan.release.releasePath, 0o555)
+  await writeFile(fixture.options.paths.launchAgentPath, legacyPlist)
+  fixture.runner.launchProgram = join(fixture.options.paths.installRoot, "current", "runtime")
+  fixture.runner.loaded = true
+
+  fixture.runner.commit = "8".repeat(40)
+  const running: RuntimeInspection = {
+    running: true,
+    runtimeEpoch: "runtime:legacy-program",
+    runtimeBuildId: firstPlan.release.runtimeBuildId,
+    nativeBuildId: firstPlan.release.nativeBuildId,
+    activeOperations: 0,
+    quarantinedResources: 0,
+  }
+  const options = { ...fixture.options, runtimeAdmin: successfulAdmin(running) }
+  const update = await planRuntimeInstall(options)
+  const result = await applyRuntimeInstall(update, options)
+
+  expect(result.state).toBe("installed")
+  expect(fixture.runner.launchProgram).toBe(join(fixture.options.paths.installRoot, "current", "computer-use"))
+  expect(JSON.parse(await readFile(join(update.release.releasePath, "manifest.json"), "utf8"))
+    .artifacts.runtime.path).toBe("computer-use")
+})
+
 test("rollback принимает старый manifest и plist без META_NATIVE_CDHASH", async () => {
   const fixture = await createFixture()
   const firstPlan = await planRuntimeInstall(fixture.options)
   await applyRuntimeInstall(firstPlan, fixture.options)
   const manifestPath = join(firstPlan.release.releasePath, "manifest.json")
   const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
+  const computerUsePath = join(firstPlan.release.releasePath, "computer-use")
+  const legacyRuntimePath = join(firstPlan.release.releasePath, "runtime")
   const currentPlist = await readFile(fixture.options.paths.launchAgentPath, "utf8")
-  const legacyPlist = currentPlist.replace(
+  const legacyPlist = currentPlist.replace("/current/computer-use", "/current/runtime").replace(
     `    <key>META_NATIVE_CDHASH</key>\n    <string>${manifest.artifacts.nativeHelper.cdhash}</string>\n`,
     "",
   )
+  await chmod(firstPlan.release.releasePath, 0o700)
+  await rename(computerUsePath, legacyRuntimePath)
+  manifest.artifacts.runtime.path = "runtime"
   manifest.tcc.requiredPassiveChecks = ["accessibility", "screen-recording"]
   manifest.launchAgent.sha256 = sha256(legacyPlist)
-  await chmod(firstPlan.release.releasePath, 0o700)
   await chmod(manifestPath, 0o600)
   await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
   await chmod(manifestPath, 0o444)
   await chmod(firstPlan.release.releasePath, 0o555)
   await writeFile(fixture.options.paths.launchAgentPath, legacyPlist)
+  fixture.runner.launchProgram = join(fixture.options.paths.installRoot, "current", "runtime")
 
   fixture.runner.commit = "9".repeat(40)
   fixture.runner.loaded = true
@@ -606,7 +672,7 @@ async function createFixture() {
     doctorTimeoutMs: 200,
     readinessProfile: "foundation",
   }
-  runner.launchProgram = join(options.paths.installRoot, "current", "runtime")
+  runner.launchProgram = join(options.paths.installRoot, "current", "computer-use")
   runner.launchPlist = options.paths.launchAgentPath
   return { root, runner, options }
 }
@@ -692,13 +758,14 @@ class FakeRunner implements CommandRunner {
           effectiveUid: process.geteuid?.() ?? 501, auditUserId: process.getuid?.() ?? 501, auditSessionId: this.auditSessionId },
       }))
     }
-    if (file.endsWith("/current/runtime") && args[0] === "--doctor") {
+    if ((file.endsWith("/current/computer-use") || file.endsWith("/current/runtime")) && args[0] === "--doctor") {
       this.doctorCalls++
       if (this.doctorUnavailableCount > 0) {
         this.doctorUnavailableCount--
         return fail("credential not ready")
       }
-      const releasePath = await readlink(file.slice(0, -"/runtime".length))
+      const artifactName = file.endsWith("/computer-use") ? "computer-use" : "runtime"
+      const releasePath = await readlink(file.slice(0, -`/${artifactName}`.length))
       const manifest = JSON.parse(await readFile(join(releasePath, "manifest.json"), "utf8"))
       if (manifest.builds.runtimeBuildId === this.failDoctorForBuild) return fail("doctor failed")
       const runtimeBuildId = manifest.builds.runtimeBuildId as string
@@ -749,6 +816,8 @@ class FakeRunner implements CommandRunner {
     if (file === "/bin/launchctl" && args[0] === "bootstrap") {
       this.mutations++
       this.loaded = true
+      const plist = await readFile(args[2]!, "utf8")
+      this.launchProgram = plist.match(/<array><string>([^<]+)<\/string><\/array>/)?.[1] ?? this.launchProgram
       return ok()
     }
     if (file === "/bin/launchctl" && args[0] === "bootout") {

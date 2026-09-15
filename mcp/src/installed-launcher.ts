@@ -8,6 +8,8 @@ import { createUnavailableRuntimeMcpServer } from "./runtime-mcp.ts"
 
 const RELEASE_FORMAT = "meta-ai-macos-runtime-release-v1"
 const SERVICE_LABEL = "com.meta.ai-macos.runtime"
+const RUNTIME_ARTIFACT_NAMES = ["computer-use", "runtime"] as const
+type RuntimeArtifactName = typeof RUNTIME_ARTIFACT_NAMES[number]
 const MAX_MANIFEST_BYTES = 1024 * 1024
 const MAX_RUNTIME_BYTES = 128 * 1024 * 1024
 const MAX_UNIX_SOCKET_BYTES = 103
@@ -70,7 +72,7 @@ type InstalledManifest = {
   format: typeof RELEASE_FORMAT
   releaseId: string
   source: { repositoryRoot: string }
-  artifacts: { runtime: { path: "runtime", sha256: string, bytes: number } }
+  artifacts: { runtime: { path: RuntimeArtifactName, sha256: string, bytes: number } }
   launchAgent: { label: typeof SERVICE_LABEL }
   entrypoint: { source: "scripts/runtime-entry.ts", modes: readonly string[], mcpTransport: "stdio" }
 }
@@ -192,7 +194,8 @@ function parseManifest(value: unknown): InstalledManifest {
   if (value === null || typeof value !== "object" || Array.isArray(value)) throw new Error("Installed manifest должен быть object")
   const manifest = value as InstalledManifest
   if (manifest.format !== RELEASE_FORMAT || typeof manifest.releaseId !== "string" || manifest.releaseId.length < 1
-    || manifest.artifacts?.runtime?.path !== "runtime" || !/^[a-f0-9]{64}$/.test(manifest.artifacts.runtime.sha256)
+    || !RUNTIME_ARTIFACT_NAMES.some(name => name === manifest.artifacts?.runtime?.path)
+    || !/^[a-f0-9]{64}$/.test(manifest.artifacts.runtime.sha256)
     || !Number.isSafeInteger(manifest.artifacts.runtime.bytes)
     || manifest.launchAgent?.label !== SERVICE_LABEL || manifest.entrypoint?.source !== "scripts/runtime-entry.ts"
     || !manifest.entrypoint.modes.includes("mcp") || manifest.entrypoint.mcpTransport !== "stdio") {

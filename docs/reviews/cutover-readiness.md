@@ -125,7 +125,7 @@ registrars, поэтому удаление legacy MCP сейчас остави
    нулём active/quarantined/recovery blockers и совпадающими permissions/code
    identity. Это не live UI acceptance.
 8. **Переключить default MCP launcher.** Codex config должен запускать
-   установленный `current/runtime --mcp`, а не repository
+   установленный `current/computer-use --mcp`, а не repository
    `bun run --cwd mcp start`.
 9. **Проверить fresh task catalog.** Уже после default launcher switch в новой
    задаче подтвердить dynamic high-level schemas, health/build IDs и

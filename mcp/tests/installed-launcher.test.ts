@@ -17,7 +17,7 @@ const installRoot = join(home, "Library", "Application Support", "ai-macos", "ru
 const releasesRoot = join(installRoot, "releases")
 const releaseId = "release-fixture"
 const releasePath = join(releasesRoot, releaseId)
-const runtimePath = join(releasePath, "runtime")
+const runtimePath = join(releasePath, "computer-use")
 
 test("wrong hostname отдаёт только passive unavailable server до filesystem/spawn", async () => {
   const fs = new MemoryFs()
@@ -69,6 +69,41 @@ test("valid owned immutable release запускает тот же artifact с -
       stderr: "inherit",
     },
   }])
+})
+
+test("старый manifest с artifact runtime остаётся запускаемым", async () => {
+  const legacyRuntimePath = join(releasePath, "runtime")
+  const runner = new FakeRunner(0)
+  const result = await runInstalledLauncher({
+    expectedHostname: "mac",
+    actualHostname: "mac",
+    homeDirectory: home,
+    uid,
+    fs: installedFs("runtime"),
+    runner,
+    serveUnavailable: async () => { throw new Error("must not fallback") },
+  })
+
+  expect(result).toEqual({ state: "launched", releaseId, runtimePath: legacyRuntimePath, exitCode: 0 })
+  expect(runner.calls[0]?.file).toBe(legacyRuntimePath)
+})
+
+test("artifact path вне точного allowlist отклоняется до spawn", async () => {
+  const runner = new FakeRunner(0)
+  const unavailable: string[] = []
+  const result = await runInstalledLauncher({
+    expectedHostname: "mac",
+    actualHostname: "mac",
+    homeDirectory: home,
+    uid,
+    fs: installedFs("bin/computer-use"),
+    runner,
+    serveUnavailable: async reason => { unavailable.push(reason) },
+  })
+
+  expect(result).toEqual({ state: "unavailable", reason: "runtime-unavailable" })
+  expect(unavailable).toEqual(["runtime-unavailable"])
+  expect(runner.calls).toHaveLength(0)
 })
 
 test("missing, escaped, foreign или corrupted install никогда не запускает executable fallback", async () => {
@@ -205,14 +240,15 @@ class FakeSignals extends EventEmitter implements LauncherSignals {
   override off(signal: "SIGINT" | "SIGTERM", listener: () => void): this { return super.off(signal, listener) }
 }
 
-function installedFs(): MemoryFs {
+function installedFs(runtimeArtifactName = "computer-use"): MemoryFs {
   const fs = new MemoryFs()
   const runtime = new TextEncoder().encode("immutable-runtime-mcp")
+  const installedRuntimePath = join(releasePath, runtimeArtifactName)
   const manifest = new TextEncoder().encode(JSON.stringify({
     format: "meta-ai-macos-runtime-release-v1",
     releaseId,
     source: { repositoryRoot: "/Users/tester/repozitarium/ai-macos" },
-    artifacts: { runtime: { path: "runtime", sha256: sha256(runtime), bytes: runtime.byteLength } },
+    artifacts: { runtime: { path: runtimeArtifactName, sha256: sha256(runtime), bytes: runtime.byteLength } },
     launchAgent: { label: "com.meta.ai-macos.runtime" },
     entrypoint: { source: "scripts/runtime-entry.ts", modes: ["runtime", "doctor", "mcp"], mcpTransport: "stdio" },
   }))
@@ -224,8 +260,8 @@ function installedFs(): MemoryFs {
   fs.nodes.set(releasePath, node("directory", 0o555))
   fs.nodes.set(join(releasePath, "manifest.json"), node("file", 0o444, manifest.byteLength))
   fs.files.set(join(releasePath, "manifest.json"), manifest)
-  fs.nodes.set(runtimePath, node("file", 0o555, runtime.byteLength))
-  fs.files.set(runtimePath, runtime)
+  fs.nodes.set(installedRuntimePath, node("file", 0o555, runtime.byteLength))
+  fs.files.set(installedRuntimePath, runtime)
   return fs
 }
 

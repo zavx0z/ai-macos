@@ -27,6 +27,9 @@ const execFileAsync = promisify(execFile)
 export const RUNTIME_SERVICE_LABEL = "com.meta.ai-macos.runtime"
 export const HELPER_SIGNING_IDENTIFIER = "com.meta.input.helper"
 const RELEASE_FORMAT = "meta-ai-macos-runtime-release-v1"
+const RUNTIME_ARTIFACT_NAMES = ["computer-use", "runtime"] as const
+type RuntimeArtifactName = typeof RUNTIME_ARTIFACT_NAMES[number]
+const CURRENT_RUNTIME_ARTIFACT_NAME: RuntimeArtifactName = "computer-use"
 const MAX_COMMAND_OUTPUT = 8 * 1024 * 1024
 const MAX_BROWSER_CONFIG_BYTES = 64 * 1024
 const STARTUP_PERMISSION_NAMES = ["accessibility", "screenRecording", "postEvents", "inputMonitoring"] as const
@@ -182,7 +185,7 @@ export type ReleaseManifest = {
   source: { repositoryRoot: string, commit: string, clean: true }
   builds: { runtimeBuildId: string, nativeBuildId: string }
   artifacts: {
-    runtime: { path: "runtime", sha256: string, bytes: number }
+    runtime: { path: RuntimeArtifactName, sha256: string, bytes: number }
     nativeHelper: {
       path: "native-helper"
       sha256: string
@@ -556,7 +559,7 @@ function installSteps(
   return [
     { id: "verify-source", description: "Проверить canonical checkout, HEAD и отсутствие uncommitted source", mutates: false },
     { id: "build-runtime", description: `Собрать runtime ${runtimeBuildId} во временный release`, mutates: true,
-      command: { file: process.execPath, args: ["build", "scripts/runtime-entry.ts", "--compile", "--outfile", `${releasePath}.staging/runtime`] } },
+      command: { file: process.execPath, args: ["build", "scripts/runtime-entry.ts", "--compile", "--outfile", `${releasePath}.staging/${CURRENT_RUNTIME_ARTIFACT_NAME}`] } },
     { id: "build-native", description: `Собрать native helper ${nativeBuildId} во временный release`, mutates: true,
       command: { file: "/bin/sh", args: [join(paths.repositoryRoot, "native/scripts/build-broker.sh"), `${releasePath}.staging/native-helper`, nativeBuildId] } },
     { id: "verify-candidate", description: `Подписать ${HELPER_SIGNING_IDENTIFIER}, проверить signature, metadata, build IDs и digests`, mutates: true },
@@ -576,7 +579,7 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
   const manifestPath = join(releasePath, "manifest.json")
   if (await exists(manifestPath)) {
     const manifest = parseManifest(JSON.parse(await readFile(manifestPath, "utf8")))
-    const plist = launchAgentPlist(plan, manifestNativeCdhash(manifest))
+    const plist = launchAgentPlist(plan, manifest.artifacts.runtime.path, manifestNativeCdhash(manifest))
     assertManifestMatchesPlan(manifest, plan, sha256(plist))
     await verifyReleaseArtifacts(releasePath, manifest, options.runner, plan)
     return {
@@ -592,7 +595,7 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
   const staging = join(stagingRoot, `${plan.release.releaseId}.${randomUUID()}`)
   await mkdir(staging, { recursive: false, mode: 0o700 })
   try {
-    const runtimePath = join(staging, "runtime")
+    const runtimePath = join(staging, CURRENT_RUNTIME_ARTIFACT_NAME)
     const nativeHelperPath = join(staging, "native-helper")
     await checked(options.runner, process.execPath, [
       "build",
@@ -634,7 +637,7 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
       artifact(runtimePath),
       artifact(nativeHelperPath),
     ])
-    const plist = launchAgentPlist(plan, signature.cdhash)
+    const plist = launchAgentPlist(plan, CURRENT_RUNTIME_ARTIFACT_NAME, signature.cdhash)
     const manifest: ReleaseManifest = {
       format: RELEASE_FORMAT,
       releaseId: plan.release.releaseId,
@@ -642,7 +645,7 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
       source: { repositoryRoot: plan.source.repositoryRoot, commit: plan.source.commit, clean: true },
       builds: { runtimeBuildId: plan.release.runtimeBuildId, nativeBuildId: plan.release.nativeBuildId },
       artifacts: {
-        runtime: { path: "runtime", ...runtimeArtifact },
+        runtime: { path: CURRENT_RUNTIME_ARTIFACT_NAME, ...runtimeArtifact },
         nativeHelper: { path: "native-helper", ...nativeArtifact, signingIdentifier: HELPER_SIGNING_IDENTIFIER,
           designatedRequirement: signature.designatedRequirement, cdhash: signature.cdhash,
           auditSession: metadata.session },
@@ -902,7 +905,7 @@ async function installedReleaseMatches(plan: RuntimeInstallPlan): Promise<boolea
     const current = await readLinkIfPresent(join(plan.paths.installRoot, "current"))
     if (current !== plan.release.releasePath) return false
     const manifest = parseManifest(JSON.parse(await readFile(join(current, "manifest.json"), "utf8")))
-    const expectedPlist = launchAgentPlist(plan, manifestNativeCdhash(manifest))
+    const expectedPlist = launchAgentPlist(plan, manifest.artifacts.runtime.path, manifestNativeCdhash(manifest))
     assertManifestMatchesPlan(manifest, plan, sha256(expectedPlist))
     const helperSha256 = await hashIfPresent(plan.paths.stableHelperPath)
     const plist = await readRegularFileIfPresent(plan.paths.launchAgentPath)
@@ -932,7 +935,7 @@ async function runDoctor(
   timeoutMs: number,
   permissionWaitMs: number,
 ): Promise<unknown> {
-  const executable = join(plan.paths.installRoot, "current", "runtime")
+  const executable = join(plan.paths.installRoot, "current", manifest.artifacts.runtime.path)
   let readinessDeadlineAt = Date.now() + timeoutMs
   let permissionDeadlineAt: number | undefined
   let previousPermissionStatePending = false
@@ -1115,8 +1118,12 @@ async function boundedDelay(ms: number): Promise<void> {
   await new Promise(resolveDelay => setTimeout(resolveDelay, ms))
 }
 
-function launchAgentPlist(plan: RuntimeInstallPlan, nativeCdhash?: string): string {
-  const runtime = join(plan.paths.installRoot, "current", "runtime")
+function launchAgentPlist(
+  plan: RuntimeInstallPlan,
+  runtimeArtifactName: RuntimeArtifactName,
+  nativeCdhash?: string,
+): string {
+  const runtime = join(plan.paths.installRoot, "current", runtimeArtifactName)
   const environment: Record<string, string> = {
     META_RUNTIME_SOCKET: join(plan.paths.runRoot, "runtime.sock"),
     META_RUNTIME_CREDENTIAL: join(plan.paths.runRoot, "credential.json"),
@@ -1284,7 +1291,8 @@ function assertManifestMatchesPlan(manifest: ReleaseManifest, plan: RuntimeInsta
 function parseManifest(value: unknown): ReleaseManifest {
   if (value === null || typeof value !== "object") throw new Error("Release manifest должен быть object")
   const manifest = value as ReleaseManifest
-  if (manifest.format !== RELEASE_FORMAT || manifest.artifacts?.runtime?.path !== "runtime"
+  if (manifest.format !== RELEASE_FORMAT
+    || !RUNTIME_ARTIFACT_NAMES.some(name => name === manifest.artifacts?.runtime?.path)
     || manifest.artifacts?.nativeHelper?.path !== "native-helper"
     || manifest.artifacts.nativeHelper.signingIdentifier !== HELPER_SIGNING_IDENTIFIER
     || !/^[a-f0-9]{64}$/.test(manifest.artifacts.runtime.sha256)
@@ -1333,8 +1341,9 @@ async function inspectLaunchService(
   const pid = Number(lines.find(line => line.startsWith("pid = "))?.slice("pid = ".length))
   const program = lines.find(line => line.startsWith("program = "))?.slice("program = ".length)
   const plistPath = lines.find(line => line.startsWith("path = "))?.slice("path = ".length)
-  const expectedProgram = join(plan.paths.installRoot, "current", "runtime")
-  if (!Number.isSafeInteger(pid) || pid < 1 || program !== expectedProgram || plistPath !== plan.paths.launchAgentPath) {
+  const expectedPrograms = RUNTIME_ARTIFACT_NAMES.map(name => join(plan.paths.installRoot, "current", name))
+  if (!Number.isSafeInteger(pid) || pid < 1 || program === undefined || !expectedPrograms.includes(program)
+    || plistPath !== plan.paths.launchAgentPath) {
     throw new Error("Loaded LaunchAgent не совпадает с exact canonical pid/program/plist ownership")
   }
   return { pid, program, plistPath }
