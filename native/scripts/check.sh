@@ -274,6 +274,24 @@ fi
   -Wextra \
   -Werror \
   -Inative/include \
+  -Inative/src/owned-sheet \
+  native/src/registry.c \
+  native/src/serialization.m \
+  native/src/owned-sheet/meta_owned_sheet_discovery.m \
+  native/src/owned-sheet/meta_owned_sheet_discovery_test.m \
+  -framework Foundation \
+  -framework AppKit \
+  -framework ApplicationServices \
+  -o "$CHECK_DIR/owned-sheet-discovery-test"
+
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
   -Inative/src/input-target \
   native/src/input-target/meta_geometry_probe.m \
   native/src/input-target/meta_geometry_probe_test.m \
@@ -373,6 +391,7 @@ fi
 "$CHECK_DIR/capture-lifecycle-test"
 "$CHECK_DIR/broker-core-test"
 "$CHECK_DIR/ax-inspector-test"
+"$CHECK_DIR/owned-sheet-discovery-test"
 "$CHECK_DIR/geometry-probe-test"
 "$CHECK_DIR/cursor-display-test"
 "$CHECK_DIR/hit-test-binder-test"

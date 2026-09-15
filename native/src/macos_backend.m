@@ -12,6 +12,7 @@
 
 #include "meta_macos.h"
 #include "observer-index/meta_observer_snapshot_gate.h"
+#include "owned-sheet/meta_owned_sheet_discovery.h"
 #include "window-actions/meta_window_readback.h"
 
 typedef struct {
@@ -823,6 +824,7 @@ bool meta_macos_refresh_inventory_with_priority(
         }
         const uint64_t owner_token =
             token_for_element(backend, pid, launch_time_micros, window);
+        bool owned_sheet_found = false;
         CFTypeRef sheets_value = NULL;
         const bool sheets_within_budget = set_ax_timeout_before_deadline(
             window, ax_deadline, 100);
@@ -844,6 +846,8 @@ bool meta_macos_refresh_inventory_with_priority(
               complete = false;
               application_failed = !application_timed_out;
               if (application_timed_out) break;
+            } else {
+              owned_sheet_found = true;
             }
           }
         } else if (sheets_error == kAXErrorSuccess) {
@@ -856,6 +860,37 @@ bool meta_macos_refresh_inventory_with_priority(
                    sheets_error != kAXErrorAttributeUnsupported) {
           application_failed = true;
           complete = false;
+        }
+        const bool fallback_allowed = !owned_sheet_found &&
+            (sheets_error == kAXErrorSuccess ||
+             sheets_error == kAXErrorNoValue ||
+             sheets_error == kAXErrorAttributeUnsupported);
+        if (fallback_allowed && !application_timed_out) {
+          MetaAXWindowInput **windows_pointer = &ax_windows;
+          size_t *count_pointer = &ax_window_count;
+          bool *timeout_pointer = &application_timed_out;
+          MetaOwnedSheetDiscoveryStatus discovery =
+              meta_discover_direct_owned_sheets(
+                  (__bridge id)window, pid, ax_deadline,
+                  meta_owned_sheet_system_backend(),
+                  ^BOOL(id sheet) {
+                    return append_ax_window(
+                        backend, windows_pointer, count_pointer, pid,
+                        launch_time_micros,
+                        (__bridge AXUIElementRef)sheet, owner_token,
+                        ax_deadline, timeout_pointer);
+                  });
+          if (discovery == MetaOwnedSheetDiscoveryTimedOut) {
+            application_timed_out = true;
+            complete = false;
+          } else if (discovery == MetaOwnedSheetDiscoveryFailed) {
+            application_failed = true;
+            complete = false;
+          }
+          if (process_start_micros(pid) != launch_time_micros) {
+            application_failed = true;
+            complete = false;
+          }
         }
         if (sheets_value != NULL) CFRelease(sheets_value);
         if (application_timed_out) break;

@@ -24,6 +24,7 @@ beforeAll(async () => {
     "registry.c",
     "macos_backend.m",
     "inventory-priority/meta_inventory_priority.c",
+    "owned-sheet/meta_owned_sheet_discovery.m",
     "observer-index/meta_observer_snapshot_gate.c",
     "window-actions/meta_window_readback.c",
     "input-target/meta_geometry_probe.m",

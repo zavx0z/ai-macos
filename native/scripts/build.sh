@@ -25,6 +25,7 @@ mkdir -p "$OUTPUT_DIRECTORY"
   native/src/broker_core.c \
   native/src/macos_backend.m \
   native/src/inventory-priority/meta_inventory_priority.c \
+  native/src/owned-sheet/meta_owned_sheet_discovery.m \
   native/src/observer-index/meta_observer_snapshot_gate.c \
   native/src/window-actions/meta_window_readback.c \
   native/src/macos_input.m \
