@@ -18,6 +18,7 @@ static NSDictionary *status_fence(MetaFence fence) {
   NSString *_requestId;
   MetaInputJobEmitter _emitter;
   atomic_bool _cancel;
+  atomic_bool _channelDisconnected;
   atomic_bool _heartbeatExpired;
   atomic_uint_fast64_t _lastHeartbeat;
   NSCondition *_condition;
@@ -34,6 +35,7 @@ static NSDictionary *status_fence(MetaFence fence) {
     _emitter = [emitter copy];
     _condition = [[NSCondition alloc] init];
     atomic_init(&_cancel, false);
+    atomic_init(&_channelDisconnected, false);
     atomic_init(&_heartbeatExpired, false);
     atomic_init(&_lastHeartbeat, job_millis());
   }
@@ -71,6 +73,10 @@ static NSDictionary *status_fence(MetaFence fence) {
   [_condition broadcast];
   [_condition unlock];
 }
+- (void)channelDisconnected {
+  atomic_store(&_channelDisconnected, true);
+  [self requestCancel];
+}
 
 - (BOOL)deliverLedgerAck:(NSDictionary *)ack {
   [_condition lock];
@@ -84,6 +90,7 @@ static NSDictionary *status_fence(MetaFence fence) {
 }
 
 - (BOOL)persistLedger:(const MetaLedgerPersistenceRequest *)request ack:(MetaLedgerPersistenceAck *)ack {
+  if (atomic_load(&_channelDisconnected)) return NO;
   static NSString *states[] = {@"pending-down", @"confirmed-down", @"pending-up", @"released", @"uncertain"};
   NSMutableArray *entries = [NSMutableArray array];
   for (size_t i = 0; i < request->snapshot.entry_count; i += 1) {
@@ -102,7 +109,7 @@ static NSDictionary *status_fence(MetaFence fence) {
   if (!_emitter(@{@"channel": @"ledger-persist", @"payload": @{@"requestId": @(request->request_id), @"snapshot": snapshot}})) return NO;
   NSDate *deadline = [NSDate dateWithTimeIntervalSinceNow:1];
   [_condition lock];
-  while (_ledgerAck == nil) {
+  while (_ledgerAck == nil && !atomic_load(&_channelDisconnected)) {
     if (![_condition waitUntilDate:deadline]) break;
   }
   NSDictionary *received = _ledgerAck;

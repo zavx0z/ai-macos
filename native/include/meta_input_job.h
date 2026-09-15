@@ -13,6 +13,7 @@ typedef BOOL (^MetaInputJobEmitter)(NSDictionary *frame);
 - (BOOL)noteHeartbeat;
 - (BOOL)heartbeatExpired;
 - (void)requestCancel;
+- (void)channelDisconnected;
 - (BOOL)deliverLedgerAck:(NSDictionary *)ack;
 - (BOOL)persistLedger:(const MetaLedgerPersistenceRequest *)request ack:(MetaLedgerPersistenceAck *)ack;
 - (void)publishStatus:(MetaExecutorStatus)status;

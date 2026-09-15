@@ -114,7 +114,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   if (_requestedExit >= 0) return;
   _sealed = YES;
   _requestedExit = code;
-  [_job requestCancel];
+  [_job channelDisconnected];
   if (!_busy) {
     atomic_store(&_exitCode, code);
   } else {

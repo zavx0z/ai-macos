@@ -229,6 +229,10 @@ static bool post_held_event(void *context, MetaHeldEventKind kind, uint32_t code
   return true;
 }
 
+static bool post_cleanup_up(void *context, MetaHeldEventKind kind, uint32_t code, uint64_t tag) {
+  return post_held_event(context, kind, code, false, tag);
+}
+
 static bool post_text_cluster(void *context, const uint16_t *utf16_units,
                               size_t utf16_count, uint64_t synthetic_tag) {
   FixtureBroker *broker = context;
@@ -682,6 +686,7 @@ int main(void) {
         .verify_target = verify_target,
         .persist_ledger = persist_ledger,
         .post_held_event = post_held_event,
+        .post_cleanup_up = post_cleanup_up,
         .post_text_cluster = post_text_cluster,
         .set_event_flags = set_event_flags,
     };

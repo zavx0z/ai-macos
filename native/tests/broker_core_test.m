@@ -74,6 +74,10 @@ static MetaCaptureTaskRef capture_start(void *context,
   return &fixture->capture_storage;
 }
 
+static bool post_cleanup(void *context, MetaHeldEventKind kind, uint32_t code, uint64_t tag) {
+  return post_held(context, kind, code, false, tag);
+}
+
 static void capture_cancel(void *context, MetaCaptureTaskRef task) {
   Fixture *fixture = context;
   assert(task == &fixture->capture_storage);
@@ -119,6 +123,7 @@ int main(void) {
         .verify_target = verify_target,
         .persist_ledger = persist,
         .post_held_event = post_held,
+        .post_cleanup_up = post_cleanup,
     };
     MetaExecutor *executor = meta_executor_create("native-1", 500,
                                                   executor_backend);

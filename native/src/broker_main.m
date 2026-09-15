@@ -75,7 +75,8 @@ static bool verify_point_borrow(void *context, const MetaAXTargetBorrow *borrow)
     _input = meta_macos_input_create();
     MetaExecutorBackend sink = {.context = _input, .post_held_event = meta_macos_input_post_held,
       .post_text_cluster = meta_macos_input_post_text, .set_event_flags = meta_macos_input_set_flags,
-      .post_pointer_event = meta_macos_input_post_pointer, .post_scroll_event = meta_macos_input_post_scroll};
+      .post_pointer_event = meta_macos_input_post_pointer, .post_scroll_event = meta_macos_input_post_scroll,
+      .post_cleanup_up = meta_macos_input_post_cleanup_up};
     MetaMacOSBackend *windows = _windows;
     _inputExecutor = [[MetaInputExecutor alloc] initWithGeneration:generation sink:sink verify:^BOOL(NSString *target) {
       return meta_macos_input_preflight() && meta_macos_target_is_focused(windows, target.UTF8String);

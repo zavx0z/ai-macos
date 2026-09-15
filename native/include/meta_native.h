@@ -371,6 +371,8 @@ typedef struct {
                          MetaLedgerPersistenceAck *ack);
   bool (*post_held_event)(void *context, MetaHeldEventKind kind, uint32_t code,
                           bool down, uint64_t synthetic_tag);
+  bool (*post_cleanup_up)(void *context, MetaHeldEventKind kind, uint32_t code,
+                          uint64_t synthetic_tag);
   bool (*post_text_cluster)(void *context, const uint16_t *utf16_units,
                             size_t utf16_count, uint64_t synthetic_tag);
   bool (*post_pointer_event)(void *context,

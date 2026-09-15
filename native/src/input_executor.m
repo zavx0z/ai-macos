@@ -36,6 +36,10 @@ static bool post(void *context, MetaHeldEventKind kind, uint32_t code, bool down
   MetaExecutorBackend sink = [(__bridge MetaInputExecutor *)context sink];
   return sink.post_held_event != NULL && sink.post_held_event(sink.context, kind, code, down, tag);
 }
+static bool cleanup_up(void *context, MetaHeldEventKind kind, uint32_t code, uint64_t tag) {
+  MetaExecutorBackend sink = [(__bridge MetaInputExecutor *)context sink];
+  return sink.post_cleanup_up != NULL && sink.post_cleanup_up(sink.context, kind, code, tag);
+}
 static bool text(void *context, const uint16_t *units, size_t length, uint64_t tag) {
   MetaExecutorBackend sink = [(__bridge MetaInputExecutor *)context sink];
   return sink.post_text_cluster != NULL && sink.post_text_cluster(sink.context, units, length, tag);
@@ -64,9 +68,11 @@ static bool dispatch_external(void *context) {
   BOOL (^_verify)(NSString *);
   BOOL (^_externalVerify)(NSString *);
   BOOL (^_pointVerify)(NSString *, double, double);
+  BOOL (^_scopedPointVerify)(NSDictionary *, double, double);
   BOOL _hasPoint;
   double _pointX;
   double _pointY;
+  uint64_t _actionDeadline;
   MetaInputJob *_job;
 }
 - (instancetype)initWithGeneration:(NSString *)generation sink:(MetaExecutorBackend)sink verify:(BOOL (^)(NSString *))targetVerify {
@@ -76,7 +82,7 @@ static bool dispatch_external(void *context) {
     _verify = [targetVerify copy];
     MetaExecutorBackend backend = {.context = (__bridge void *)self, .monotonic_millis = clock_now, .verify_target = verify,
       .persist_ledger = persist, .post_held_event = post, .post_text_cluster = text, .set_event_flags = flags,
-      .post_pointer_event = pointer, .post_scroll_event = scroll, .should_cancel = cancelled};
+      .post_pointer_event = pointer, .post_scroll_event = scroll, .post_cleanup_up = cleanup_up, .should_cancel = cancelled};
     _executor = meta_executor_create(generation.UTF8String, 1000, backend);
     if (_executor == NULL) return nil;
   }
@@ -88,18 +94,32 @@ static bool dispatch_external(void *context) {
 - (BOOL)verify:(const char *)target {
   [_job publishStatus:meta_executor_status(_executor)];
   if (_externalVerify != nil) return _externalVerify(@(target));
-  return _verify(@(target)) && (!_hasPoint || (_pointVerify != nil && _pointVerify(@(target), _pointX, _pointY)));
+  NSDictionary *scope = _job.operation[@"target"];
+  BOOL broad = [scope[@"kind"] isEqual:@"display"] || [scope[@"kind"] isEqual:@"desktop-layout"];
+  if (broad) return _hasPoint && _scopedPointVerify != nil && _scopedPointVerify(scope, _pointX, _pointY);
+  BOOL pointVerified = !_hasPoint || (_scopedPointVerify != nil ? _scopedPointVerify(scope, _pointX, _pointY) :
+      (_pointVerify != nil && _pointVerify(@(target), _pointX, _pointY)));
+  return _verify(@(target)) && pointVerified;
 }
 - (void)setPointVerifier:(BOOL (^)(NSString *, double, double))verify { _pointVerify = [verify copy]; }
+- (void)setScopedPointVerifier:(BOOL (^)(NSDictionary *, double, double))verify { _scopedPointVerify = [verify copy]; }
 - (BOOL)postPointer:(const MetaPointerEvent *)event tag:(uint64_t)tag {
-  NSString *target = _job.operation[@"target"][@"ref"][@"windowRef"] ?: _job.operation[@"target"][@"ref"][@"surfaceRef"];
-  if (event == NULL || _pointVerify == nil || !_pointVerify(target, event->x, event->y) || [self cancelled] || _sink.post_pointer_event == NULL) return NO;
+  NSDictionary *scope = _job.operation[@"target"];
+  NSString *target = scope[@"ref"][@"windowRef"] ?: scope[@"ref"][@"surfaceRef"];
+  if (event == NULL) return NO;
+  BOOL verified = _scopedPointVerify != nil ? _scopedPointVerify(scope, event->x, event->y) :
+      _pointVerify != nil && target != nil && _pointVerify(target, event->x, event->y);
+  if (!verified || [self cancelled] || clock_now(NULL) >= _actionDeadline || _sink.post_pointer_event == NULL) return NO;
   _hasPoint = YES; _pointX = event->x; _pointY = event->y;
   return _sink.post_pointer_event(_sink.context, event, tag);
 }
 - (BOOL)postScroll:(const MetaScrollEvent *)event tag:(uint64_t)tag {
-  NSString *target = _job.operation[@"target"][@"ref"][@"windowRef"] ?: _job.operation[@"target"][@"ref"][@"surfaceRef"];
-  if (event == NULL || _pointVerify == nil || !_pointVerify(target, event->x, event->y) || [self cancelled] || _sink.post_scroll_event == NULL) return NO;
+  NSDictionary *scope = _job.operation[@"target"];
+  NSString *target = scope[@"ref"][@"windowRef"] ?: scope[@"ref"][@"surfaceRef"];
+  if (event == NULL) return NO;
+  BOOL verified = _scopedPointVerify != nil ? _scopedPointVerify(scope, event->x, event->y) :
+      _pointVerify != nil && target != nil && _pointVerify(target, event->x, event->y);
+  if (!verified || [self cancelled] || clock_now(NULL) >= _actionDeadline || _sink.post_scroll_event == NULL) return NO;
   return _sink.post_scroll_event(_sink.context, event, tag);
 }
 - (BOOL)persist:(const MetaLedgerPersistenceRequest *)request ack:(MetaLedgerPersistenceAck *)ack {
@@ -161,7 +181,7 @@ static bool dispatch_external(void *context) {
   NSDictionary *fence = operation[@"fence"];
   NSDictionary *action = request[@"payload"][@"action"];
   NSDictionary *ref = operation[@"target"][@"ref"];
-  NSString *target = ref[@"windowRef"] ?: ref[@"surfaceRef"];
+  NSString *target = ref[@"windowRef"] ?: ref[@"surfaceRef"] ?: ref[@"displayRef"] ?: ref[@"layoutRef"];
   MetaFence token = {0};
   NSString *names[] = {@"runtimeEpoch", @"loginSessionId", @"nativeGeneration"};
   char *destinations[] = {token.runtime_epoch, token.login_session_id, token.native_generation};
@@ -181,7 +201,9 @@ static bool dispatch_external(void *context) {
     valid = valid && point_value(initialPoint, &_pointX, &_pointY);
     _hasPoint = valid;
   }
-  valid = valid && [@[@"window", @"surface"] containsObject:operation[@"target"][@"kind"]] &&
+  BOOL windowScope = [@[@"window", @"surface"] containsObject:operation[@"target"][@"kind"]];
+  BOOL displayScope = [@[@"display", @"desktop-layout"] containsObject:operation[@"target"][@"kind"]];
+  valid = valid && (windowScope || (pointerAction && displayScope)) &&
       [ref[@"runtimeEpoch"] isEqual:operation[@"runtimeEpoch"]] &&
       [ref[@"loginSessionId"] isEqual:operation[@"loginSessionId"]] &&
       [ref[@"nativeGeneration"] isEqual:operation[@"nativeGeneration"]];
@@ -199,6 +221,7 @@ static bool dispatch_external(void *context) {
   NSTimeInterval remaining = actionDeadline.timeIntervalSinceNow * 1000;
   valid = valid && actionDeadline != nil && outerDeadline != nil && [actionDeadline compare:outerDeadline] != NSOrderedDescending && remaining > 0;
   uint64_t deadline = clock_now(NULL) + (uint64_t)MAX(0, MIN(remaining, isText ? 30000 : 5000));
+  _actionDeadline = deadline;
   BOOL began = valid && meta_executor_open_runtime_epoch(_executor, token.runtime_epoch, token.login_session_id) &&
     meta_executor_begin(_executor, [operation[@"operationId"] UTF8String], target.UTF8String, token, deadline);
   if (!began) {

@@ -74,6 +74,10 @@ static bool fake_text(void *context, const uint16_t *units, size_t count,
   return true;
 }
 
+static bool fake_cleanup(void *context, MetaHeldEventKind kind, uint32_t code, uint64_t tag) {
+  return fake_held(context, kind, code, false, tag);
+}
+
 static bool fake_pointer(void *context, const MetaPointerEvent *event,
                          uint64_t tag) {
   FakeTextBackend *backend = context;
@@ -125,6 +129,7 @@ static MetaExecutor *create_executor(FakeTextBackend *backend) {
       .verify_target = fake_verify,
       .persist_ledger = fake_persist,
       .post_held_event = fake_held,
+      .post_cleanup_up = fake_cleanup,
       .post_text_cluster = fake_text,
       .post_pointer_event = fake_pointer,
       .post_scroll_event = fake_scroll,

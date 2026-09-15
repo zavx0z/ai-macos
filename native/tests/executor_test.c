@@ -10,11 +10,15 @@ typedef struct {
   bool target_valid;
   size_t persist_calls;
   size_t fail_persist_call;
+  uint64_t fail_persist_advance_millis;
   size_t event_count;
+  size_t cleanup_count;
+  bool fail_cleanup;
   struct {
     MetaHeldEventKind kind;
     uint32_t code;
     bool down;
+    bool cleanup;
   } events[32];
 } FakeBackend;
 
@@ -35,7 +39,10 @@ static bool fake_persist(void *context,
   assert(request->snapshot.operation_id[0] != '\0');
   if (request->snapshot.entry_count > 0)
     assert(request->snapshot.entries != NULL);
-  if (backend->persist_calls == backend->fail_persist_call) return false;
+  if (backend->persist_calls == backend->fail_persist_call) {
+    backend->now += backend->fail_persist_advance_millis;
+    return false;
+  }
   char digest[65] = {0};
   assert(meta_ledger_snapshot_sha256(&request->snapshot, digest));
   snprintf(ack->request_id, sizeof(ack->request_id), "%s",
@@ -63,8 +70,23 @@ static bool fake_post(void *context, MetaHeldEventKind kind, uint32_t code,
   backend->events[backend->event_count].kind = kind;
   backend->events[backend->event_count].code = code;
   backend->events[backend->event_count].down = down;
+  backend->events[backend->event_count].cleanup = false;
   backend->event_count += 1;
   return true;
+}
+
+static bool fake_cleanup_up(void *context, MetaHeldEventKind kind,
+                            uint32_t code, uint64_t synthetic_tag) {
+  FakeBackend *backend = context;
+  assert(synthetic_tag != 0);
+  assert(backend->event_count < 32);
+  backend->events[backend->event_count].kind = kind;
+  backend->events[backend->event_count].code = code;
+  backend->events[backend->event_count].down = false;
+  backend->events[backend->event_count].cleanup = true;
+  backend->event_count += 1;
+  backend->cleanup_count += 1;
+  return !backend->fail_cleanup;
 }
 
 static MetaExecutor *executor(FakeBackend *backend,
@@ -75,6 +97,7 @@ static MetaExecutor *executor(FakeBackend *backend,
       .verify_target = fake_verify_target,
       .persist_ledger = fake_persist,
       .post_held_event = fake_post,
+      .post_cleanup_up = fake_cleanup_up,
   };
   return meta_executor_create(native_generation, 500, callbacks);
 }
@@ -130,7 +153,7 @@ static void test_cancel_releases_confirmed_down(void) {
   meta_executor_destroy(value);
 }
 
-static void test_lost_ack_quarantines_without_blind_up(void) {
+static void test_confirmed_ack_failure_releases_live_owned_down_once(void) {
   FakeBackend backend = {
       .now = 100,
       .target_valid = true,
@@ -145,10 +168,122 @@ static void test_lost_ack_quarantines_without_blind_up(void) {
   assert(status.execution == META_EXECUTOR_QUARANTINED);
   assert(status.cleanup == META_CLEANUP_UNKNOWN);
   assert(status.quarantined);
-  assert(backend.event_count == 1);
+  assert(backend.event_count == 2);
   assert(backend.events[0].down);
+  assert(!backend.events[1].down);
+  assert(backend.events[1].cleanup);
+  assert(backend.cleanup_count == 1);
+  MetaLedgerEntry ledger[1];
+  assert(meta_executor_copy_ledger(value, ledger, 1) == 1);
+  assert(ledger[0].state == META_LEDGER_UNCERTAIN);
   assert(!meta_executor_cancel(value));
-  assert(backend.event_count == 1);
+  assert(backend.event_count == 2);
+  assert(backend.cleanup_count == 1);
+  meta_executor_destroy(value);
+}
+
+static void test_pending_down_ack_failure_posts_no_cleanup_up(void) {
+  FakeBackend backend = {
+      .now = 100,
+      .target_valid = true,
+      .fail_persist_call = 1,
+  };
+  MetaExecutor *value = executor(&backend, "native-1");
+  assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+  assert(meta_executor_begin(value, "pending-down-failure", "window-1",
+                             fence("runtime-1", "native-1", 1), 1000));
+  assert(!meta_executor_post_down(value, META_EVENT_KEY, 55));
+  const MetaExecutorStatus status = meta_executor_status(value);
+  assert(status.execution == META_EXECUTOR_QUARANTINED);
+  assert(status.dispatch == META_DISPATCH_NONE);
+  assert(status.cleanup == META_CLEANUP_UNKNOWN);
+  assert(status.quarantined);
+  assert(status.held_count == 1);
+  assert(strcmp(status.last_checkpoint, "pending-down-ack-unknown") == 0);
+  assert(backend.event_count == 0);
+  assert(backend.cleanup_count == 0);
+  MetaLedgerEntry ledger[1];
+  assert(meta_executor_copy_ledger(value, ledger, 1) == 1);
+  assert(ledger[0].state == META_LEDGER_UNCERTAIN);
+  meta_executor_destroy(value);
+}
+
+static void test_pending_up_ack_failure_releases_live_owned_down_once(void) {
+  FakeBackend backend = {
+      .now = 100,
+      .target_valid = true,
+      .fail_persist_call = 3,
+  };
+  MetaExecutor *value = executor(&backend, "native-1");
+  assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+  assert(meta_executor_begin(value, "pending-up-failure", "window-1",
+                             fence("runtime-1", "native-1", 1), 1000));
+  assert(meta_executor_post_down(value, META_EVENT_BUTTON, 0));
+  assert(!meta_executor_post_up(value, META_EVENT_BUTTON, 0));
+  const MetaExecutorStatus status = meta_executor_status(value);
+  assert(status.execution == META_EXECUTOR_QUARANTINED);
+  assert(status.cleanup == META_CLEANUP_UNKNOWN);
+  assert(status.quarantined);
+  assert(backend.event_count == 2);
+  assert(backend.events[0].down);
+  assert(backend.events[1].cleanup);
+  assert(backend.cleanup_count == 1);
+  MetaLedgerEntry ledger[1];
+  assert(meta_executor_copy_ledger(value, ledger, 1) == 1);
+  assert(ledger[0].state == META_LEDGER_UNCERTAIN);
+  assert(!meta_executor_cancel(value));
+  assert(backend.cleanup_count == 1);
+  meta_executor_destroy(value);
+}
+
+static void test_released_ack_failure_does_not_repeat_normal_up(void) {
+  FakeBackend backend = {
+      .now = 100,
+      .target_valid = true,
+      .fail_persist_call = 4,
+  };
+  MetaExecutor *value = executor(&backend, "native-1");
+  assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+  assert(meta_executor_begin(value, "released-ack-failure", "window-1",
+                             fence("runtime-1", "native-1", 1), 1000));
+  assert(meta_executor_post_down(value, META_EVENT_KEY, 55));
+  assert(!meta_executor_post_up(value, META_EVENT_KEY, 55));
+  const MetaExecutorStatus status = meta_executor_status(value);
+  assert(status.execution == META_EXECUTOR_QUARANTINED);
+  assert(status.cleanup == META_CLEANUP_UNKNOWN);
+  assert(status.quarantined);
+  assert(backend.event_count == 2);
+  assert(backend.events[0].down);
+  assert(!backend.events[1].down);
+  assert(!backend.events[1].cleanup);
+  assert(backend.cleanup_count == 0);
+  MetaLedgerEntry ledger[1];
+  assert(meta_executor_copy_ledger(value, ledger, 1) == 1);
+  assert(ledger[0].state == META_LEDGER_UNCERTAIN);
+  assert(!meta_executor_cancel(value));
+  assert(backend.event_count == 2);
+  meta_executor_destroy(value);
+}
+
+static void test_failed_cleanup_up_is_attempted_only_once(void) {
+  FakeBackend backend = {
+      .now = 100,
+      .target_valid = true,
+      .fail_cleanup = true,
+  };
+  MetaExecutor *value = executor(&backend, "native-1");
+  assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+  assert(meta_executor_begin(value, "cleanup-up-failure", "window-1",
+                             fence("runtime-1", "native-1", 1), 1000));
+  assert(meta_executor_post_down(value, META_EVENT_BUTTON, 0));
+  assert(!meta_executor_cancel(value));
+  MetaExecutorStatus status = meta_executor_status(value);
+  assert(status.execution == META_EXECUTOR_QUARANTINED);
+  assert(status.cleanup == META_CLEANUP_UNKNOWN);
+  assert(status.quarantined);
+  assert(backend.cleanup_count == 1);
+  assert(!meta_executor_cancel(value));
+  assert(backend.cleanup_count == 1);
   meta_executor_destroy(value);
 }
 
@@ -194,7 +329,7 @@ static void test_same_epoch_does_not_reset_fence_or_event_tag(void) {
   meta_executor_destroy(value);
 }
 
-static void test_second_down_failure_releases_existing_hold(void) {
+static void test_second_pending_down_failure_releases_existing_live_hold(void) {
   FakeBackend backend = {
       .now = 100,
       .target_valid = true,
@@ -207,16 +342,46 @@ static void test_second_down_failure_releases_existing_hold(void) {
   assert(meta_executor_post_down(value, META_EVENT_KEY, 55));
   assert(!meta_executor_post_down(value, META_EVENT_KEY, 56));
   MetaExecutorStatus status = meta_executor_status(value);
-  assert(status.execution == META_EXECUTOR_FAILED);
-  assert(status.cleanup == META_CLEANUP_COMPLETE);
-  assert(!status.quarantined);
-  assert(status.held_count == 0);
+  assert(status.execution == META_EXECUTOR_QUARANTINED);
+  assert(status.cleanup == META_CLEANUP_UNKNOWN);
+  assert(status.quarantined);
+  assert(status.held_count == 2);
   assert(backend.event_count == 2);
   assert(backend.events[0].code == 55 && backend.events[0].down);
-  assert(backend.events[1].code == 55 && !backend.events[1].down);
-  assert(meta_executor_begin(value, "operation-8", "window-1",
-                             fence("runtime-1", "native-1", 2), 1000));
-  assert(meta_executor_finish(value));
+  assert(backend.events[1].code == 55 && !backend.events[1].down &&
+         backend.events[1].cleanup);
+  assert(backend.cleanup_count == 1);
+  assert(!meta_executor_begin(value, "operation-8", "window-1",
+                              fence("runtime-1", "native-1", 2), 1000));
+  meta_executor_destroy(value);
+}
+
+static void test_broken_persistence_releases_all_live_owned_holds_once(void) {
+  FakeBackend backend = {
+      .now = 100,
+      .target_valid = true,
+      .fail_persist_call = 5,
+      .fail_persist_advance_millis = 1001,
+  };
+  MetaExecutor *value = executor(&backend, "native-1");
+  assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+  assert(meta_executor_begin(value, "multi-cleanup", "window-1",
+                             fence("runtime-1", "native-1", 1), 10000));
+  assert(meta_executor_post_down(value, META_EVENT_KEY, 55));
+  assert(meta_executor_post_down(value, META_EVENT_KEY, 56));
+  assert(!meta_executor_cancel(value));
+  const MetaExecutorStatus status = meta_executor_status(value);
+  assert(status.execution == META_EXECUTOR_QUARANTINED);
+  assert(status.cleanup == META_CLEANUP_UNKNOWN);
+  assert(status.quarantined);
+  assert(status.held_count == 2);
+  assert(backend.persist_calls == 5);
+  assert(backend.event_count == 4);
+  assert(backend.cleanup_count == 2);
+  assert(backend.events[2].cleanup && backend.events[2].code == 56);
+  assert(backend.events[3].cleanup && backend.events[3].code == 55);
+  assert(!meta_executor_cancel(value));
+  assert(backend.cleanup_count == 2);
   meta_executor_destroy(value);
 }
 
@@ -302,6 +467,7 @@ static void test_restored_uncertain_ledger_starts_quarantined(void) {
   assert(!meta_executor_open_runtime_epoch(value, "runtime-after-crash",
                                            "login-after-crash"));
   assert(backend.event_count == 0);
+  assert(backend.cleanup_count == 0);
   meta_executor_destroy(value);
 }
 
@@ -376,10 +542,15 @@ int main(void) {
   test_external_action_uses_same_fence();
   test_cancel_before_first_event();
   test_cancel_releases_confirmed_down();
-  test_lost_ack_quarantines_without_blind_up();
+  test_confirmed_ack_failure_releases_live_owned_down_once();
+  test_pending_down_ack_failure_posts_no_cleanup_up();
+  test_pending_up_ack_failure_releases_live_owned_down_once();
+  test_released_ack_failure_does_not_repeat_normal_up();
+  test_failed_cleanup_up_is_attempted_only_once();
   test_stale_fence_after_generation_change();
   test_same_epoch_does_not_reset_fence_or_event_tag();
-  test_second_down_failure_releases_existing_hold();
+  test_second_pending_down_failure_releases_existing_live_hold();
+  test_broken_persistence_releases_all_live_owned_holds_once();
   test_target_change_stops_before_next_event();
   test_user_takeover_and_watchdog();
   test_restored_uncertain_ledger_starts_quarantined();

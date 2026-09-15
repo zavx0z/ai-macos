@@ -5,6 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+  bool live_owned_down;
+  bool up_attempted;
+  bool durability_lost;
+} MetaVolatileHold;
+
 struct MetaExecutor {
   char native_generation[META_NATIVE_REF_CAPACITY];
   char runtime_epoch[META_NATIVE_REF_CAPACITY];
@@ -20,11 +26,13 @@ struct MetaExecutor {
   uint64_t next_ledger_sequence;
   MetaExecutorBackend backend;
   MetaLedgerEntry *ledger;
+  MetaVolatileHold *volatile_holds;
   size_t ledger_count;
   MetaExecutorStatus status;
   MetaObserverState observer_state;
   bool active;
   bool rotation_sealed;
+  bool persistence_unavailable;
   MetaRecoveryLedgerStatus recovery_status;
   bool has_previous_ledger_digest;
   char previous_ledger_digest[65];
@@ -62,7 +70,11 @@ static uint64_t hash_text(uint64_t value, const char *text) {
 }
 
 static bool persist_ledger(MetaExecutor *executor) {
-  if (executor->backend.persist_ledger == NULL) return false;
+  if (executor->persistence_unavailable ||
+      executor->backend.persist_ledger == NULL) {
+    executor->persistence_unavailable = true;
+    return false;
+  }
   MetaLedgerPersistenceRequest request = {0};
   request.snapshot.revision = executor->status.ledger_revision + 1;
   request.snapshot.has_previous_snapshot_sha256 =
@@ -90,6 +102,7 @@ static bool persist_ledger(MetaExecutor *executor) {
            (unsigned long long)executor->synthetic_tag);
   char expected_digest[65] = {0};
   if (!meta_ledger_snapshot_sha256(&request.snapshot, expected_digest)) {
+    executor->persistence_unavailable = true;
     return false;
   }
   MetaLedgerPersistenceAck ack = {0};
@@ -103,6 +116,7 @@ static bool persist_ledger(MetaExecutor *executor) {
       strcmp(ack.native_generation, request.snapshot.native_generation) != 0 ||
       ack.revision != request.snapshot.revision ||
       strcmp(ack.snapshot_sha256, expected_digest) != 0) {
+    executor->persistence_unavailable = true;
     return false;
   }
   executor->status.ledger_revision = request.snapshot.revision;
@@ -134,49 +148,72 @@ static void quarantine(MetaExecutor *executor) {
   executor->active = false;
 }
 
+static bool release_live_owned_entry(MetaExecutor *executor, size_t index,
+                                     uint64_t cleanup_deadline) {
+  MetaLedgerEntry *entry = &executor->ledger[index];
+  MetaVolatileHold *hold = &executor->volatile_holds[index];
+  if (!hold->live_owned_down) {
+    if (entry->state == META_LEDGER_RELEASED && !hold->durability_lost) {
+      return true;
+    }
+    if (entry->state != META_LEDGER_RELEASED) {
+      entry->state = META_LEDGER_UNCERTAIN;
+    }
+    return false;
+  }
+  if (hold->up_attempted ||
+      (!executor->persistence_unavailable &&
+       now_millis(executor) > cleanup_deadline)) {
+    entry->state = META_LEDGER_UNCERTAIN;
+    return false;
+  }
+
+  entry->state = META_LEDGER_PENDING_UP;
+  if (executor->persistence_unavailable || !persist_ledger(executor)) {
+    hold->durability_lost = true;
+    entry->state = META_LEDGER_UNCERTAIN;
+  }
+  // Volatile отметка ставится до callback: один live down получает не более
+  // одной cleanup-up попытки даже при потерянном результате или повторном stop.
+  hold->up_attempted = true;
+  const bool posted = executor->backend.post_cleanup_up != NULL &&
+                      executor->backend.post_cleanup_up(
+                          executor->backend.context, entry->kind, entry->code,
+                          executor->synthetic_tag);
+  executor->status.dispatch_attempts += 1;
+  copy_text(executor->status.last_checkpoint,
+            sizeof(executor->status.last_checkpoint), "cleanup-up");
+  if (!posted) {
+    entry->state = META_LEDGER_UNCERTAIN;
+    persist_ledger(executor);
+    return false;
+  }
+  hold->live_owned_down = false;
+  if (hold->durability_lost) {
+    entry->state = META_LEDGER_UNCERTAIN;
+    persist_ledger(executor);
+    return false;
+  }
+  entry->state = META_LEDGER_RELEASED;
+  if (!persist_ledger(executor)) {
+    hold->durability_lost = true;
+    entry->state = META_LEDGER_UNCERTAIN;
+    return false;
+  }
+  return true;
+}
+
 static bool release_confirmed_holds(MetaExecutor *executor) {
   bool complete = true;
   const uint64_t cleanup_deadline = now_millis(executor) + 1000;
 
   for (size_t offset = executor->ledger_count; offset > 0; offset -= 1) {
     MetaLedgerEntry *entry = &executor->ledger[offset - 1];
-    if (entry->state == META_LEDGER_PENDING_DOWN ||
-        entry->state == META_LEDGER_PENDING_UP ||
-        entry->state == META_LEDGER_UNCERTAIN) {
-      entry->state = META_LEDGER_UNCERTAIN;
-      complete = false;
-      continue;
-    }
-    if (entry->state != META_LEDGER_CONFIRMED_DOWN) continue;
-    if (now_millis(executor) > cleanup_deadline) {
-      entry->state = META_LEDGER_UNCERTAIN;
-      complete = false;
-      continue;
-    }
-    entry->state = META_LEDGER_PENDING_UP;
-    if (!persist_ledger(executor)) {
-      entry->state = META_LEDGER_UNCERTAIN;
-      complete = false;
-      continue;
-    }
-    const bool posted = executor->backend.post_held_event != NULL &&
-                        executor->backend.post_held_event(
-                            executor->backend.context, entry->kind, entry->code,
-                            false, executor->synthetic_tag);
-    executor->status.dispatch_attempts += 1;
-    copy_text(executor->status.last_checkpoint,
-              sizeof(executor->status.last_checkpoint), "cleanup-up");
-    if (!posted) {
-      entry->state = META_LEDGER_UNCERTAIN;
-      persist_ledger(executor);
-      complete = false;
-      continue;
-    }
-    entry->state = META_LEDGER_RELEASED;
-    if (!persist_ledger(executor)) {
-      entry->state = META_LEDGER_UNCERTAIN;
-      complete = false;
-    }
+    MetaVolatileHold *hold = &executor->volatile_holds[offset - 1];
+    if (entry->state == META_LEDGER_RELEASED &&
+        !hold->live_owned_down && !hold->durability_lost) continue;
+    if (!release_live_owned_entry(executor, offset - 1,
+                                  cleanup_deadline)) complete = false;
   }
 
   executor->status.held_count = held_count(executor);
@@ -227,12 +264,14 @@ MetaExecutor *meta_executor_create(const char *native_generation,
   executor->next_ledger_sequence = 1;
   executor->has_previous_ledger_digest = false;
   executor->previous_ledger_digest[0] = '\0';
+  executor->persistence_unavailable = false;
   return executor;
 }
 
 void meta_executor_destroy(MetaExecutor *executor) {
   if (executor == NULL) return;
   free(executor->ledger);
+  free(executor->volatile_holds);
   free(executor->retired_generations);
   free(executor);
 }
@@ -307,6 +346,13 @@ bool meta_executor_restore_ledger(
   if (entry_count > 0) {
     executor->ledger = calloc(entry_count, sizeof(*executor->ledger));
     if (executor->ledger == NULL) return false;
+    executor->volatile_holds =
+        calloc(entry_count, sizeof(*executor->volatile_holds));
+    if (executor->volatile_holds == NULL) {
+      free(executor->ledger);
+      executor->ledger = NULL;
+      return false;
+    }
     memcpy(executor->ledger, entries, entry_count * sizeof(*entries));
   }
   executor->ledger_count = entry_count;
@@ -382,11 +428,14 @@ bool meta_executor_begin(MetaExecutor *executor, const char *operation_id,
     return false;
   }
   free(executor->ledger);
+  free(executor->volatile_holds);
   executor->ledger = NULL;
+  executor->volatile_holds = NULL;
   executor->ledger_count = 0;
   executor->next_ledger_sequence = 1;
   executor->has_previous_ledger_digest = false;
   executor->previous_ledger_digest[0] = '\0';
+  executor->persistence_unavailable = false;
   copy_text(executor->operation_id, sizeof(executor->operation_id),
             operation_id);
   copy_text(executor->target_ref, sizeof(executor->target_ref), target_ref);
@@ -469,13 +518,21 @@ bool meta_executor_post_down(MetaExecutor *executor, MetaHeldEventKind kind,
   }
 
   const size_t next_count = executor->ledger_count + 1;
-  MetaLedgerEntry *next =
-      realloc(executor->ledger, next_count * sizeof(*next));
+  MetaVolatileHold *next_holds = realloc(
+      executor->volatile_holds, next_count * sizeof(*next_holds));
+  if (next_holds == NULL) {
+    stop_for_reason(executor, META_EXECUTOR_FAILED);
+    return false;
+  }
+  executor->volatile_holds = next_holds;
+  MetaLedgerEntry *next = realloc(
+      executor->ledger, next_count * sizeof(*next));
   if (next == NULL) {
     stop_for_reason(executor, META_EXECUTOR_FAILED);
     return false;
   }
   executor->ledger = next;
+  executor->volatile_holds[next_count - 1] = (MetaVolatileHold){0};
   MetaLedgerEntry *entry = &next[next_count - 1];
   *entry = (MetaLedgerEntry){
       .sequence = executor->next_ledger_sequence++,
@@ -485,8 +542,15 @@ bool meta_executor_post_down(MetaExecutor *executor, MetaHeldEventKind kind,
   };
   executor->ledger_count = next_count;
   if (!persist_ledger(executor)) {
-    executor->ledger_count -= 1;
-    stop_for_reason(executor, META_EXECUTOR_FAILED);
+    entry->state = META_LEDGER_UNCERTAIN;
+    executor->volatile_holds[next_count - 1].durability_lost = true;
+    copy_text(executor->status.last_checkpoint,
+              sizeof(executor->status.last_checkpoint),
+              "pending-down-ack-unknown");
+    release_confirmed_holds(executor);
+    if (executor->status.dispatch_attempts == 0) {
+      executor->status.dispatch = META_DISPATCH_NONE;
+    }
     return false;
   }
 
@@ -502,10 +566,12 @@ bool meta_executor_post_down(MetaExecutor *executor, MetaHeldEventKind kind,
     quarantine(executor);
     return false;
   }
+  executor->volatile_holds[next_count - 1].live_owned_down = true;
   entry->state = META_LEDGER_CONFIRMED_DOWN;
   if (!persist_ledger(executor)) {
     entry->state = META_LEDGER_UNCERTAIN;
-    quarantine(executor);
+    executor->volatile_holds[next_count - 1].durability_lost = true;
+    release_confirmed_holds(executor);
     return false;
   }
   executor->status.held_count = held_count(executor);
@@ -526,12 +592,23 @@ bool meta_executor_post_up(MetaExecutor *executor, MetaHeldEventKind kind,
   }
   if (entry == NULL) return false;
 
-  entry->state = META_LEDGER_PENDING_UP;
-  if (!persist_ledger(executor)) {
+  size_t index = (size_t)(entry - executor->ledger);
+  MetaVolatileHold *hold = &executor->volatile_holds[index];
+  if (!hold->live_owned_down || hold->up_attempted) {
     entry->state = META_LEDGER_UNCERTAIN;
     quarantine(executor);
     return false;
   }
+  entry->state = META_LEDGER_PENDING_UP;
+  if (!persist_ledger(executor)) {
+    entry->state = META_LEDGER_UNCERTAIN;
+    hold->durability_lost = true;
+    release_confirmed_holds(executor);
+    return false;
+  }
+  // Обычный up также помечается до post: его неопределённый результат нельзя
+  // повторять через cleanup callback.
+  hold->up_attempted = true;
   const bool posted = executor->backend.post_held_event(
       executor->backend.context, kind, code, false, executor->synthetic_tag);
   executor->status.dispatch_attempts += 1;
@@ -542,9 +619,11 @@ bool meta_executor_post_up(MetaExecutor *executor, MetaHeldEventKind kind,
     quarantine(executor);
     return false;
   }
+  hold->live_owned_down = false;
   entry->state = META_LEDGER_RELEASED;
   if (!persist_ledger(executor)) {
     entry->state = META_LEDGER_UNCERTAIN;
+    hold->durability_lost = true;
     quarantine(executor);
     return false;
   }

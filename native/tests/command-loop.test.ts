@@ -9,6 +9,7 @@ import { nativeInputExecutionRequestSchema, nativeInputExecutionResponseSchema, 
 import { heldInputLedgerDigest, type HeldInputLedgerSink } from "@meta/shared/contracts"
 import { nativeClipboardRequestSchema } from "../src/clipboard-protocol.ts"
 import { nativeWindowTransitionRequestSchema, nativeWindowTransitionResponseSchema } from "../src/protocol.ts"
+import { NativeTransportStreamDecoder, encodeNativeFrame, type NativeTransportRequestFrame, type NativeTransportResponseFrame } from "../src/protocol.ts"
 
 let directory = ""
 let binary = ""
@@ -24,7 +25,7 @@ beforeAll(async () => {
   ], { stderr: "pipe" })
   const [code, error] = await Promise.all([compile.exited, new Response(compile.stderr).text()])
   if (code !== 0) throw new Error(error)
-})
+}, 20_000)
 afterAll(async () => { if (directory) await rm(directory, { recursive: true }) })
 
 function createAdapter(ledgerSink: HeldInputLedgerSink = { persist: async () => { throw new Error("ledger не используется") } }, args: string[] = []) {
@@ -86,6 +87,55 @@ function inputRequest(action: NativeInputExecutionPayload["action"]) {
     payload: { actionDeadlineAt: deadlineAt, action },
   })
 }
+
+test.each([false, true])("parent EOF: physicalDown=%s, cleanup не ждёт исчезнувший durable ACK", async physicalDown => {
+  const child = Bun.spawn([binary, "--event-log"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" })
+  const stderr = new Response(child.stderr).text()
+  const reader = child.stdout.getReader()
+  const decoder = new NativeTransportStreamDecoder()
+  const frames: NativeTransportResponseFrame[] = []
+  const write = async (frame: NativeTransportRequestFrame) => {
+    child.stdin.write(encodeNativeFrame(frame))
+    await child.stdin.flush()
+  }
+  const next = async () => {
+    while (frames.length === 0) {
+      const chunk = await reader.read()
+      if (chunk.done) throw new Error("Fixture EOF до ожидаемого frame")
+      for (const packet of decoder.push(chunk.value)) if (packet.kind === "message") frames.push(packet.frame)
+    }
+    return frames.shift()!
+  }
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    await write({ channel: "handshake", payload: { kind: "handshake", protocolVersion: "1", requestId: "eof-handshake",
+      runtimeEpoch: "runtime", loginSessionId: "login", runtimeBuildId: "runtime-build", expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" } })
+    expect((await next()).channel).toBe("handshake")
+    await write({ channel: "request", payload: inputRequest({ kind: "key", stroke: { keyCode: 37, flags: 0 } }) })
+    const pending = await next()
+    if (pending.channel !== "ledger-persist") throw new Error("Ожидался pending-down ledger")
+    if (physicalDown) {
+      const snapshot = pending.payload.snapshot
+      await write({ channel: "ledger-ack", payload: { requestId: pending.payload.requestId, operationId: snapshot.operationId,
+        runtimeEpoch: snapshot.runtimeEpoch, loginSessionId: snapshot.loginSessionId, nativeGeneration: snapshot.nativeGeneration,
+        revision: snapshot.revision, snapshotSha256: heldInputLedgerDigest(snapshot), persistedAt: new Date().toISOString(), durable: true } })
+      const confirmed = await next()
+      if (confirmed.channel !== "ledger-persist") throw new Error("Ожидался confirmed-down ledger")
+      expect(confirmed.payload.snapshot.entries[0]?.state).toBe("confirmed-down")
+    }
+    child.stdin.end()
+    await Promise.race([child.exited, new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("Fixture не завершился после EOF")), 2500) })])
+    const events = await stderr
+    expect(events.split("\n").filter(line => line === "held:37:down")).toHaveLength(physicalDown ? 1 : 0)
+    expect(events.split("\n").filter(line => line === "held:37:up")).toHaveLength(physicalDown ? 1 : 0)
+    expect(events).toContain("terminal:quarantined:unknown")
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    await reader.cancel().catch(() => undefined)
+    if (child.exitCode === null) child.kill("SIGKILL")
+    await child.exited
+  }
+}, 5000)
 
 test("window transition и input используют один native fence high-water", async () => {
   const adapter = createAdapter()

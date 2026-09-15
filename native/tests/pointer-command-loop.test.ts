@@ -20,7 +20,7 @@ beforeAll(async () => {
 })
 afterAll(async () => { if (directory) await rm(directory, { recursive: true }) })
 
-async function execute(action: NativeInputExecutionPayload["action"]) {
+async function execute(action: NativeInputExecutionPayload["action"], scope: "window" | "display" | "desktop-layout" = "window") {
   const adapter = new NativeBrokerAdapter({
     host: { generation: { runtimeEpoch: "runtime", loginSessionId: "login" }, runtimeBuildId: "runtime-build",
       capabilities: { schemaVersion: "1", scope: "adapter", producerRef: "pointer-fixture", capabilities: [] } },
@@ -42,7 +42,9 @@ async function execute(action: NativeInputExecutionPayload["action"]) {
         kind: "native", operationId: "pointer-operation", clientRequestId: "pointer-client-request", clientSessionId: "client", principalId: "principal",
         ...generation, deadlineAt, inventoryId: "inventory", inventoryRevision: 1, fence: { ...generation, counter: 1 },
         observationRef: { observationId: "observation-fixture", inventoryRevision: 1, displayLayoutRevision: 1, proofRef: "proof-fixture" },
-        target: { kind: "window", ref: { ...generation, applicationRef: "application-fixture", windowRef: "window-fixture" } },
+        target: scope === "window" ? { kind: "window", ref: { ...generation, applicationRef: "application-fixture", windowRef: "window-fixture" } }
+          : scope === "display" ? { kind: "display", ref: { ...generation, displayRef: "display-fixture", displayLayoutRevision: 1 } }
+            : { kind: "desktop-layout", ref: { ...generation, layoutRef: "layout-fixture", displayLayoutRevision: 1 } },
       }, payload: { actionDeadlineAt: deadlineAt, action } })
     return await adapter.request(nativeInputExecutionRequestSchema, request, nativeInputExecutionResponseSchema,
       { signal: new AbortController().signal, checkpoint: () => undefined })
@@ -71,4 +73,11 @@ test("неподтверждённая point ownership отвергается д
   if (result.ok) throw new Error("Ожидался отказ target")
   expect(result.nativeStatus?.dispatchAttempts).toBe(0)
   expect(result.nativeStatus?.targetVerified).toBe("failed")
+})
+
+test.each(["display", "desktop-layout"] as const)("explicit %s pointer не требует выдуманного AX window focus", async scope => {
+  const result = await execute({ kind: "click", point: { x: 10, y: 10 }, modifiers, count: 1, button: "left" }, scope)
+  expect(result.ok).toBe(true)
+  if (!result.ok) throw new Error(result.error.message)
+  expect(result.result.dispatchAttempts).toBe(3)
 })
