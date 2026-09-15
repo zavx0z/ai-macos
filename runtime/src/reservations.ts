@@ -90,6 +90,7 @@ export class BrowserLifetimeCoordinator {
   readonly #ttlMs: number
   readonly authority: LifetimeReservationAuthority & {
     resume(session: RuntimeClientSession, reservationId: string): Promise<LifetimeReservationHandle>
+    inspect(session: RuntimeClientSession, target: OperationTarget): Promise<LifetimeReservationHandle | undefined>
   }
 
   constructor(options: {
@@ -112,6 +113,7 @@ export class BrowserLifetimeCoordinator {
     this.authority = Object.freeze({
       assertChild: (request: ReservationChildRequest) => this.#assertChild(request),
       resume: (session: RuntimeClientSession, id: string) => this.#resume(session, id),
+      inspect: (session: RuntimeClientSession, target: OperationTarget) => this.#inspect(session, target),
     })
   }
 
@@ -205,6 +207,7 @@ export class BrowserLifetimeCoordinator {
           } as InstanceTarget)
           if (stableKey(actual) !== key || structurallyEqual(actual, instance)) throw new Error("Connect не создал новое transport generation")
           await binding.verifier.verifyConnected(actual, context.control.signal)
+          await this.#clients.assertActive(session, this.#clock.now())
           const now = this.#clock.now()
           const handle = lifetimeReservationHandleSchema.parse({
             reservationId: this.#ids.next("reservation"),
@@ -228,6 +231,7 @@ export class BrowserLifetimeCoordinator {
         }
         if (request.kind === "disconnect-instance") {
           await binding.verifier.verifyRemoved(slot.target, context.control.signal)
+          await this.#clients.assertActive(session, this.#clock.now())
           if (slot.handle === undefined) throw new Error("Reservation handle отсутствует")
           const receipt = reservationCleanupReceiptSchema.parse({
             receiptId: this.#ids.next("reservation-cleanup"),
@@ -286,6 +290,15 @@ export class BrowserLifetimeCoordinator {
     if (slot !== undefined) this.#expire(slot)
     if (slot?.handle === undefined || slot.state !== "active" || slot.lineageId !== this.#clients.lineage(session)) throw new Error("Reservation недоступна этой active lineage")
     return structuredClone(slot.handle)
+  }
+
+  async #inspect(session: RuntimeClientSession, target: OperationTarget): Promise<LifetimeReservationHandle | undefined> {
+    await this.#clients.assertActive(session, this.#clock.now())
+    const slot = this.#slots.get(stableKey(instanceTarget(target)))
+    if (slot === undefined) return undefined
+    if (slot.lineageId !== this.#clients.lineage(session)) throw new Error("Reservation принадлежит другой lineage")
+    this.#expire(slot)
+    return slot.handle === undefined ? undefined : structuredClone(slot.handle)
   }
 
   #expire(slot: Slot): void {

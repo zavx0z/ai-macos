@@ -4,14 +4,15 @@
 [computer-use-coordination.md](../computer-use-coordination.md).
 Принятый ограниченный этап не означает готовность установленного сервиса.
 
-**Git checkpoint:** исходники сохранены в незавершённом состоянии C3.
-Текущий root typecheck даёт семь ошибок миграции reservation coordinator;
-подробности и дальнейшее исправление —
-[WIP checkpoint](../checkpoints/2026-09-15-computer-use-wip.md).
+**Git checkpoints:** исходное незавершённое состояние сохранено в `3796409`;
+его описание — [WIP checkpoint](../checkpoints/2026-09-15-computer-use-wip.md).
+Миграция coordinator теперь связана с core: root 34 runtime tests / 172 assertions
+и общий TypeScript check проходят. Каждый следующий проверенный этап коммитится
+и отправляется отдельно.
 
 | Задача | Что принято | Что остаётся |
 | --- | --- | --- |
-| Computer use: runtime, контракты и MCP | C2 core/evidence/continuation, thin UDS auth/lineage/status/cancel | На Astra/high исправляет C3 reservation authority и pre-dispatch exclusion; production MCP tools/frame/catalog впереди |
+| Computer use: runtime, контракты и MCP | C2 core/evidence/continuation, thin UDS, automatic browser coordinator и enforced admission | Quarantine recovery/Android composition и production MCP tools/frame/catalog |
 | Computer use: native broker и окна | C0 native core, ABI v2 subset, identity/extractor и часть C2 integration | На Astra/high исправляет concurrent task lifetime, tombstone horizon, capture outcome schema и memory bounds; затем command-loop/live |
 | Computer use: ввод и interaction | C2 adapter/authorization/status/compiler, injected clipboard; text bridge до C executor с fake sink | Остальные native actions, runtime wiring, versioned clipboard backend, live |
 | Computer use: снимки и координаты | C2 adapter/protocol driver, late reconciliation/ACK tombstones/taskRef protection и pixel orientation | Dropped-start production cancel/drain wiring, installed helper и live capture/mixed displays |
@@ -51,9 +52,9 @@
 
 ## Эксплуатационный статус
 
-`git diff --check` текущего WIP проходит. Общая проверка TypeScript сейчас
-не проходит из-за незавершённой замены lifetime registry на coordinator;
-прежний зелёный root check относился к состоянию до этой переработки.
+`git diff --check` и общий TypeScript check прошли после завершения coordinator
+wiring и блокировки raw browser/device admission. Это проверка текущего кода,
+но не installed/live acceptance.
 
 Installed services, helper и Codex configuration не переключены.
 Live input/capture/ADB в этой волне не выполнялись, кроме ошибочного запуска

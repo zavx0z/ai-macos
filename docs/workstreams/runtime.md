@@ -3,8 +3,38 @@
 ## Текущее состояние
 
 Статус: C1 принят. C2 runtime core/evidence/continuation принят scoped ведущим.
-C3 lifetime reservations и transport hardening реализованы в source/tests и
-переданы на отдельную приёмку; production cutover ещё не выполнен.
+C3 lifetime coordinator связан с RuntimeCore; текущий атомарный checkpoint
+компилируется и проходит 34 runtime tests. Transport foundation принят scoped;
+production catalog/cutover и полная lifetime recovery composition ещё впереди.
+
+## Checkpoint после resume Git
+
+- `runtime/src/core.ts` вызывает private coordinated lifecycle: admission до
+  adapter side effect, bounded verification/staging, synchronous reservation
+  commit вместе с cleanup и quarantine при незавершённой операции.
+- Public `runOperation` отклоняет browser/device domains без зарегистрированного
+  private lifecycle до callback, включая `intent:read`. Прямой first/second
+  connect не достигает adapter/driver. Транспортный echo fixture и проверка
+  зависшего non-native verifier используют in-memory clipboard domain без OS I/O.
+- `BrowserLifetimeCoordinator` держит exclusive connecting slot до connect,
+  получает actual instance из результата собственного journal, вызывает verifier
+  из immutable host binding и автоматически создаёт reservation. Child и
+  disconnect проходят тот же coordinator.
+- Публичная reservation authority предоставляет только assertChild/resume/inspect.
+  Старые caller-owned reserve/release/verifier API удалены. Все обращения
+  проверяют active session; expiry переводит reservation в quarantine.
+- Device transport generations остаются структурированной парой полей.
+- Тесты переведены на real RuntimeBrowserAdapter и автоматический lifecycle:
+  second connect блокируется до driver, resumption/revoke/expiry и failed child
+  проверены. Manual positive reserve/release orchestration удалён.
+- `bun test runtime/tests`: **34 pass / 172 assertions**.
+- `bunx --no-install tsc --noEmit`: **exit 0**.
+- `git diff --check`: **pass**.
+
+Оставшиеся lifetime части: отдельный runtime recovery для quarantined/expired
+connection, actual Android coordinator composition и чтение inventory через
+coordinator. Следующий production catalogue должен владеть этим routing; UI/MCP
+слой получает только schema-derived descriptors и transport client.
 
 Общая wire-модель теперь объявлена один раз на Zod 4.4.3. Из той же декларации
 получаются runtime validation, TypeScript-типы через `z.infer` и JSON Schema для

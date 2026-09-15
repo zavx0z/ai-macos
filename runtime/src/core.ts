@@ -46,7 +46,7 @@ import type { NativeEvidenceBinding } from "./authorities.ts"
 import { canonicalJson, hmacSha256, randomIdSource, systemClock, type RuntimeClock, type RuntimeIdSource } from "./primitives.ts"
 import { ResourceRegistry } from "./resources.ts"
 import { NativeContinuationRegistry } from "./continuations.ts"
-import { LifetimeReservationRegistry } from "./reservations.ts"
+import { BrowserLifetimeCoordinator, type CoordinatedLifecycle } from "./reservations.ts"
 
 type JournalEntry = {
   digest: string
@@ -87,6 +87,7 @@ export type RuntimeCoreOptions = {
   cancelGraceMs?: number
   completionVerifier?: BackendCompletionVerifier
   nativeSourceIdentity?: NativeEvidenceBinding
+  reservationTtlMs?: number
 }
 
 export class RuntimeCore implements RuntimeAdapter {
@@ -101,7 +102,8 @@ export class RuntimeCore implements RuntimeAdapter {
   readonly frames: FrameStore
   readonly observations: ObservationRegistry
   readonly continuations: NativeContinuationRegistry
-  readonly reservations: LifetimeReservationRegistry
+  readonly browserLifetime: BrowserLifetimeCoordinator
+  readonly reservations: BrowserLifetimeCoordinator["authority"]
   readonly services: AdapterServices
   readonly #runtimeBuildId: string
   readonly #nativeGeneration?: string
@@ -135,12 +137,16 @@ export class RuntimeCore implements RuntimeAdapter {
     this.capabilities = unavailableRuntimeCapabilities(this.#ids.next("runtime-capabilities"))
     this.clients = new ClientSessionRegistry(this.generation, { clock: this.#clock, ids: this.#ids })
     this.resources = new ResourceRegistry(this.generation, this.#secret, { clock: this.#clock, ids: this.#ids })
-    this.reservations = new LifetimeReservationRegistry({
+    this.browserLifetime = new BrowserLifetimeCoordinator({
       generation: this.generation,
       clients: this.clients,
       clock: this.#clock,
       ids: this.#ids,
+      ttlMs: options.reservationTtlMs,
+      lookup: id => this.#journal.get(id)?.record,
+      run: (session, intent, request, execute, lifecycle) => this.#runOperation(session, intent, request, execute, lifecycle),
     })
+    this.reservations = this.browserLifetime.authority
     this.targets = new TargetRegistry(this.generation, { clock: this.#clock })
     this.proofs = new ProofRegistry(this.generation, {
       ...(this.#nativeGeneration === undefined ? {} : { nativeGeneration: this.#nativeGeneration }),
@@ -198,9 +204,29 @@ export class RuntimeCore implements RuntimeAdapter {
     request: TRequest,
     execute: (context: RuntimeOperationContext, request: TRequest) => Promise<AdapterResult<TResult>>,
   ): Promise<RuntimeExecution<TResult>> {
+    return this.#runOperation(session, intentValue, request, execute)
+  }
+
+  async #runOperation<TRequest, TResult>(
+    session: RuntimeClientSession,
+    intentValue: RuntimeOperationIntent,
+    request: TRequest,
+    execute: (context: RuntimeOperationContext, request: TRequest) => Promise<AdapterResult<TResult>>,
+    lifecycle?: CoordinatedLifecycle,
+  ): Promise<RuntimeExecution<TResult>> {
     const now = this.#clock.now()
     await this.clients.assertActive(session, now)
     const intent = runtimeOperationIntentSchema.parse(intentValue)
+    const domain = intent.precondition.target.kind
+    if (lifecycle === undefined && [
+      "browser-instance", "browser-target", "device", "device-browser-instance", "device-browser-target",
+    ].includes(domain)) {
+      throw new RuntimeContractError(
+        "unauthorized",
+        "Browser/device operation требует зарегистрированный lifetime coordinator",
+        "runtime-admission",
+      )
+    }
     const digest = hmacSha256(this.#secret, canonicalJson({
       intent: intent.intent,
       precondition: intent.precondition,
@@ -274,7 +300,7 @@ export class RuntimeCore implements RuntimeAdapter {
     this.#dedup.set(dedupKey, operationId)
     const deadlineDelay = Math.max(0, Date.parse(intent.deadlineAt) - this.#clock.now().getTime())
     entry.deadlineTimer = setTimeout(() => controller.abort("operation deadline exceeded"), deadlineDelay)
-    const promise = this.#execute(entry, session, handles, request, execute)
+    const promise = this.#execute(entry, session, handles, request, execute, lifecycle)
     entry.promise = promise as Promise<RuntimeExecution<unknown>>
     return promise
   }
@@ -420,6 +446,7 @@ export class RuntimeCore implements RuntimeAdapter {
     handles: RuntimeResourceHandle[],
     request: TRequest,
     execute: (context: RuntimeOperationContext, request: TRequest) => Promise<AdapterResult<TResult>>,
+    lifecycle?: CoordinatedLifecycle,
   ): Promise<RuntimeExecution<TResult>> {
     const context: RuntimeOperationContext = {
       wire: entry.record.context,
@@ -454,6 +481,7 @@ export class RuntimeCore implements RuntimeAdapter {
     let abortGuard: { promise: Promise<never>, dispose(): void } | undefined
     try {
       await context.control.checkpoint("before-adapter-dispatch")
+      await lifecycle?.before(context)
       if (entry.controller.signal.aborted) throw new RuntimeContractError("cancelled", "Operation отменена", "before-adapter-dispatch")
       entry.record = operationRecordSchema.parse({
         ...entry.record,
@@ -465,10 +493,9 @@ export class RuntimeCore implements RuntimeAdapter {
       const adapterPromise = Promise.resolve().then(() => execute(context, request))
       const rawResult = await Promise.race([adapterPromise, abortGuard.promise])
       const parsedResult = parseWireValue(adapterResultSchema(z.unknown()), rawResult) as AdapterResult<TResult>
-      const verifiedNativeStatus = await Promise.race([
-        this.#verifyBackendCompletion(context, parsedResult),
-        abortGuard.promise,
-      ])
+      const verifiedNativeStatus = lifecycle === undefined
+        ? await Promise.race([this.#verifyBackendCompletion(context, parsedResult), abortGuard.promise])
+        : undefined
       const result: AdapterResult<TResult> = verifiedNativeStatus === undefined
         ? parsedResult
         : { ...parsedResult, nativeStatus: verifiedNativeStatus }
@@ -485,6 +512,8 @@ export class RuntimeCore implements RuntimeAdapter {
         updatedAt: this.#clock.now().toISOString(),
         ...(!result.ok ? { error: result.error } : {}),
       })
+      const commitLifecycle = lifecycle === undefined ? undefined
+        : await Promise.race([lifecycle.stage(stagedRecord, result), abortGuard.promise])
       const confirmedCancellation = !result.ok
         && result.error.code === "cancelled"
         && outcome.cleanup.state === "complete"
@@ -497,11 +526,13 @@ export class RuntimeCore implements RuntimeAdapter {
         )
       }
       this.resources.applyCleanup(entry.record.context.operationId, handles, outcome.cleanup)
+      commitLifecycle?.()
       const execution = { operation: stagedRecord, result }
       this.#settle(entry, execution)
       return execution
     } catch (error) {
       if (entry.result !== undefined) return entry.result as RuntimeExecution<TResult>
+      lifecycle?.failed(entry.adapterStarted)
       const contractError = contractErrorFrom(error, "runtime-execute")
       if (!entry.adapterStarted) {
         const cleanup = releasedCleanup(handles)

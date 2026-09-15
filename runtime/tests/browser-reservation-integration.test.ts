@@ -1,165 +1,71 @@
 import { expect, test } from "bun:test"
-import {
-  browserOperationRequestSchema,
-  freezeAdapterHostContext,
-  runtimeOperationIntentSchema,
-  type BrowserExecutionContext,
-  type RuntimeOperationContext,
-} from "@meta/shared/contracts"
-import { RuntimeBrowserAdapter, type BrowserDriver } from "@meta/chrome/adapter"
-import { RuntimeCore } from "../src/core.ts"
+import { browserFixture } from "./browser-fixture.ts"
+import { runtimeOperationIntentSchema, type BrowserExecutionContext, type RuntimeOperationContext } from "@meta/shared/contracts"
 
-const generation = { runtimeEpoch: "runtime:browser-composition", loginSessionId: "login:browser-composition" }
-const instance0 = {
-  ...generation,
-  browserInstanceRef: "browser:composition",
-  transportGeneration: "cdp:0",
-}
-
-test("RuntimeBrowserAdapter connect creates lifetime reservation used by child and verified disconnect", async () => {
-  const runtime = new RuntimeCore({
-    generation,
-    runtimeBuildId: "runtime-build:browser-composition",
-    completionVerifier: { async verify() {} },
-  })
-  const driver = new FakeBrowserDriver()
-  const browser = new RuntimeBrowserAdapter(
-    freezeAdapterHostContext({
-      generation,
-      runtimeBuildId: "runtime-build:browser-composition",
-      capabilities: {
-        schemaVersion: "1",
-        scope: "adapter",
-        producerRef: "browser:composition",
-        capabilities: [
-          { id: "browser.instances", state: "ready" },
-          { id: "browser.targets", state: "ready" },
-          { id: "browser.resources", state: "ready" },
-        ],
-      },
+test("raw runOperation не допускает first/second connect и intent read обход", async () => {
+  const { runtime, driver, credential, initial, adapter, invoke, register } = browserFixture()
+  const raw = (instance: typeof initial, revision: number, intent: "mutation" | "read") => runtime.runOperation(
+    credential.session,
+    runtimeOperationIntentSchema.parse({
+      intent,
+      clientRequestId: `raw:${revision}:${intent}`,
+      precondition: { target: { kind: "browser-instance", ref: instance }, inventoryId: `inventory:${revision}`, inventoryRevision: revision },
+      deadlineAt: new Date(Date.now() + 5000).toISOString(),
+      requestedResources: [{ kind: "cdp-target", resourceRef: instance.browserInstanceRef }],
     }),
-    runtime.services,
-    [{
-      browserInstanceRef: instance0.browserInstanceRef,
-      initialTransportGeneration: instance0.transportGeneration,
-      provenance: {
-        kind: "local-cdp",
-        endpointHost: "127.0.0.1",
-        endpointPort: 9222,
-        profilePath: "/tmp/browser-composition",
-      },
-      driver,
-    }],
-    () => "cdp:1",
+    { kind: "connect-instance" as const, instance },
+    (context, request) => adapter.execute(context as RuntimeOperationContext<BrowserExecutionContext>, request),
   )
-  runtime.targets.register(
-    { kind: "browser-instance", ref: instance0 },
-    "browser-inventory:0",
-    1,
-    "resolution:browser:0",
-    "proof:browser:0",
-    0,
-  )
-  const client = runtime.openClient("principal:browser-composition")
-  const connectRequest = browserOperationRequestSchema.parse({ kind: "connect-instance", instance: instance0 })
-  const connect = await runtime.runOperation(
-    client.session,
-    operationIntent("connect", { kind: "browser-instance", ref: instance0 }, "browser-inventory:0", 1, instance0.browserInstanceRef),
-    connectRequest,
-    (context, request) => browser.execute(context as RuntimeOperationContext<BrowserExecutionContext>, request),
-  )
-  if (!connect.result.ok || connect.result.value.value.kind !== "instance-connected") throw new Error("Browser connect failed")
-  const instance1 = connect.result.value.value.instance.ref
-  const reservation = runtime.reservations.reserve({
-    session: client.session,
-    operation: connect.operation,
-    target: { kind: "browser-instance", ref: instance1 },
-    statusRevision: 1,
-    ttlMs: 60_000,
-  })
-  runtime.targets.register(
-    { kind: "browser-instance", ref: instance1 },
-    "browser-inventory:1",
-    2,
-    "resolution:browser:1",
-    "proof:browser:1",
-    0,
-  )
-  const openRequest = browserOperationRequestSchema.parse({
-    kind: "open-target",
-    instance: instance1,
-    url: "https://example.com",
-    policy: { policyId: "policy:browser", requiredSteps: [], disabledSteps: [] },
-    timeoutMs: 1_000,
-  })
-  const opened = await runtime.runOperation(
-    client.session,
-    operationIntent("open", { kind: "browser-instance", ref: instance1 }, "browser-inventory:1", 2, instance1.browserInstanceRef),
-    openRequest,
-    (context, request) => browser.execute(context as RuntimeOperationContext<BrowserExecutionContext>, request),
-  )
-  expect(opened.operation.state).toBe("completed")
-  expect(driver.openCalls).toBe(1)
-
-  const disconnectRequest = browserOperationRequestSchema.parse({ kind: "disconnect-instance", instance: instance1 })
-  const disconnected = await runtime.runOperation(
-    client.session,
-    operationIntent("disconnect", { kind: "browser-instance", ref: instance1 }, "browser-inventory:1", 2, instance1.browserInstanceRef),
-    disconnectRequest,
-    (context, request) => browser.execute(context as RuntimeOperationContext<BrowserExecutionContext>, request),
-  )
-  expect(disconnected.operation.state).toBe("completed")
-  const cleanupReport = {
-    reservationId: reservation.reservationId,
-    reservationGeneration: reservation.reservationGeneration,
-    externalGeneration: reservation.externalGeneration,
-    statusRevision: 2,
-    cleanupEvidenceRef: "browser-disconnect-confirmed:1",
-  }
-  expect((await runtime.reservations.release(client.session, cleanupReport, {
-    async verifyRemoval(_handle, report) {
-      expect(driver.connected).toBe(false)
-      expect(report.cleanupEvidenceRef).toBe("browser-disconnect-confirmed:1")
-    },
-  })).state).toBe("released")
+  await expect(raw(initial, 1, "mutation")).rejects.toThrow("lifetime coordinator")
+  await expect(raw(initial, 1, "read")).rejects.toThrow("lifetime coordinator")
+  expect(driver.connectCalls).toBe(0)
+  const connected = await invoke(credential.session, "connect:owned", { kind: "connect-instance", instance: initial }, 1)
+  if (!connected.result.ok || connected.result.value.value.kind !== "instance-connected") throw new Error("connect failed")
+  const instance = connected.result.value.value.instance.ref
+  if ("deviceRef" in instance) throw new Error("browser expected")
+  register(instance, 2)
+  await expect(raw(instance, 2, "mutation")).rejects.toThrow("lifetime coordinator")
+  await expect(raw(instance, 2, "read")).rejects.toThrow("lifetime coordinator")
+  expect(driver.connectCalls).toBe(1)
 })
 
-function operationIntent(
-  suffix: string,
-  target: { kind: "browser-instance", ref: typeof instance0 },
-  inventoryId: string,
-  inventoryRevision: number,
-  resourceRef: string,
-) {
-  return runtimeOperationIntentSchema.parse({
-    intent: "mutation",
-    clientRequestId: `request:browser:${suffix}`,
-    precondition: { target, inventoryId, inventoryRevision },
-    deadlineAt: new Date(Date.now() + 5_000).toISOString(),
-    requestedResources: [{ kind: "cdp-target", resourceRef }],
-  })
-}
+test("coordinator резервирует до connect, автоматически допускает child и освобождает после disconnect", async () => {
+  const { runtime, driver, credential, initial, invoke, register } = browserFixture()
+  const connect = await invoke(credential.session, "connect:1", { kind: "connect-instance", instance: initial }, 1)
+  expect(connect.operation.state).toBe("completed")
+  if (!connect.result.ok || connect.result.value.value.kind !== "instance-connected") throw new Error("connect failed")
+  const instance = connect.result.value.value.instance.ref
+  if (!("transportGeneration" in instance) || "deviceRef" in instance) throw new Error("browser instance expected")
+  const reservation = await runtime.reservations.inspect(credential.session, { kind: "browser-instance", ref: instance })
+  expect(reservation?.state).toBe("active")
+  register(instance, 2)
+  const second = await invoke(credential.session, "connect:2", { kind: "connect-instance", instance }, 2)
+  expect(second.operation.state).toBe("rejected")
+  expect(driver.connectCalls).toBe(1)
+  const open = await invoke(credential.session, "open:1", {
+    kind: "open-target", instance, url: "https://example.com", timeoutMs: 1000,
+    policy: { policyId: "empty", requiredSteps: [], disabledSteps: [] },
+  }, 2)
+  expect(open.operation.state).toBe("completed")
+  expect(driver.openCalls).toBe(1)
+  const disconnect = await invoke(credential.session, "disconnect:1", { kind: "disconnect-instance", instance }, 2)
+  expect(disconnect.operation.state).toBe("completed")
+  expect(driver.disconnectCalls).toBe(1)
+  expect((await runtime.reservations.inspect(credential.session, { kind: "browser-instance", ref: instance }))?.state).toBe("released")
+  const replay = await invoke(credential.session, "disconnect:1", { kind: "disconnect-instance", instance }, 2)
+  expect(replay.operation.context.operationId).toBe(disconnect.operation.context.operationId)
+  expect(driver.disconnectCalls).toBe(1)
+})
 
-class FakeBrowserDriver implements BrowserDriver {
-  connected = false
-  openCalls = 0
-
-  async connect() { this.connected = true; return { browserVersion: "Chrome/Fake" } }
-  async disconnect() { this.connected = false }
-  async listTargets() { return [] }
-  async openTarget(url: string) {
-    this.openCalls++
-    return { id: "target:composition", type: "page", title: "Example", url, webSocketDebuggerUrl: "ws://fake" }
-  }
-  async closeTarget() {}
-  async activateTarget() {}
-  async navigateTarget(): Promise<never> { throw new Error("not used") }
-  async reloadTarget(): Promise<never> { throw new Error("not used") }
-  async waitTarget(_targetId: string, policy: Parameters<BrowserDriver["waitTarget"]>[1]) {
-    return { state: "ready" as const, policy, steps: [], timedOut: false }
-  }
-  async captureTarget(): Promise<never> { throw new Error("not used") }
-  async readConsole(): Promise<never> { throw new Error("not used") }
-  async readDom(): Promise<never> { throw new Error("not used") }
-  async readAccessibility(): Promise<never> { throw new Error("not used") }
-}
+test("in-flight connect блокирует другую lineage до второго driver call", async () => {
+  const { runtime, driver, credential, initial, invoke } = browserFixture()
+  let release!: () => void
+  driver.verifierGate = new Promise<void>(resolve => { release = resolve })
+  const running = invoke(credential.session, "connect:pending", { kind: "connect-instance", instance: initial }, 1)
+  while (driver.connectCalls === 0) await Promise.resolve()
+  const other = runtime.openClient("principal:lifetime")
+  await expect(invoke(other.session, "connect:other", { kind: "connect-instance", instance: initial }, 1)).rejects.toThrow("Resource занят")
+  release()
+  expect((await running).operation.state).toBe("completed")
+  expect(driver.connectCalls).toBe(1)
+})

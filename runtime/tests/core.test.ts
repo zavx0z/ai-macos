@@ -30,16 +30,6 @@ const windowTarget = {
     windowRef: "window:test",
   },
 }
-const browserTarget = {
-  kind: "browser-target" as const,
-  ref: {
-    ...generation,
-    browserInstanceRef: "browser:test",
-    transportGeneration: "browser-transport:test",
-    targetId: "browser-target:test",
-    resourceRef: "browser-resource:test",
-  },
-}
 
 class FakeNativeAdapter implements NativeAdapter {
   readonly adapterInstanceRef = "native-adapter:continuation"
@@ -705,6 +695,7 @@ describe("RuntimeCore operations", () => {
   })
 
   test("hung non-native completion verifier is bounded and late resolve cannot commit", async () => {
+    const clipboardTarget = { kind: "clipboard" as const, ref: { ...generation, clipboardRef: "system" as const } }
     let releaseVerifier: (() => void) | undefined
     const completionVerifier = {
       async verify() {
@@ -719,7 +710,7 @@ describe("RuntimeCore operations", () => {
       secret: new Uint8Array(32).fill(8),
     })
     runtime.targets.register(
-      browserTarget,
+      clipboardTarget,
       "browser-inventory:test",
       1,
       "resolution:browser:test",
@@ -731,12 +722,12 @@ describe("RuntimeCore operations", () => {
       intent: "mutation",
       clientRequestId: "request:browser-finalizer",
       precondition: {
-        target: browserTarget,
+        target: clipboardTarget,
         inventoryId: "browser-inventory:test",
         inventoryRevision: 1,
       },
       deadlineAt: new Date(Date.now() + 20).toISOString(),
-      requestedResources: [{ kind: "cdp-target", resourceRef: browserTarget.ref.resourceRef }],
+      requestedResources: [{ kind: "clipboard", resourceRef: "system" }],
     })
     const execution = await runtime.runOperation(
       client.session,

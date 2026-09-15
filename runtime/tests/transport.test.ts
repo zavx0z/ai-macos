@@ -16,14 +16,11 @@ import {
 } from "../src/transport.ts"
 
 const generation = { runtimeEpoch: "runtime:uds", loginSessionId: "login:uds" }
-const browserTarget = {
-  kind: "browser-target" as const,
+const fixtureTarget = {
+  kind: "clipboard" as const,
   ref: {
     ...generation,
-    browserInstanceRef: "browser:uds",
-    transportGeneration: "transport:uds",
-    targetId: "target:uds",
-    resourceRef: "browser-target:uds",
+    clipboardRef: "system" as const,
   },
 }
 
@@ -33,7 +30,7 @@ test("private UDS authenticates clients before executor and preserves exact oper
   const credentialPath = join(directory, "credential.json")
   const runtime = new RuntimeCore({ generation, runtimeBuildId: "runtime-build:uds" })
   runtime.targets.register(
-    browserTarget,
+    fixtureTarget,
     "browser-inventory:uds",
     1,
     "resolution:browser:uds",
@@ -106,7 +103,7 @@ test("private UDS authenticates clients before executor and preserves exact oper
       intent: "read",
       clientRequestId: "request:uds:1",
       precondition: {
-        target: browserTarget,
+        target: fixtureTarget,
         inventoryId: "browser-inventory:uds",
         inventoryRevision: 1,
       },
