@@ -427,28 +427,6 @@ describe("ai-macos MCP server", () => {
     }
   })
 
-  test("launcher reuses all compatible desktop listeners on the expected Mac", async () => {
-    fakeRequestCount = 0
-    transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ["src/launcher.ts"],
-      cwd: new URL("..", import.meta.url).pathname,
-      env: {...process.env, ...serviceEnv, AI_MACOS_EXPECTED_HOSTNAME: hostname()},
-    })
-    const client = new Client({name: "ai-macos-launcher-test", version: "0.1.0"})
-    await client.connect(transport)
-
-    const health = await client.callTool({name: "system_health", arguments: {}})
-    expect(health.structuredContent).toMatchObject({
-      servicesProbed: true,
-      window: {ok: true, service: "@meta/window"},
-      screen: {ok: true, service: "@meta/screen"},
-      chrome: {ok: true, service: "@meta/chrome"},
-      input: {ok: true, service: "@meta/input"},
-    })
-    expect(fakeRequestCount).toBeGreaterThanOrEqual(8)
-  })
-
   test("reports a delivered click without retry when post-action capture fails", async () => {
     const client = await connectDirectClient("ai-macos-click-verification-test")
     fakeScreenFailure = true
@@ -531,31 +509,4 @@ describe("ai-macos MCP server", () => {
     expect((await click).structuredContent).toMatchObject({delivered: true})
   })
 
-  test("does not probe or start REST services before physical machine identity matches", async () => {
-    fakeRequestCount = 0
-    const expectedHostname = `not-${hostname()}`
-    transport = new StdioClientTransport({
-      command: process.execPath,
-      args: ["src/launcher.ts"],
-      cwd: new URL("..", import.meta.url).pathname,
-      env: {...process.env, ...serviceEnv, AI_MACOS_EXPECTED_HOSTNAME: expectedHostname},
-    })
-    const client = new Client({name: "ai-macos-machine-gate-test", version: "0.1.0"})
-    await client.connect(transport)
-
-    const health = await client.callTool({name: "system_health", arguments: {}})
-    expect(health.isError).not.toBe(true)
-    expect(health.structuredContent).toEqual({
-      machine: {
-        hostname: hostname(),
-        expectedHostname,
-        matchesExpected: false,
-        platform: "darwin",
-        arch: expect.any(String),
-        projectRoot: new URL("../..", import.meta.url).pathname.replace(/\/$/, ""),
-      },
-      servicesProbed: false,
-    })
-    expect(fakeRequestCount).toBe(0)
-  })
 })

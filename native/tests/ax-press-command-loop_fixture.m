@@ -32,8 +32,12 @@
   if ([attribute isEqual:@"role"]) *value = element.role;
   else if ([attribute isEqual:@"subrole"] || [attribute isEqual:@"title"])
     *value = @"";
-  else return META_AX_READ_FAILED;
+  else return META_AX_READ_ABSENT;
   return META_AX_READ_OK;
+}
+- (MetaAXReadStatus)valueForElement:(__unused id)element value:(id *)value {
+  *value = nil;
+  return META_AX_READ_ABSENT;
 }
 - (MetaAXReadStatus)frameForElement:(__unused id)element
                               value:(CGRect *)value {
