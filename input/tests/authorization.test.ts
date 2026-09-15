@@ -357,6 +357,27 @@ describe("C2 input authorization", () => {
       text: "текст",
       delayMs: 0,
     }, now)).rejects.toMatchObject({ contract: { code: "invalid-request" } })
+
+    const elementContext = fixture({
+      wire: {
+        ...wire,
+        target: {
+          kind: "element",
+          ref: {
+            runtimeEpoch,
+            loginSessionId,
+            nativeGeneration,
+            applicationRef: "application:1",
+            elementRef: "element:1",
+            snapshotId: "snapshot:1",
+          },
+        },
+      },
+    })
+    await expect(prepareInputAction(host, elementContext.services, elementContext.context, {
+      kind: "hover",
+      point: { x: 20, y: 20 },
+    }, now)).rejects.toMatchObject({ contract: { code: "invalid-request" } })
   })
 
   test("не принимает substituted target resolution", async () => {

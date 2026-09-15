@@ -15,6 +15,8 @@ import { MethodRegistry } from "../src/method-registry.ts"
 import {
   INPUT_METHOD_GAPS,
   INPUT_METHOD_BUDGETS,
+  keyboardInputPreconditionSchema,
+  pointerInputPreconditionSchema,
   registerInputMethods,
 } from "../src/input-methods.ts"
 
@@ -258,6 +260,64 @@ describe("C3 runtime input method catalogue", () => {
       },
       new AbortController().signal,
     )).rejects.toThrow()
+    expect(value.calls()).toBe(0)
+  })
+
+  test("public input targets не рекламируют unretained element или application focus", () => {
+    const value = fixture()
+    const observationRef = {
+      observationId: "observation:target-scope",
+      inventoryRevision: 1,
+      displayLayoutRevision: 1,
+      proofRef: "proof:target-scope",
+    }
+    const element = {
+      kind: "element" as const,
+      ref: {
+        ...generation,
+        nativeGeneration,
+        applicationRef: "application:scope",
+        elementRef: "element:scope",
+        snapshotId: "snapshot:scope",
+      },
+    }
+    const application = {
+      kind: "application" as const,
+      ref: {
+        ...generation,
+        nativeGeneration,
+        applicationRef: "application:scope",
+        pid: 100,
+        launchedAt: "2026-09-15T10:00:00.000Z",
+        registrationNonce: "registration:scope",
+      },
+    }
+
+    expect(pointerInputPreconditionSchema.safeParse({
+      target: element,
+      inventoryId: "inventory:input-methods",
+      inventoryRevision: 1,
+      observationRef,
+    }).success).toBe(false)
+    expect(keyboardInputPreconditionSchema.safeParse({
+      target: application,
+      inventoryId: "inventory:input-methods",
+      inventoryRevision: 1,
+    }).success).toBe(false)
+    expect(pointerInputPreconditionSchema.safeParse({
+      target: {
+        kind: "display",
+        ref: {
+          ...generation,
+          nativeGeneration,
+          displayRef: "display:scope",
+          displayLayoutRevision: 1,
+        },
+      },
+      inventoryId: "inventory:input-methods",
+      inventoryRevision: 1,
+      observationRef,
+    }).success).toBe(true)
     expect(value.calls()).toBe(0)
   })
 

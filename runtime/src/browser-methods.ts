@@ -201,6 +201,7 @@ function registerChromeMethods(registry: MethodRegistry, runtime: RuntimeCore, b
     destructive: true,
     timeoutMs: 30_000,
     requiredCapabilities: ["browser.instances", "runtime.operations"],
+    availableDuringDrain: true,
     async execute(context, input) {
       return browserExecutionSchema.parse(await runtime.browserLifetime.recover(context.session, binding.bindingId, input.intent, context.signal))
     },
@@ -282,6 +283,7 @@ function registerAndroidMethods(registry: MethodRegistry, runtime: RuntimeCore, 
     destructive: true,
     timeoutMs: 30_000,
     requiredCapabilities: ["android.chrome", "runtime.operations"],
+    availableDuringDrain: true,
     async execute(context, input) {
       return deviceExecutionSchema.parse(await runtime.browserLifetime.recover(context.session, binding.bindingId, input.intent, context.signal))
     },

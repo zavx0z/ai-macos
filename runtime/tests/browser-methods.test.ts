@@ -64,6 +64,8 @@ test("Chrome methods проходят lifetime coordinator и сохраняют
   await expect(registry.dispatch(foreign, "browser_chrome_reservation", {
     target: { kind: "browser-instance", ref: actual },
   }, new AbortController().signal)).rejects.toThrow("lineage")
+  fixture.runtime.sealAdmission()
+  expect(registry.descriptors().tools.map(tool => tool.name)).toEqual(["browser_chrome_recover"])
 })
 
 test("Android catalogue остаётся opt-in и capability-gated", () => {
@@ -109,6 +111,8 @@ test("Android catalogue остаётся opt-in и capability-gated", () => {
   expect(publicSchema).not.toContain("publication")
   expect(publicSchema).not.toContain("cacheScopeRef")
   expect(publicSchema).not.toContain("frameRef")
+  fixture.runtime.sealAdmission()
+  expect(registry.descriptors().tools.map(tool => tool.name)).toEqual(["android_chrome_recover"])
 })
 
 test("pre-aborted method не достигает lifetime coordinator", async () => {

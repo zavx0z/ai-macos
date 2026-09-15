@@ -1,9 +1,7 @@
 import {
   adapterResultSchema,
-  applicationRefSchema,
   desktopLayoutRefSchema,
   displayRefSchema,
-  elementRefSchema,
   observationRefSchema,
   opaqueIdSchema,
   operationRecordSchema,
@@ -36,16 +34,13 @@ import type { MethodDefinition, MethodRegistry } from "./method-registry.ts"
 const pointerTargetSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("window"), ref: windowRefSchema }),
   z.strictObject({ kind: z.literal("surface"), ref: surfaceRefSchema }),
-  z.strictObject({ kind: z.literal("element"), ref: elementRefSchema }),
   z.strictObject({ kind: z.literal("display"), ref: displayRefSchema }),
   z.strictObject({ kind: z.literal("desktop-layout"), ref: desktopLayoutRefSchema }),
 ])
 
 const keyboardTargetSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("application"), ref: applicationRefSchema }),
   z.strictObject({ kind: z.literal("window"), ref: windowRefSchema }),
   z.strictObject({ kind: z.literal("surface"), ref: surfaceRefSchema }),
-  z.strictObject({ kind: z.literal("element"), ref: elementRefSchema }),
 ])
 
 export const pointerInputPreconditionSchema = z.strictObject({

@@ -49,8 +49,8 @@ export type PreparedInputAction = Readonly<{
   authorizedPoints: readonly AuthorizedObservationPoint[]
 }>
 
-const pointerTargetKinds = new Set(["window", "surface", "element", "display", "desktop-layout"])
-const keyboardTargetKinds = new Set(["application", "window", "surface", "element"])
+const pointerTargetKinds = new Set(["window", "surface", "display", "desktop-layout"])
+const keyboardTargetKinds = new Set(["window", "surface"])
 
 export async function prepareInputAction(
   host: AdapterHostContext,
