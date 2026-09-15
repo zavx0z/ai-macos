@@ -24,7 +24,7 @@ import { FileHeldInputLedger, FileOperationJournal } from "./storage/index.ts"
 import { registerWindowMethods } from "./window-methods.ts"
 import { FileClientState } from "./client-state.ts"
 import { sha256 } from "./primitives.ts"
-import { startRuntimeHeartbeat } from "./heartbeat.ts"
+import { runtimeHeartbeatFailureReason, startRuntimeHeartbeat } from "./heartbeat.ts"
 import { createBrowserHostComposition, type BrowserHostConfig } from "./browser-host.ts"
 import { registerBrowserMethods } from "./browser-methods.ts"
 import { registerInputMethods } from "./input-methods.ts"
@@ -671,7 +671,11 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
         if (permissionFlow !== undefined) core.sealAdmission()
         if (native !== undefined && handshake !== undefined) heartbeat = startRuntimeHeartbeat({ native,
           generation: { ...generation, nativeGeneration: handshake.nativeGeneration },
-          onFailure(error) { core.quarantineStartup(`Native heartbeat unavailable: ${error.message}`); revokeNative("Native heartbeat unavailable") },
+          onFailure(error) {
+            const reason = runtimeHeartbeatFailureReason(error)
+            core.quarantineStartup(reason)
+            revokeNative(reason)
+          },
         })
         await uds.start()
         if (permissionFlow === undefined) void beginBackendPreparation()

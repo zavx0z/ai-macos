@@ -157,7 +157,13 @@ test.each([
   ])
   expect(exit).toBe(75)
   expect(output.byteLength).toBeGreaterThan(0)
-  expect(errors.trim()).toBe(`{"kind":"native-terminal","exitCode":75,"stage":"${stage}"}`)
+  const terminal = JSON.parse(errors.trim()) as Record<string, unknown>
+  expect(terminal).toMatchObject({ kind: "native-terminal", runtimeEpoch: "runtime",
+    nativeGeneration: "native-command-fixture", exitCode: 75, stage })
+  expect(Object.keys(terminal).sort()).toEqual([
+    "exitCode", "kind", "nativeGeneration", "recordedAt", "runtimeEpoch", "stage",
+  ])
+  expect(Number.isNaN(Date.parse(String(terminal.recordedAt)))).toBe(false)
   expect(errors).not.toContain("application")
 })
 

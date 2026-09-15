@@ -161,11 +161,21 @@ static NSDictionary *failure(NSString *code, NSString *message) {
 
 - (void)shutdown:(int)code stage:(NSString *)stage {
   if (_requestedExit >= 0) return;
-  if (code == 75) {
-    fprintf(stderr,
-            "{\"kind\":\"native-terminal\",\"exitCode\":75,\"stage\":\"%s\"}\n",
-            stage.UTF8String ?: "native-resource-limit");
-    fflush(stderr);
+  if (code != 0) {
+    NSDictionary *terminal = @{
+      @"kind" : @"native-terminal",
+      @"recordedAt" : timestamp(),
+      @"runtimeEpoch" : _runtimeEpoch ?: @"unavailable",
+      @"nativeGeneration" : _generation ?: @"unavailable",
+      @"exitCode" : @(code),
+      @"stage" : [stage isKindOfClass:NSString.class] ? stage : @"native-shutdown",
+    };
+    NSData *encoded = [NSJSONSerialization dataWithJSONObject:terminal options:0 error:NULL];
+    if (encoded != nil) {
+      fwrite(encoded.bytes, 1, encoded.length, stderr);
+      fputc('\n', stderr);
+      fflush(stderr);
+    }
   }
   _sealed = YES;
   if ([_backend respondsToSelector:@selector(sealPermissionRequests)]) [_backend sealPermissionRequests];
@@ -181,7 +191,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
 }
 
 - (void)send:(NSString *)channel payload:(NSDictionary *)payload {
-  if (![_transport enqueueFrame:@{@"channel": channel, @"payload": payload}]) [self shutdown:74];
+  if (![_transport enqueueFrame:@{@"channel": channel, @"payload": payload}]) [self shutdown:74 stage:@"transport-write-failed"];
 }
 
 - (NSDictionary *)statusForOperation:(NSString *)operationId requestId:(NSString *)requestId {
@@ -294,7 +304,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     } completed:^(NSDictionary *result) {
       self->_observerCommandPending = NO;
       if (result == nil) { [self shutdown:70]; return; }
-      if (![self->_transport enqueueFrame:@{@"channel": @"observer", @"payload": result}]) { [self shutdown:74]; return; }
+      if (![self->_transport enqueueFrame:@{@"channel": @"observer", @"payload": result}]) { [self shutdown:74 stage:@"transport-write-failed"]; return; }
       if ([result[@"ok"] isEqual:@YES] && [result[@"command"] isEqual:@"prepare"]) {
         NSString *instance = result[@"snapshot"][@"observerInstanceRef"];
         if (![self->_backend respondsToSelector:@selector(activateObserverPush:)] ||
@@ -558,7 +568,7 @@ int meta_command_loop_run(id<MetaCommandBackend> backend, NSString *buildId,
     installRoot:installRoot generation:nativeGeneration control:control];
   MetaBrokerTransport *transport = [[MetaBrokerTransport alloc] initWithInput:inputDescriptor output:outputDescriptor callbackQueue:control
     onMessage:^(NSDictionary *message) { [controller handle:message]; }
-    onFailure:^(__unused NSString *reason) { [controller shutdown:74]; }];
+    onFailure:^(__unused NSString *reason) { [controller shutdown:74 stage:@"transport-failure"]; }];
   if (transport == nil) return 70;
   controller.transport = transport;
   [transport start];
