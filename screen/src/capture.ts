@@ -19,12 +19,81 @@ const DETAIL_SCALE: Record<DetailLevel, number> = {
   full:   1.0,
 };
 
-export function parseDetail(value: string | null | undefined, fallback: number = 1.0): number {
-  if (value == null) return fallback;
-  if (value in DETAIL_SCALE) return DETAIL_SCALE[value as DetailLevel]!;
-  const n = parseFloat(value);
-  if (!isNaN(n) && n > 0 && n <= 1) return n;
-  return fallback;
+export const MAX_CAPTURE_DIMENSION = 32_768
+export const MAX_CAPTURE_PIXELS = 32_000_000
+export const MAX_CAPTURE_ENCODED_BYTES = 64 * 1024 * 1024
+
+export type EncodedImageMetadata = {
+  widthPx: number
+  heightPx: number
+  encodedBytes: number
+}
+
+export type LegacyCaptureMetadata = EncodedImageMetadata & {
+  caption?: string
+}
+
+export function parseDetail(value: unknown, fallback: number = 1.0): number {
+  if (value == null || value === "") return fallback
+  if (typeof value === "string") {
+    const normalized = value.trim().toLowerCase()
+    if (normalized in DETAIL_SCALE) return DETAIL_SCALE[normalized as DetailLevel]!
+    value = Number(normalized)
+  }
+  if (typeof value === "number" && Number.isFinite(value) && value > 0 && value <= 1) {
+    return value
+  }
+  return fallback
+}
+
+export function finiteNumber(value: unknown): number | undefined {
+  if (value === undefined || value === null || value === "") return undefined
+  const number = Number(value)
+  return Number.isFinite(number) ? number : undefined
+}
+
+export function inspectPng(data: Uint8Array): EncodedImageMetadata {
+  const signature = [137, 80, 78, 71, 13, 10, 26, 10]
+  const ihdr = [73, 72, 68, 82]
+  if (data.byteLength < 24
+      || signature.some((byte, index) => data[index] !== byte)
+      || ihdr.some((byte, index) => data[index + 12] !== byte)) {
+    throw new Error("Capture backend вернул некорректный PNG")
+  }
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength)
+  const widthPx = view.getUint32(16)
+  const heightPx = view.getUint32(20)
+  assertCaptureBudget(widthPx, heightPx, data.byteLength)
+  return { widthPx, heightPx, encodedBytes: data.byteLength }
+}
+
+export function legacyCaptureMetadata(
+  data: Uint8Array,
+  caption?: string,
+): LegacyCaptureMetadata {
+  return {
+    ...inspectPng(data),
+    ...(caption ? { caption } : {}),
+  }
+}
+
+export function assertCaptureBudget(
+  widthPx: number,
+  heightPx: number,
+  encodedBytes: number,
+): void {
+  if (!Number.isInteger(widthPx) || !Number.isInteger(heightPx)
+      || widthPx <= 0 || heightPx <= 0
+      || widthPx > MAX_CAPTURE_DIMENSION || heightPx > MAX_CAPTURE_DIMENSION) {
+    throw new Error("Capture dimensions превышают допустимый предел")
+  }
+  if (widthPx > Math.floor(MAX_CAPTURE_PIXELS / heightPx)) {
+    throw new Error("Capture frame превышает 32 мегапикселя")
+  }
+  if (!Number.isInteger(encodedBytes) || encodedBytes <= 0
+      || encodedBytes > MAX_CAPTURE_ENCODED_BYTES) {
+    throw new Error("Encoded capture превышает 64 МиБ")
+  }
 }
 
 export type CaptureOptions = {

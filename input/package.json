@@ -4,6 +4,16 @@
   "version": "0.0.0",
   "type": "module",
   "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./adapter": "./src/adapter.ts",
+    "./action-plan": "./src/action-plan.ts",
+    "./actions": "./src/actions.ts",
+    "./authorization": "./src/authorization.ts",
+    "./clipboard-adapter": "./src/clipboard-adapter.ts",
+    "./native-action": "./src/native-action.ts",
+    "./native-clipboard-backend": "./src/native-clipboard-backend.ts"
+  },
   "scripts": {
     "dev": "bun --hot src/index.ts",
     "start": "bun src/index.ts",
@@ -12,6 +22,7 @@
     "test": "bun test"
   },
   "dependencies": {
+    "@meta/native": "workspace:*",
     "@meta/shared": "workspace:*"
   }
 }

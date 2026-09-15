@@ -1,6 +1,3 @@
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { spawn } from "bun";
 import { logCaption, osa, quote } from "@meta/shared";
 import {
@@ -14,7 +11,6 @@ import {
   cdpSetViewport,
   cdpWaitReady,
   findTargetById,
-  findTargetByUrl,
   isCdpAvailable,
   type ConsoleEntry,
   type ViewportOverride,
@@ -388,13 +384,6 @@ export async function activateTab(windowId: number, tabIndex: number): Promise<v
   `)
 }
 
-async function tabUrl(windowId?: number, tabIndex?: number): Promise<string> {
-  return await chromeJxaValue<string>(`
-    var w = chromeWindow(app, ${jxaArg(windowId)});
-    return String(chromeTab(w, ${jxaArg(tabIndex)}).url() || "");
-  `)
-}
-
 async function resolveCdpTarget(
   targetId?: string,
   windowId?: number,
@@ -410,14 +399,7 @@ async function resolveCdpTarget(
     return null
   }
   if (targetId) return await findTargetById(targetId)
-  const url = await tabUrl(windowId, tabIndex).catch(() => "")
-  if (!url) return null
-  try {
-    return await findTargetByUrl(url)
-  } catch (error) {
-    if (error instanceof CdpTargetSelectionError && error.status === 503) return null
-    throw error
-  }
+  return null
 }
 
 export async function navigate(
@@ -671,107 +653,69 @@ export async function screenshotTab(opts: ScreenshotOptions = {}): Promise<Scree
     : wins.find((w) => w.index === 1) ?? wins[0]
   if (!target) throw new Error(`window not found: id=${opts.windowId}`)
 
-  if (opts.tabIndex != null && opts.tabIndex !== target.activeTabIndex) {
-    const tabExists = target.tabs.some((t) => t.index === opts.tabIndex)
-    if (!tabExists) throw new Error(`tab ${opts.tabIndex} not found in window ${target.id}`)
-    await activateTab(target.id, opts.tabIndex)
-  }
-
-  const fresh = (await listWindows()).find((w) => w.id === target.id) ?? target
   const restore = opts.restore !== false
 
-  // Save frontmost app BEFORE activating Chrome
   let prevApp: string | null = null
   if (restore) {
     prevApp = await osa(`tell application "System Events" to get name of first application process whose frontmost is true`).catch(() => null)
   }
 
-  if (opts.caption) logCaption(opts.caption)
-
-  // Bring the exact Chrome window to front before capture.
-  await runJxa(`
-    var w = chromeWindow(app, ${fresh.id});
-    w.index = 1;
-    app.activate();
-  `)
-
-  // Wait for page to be fully ready before capture (lazy images, fonts, animations, ...).
-  // Best-effort: silently skip if CDP is unavailable or target can't be matched.
-  const shouldWait = opts.waitReady !== false
-  if (shouldWait && await isCdpAvailable()) {
-    const u = fresh.tabs.find((t) => t.index === fresh.activeTabIndex)?.url ?? ""
-    const target = u ? await findTargetByUrl(u) : null
-    if (target) await cdpWaitReady(target, opts.waitOpts ?? {})
+  if (opts.tabIndex != null && opts.tabIndex !== target.activeTabIndex) {
+    const tabExists = target.tabs.some((tab) => tab.index === opts.tabIndex)
+    if (!tabExists) throw new Error(`tab ${opts.tabIndex} not found in window ${target.id}`)
+    await activateTab(target.id, opts.tabIndex)
   }
 
-  const body: Record<string, unknown> = {
-    x: fresh.x,
-    y: fresh.y,
-    width: fresh.width,
-    height: fresh.height,
+  try {
+    if (opts.caption) logCaption(opts.caption)
+    await runJxa(`
+      var w = chromeWindow(app, ${target.id});
+      w.index = 1;
+      app.activate();
+    `)
+
+    const fresh = (await listWindows()).find((window) => window.id === target.id)
+    if (!fresh) throw new Error(`window closed before capture: id=${target.id}`)
+    const body = chromeScreenCaptureRequest(fresh, opts)
+    const res = await fetch(`${SCREEN_API}/rect`, {
+      method: "POST",
+      headers: {"content-type": "application/json"},
+      body: JSON.stringify(body),
+    })
+    const buffer = await res.arrayBuffer()
+    if (!res.ok) {
+      const text = new TextDecoder().decode(buffer)
+      throw new Error(`screen api ${res.status}: ${text}`)
+    }
+
+    return {
+      status: res.status,
+      contentType: res.headers.get("content-type") ?? "application/octet-stream",
+      body: buffer,
+      caption: opts.caption,
+    }
+  } finally {
+    if (restore && prevApp && prevApp !== "Google Chrome") {
+      await osa(`tell application ${quote(prevApp)} to activate`).catch(() => {})
+    }
+  }
+}
+
+export function chromeScreenCaptureRequest(
+  window: Pick<WindowInfo, "x" | "y" | "width" | "height">,
+  opts: ScreenshotOptions,
+): Record<string, unknown> {
+  return {
+    x: window.x,
+    y: window.y,
+    width: window.width,
+    height: window.height,
     restore: false,
     format: opts.format ?? "png",
-  }
-  if (opts.shadow !== undefined) body.shadow = opts.shadow
-  if (opts.delayMs !== undefined) body.delayMs = opts.delayMs
-  if (opts.detail !== undefined) body.detail = opts.detail
-  if (opts.scale !== undefined) body.scale = opts.scale
-  if (opts.caption !== undefined) body.caption = opts.caption
-
-  const res = await fetch(`${SCREEN_API}/rect`, {
-    method: "POST",
-    headers: {"content-type": "application/json"},
-    body: JSON.stringify(body),
-  })
-  let buf = await res.arrayBuffer()
-
-  // Restore focus after screenshot
-  if (restore && prevApp && prevApp !== "Google Chrome") {
-    await osa(`tell application ${quote(prevApp)} to activate`).catch(() => {})
-  }
-
-  if (!res.ok) {
-    const text = new TextDecoder().decode(buf)
-    throw new Error(`screen api ${res.status}: ${text}`)
-  }
-
-  // Apply scale locally (screen service may be running without the detail feature)
-  const scale = resolveScale(opts.detail, opts.scale)
-  if (scale < 1) buf = await downscalePng(buf, scale)
-
-  return {
-    status: res.status,
-    contentType: res.headers.get("content-type") ?? "application/octet-stream",
-    body: buf,
-    caption: opts.caption,
-  }
-}
-
-const DETAIL_SCALE: Record<string, number> = { low: 0.25, medium: 0.5, high: 0.75, full: 1.0 }
-
-function resolveScale(detail?: string, scale?: number): number {
-  if (detail && detail in DETAIL_SCALE) return DETAIL_SCALE[detail]!
-  if (scale !== undefined && scale > 0 && scale <= 1) return scale
-  return 1.0
-}
-
-async function downscalePng(buf: ArrayBuffer, scale: number): Promise<ArrayBuffer> {
-  const dir = await mkdtemp(join(tmpdir(), "meta-chrome-"))
-  const path = join(dir, "shot.png")
-  try {
-    await Bun.write(path, buf)
-    const info = spawn(["sips", "-g", "pixelWidth", path], { stdout: "pipe", stderr: "pipe" })
-    const out = await new Response(info.stdout).text()
-    await info.exited
-    const match = out.match(/pixelWidth:\s+(\d+)/)
-    if (match) {
-      const w = Math.max(1, Math.round(parseInt(match[1]!) * scale))
-      const sips = spawn(["sips", "--resampleWidth", String(w), "--out", path, path], { stdout: "pipe", stderr: "pipe" })
-      await sips.exited
-    }
-    const data = await readFile(path)
-    return data.buffer as ArrayBuffer
-  } finally {
-    await rm(dir, { recursive: true, force: true })
+    ...(opts.shadow === undefined ? {} : { shadow: opts.shadow }),
+    ...(opts.delayMs === undefined ? {} : { delayMs: opts.delayMs }),
+    ...(opts.detail === undefined ? {} : { detail: opts.detail }),
+    ...(opts.scale === undefined ? {} : { scale: opts.scale }),
+    ...(opts.caption === undefined ? {} : { caption: opts.caption }),
   }
 }

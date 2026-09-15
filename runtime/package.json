@@ -1,0 +1,21 @@
+{
+  "name": "@meta/runtime",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "start": "bun src/index.ts",
+    "test": "bun test",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  },
+  "dependencies": {
+    "@meta/shared": "workspace:*",
+    "@meta/native": "workspace:*",
+    "@meta/chrome": "workspace:*",
+    "@meta/android": "workspace:*"
+  }
+}

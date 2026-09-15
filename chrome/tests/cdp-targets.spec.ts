@@ -21,7 +21,7 @@ describe("CDP target selection", () => {
     expect(selectCdpTarget(targets, { targetId: "B" })?.id).toBe("B")
   })
 
-  test("URL fallback refuses an ambiguous target", () => {
+  test("URL selection is disabled even for one matching target", () => {
     const targets = [target("A", "https://example.test"), target("B", "https://example.test")]
     expect(() => selectCdpTarget(targets, { url: "https://example.test" })).toThrow(
       CdpTargetSelectionError,

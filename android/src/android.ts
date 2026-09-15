@@ -4,7 +4,7 @@ import { join } from "node:path"
 import { spawn } from "bun"
 import { logCaption } from "@meta/shared"
 import { CdpHttp, withSession, type CdpTarget } from "./cdp.ts"
-import { adbForward, DEFAULT_DEBUG_PORT } from "./adb.ts"
+import { adbForward, adbOpenUrl, DEFAULT_DEBUG_PORT } from "./adb.ts"
 
 const cdp = new CdpHttp("localhost", DEFAULT_DEBUG_PORT)
 
@@ -15,8 +15,15 @@ export type TabInfo = {
   type: string
 }
 
-export async function ensureForward(): Promise<void> {
-  await adbForward(DEFAULT_DEBUG_PORT)
+export type AndroidTargetCreationDeps = {
+  listTargets(): Promise<CdpTarget[]>
+  openUrl(serial: string, url: string): Promise<void>
+  delay(ms: number): Promise<void>
+  now(): number
+}
+
+export async function ensureForward(serial: string): Promise<void> {
+  await adbForward(DEFAULT_DEBUG_PORT, serial)
 }
 
 export async function listTabs(): Promise<TabInfo[]> {
@@ -26,23 +33,50 @@ export async function listTabs(): Promise<TabInfo[]> {
     .map((t) => ({ id: t.id, title: t.title, url: t.url, type: t.type }))
 }
 
-export async function getActiveTab(): Promise<TabInfo | null> {
-  const tabs = await listTabs()
-  return tabs[0] ?? null
-}
-
-async function getTarget(id?: string): Promise<CdpTarget> {
+async function getTarget(id: string): Promise<CdpTarget> {
   const targets = (await cdp.list()).filter((t) => t.type === "page")
-  if (targets.length === 0) throw new Error("no Chrome tabs on Android device")
-  if (id == null) return targets[0]!
   const t = targets.find((x) => x.id === id)
   if (!t) throw new Error(`tab not found: id=${id}`)
   return t
 }
 
-export async function newTab(url = "about:blank"): Promise<TabInfo> {
-  const t = await cdp.newTab(url)
-  return { id: t.id, title: t.title, url: t.url, type: t.type }
+export async function newTab(
+  serial: string,
+  url = "about:blank",
+  deps: AndroidTargetCreationDeps = {
+    listTargets: () => cdp.list(),
+    openUrl: adbOpenUrl,
+    delay: Bun.sleep,
+    now: Date.now,
+  },
+  timeoutMs = 5_000,
+): Promise<TabInfo> {
+  const before = new Set(
+    (await deps.listTargets())
+      .filter((target) => target.type === "page")
+      .map((target) => target.id),
+  )
+  await deps.openUrl(serial, url)
+  const deadline = deps.now() + Math.max(100, Math.min(timeoutMs, 10_000))
+  while (deps.now() < deadline) {
+    const created = selectCreatedTarget(before, await deps.listTargets())
+    if (created) return { id: created.id, title: created.title, url: created.url, type: created.type }
+    await deps.delay(50)
+  }
+  throw new Error(`Android target creation timed out for serial=${serial}`)
+}
+
+export function selectCreatedTarget(
+  previousTargetIds: ReadonlySet<string>,
+  currentTargets: readonly CdpTarget[],
+): CdpTarget | null {
+  const created = currentTargets.filter(
+    (target) => target.type === "page" && !previousTargetIds.has(target.id),
+  )
+  if (created.length > 1) {
+    throw new Error(`Android target creation is ambiguous: ${created.map((target) => target.id).join(", ")}`)
+  }
+  return created[0] ?? null
 }
 
 export async function closeTab(id: string): Promise<void> {
@@ -53,14 +87,14 @@ export async function activateTab(id: string): Promise<void> {
   await cdp.activateTab(id)
 }
 
-export async function navigate(url: string, tabId?: string): Promise<void> {
+export async function navigate(url: string, tabId: string): Promise<void> {
   const target = await getTarget(tabId)
   await withSession(target, async (s) => {
     await s.send("Page.navigate", { url })
   })
 }
 
-export async function reload(tabId?: string, wait = true, ignoreCache = false): Promise<number> {
+export async function reload(tabId: string, wait = true, ignoreCache = false): Promise<number> {
   const target = await getTarget(tabId)
   return await withSession(target, async (s) => {
     await s.send("Page.enable")
@@ -89,7 +123,7 @@ async function waitForLoad(
   return Date.now() - t0
 }
 
-export async function evalJs(js: string, tabId?: string): Promise<string> {
+export async function evalJs(js: string, tabId: string): Promise<string> {
   const target = await getTarget(tabId)
   return await withSession(target, async (s) => {
     const wrapped = `(function(){try{var __r=(function(){${js}})();return (typeof __r==='undefined')?'':(typeof __r==='string'?__r:JSON.stringify(__r));}catch(e){throw e;}})()`
@@ -106,11 +140,11 @@ export async function evalJs(js: string, tabId?: string): Promise<string> {
   })
 }
 
-export async function getSource(tabId?: string): Promise<string> {
+export async function getSource(tabId: string): Promise<string> {
   return await evalJs("return document.documentElement.outerHTML;", tabId)
 }
 
-export async function getText(tabId?: string): Promise<string> {
+export async function getText(tabId: string): Promise<string> {
   return await evalJs("return document.body && document.body.innerText || '';", tabId)
 }
 
@@ -124,28 +158,19 @@ export function getLocalIp(): string | null {
   return null
 }
 
-export async function openDev(opts: { port: number; tabId?: string; path?: string }): Promise<{ url: string; tab: TabInfo }> {
+export async function openDev(opts: { port: number; tabId: string; path?: string }): Promise<{ url: string; tab: TabInfo }> {
   const ip = getLocalIp()
   if (!ip) throw new Error("локальный IPv4-адрес не найден")
   const url = `http://${ip}:${opts.port}${opts.path ?? "/"}`
-  if (opts.tabId) {
-    await navigate(url, opts.tabId)
-    const tabs = await listTabs()
-    const tab = tabs.find((t) => t.id === opts.tabId) ?? tabs[0]!
-    return { url, tab }
-  }
-  // Android Chrome не поддерживает CDP /json/new — открываем через ADB intent
-  const { spawn: spawnProc } = await import("bun")
-  const proc = spawnProc(["adb", "shell", "am", "start", "-a", "android.intent.action.VIEW", "-d", url, "com.android.chrome"], { stdout: "pipe", stderr: "pipe" })
-  await proc.exited
-  await new Promise((r) => setTimeout(r, 800))
+  await navigate(url, opts.tabId)
   const tabs = await listTabs()
-  const tab = tabs[0]!
+  const tab = tabs.find((candidate) => candidate.id === opts.tabId)
+  if (!tab) throw new Error(`tab disappeared after navigation: id=${opts.tabId}`)
   return { url, tab }
 }
 
 export type ScreenshotOptions = {
-  tabId?: string
+  tabId: string
   detail?: string
   scale?: number
   caption?: string
@@ -159,9 +184,14 @@ export type ScreenshotResult = {
   body: ArrayBuffer
   caption?: string
   base64?: string
+  measured: { width: number; height: number; fullPage: boolean }
 }
 
-export async function screenshot(opts: ScreenshotOptions = {}): Promise<ScreenshotResult> {
+const CAPTURE_MAX_DIMENSION = 16_384
+const CAPTURE_MAX_PIXELS = 32_000_000
+const CAPTURE_MAX_BYTES = 64 * 1024 * 1024
+
+export async function screenshot(opts: ScreenshotOptions): Promise<ScreenshotResult> {
   if (opts.caption) logCaption(opts.caption)
   const target = await getTarget(opts.tabId)
   await cdp.activateTab(target.id)
@@ -169,12 +199,44 @@ export async function screenshot(opts: ScreenshotOptions = {}): Promise<Screensh
   const buf = await withSession(target, async (s) => {
     await s.send("Page.enable")
     const params: Record<string, unknown> = { format: "png" }
-    if (opts.fullPage) params.captureBeyondViewport = true
+    const metrics = await s.send<{
+      cssContentSize?: { x: number; y: number; width: number; height: number }
+      contentSize?: { x: number; y: number; width: number; height: number }
+      cssVisualViewport?: { clientWidth: number; clientHeight: number }
+      visualViewport?: { clientWidth: number; clientHeight: number }
+    }>("Page.getLayoutMetrics")
+    const size = opts.fullPage
+      ? metrics.cssContentSize ?? metrics.contentSize
+      : metrics.cssVisualViewport ?? metrics.visualViewport
+    if (!size) throw new Error("Android Chrome did not return measured capture dimensions")
+    const width = Math.max(1, Math.ceil("width" in size ? size.width : size.clientWidth))
+    const height = Math.max(1, Math.ceil("height" in size ? size.height : size.clientHeight))
+    assertAndroidCaptureDimensions(width, height)
+    if (opts.fullPage) {
+      params.captureBeyondViewport = true
+      params.clip = {
+        x: "x" in size ? size.x : 0,
+        y: "y" in size ? size.y : 0,
+        width,
+        height,
+        scale: 1,
+      }
+    }
     const result = await s.send<{ data: string }>("Page.captureScreenshot", params)
-    return Buffer.from(result.data, "base64")
+    const bytes = decodedBase64Bytes(result.data)
+    if (bytes > CAPTURE_MAX_BYTES) {
+      throw new Error(`Android capture exceeds byte limit: ${bytes} > ${CAPTURE_MAX_BYTES}`)
+    }
+    return {
+      buffer: Buffer.from(result.data, "base64"),
+      measured: { width, height, fullPage: opts.fullPage === true },
+    }
   })
 
-  let arr: ArrayBuffer = buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength) as ArrayBuffer
+  let arr: ArrayBuffer = buf.buffer.buffer.slice(
+    buf.buffer.byteOffset,
+    buf.buffer.byteOffset + buf.buffer.byteLength,
+  ) as ArrayBuffer
   const scale = resolveScale(opts.detail, opts.scale)
   if (scale < 1) arr = await downscalePng(arr, scale)
 
@@ -185,6 +247,7 @@ export async function screenshot(opts: ScreenshotOptions = {}): Promise<Screensh
       body: arr,
       caption: opts.caption,
       base64: Buffer.from(arr).toString("base64"),
+      measured: buf.measured,
     }
   }
 
@@ -193,7 +256,26 @@ export async function screenshot(opts: ScreenshotOptions = {}): Promise<Screensh
     contentType: "image/png",
     body: arr,
     caption: opts.caption,
+    measured: buf.measured,
   }
+}
+
+export function assertAndroidCaptureDimensions(width: number, height: number): void {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    throw new Error(`Invalid Android capture dimensions: ${width}x${height}`)
+  }
+  if (width > CAPTURE_MAX_DIMENSION || height > CAPTURE_MAX_DIMENSION) {
+    throw new Error(`Android capture dimensions exceed limit: ${width}x${height}`)
+  }
+  if (width * height > CAPTURE_MAX_PIXELS) {
+    throw new Error(`Android capture pixel count exceeds limit: ${width * height} > ${CAPTURE_MAX_PIXELS}`)
+  }
+}
+
+function decodedBase64Bytes(value: string): number {
+  if (value.length === 0) return 0
+  const padding = value.endsWith("==") ? 2 : value.endsWith("=") ? 1 : 0
+  return Math.floor(value.length * 3 / 4) - padding
 }
 
 const DETAIL_SCALE: Record<string, number> = { low: 0.25, medium: 0.5, high: 0.75, full: 1.0 }
