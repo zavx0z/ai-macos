@@ -1270,7 +1270,14 @@ test("orphan helper timeout сохраняет witness и запрещает rol
   }
   const update = await planRuntimeInstall(options)
 
-  await expect(applyRuntimeInstall(update, options)).rejects.toThrow("rollback incomplete")
+  let failure: unknown
+  try { await applyRuntimeInstall(update, options) }
+  catch (error) { failure = error }
+  expect(failure).toBeInstanceOf(AggregateError)
+  const convergence = (failure as AggregateError).errors[0] as Error & { lastSample?: unknown }
+  expect(convergence.message).toContain("elapsedMs=100, label=absent, parent=gone, helper=alive-orphan")
+  expect(convergence.lastSample).toEqual({ elapsedMs: 100, label: "absent",
+    parent: "gone", helper: "alive-orphan" })
   expect(fixture.runner.bootstrapCalls).toBe(1)
   expect(fixture.runner.helperOrphaned).toBe(true)
   expect(await readlink(join(options.paths.installRoot, "current"))).toBe(first.release.releasePath)

@@ -961,12 +961,17 @@ type OwnedRuntimeProcesses = {
   helper: ProcessIncarnation
 }
 
+type BootoutConvergenceSample = {
+  elapsedMs: number
+  label: "running" | "removing" | "absent"
+  parent: "alive" | "alive-orphan" | "gone"
+  helper: "alive" | "alive-orphan" | "gone"
+}
+
 class BootoutConvergenceError extends Error {
-  constructor(
-    readonly service: LaunchServiceIdentity,
-    readonly processes: OwnedRuntimeProcesses,
-  ) {
-    super("Runtime bootout convergence deadline exceeded: exact label/parent/helper ещё не исчезли")
+  constructor(readonly lastSample: BootoutConvergenceSample) {
+    super(`Runtime bootout convergence deadline exceeded: elapsedMs=${lastSample.elapsedMs}, `
+      + `label=${lastSample.label}, parent=${lastSample.parent}, helper=${lastSample.helper}`)
   }
 }
 
@@ -2361,17 +2366,31 @@ async function awaitBootoutConvergence(
   service: LaunchServiceIdentity,
   processes: OwnedRuntimeProcesses,
 ): Promise<void> {
-  const deadlineAt = Date.now() + shutdownConvergenceTimeout(options)
+  const startedAt = Date.now()
+  const timeoutMs = shutdownConvergenceTimeout(options)
+  const deadlineAt = startedAt + timeoutMs
+  let lastSample: BootoutConvergenceSample = {
+    elapsedMs: 0,
+    label: "running",
+    parent: "alive",
+    helper: "alive",
+  }
   while (Date.now() < deadlineAt) {
     const serviceState = await inspectLaunchServiceConvergence(options.runner, plan, service)
-    const [parentGone, helperGone] = await Promise.all([
-      capturedProcessGone(options.runner, processes.parent),
-      capturedProcessGone(options.runner, processes.helper),
+    const [parent, helper] = await Promise.all([
+      capturedProcessState(options.runner, processes.parent),
+      capturedProcessState(options.runner, processes.helper),
     ])
-    if (serviceState === "absent" && parentGone && helperGone) return
+    lastSample = {
+      elapsedMs: Math.min(timeoutMs, Math.max(0, Date.now() - startedAt)),
+      label: serviceState,
+      parent,
+      helper,
+    }
+    if (serviceState === "absent" && parent === "gone" && helper === "gone") return
     await boundedDelay(Math.min(50, Math.max(1, deadlineAt - Date.now())))
   }
-  throw new BootoutConvergenceError(service, processes)
+  throw new BootoutConvergenceError({ ...lastSample, elapsedMs: timeoutMs })
 }
 
 async function inspectLaunchServiceConvergence(
@@ -2428,14 +2447,17 @@ async function captureOwnedRuntimeProcesses(
   return { parent, helper: children[0]! }
 }
 
-async function capturedProcessGone(runner: CommandRunner, captured: ProcessIncarnation): Promise<boolean> {
+async function capturedProcessState(
+  runner: CommandRunner,
+  captured: ProcessIncarnation,
+): Promise<"alive" | "alive-orphan" | "gone"> {
   const current = await readProcessIncarnation(runner, captured.pid)
-  if (current === undefined) return true
-  if (current.startedAt !== captured.startedAt) return true
+  if (current === undefined) return "gone"
+  if (current.startedAt !== captured.startedAt) return "gone"
   if (current.command !== captured.command) {
     throw new Error(`Process ${captured.pid} изменил command при том же PID/lstart`)
   }
-  return false
+  return current.parentPid === captured.parentPid ? "alive" : "alive-orphan"
 }
 
 async function readProcessIncarnation(runner: CommandRunner, pid: number): Promise<ProcessIncarnation | undefined> {
@@ -2473,9 +2495,9 @@ function commandMatchesPath(command: string, path: string): boolean {
 }
 
 function shutdownConvergenceTimeout(options: RuntimeInstallOptions): number {
-  const timeout = options.shutdownConvergenceTimeoutMs ?? 5_000
-  if (!Number.isSafeInteger(timeout) || timeout < 100 || timeout > 10_000) {
-    throw new Error("Shutdown convergence timeout должен быть 100..10000 ms")
+  const timeout = options.shutdownConvergenceTimeoutMs ?? 60_000
+  if (!Number.isSafeInteger(timeout) || timeout < 100 || timeout > 60_000) {
+    throw new Error("Shutdown convergence timeout должен быть 100..60000 ms")
   }
   return timeout
 }
@@ -2764,9 +2786,30 @@ async function readBrowserConfigFile(path: string): Promise<string> {
   return text
 }
 
+function formatCliError(error: unknown): string {
+  const lines: string[] = []
+  const seen = new Set<unknown>()
+  const visit = (value: unknown, depth: number, label?: string) => {
+    if (depth > 8 || seen.has(value)) return
+    seen.add(value)
+    const prefix = `${"  ".repeat(depth)}${label === undefined ? "" : `${label}: `}`
+    const message = value instanceof Error ? value.message : String(value)
+    lines.push(`${prefix}${message.slice(0, 4_096)}`)
+    if (value instanceof AggregateError) {
+      for (const [index, nested] of [...value.errors].slice(0, 16).entries()) {
+        visit(nested, depth + 1, `error[${index}]`)
+      }
+    } else if (value instanceof Error && value.cause !== undefined) {
+      visit(value.cause, depth + 1, "cause")
+    }
+  }
+  visit(error, 0)
+  return lines.join("\n").slice(0, 32_768)
+}
+
 if (import.meta.main) {
   cli().catch(error => {
-    process.stderr.write(`${error instanceof Error ? error.message : String(error)}\n`)
+    process.stderr.write(`${formatCliError(error)}\n`)
     process.exitCode = 1
   })
 }
