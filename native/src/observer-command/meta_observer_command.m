@@ -627,6 +627,51 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   }
 }
 
+- (NSDictionary *)historySnapshotForObserverInstance:
+    (NSString *)observerInstanceRef
+                                              maximumEvents:
+    (NSUInteger)maximumEvents {
+  if (!identifier(observerInstanceRef, 127) || maximumEvents == 0 ||
+      maximumEvents > META_OBSERVER_COMMAND_MAX_EVENTS) {
+    return nil;
+  }
+  [_lock lock];
+  BOOL current = [_observerInstanceRef isEqual:observerInstanceRef] &&
+                 [_acceptingInstanceRef isEqual:observerInstanceRef] &&
+                 _observer != nil && _gapReason == nil &&
+                 _history.count <= maximumEvents;
+  NSDictionary *result = nil;
+  if (current) {
+    NSDictionary *coverage = immutable_json_copy(_observer.coverage);
+    NSArray *events = immutable_json_copy(_history);
+    NSDictionary *last = events.lastObject;
+    NSNumber *nextSequence = coverage[@"nextSequence"];
+    NSNumber *lastSequence = last[@"sequence"];
+    BOOL coherent = coverage != nil && events != nil &&
+        [coverage[@"state"] isEqual:@"ready"] &&
+        ![coverage[@"gapDetected"] boolValue] &&
+        [coverage[@"droppedEvents"] unsignedLongLongValue] == 0 &&
+        [nextSequence isKindOfClass:NSNumber.class] &&
+        ((last == nil && [coverage[@"cursor"] isEqual:_baselineCursor]) ||
+         (last != nil && [last[@"cursor"] isEqual:coverage[@"cursor"]] &&
+          [lastSequence isKindOfClass:NSNumber.class] &&
+          lastSequence.unsignedLongLongValue < UINT64_MAX &&
+          nextSequence.unsignedLongLongValue ==
+              lastSequence.unsignedLongLongValue + 1));
+    if (coherent) {
+      result = @{
+        @"observerInstanceRef" : observerInstanceRef,
+        @"baselineCursor" : _baselineCursor,
+        @"baselineAvailable" : _baselineAvailable ? @YES : @NO,
+        @"coverage" : coverage,
+        @"events" : events,
+      };
+    }
+  }
+  [_lock unlock];
+  return result;
+}
+
 - (void)acceptEvent:(NSDictionary *)event
     observerInstanceRef:(NSString *)observerInstanceRef {
   NSDictionary *immutable = immutable_json_copy(event);

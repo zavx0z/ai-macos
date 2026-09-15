@@ -27,6 +27,7 @@
 #include "ax-actions/meta_ax_press.h"
 #include "recovery-domain/meta_recovery_domain.h"
 #include "domain-recovery/meta_domain_recovery.h"
+#include "view-admission/meta_view_admission.h"
 #include <time.h>
 #include <math.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -179,6 +180,7 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
   MetaBrokerCore *_core;
   MetaCaptureCommandBinder *_captureCommands;
   MetaObserverCommandBinder *_observerCommands;
+  MetaViewAdmissionController *_viewAdmissions;
   NSDictionary *_observerRequest;
   NSString *_observerInstance;
   NSDate *_observerMainDeadline;
@@ -277,6 +279,7 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
 }
 
 - (NSString *)recoveryDomainVersion { return @"1"; }
+- (NSString *)viewAdmissionVersion { return @"1"; }
 - (BOOL)validateRecoveryRequest:(NSDictionary *)request {
   return meta_recovery_domain_validate_request(request, @META_NATIVE_BUILD_ID, NULL, NULL);
 }
@@ -492,6 +495,8 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
     [_asyncLock lock];
     _observerCommands = binder;
     [_asyncLock unlock];
+    _viewAdmissions = [[MetaViewAdmissionController alloc] initWithObserver:binder now:^NSDate * { return NSDate.date; }
+      tombstoneTtlMillis:120000 maximumRecords:4096];
   }
   NSDictionary *result = [_observerCommands handleRequest:request];
   if ([result[@"ok"] isEqual:@YES]) {
@@ -694,6 +699,14 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
   uint64_t deadline = native_millis() + (uint64_t)MIN(remaining, 5000);
   MetaMacOSBackend *windows = _windows;
   MetaExecutor *executor = [_inputExecutor executorOnActionWorker];
+  NSString *viewError = nil;
+  NSDictionary *viewHead = [_viewAdmissions admitRequest:request proof:request[@"viewAdmission"] error:&viewError];
+  __block BOOL admissionRejected = viewHead == nil;
+  [_inputExecutor setFirstDispatchGuard:^BOOL {
+    BOOL allowed = viewHead != nil && [self->_viewAdmissions recheckOperationId:operation[@"operationId"]];
+    if (!allowed) admissionRejected = YES;
+    return allowed;
+  }];
   __block BOOL accepted = NO;
   __block NSString *code = @"target-stale";
   __block NSString *message = @"Retained AX snapshot или exact parent недоступны";
@@ -708,6 +721,7 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
           [operation[@"inventoryRevision"] unsignedLongLongValue], [operation[@"nativeGeneration"] UTF8String],
           consume_borrow_block, (__bridge void *)identity) == META_AX_BORROW_OK;
     } action:^NSDictionary * {
+      if (viewHead == nil) { meta_executor_fail(executor, "view-admission-rejected"); return @{}; }
       __block BOOL visited = NO;
       MetaAXRetainedBorrowStatus retained = [self->_axSnapshots withPressElement:element target:target
         inventoryId:operation[@"inventoryId"] inventoryRevision:[operation[@"inventoryRevision"] unsignedLongLongValue]
@@ -740,6 +754,9 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
       if (!accepted) meta_executor_fail(executor, "ax-press-not-confirmed");
       return accepted ? @{@"element": element, @"action": @"AXPress", @"performed": @YES} : @{};
     }];
+  [_inputExecutor setFirstDispatchGuard:nil];
+  [_viewAdmissions finishOperationId:operation[@"operationId"]];
+  if (admissionRejected) { code = @"observation-stale"; message = viewError ?: @"View admission изменилась перед AXPress dispatch"; }
   if (accepted && [execution[@"finished"] boolValue]) return @{@"value": execution[@"value"], @"status": execution[@"status"]};
   if (accepted) { code = @"operation-outcome-unknown"; message = @"AXPress вызван, но parent operation не подтвердила finish"; }
   NSMutableDictionary *failure = [@{@"nativeError": @{@"code": code, @"message": message, @"stage": @"ax-press",
@@ -1035,23 +1052,41 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
   }
   _inputLoginSession = operation[@"loginSessionId"];
   if (![self prepareInputRisk:request]) return nil;
+  NSString *viewError = nil;
+  NSDictionary *viewHead = [_viewAdmissions admitRequest:request proof:request[@"viewAdmission"] error:&viewError];
+  __block BOOL admissionRejected = viewHead == nil;
   MetaInputObserverBinding *binding = [[MetaInputObserverBinding alloc] initWithObserver:_observerCommands
     observerInstanceRef:_observerInstance operationId:operation[@"operationId"] target:scope interactionId:nil];
+  BOOL headInstalled = viewHead != nil && [binding useAdmissionHead:viewHead];
+  if (!headInstalled) admissionRejected = YES;
   [job setObserverCoverageProvider:^NSDictionary * { return [binding currentCoverage]; }];
   MetaExecutor *executor = [_inputExecutor executorOnActionWorker];
   meta_executor_set_observer_state(executor, [binding currentCoverage] != nil ? META_OBSERVER_READY : META_OBSERVER_UNAVAILABLE);
   [_inputExecutor setInputObserverAfterBegin:^BOOL(MetaExecutor *accepted, MetaInputJob *current) {
-    return current == job && accepted == executor && [binding registerTag:meta_executor_synthetic_tag(accepted)];
+    return headInstalled && current == job && accepted == executor && [binding registerTag:meta_executor_synthetic_tag(accepted)];
   } poll:^MetaInputObserverDecision {
     MetaInputObserverPollResult decision = [binding poll];
     return decision == MetaInputObserverPollContinue ? MetaInputObserverContinue :
         decision == MetaInputObserverPollForeignEvent ? MetaInputObserverForeignEvent : MetaInputObserverUnavailable;
   }];
+  [_inputExecutor setFirstDispatchGuard:^BOOL {
+    BOOL allowed = headInstalled && [self->_viewAdmissions recheckOperationId:operation[@"operationId"]];
+    if (!allowed) admissionRejected = YES;
+    return allowed;
+  }];
   NSDictionary *result = [_inputExecutor execute:request job:job];
   [binding stop];
   [_inputExecutor setInputObserverAfterBegin:nil poll:nil];
+  [_inputExecutor setFirstDispatchGuard:nil];
+  [_viewAdmissions finishOperationId:operation[@"operationId"]];
   meta_executor_set_observer_state(executor, META_OBSERVER_UNAVAILABLE);
   _activeInputRecoveryDescriptor = nil;
+  if (admissionRejected) {
+    NSMutableDictionary *failure = [@{@"nativeError": @{@"code": @"observation-stale", @"message": viewError ?: @"View admission изменилась перед input dispatch",
+      @"stage": @"view-admission", @"retryable": @NO, @"replayAllowed": @NO, @"recoveryAction": @"capture-new-observation"}} mutableCopy];
+    if (result[@"status"] != nil) failure[@"nativeStatus"] = result[@"status"];
+    return failure;
+  }
   return result;
 }
 

@@ -58,6 +58,12 @@ typedef NSString *_Nullable (^MetaObserverInstanceIdProvider)(void);
                                  requireOwnEvent:(BOOL)requireOwnEvent
                                    timeoutMillis:(NSUInteger)timeoutMillis
                              observerInstanceRef:(NSString *)observerInstanceRef;
+// Возвращает один атомарный bounded снимок history и current head, не ожидая
+// новых событий и не извлекая envelopes из primary PUSH queue.
+- (nullable NSDictionary *)historySnapshotForObserverInstance:
+    (NSString *)observerInstanceRef
+                                              maximumEvents:
+    (NSUInteger)maximumEvents;
 @end
 
 NS_ASSUME_NONNULL_END

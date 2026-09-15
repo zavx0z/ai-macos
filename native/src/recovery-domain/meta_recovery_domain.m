@@ -396,7 +396,7 @@ static BOOL operation_valid(NSDictionary *request) {
 
 static BOOL request_envelope(NSDictionary *request) {
   NSArray *required = @[@"kind", @"protocolVersion", @"requestId", @"runtimeEpoch", @"loginSessionId", @"nativeGeneration", @"deadlineAt", @"intent", @"method", @"operation", @"payload"];
-  if (!exact_keys(request, required, @[@"recoveryGrant"]) ||
+  if (!exact_keys(request, required, @[@"recoveryGrant", @"viewAdmission"]) ||
       ![request[@"kind"] isEqual:@"request"] ||
       ![request[@"protocolVersion"] isEqual:@"1"] ||
       !identifier(request[@"requestId"], 127) ||
@@ -405,7 +405,8 @@ static BOOL request_envelope(NSDictionary *request) {
       !identifier(request[@"nativeGeneration"], 64) ||
       ![request[@"deadlineAt"] isKindOfClass:NSString.class] ||
       ![request[@"intent"] isEqual:@"mutation"] ||
-      !identifier(request[@"method"], 128)) return NO;
+      !identifier(request[@"method"], 128) ||
+      (request[@"viewAdmission"] != nil && ![@[@"input.execute", @"ax.press"] containsObject:request[@"method"]])) return NO;
   return operation_valid(request);
 }
 

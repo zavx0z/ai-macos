@@ -363,6 +363,14 @@ static void test_readiness_scan_is_exact_and_nondestructive(void) {
         observerInstanceRef:@"observer-1"];
   assert([own[@"state"] isEqual:@"own-event-only"]);
   assert([own[@"syntheticTag"] isEqual:@"event-000000000000002a"]);
+  NSDictionary *history = [value
+      historySnapshotForObserverInstance:@"observer-1"
+                            maximumEvents:1000];
+  assert([history[@"observerInstanceRef"] isEqual:@"observer-1"]);
+  assert([history[@"baselineCursor"] isEqual:baseline]);
+  assert([history[@"baselineAvailable"] isEqual:@YES]);
+  assert([history[@"coverage"][@"cursor"] isEqual:own[@"cursor"]]);
+  assert([history[@"events"] count] == 1);
   NSDictionary *push = [value takePushEnvelopes:10];
   assert([push[@"events"] count] == 1);
   assert([push[@"events"][0][@"event"][@"cursor"] isEqual:own[@"cursor"]]);
@@ -388,6 +396,10 @@ static void test_readiness_scan_is_exact_and_nondestructive(void) {
                       requireOwnEvent:NO
                         timeoutMillis:10
                   observerInstanceRef:@"observer-foreign"] == nil);
+  assert([value historySnapshotForObserverInstance:@"observer-foreign"
+                                      maximumEvents:1000] == nil);
+  assert([value historySnapshotForObserverInstance:@"observer-1"
+                                      maximumEvents:1] == nil);
   [value unregisterSyntheticTag:42 observerInstanceRef:@"observer-1"];
 }
 

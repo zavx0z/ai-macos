@@ -22,6 +22,8 @@ typedef NS_ENUM(NSUInteger, MetaInputObserverPollResult) {
                                     target:(NSDictionary *)target
                              interactionId:(nullable NSString *)interactionId;
 - (nullable NSDictionary *)currentCoverage;
+// Связывает созданный binding с exact атомарным head admission, до tag/post.
+- (BOOL)useAdmissionHead:(NSDictionary *)head;
 - (BOOL)registerTag:(uint64_t)tag;
 - (MetaInputObserverPollResult)poll;
 - (void)stop;

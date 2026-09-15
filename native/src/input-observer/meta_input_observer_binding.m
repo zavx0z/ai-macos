@@ -168,6 +168,18 @@ static BOOL meta_input_observer_same_continuity(NSDictionary *baseline,
   return stopped ? nil : meta_input_observer_json_copy(coverage);
 }
 
+- (BOOL)useAdmissionHead:(NSDictionary *)head {
+  [_lock lock];
+  BOOL matching = !_stopped && _tag == 0 && [head isKindOfClass:NSDictionary.class] &&
+      [head[@"observerInstanceRef"] isEqual:_observerInstanceRef] &&
+      [head[@"coverageStartCursor"] isEqual:_baselineCoverage[@"coverageStartCursor"]] &&
+      [head[@"cursor"] isEqual:_baselineCoverage[@"cursor"]] &&
+      [head[@"nextSequence"] isEqual:_baselineCoverage[@"nextSequence"]];
+  if (!matching) _baselineCoverage = nil;
+  [_lock unlock];
+  return matching;
+}
+
 - (BOOL)registerTag:(uint64_t)tag {
   if (tag == 0) return NO;
   [_lock lock];

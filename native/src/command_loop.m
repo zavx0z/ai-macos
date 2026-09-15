@@ -234,6 +234,9 @@ static NSDictionary *failure(NSString *code, NSString *message) {
       @"session": session,
     } mutableCopy];
     if (recoveryVersion != nil) handshake[@"recoveryDomainVersion"] = recoveryVersion;
+    NSString *viewVersion = [_backend respondsToSelector:@selector(viewAdmissionVersion)] ? [_backend viewAdmissionVersion] : nil;
+    if (payload[@"requiredViewAdmissionVersion"] != nil && ![payload[@"requiredViewAdmissionVersion"] isEqual:viewVersion]) _admitted = NO;
+    if (viewVersion != nil) handshake[@"viewAdmissionVersion"] = viewVersion;
     [self send:@"handshake" payload:handshake];
     return;
   }

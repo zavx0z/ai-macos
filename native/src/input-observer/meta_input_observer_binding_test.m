@@ -143,6 +143,16 @@ static MetaInputObserverBinding *fixture_binding(
              interactionId:@"interaction-1"];
 }
 
+static NSDictionary *fixture_admission_head(NSDictionary *coverage,
+                                             NSString *instance) {
+  return @{
+    @"observerInstanceRef" : instance,
+    @"coverageStartCursor" : coverage[@"coverageStartCursor"],
+    @"cursor" : coverage[@"cursor"],
+    @"nextSequence" : coverage[@"nextSequence"],
+  };
+}
+
 static void fixture_prepare(MetaObserverCommandBinder *binder) {
   NSDictionary *prepared =
       [binder handleRequest:fixture_request(@"prepare", nil, nil)];
@@ -174,6 +184,40 @@ static void test_own_events_continue_without_stealing_push(void) {
   assert([fixture.observer.coverage[@"cursor"]
       isEqual:push[@"events"][0][@"event"][@"cursor"]] == NO);
   assert([binding poll] == MetaInputObserverPollUnavailable);
+}
+
+static void test_exact_admission_head_binds_without_stealing_event(void) {
+  MetaInputObserverFixture fixture = {0};
+  MetaObserverCommandBinder *binder = fixture_binder(&fixture);
+  fixture_prepare(binder);
+  MetaInputObserverBinding *binding = fixture_binding(binder, @"observer-1");
+  NSDictionary *coverage = [binding currentCoverage];
+  assert([binding useAdmissionHead:
+                      fixture_admission_head(coverage, @"observer-1")]);
+  [fixture.observer recordInputFromPid:getpid() + 1 syntheticTag:0];
+  assert([binding registerTag:41]);
+  assert([binding poll] == MetaInputObserverPollForeignEvent);
+  NSDictionary *push = [binder takePushEnvelopes:10];
+  assert([push[@"events"] count] == 1);
+  assert([push[@"events"][0][@"event"][@"source"] isEqual:@"unknown"]);
+  [binding stop];
+}
+
+static void test_stale_admission_head_clears_binding_fail_closed(void) {
+  MetaInputObserverFixture fixture = {0};
+  MetaObserverCommandBinder *binder = fixture_binder(&fixture);
+  fixture_prepare(binder);
+  MetaInputObserverBinding *binding = fixture_binding(binder, @"observer-1");
+  NSMutableDictionary *stale = [fixture_admission_head(
+      [binding currentCoverage], @"observer-1") mutableCopy];
+  stale[@"cursor"] = @"cursor-stale";
+  assert(![binding useAdmissionHead:stale]);
+  assert(![binding registerTag:40]);
+  [fixture.observer recordInputFromPid:getpid() + 1 syntheticTag:0];
+  NSDictionary *push = [binder takePushEnvelopes:10];
+  assert([push[@"events"] count] == 1);
+  assert([binding poll] == MetaInputObserverPollUnavailable);
+  [binding stop];
 }
 
 static void test_foreign_input_and_lifecycle_stop_continuation(void) {
@@ -263,6 +307,8 @@ static void test_invalid_generation_never_registers(void) {
 int main(void) {
   @autoreleasepool {
     test_own_events_continue_without_stealing_push();
+    test_exact_admission_head_binds_without_stealing_event();
+    test_stale_admission_head_clears_binding_fail_closed();
     test_foreign_input_and_lifecycle_stop_continuation();
     test_registration_baseline_keeps_interleaved_foreign_event();
     test_construction_baseline_keeps_pre_registration_event();
