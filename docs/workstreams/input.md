@@ -21,6 +21,54 @@ Legacy REST/helper path сохранён до согласованного runti
 injected versioned backend. Действующий `pbpaste/pbcopy` не объявлен таким
 backend: он не предоставляет достоверный системный `changeCount`.
 
+## Native clipboard checkpoint
+
+В новой согласованной owner-области реализован независимый модуль:
+
+- `native/src/clipboard/meta_clipboard.h` — C ABI version/read/write результата;
+- `native/src/clipboard/meta_clipboard.m` — реальный AppKit backend и чистая
+  orchestration поверх injected callbacks;
+- `native/src/clipboard/meta_clipboard_test.m` — только mock pasteboard, без
+  чтения или записи системного clipboard.
+
+Честная семантика: `NSPasteboard.changeCount` — счётчик смены ownership, пригодный
+для сравнения наблюдений, но не глобальный межпроцессный CAS. `expectedChangeCount`
+проверяется непосредственно перед mutation и может выявить уже случившийся
+конфликт, но другое приложение всё ещё может вмешаться между check,
+`clearContents` и `setString`. Поэтому write возвращает измеренные
+`before/declared/after` counts и всегда `atomicPrecondition: false`.
+
+- mismatch до clear → `PRECONDITION_MISMATCH`, `mutationAttempted: false`;
+- `setString=false`, новый owner после clear или ошибка после начала mutation →
+  `WRITE_PARTIAL_UNKNOWN`, без replay и обещания rollback;
+- success допустим только при `setString=true` и `after == declared`;
+- read возвращает текст только при одинаковом count до и после чтения;
+- пустая строка отличается от отсутствующего text type;
+- invalid UTF-8 и размер больше 1 000 000 bytes отклоняются до `clearContents`;
+- result/error structs не содержат write payload.
+
+После ABI review bounded-read исправлен до common wiring: backend callback
+получает `maxBytes` и отдельно возвращает `OK / TEXT_UNAVAILABLE /
+PAYLOAD_TOO_LARGE / FAILED`. Системный backend вызывает
+`lengthOfBytesUsingEncoding` до `dataUsingEncoding` и malloc; oversized не
+путается с отсутствующим text type или backend failure. Это ограничивает наши
+дополнительные UTF-8 data/copy allocations, но не обещает ограничить внутреннее
+получение `NSString` чужим OS IPC, для которого AppKit не даёт preallocation cap.
+
+Safe compile/check:
+
+```text
+/usr/bin/clang -fobjc-arc -mmacosx-version-min=13.0 -Wall -Wextra -Werror \
+  -Inative/src/clipboard native/src/clipboard/meta_clipboard.m \
+  native/src/clipboard/meta_clipboard_test.m \
+  -framework AppKit -framework Foundation -o <temporary>/meta-clipboard-test
+<temporary>/meta-clipboard-test
+clipboard module tests passed
+```
+
+Бинарник создавался в `mktemp -d /tmp/meta-clipboard-check.XXXXXX` и удалён.
+Системный `NSPasteboard` backend не вызывался.
+
 ## Реализовано
 
 - `input/src/action-plan.ts`:
