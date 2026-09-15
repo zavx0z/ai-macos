@@ -273,6 +273,20 @@ function intent(clientRequestId: string, deadlineAt = new Date(Date.now() + 30_0
 }
 
 describe("RuntimeCore operations", () => {
+  test("drain seals new admission before waiting for active cleanup", async () => {
+    const native = new FakeNativeAdapter()
+    native.mode = "cancel"
+    const { runtime } = createRuntime(native)
+    const client = runtime.openClient("principal:drain")
+    const active = runtime.runOperation(client.session, intent("request:active-drain"), { key: "a" }, context => native.dispatch(context))
+    await native.started
+    const draining = runtime.drainOperations()
+    expect(runtime.admissionSealed).toBe(true)
+    await expect(runtime.runOperation(client.session, intent("request:during-drain"), { key: "b" }, context => native.dispatch(context))).rejects.toThrow("sealed")
+    await draining
+    expect((await active).operation.state).toBe("cancelled")
+    expect(native.dispatches).toBe(1)
+  })
   test("два клиента не выполняют desktop dispatch одновременно", async () => {
     const { runtime, native } = createRuntime()
     native.mode = "block"

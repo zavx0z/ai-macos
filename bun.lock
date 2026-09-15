@@ -60,8 +60,11 @@
       "dependencies": {
         "@meta/android": "workspace:*",
         "@meta/chrome": "workspace:*",
+        "@meta/input": "workspace:*",
         "@meta/native": "workspace:*",
+        "@meta/screen": "workspace:*",
         "@meta/shared": "workspace:*",
+        "@meta/window": "workspace:*",
       },
     },
     "screen": {

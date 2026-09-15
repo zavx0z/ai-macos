@@ -92,7 +92,10 @@ export type RuntimeCoreOptions = {
 
 export class RuntimeCore implements RuntimeAdapter {
   readonly generation: RuntimeGeneration
-  readonly capabilities: CapabilitySet
+  #capabilities: CapabilitySet
+  readonly #capabilityListeners = new Set<() => void>()
+  readonly #admissionListeners = new Set<() => void>()
+  #admissionSealed = false
   readonly native?: NativeAdapter
   readonly clients: ClientSessionRegistry
   readonly resources: ResourceRegistry
@@ -134,7 +137,7 @@ export class RuntimeCore implements RuntimeAdapter {
     this.#hmacKeyGeneration = this.#ids.next("hmac-key")
     this.#cancelGraceMs = options.cancelGraceMs ?? 1_000
     this.#completionVerifier = options.completionVerifier
-    this.capabilities = unavailableRuntimeCapabilities(this.#ids.next("runtime-capabilities"))
+    this.#capabilities = unavailableRuntimeCapabilities(this.#ids.next("runtime-capabilities"))
     this.clients = new ClientSessionRegistry(this.generation, { clock: this.#clock, ids: this.#ids })
     this.resources = new ResourceRegistry(this.generation, this.#secret, { clock: this.#clock, ids: this.#ids })
     this.browserLifetime = new BrowserLifetimeCoordinator({
@@ -199,13 +202,54 @@ export class RuntimeCore implements RuntimeAdapter {
     return this.clients.open(principalId, ttlMs)
   }
 
+  get capabilities(): CapabilitySet { return structuredClone(this.#capabilities) }
+
+  updateCapabilities(value: CapabilitySet): void {
+    this.#capabilities = capabilitySetSchema.parse(value)
+    for (const listener of this.#capabilityListeners) listener()
+  }
+
+  subscribeCapabilities(listener: () => void): () => void {
+    this.#capabilityListeners.add(listener)
+    return () => { this.#capabilityListeners.delete(listener) }
+  }
+
+  get admissionSealed(): boolean { return this.#admissionSealed }
+
+  sealAdmission(): void {
+    if (this.#admissionSealed) return
+    this.#admissionSealed = true
+    for (const listener of this.#admissionListeners) listener()
+  }
+
+  unsealAdmission(): void {
+    if (!this.#admissionSealed) return
+    if (this.activeOperationCount() !== 0 || this.resources.quarantinedCount() !== 0) throw new Error("Runtime admission нельзя открыть при active/unknown operations")
+    this.#admissionSealed = false
+    for (const listener of this.#admissionListeners) listener()
+  }
+
+  subscribeAdmission(listener: () => void): () => void {
+    this.#admissionListeners.add(listener)
+    return () => { this.#admissionListeners.delete(listener) }
+  }
+
+  async drainOperations(): Promise<void> {
+    this.sealAdmission()
+    const active = [...this.#journal.values()].filter(entry => !entry.settled)
+    for (const entry of active) entry.controller.abort("runtime drain")
+    await Promise.all(active.map(entry => entry.promise?.catch(() => undefined)))
+    if (this.resources.quarantinedCount() > 0 || this.activeOperationCount() > 0) throw new Error("Runtime drain оставил unknown/active operations")
+  }
+
   async runOperation<TRequest, TResult>(
     session: RuntimeClientSession,
     intentValue: RuntimeOperationIntent,
     request: TRequest,
     execute: (context: RuntimeOperationContext, request: TRequest) => Promise<AdapterResult<TResult>>,
+    signal?: AbortSignal,
   ): Promise<RuntimeExecution<TResult>> {
-    return this.#runOperation(session, intentValue, request, execute)
+    return this.#runOperation(session, intentValue, request, execute, undefined, signal)
   }
 
   async #runOperation<TRequest, TResult>(
@@ -214,6 +258,7 @@ export class RuntimeCore implements RuntimeAdapter {
     request: TRequest,
     execute: (context: RuntimeOperationContext, request: TRequest) => Promise<AdapterResult<TResult>>,
     lifecycle?: CoordinatedLifecycle,
+    signal?: AbortSignal,
   ): Promise<RuntimeExecution<TResult>> {
     const now = this.#clock.now()
     await this.clients.assertActive(session, now)
@@ -259,6 +304,8 @@ export class RuntimeCore implements RuntimeAdapter {
     }
 
     this.#assertIntentAuthority(session, intent, now)
+    if (this.#admissionSealed) throw new RuntimeContractError("capability-unavailable", "Runtime admission sealed", "runtime-admission")
+    if (signal?.aborted) throw new RuntimeContractError("cancelled", "Operation отменена до admission", "runtime-admission")
     if (lifecycle?.admission !== "stored-cleanup") {
       await this.targets.resolve({
         target: intent.precondition.target,
@@ -276,6 +323,9 @@ export class RuntimeCore implements RuntimeAdapter {
     const resourceExpiry = new Date(Math.min(Date.parse(intent.deadlineAt), now.getTime() + 30_000)).toISOString()
     const handles = this.resources.acquire(session, operationId, intent.requestedResources, resourceExpiry)
     const controller = new AbortController()
+    const abortFromCaller = () => controller.abort(signal?.reason ?? "caller cancellation")
+    signal?.addEventListener("abort", abortFromCaller, { once: true })
+    if (signal?.aborted) abortFromCaller()
     const record = operationRecordSchema.parse({
       clientSessionId: session.clientSessionId,
       principalId: session.principalId,
@@ -305,7 +355,8 @@ export class RuntimeCore implements RuntimeAdapter {
     entry.deadlineTimer = setTimeout(() => controller.abort("operation deadline exceeded"), deadlineDelay)
     const promise = this.#execute(entry, session, handles, request, execute, lifecycle)
     entry.promise = promise as Promise<RuntimeExecution<unknown>>
-    return promise
+    try { return await promise }
+    finally { signal?.removeEventListener("abort", abortFromCaller) }
   }
 
   async getOperation(session: RuntimeClientSession, operationId: string): Promise<OperationRecord | undefined> {
@@ -515,6 +566,7 @@ export class RuntimeCore implements RuntimeAdapter {
     let abortGuard: { promise: Promise<never>, dispose(): void } | undefined
     try {
       await context.control.checkpoint("before-adapter-dispatch")
+      if (this.#admissionSealed) throw new RuntimeContractError("capability-unavailable", "Runtime admission sealed", "runtime-admission")
       await lifecycle?.before(context)
       if (entry.controller.signal.aborted) throw new RuntimeContractError("cancelled", "Operation отменена", "before-adapter-dispatch")
       entry.record = operationRecordSchema.parse({
@@ -526,7 +578,9 @@ export class RuntimeCore implements RuntimeAdapter {
       abortGuard = this.#createAbortGuard(entry, context)
       const adapterPromise = Promise.resolve().then(() => execute(context, request))
       const rawResult = await Promise.race([adapterPromise, abortGuard.promise])
-      const parsedResult = parseWireValue(adapterResultSchema(z.unknown()), rawResult) as AdapterResult<TResult>
+      const parsedResult = parseWireValue(adapterResultSchema(z.unknown()), rawResult, {
+        maxDepth: 32, maxBytes: context.wire.kind === "clipboard" ? 8 * 1024 * 1024 : 1024 * 1024,
+      }) as AdapterResult<TResult>
       const verifiedNativeStatus = lifecycle === undefined
         ? await Promise.race([this.#verifyBackendCompletion(context, parsedResult), abortGuard.promise])
         : undefined

@@ -8,6 +8,64 @@ C3 lifetime coordinator связан с RuntimeCore; текущий атомар
 production catalog/cutover ещё впереди. Следующий checkpoint закрывает
 quarantined/expired recovery и actual Android adapter composition.
 
+## Checkpoint MethodRegistry, host и clipboard mapper
+
+Доработка после host review:
+
+- Последние catalogue corrections: seal/unseal вызывают admission notification,
+  registry увеличивает revision и фильтрует descriptors тем же
+  availableDuringDrain policy, который использует dispatch. Clipboard descriptors
+  используют concrete Input-owned read/write request/result schemas; union.refine
+  больше не создаёт ложную JSON Schema. Targeted host/registry **6 pass/40
+  assertions**, root typecheck **exit 0**, diff-check **pass**.
+
+- Method definition snapshot фиксируется в register: input/output schema clones,
+  bound execute/frames/isError callbacks и immutable annotations/budgets.
+- Catalogue advertisement и dispatch используют тот же actual host capability
+  snapshot; required dependencies проверяются, native transport close/permission
+  revocation понижают доступность. Clipboard read/write имеют разные annotations.
+- Serialized clipboard profile — explicit 8 MiB на registry, core output, UDS и
+  клиенте, logical text limit остаётся 1 000 000 UTF-8 bytes. Host-owned isError
+  predicate сохраняет partial/native failure semantics в MCP result.
+- Singleton owner acquired до metadata/helper spawn. Core sealAdmission закрывает
+  новые операции до wait/cancel/drain, failure оставляет admission sealed.
+- Optional shared NativeAuditSession schema добавлена. Production host требует
+  verified native metadata UID/auditSessionId, выводит audit:uid:asid и проверяет
+  такое же session в долгоживущем handshake. Static install session env удалён.
+- Последний run: **58 pass/317 assertions** в runtime suite, включая 11 storage
+  tests отдельного владельца; root typecheck **exit 0**, diff-check **pass**.
+
+- `runtime/src/method-registry.ts`: MethodRegistry выводит descriptors из Zod,
+  проверяет active session/input/output, ограничивает execution и сообщает
+  revision/list changes. Input не содержит callback или resource policy.
+- `runtime/src/transport.ts`: UDS `/v1/catalog`, `/v1/tools/:name`, `/v1/frames/:ref`.
+  RuntimeUdsClient публикует `listTools`, `callTool(name,args,signal)`,
+  `subscribeCatalogChanged`, `readFrame`. Frame scope — server client lineage;
+  `callTool` превращает выданные frameRefs в image content только на клиенте.
+- `runtime/src/server.ts` — import-safe entrypoint; `host.ts/createRuntimeHost`
+  конфигурирует machine/build check, native handshake/evidence binding, UDS и
+  начальный каталог health/get/cancel/list_windows/clipboard. Полный action
+  catalogue остаётся следующим integration scope.
+- Env: `META_RUNTIME_SOCKET`, `META_RUNTIME_CREDENTIAL`, `META_NATIVE_HELPER`,
+  `META_NATIVE_BUILD_ID`, `AI_MACOS_EXPECTED_HOSTNAME`.
+  Runtime build внедряется через `__META_RUNTIME_BUILD_ID__`; development fallback
+  только явный `META_RUNTIME_BUILD_ID`. `--doctor` читает уже работающий UDS host.
+- Пока durable store не подключён к host, его native ledgerSink отклоняет
+  persistence: этот entrypoint не предназначен для installed action cutover.
+- `RuntimeClipboardHandler` использует настоящие Input schemas/adapter/backend,
+  проверяет registered native receipt, превращает pending в verified complete
+  либо unknown quarantine и исключает clipboard extra из generic AdapterResult.
+  Plaintext не пишется в OperationRecord/report; metadata bounded, unresolved
+  receipt budget блокирует новые действия без silent eviction.
+- Tests clipboard success/mismatch/partial/lost — 4 pass/35 assertions;
+  registry/UDS catalogue/frame isolation — 2 pass/11 assertions.
+- Последний полный runtime run: **48 pass/274 assertions**, включая 7 tests
+  storage-owned slice (файлы storage не менялись). Root typecheck — **exit 0**.
+
+Следующий шаг после scoped checkpoint: принятие storage interfaces → durable
+pre-dispatch journal/native ledger/startup reconciliation, затем полный adapter
+catalogue и host lifecycle. Installed services не переключались.
+
 ## Checkpoint recovery и Android
 
 - `BrowserLifetimeCoordinator.recover(session,bindingId,intent)` допускает только

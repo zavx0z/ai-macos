@@ -20,6 +20,15 @@ export const processInstanceSchema = z.strictObject({
 })
 export type ProcessInstance = z.infer<typeof processInstanceSchema>
 
+export const nativeAuditSessionSchema = z.discriminatedUnion("verified", [
+  z.strictObject({ verified: z.literal(true), source: z.literal("darwin-audit"),
+    uid: z.number().int().min(0).max(0xffffffff), effectiveUid: z.number().int().min(0).max(0xffffffff),
+    auditUserId: z.number().int().min(0).max(0xffffffff), auditSessionId: z.number().int().min(0).max(0xffffffff) }),
+  z.strictObject({ verified: z.literal(false), source: z.literal("darwin-audit"),
+    uid: z.number().int().min(0).max(0xffffffff), effectiveUid: z.number().int().min(0).max(0xffffffff), reason: z.string().min(1).max(1024) }),
+])
+export type NativeAuditSession = z.infer<typeof nativeAuditSessionSchema>
+
 export const nativeHandshakeRequestSchema = z.strictObject({
   kind: z.literal("handshake"),
   protocolVersion: z.literal(NATIVE_PROTOCOL_VERSION),
@@ -44,6 +53,7 @@ export const nativeHandshakeResponseSchema = z.strictObject({
   installRoot: z.string().min(1).max(4_096).refine(path => path.startsWith("/"), "installRoot должен быть абсолютным"),
   process: processInstanceSchema,
   capabilities: capabilitySetSchema,
+  session: nativeAuditSessionSchema.optional(),
 })
 export type NativeHandshakeResponse = z.infer<typeof nativeHandshakeResponseSchema>
 

@@ -14,9 +14,10 @@ import {
 import { RuntimeCore } from "./core.ts"
 import { RuntimeContractError, contractErrorFrom } from "./errors.ts"
 import { randomIdSource, type RuntimeIdSource } from "./primitives.ts"
+import { MethodRegistry, type RuntimeMethodResponse, type RuntimeToolDescriptor } from "./method-registry.ts"
 
 const MAX_RUNTIME_REQUEST_BYTES = 1024 * 1024
-const MAX_RUNTIME_RESPONSE_BYTES = 1024 * 1024
+const MAX_RUNTIME_RESPONSE_BYTES = 8 * 1024 * 1024
 const RUNTIME_TRANSPORT_TIMEOUT_MS = 5_000
 
 export class RuntimeUnknownDeliveryError extends Error {
@@ -28,6 +29,12 @@ export class RuntimeUnknownDeliveryError extends Error {
     super(message, options)
     this.name = "RuntimeUnknownDeliveryError"
   }
+}
+
+export type RuntimeToolResult = {
+  content: Array<{ type: "text", text: string } | { type: "image", mimeType: "image/png", data: string }>
+  structuredContent?: Record<string, unknown>
+  isError?: boolean
 }
 
 class RuntimeUdsHttpError extends Error {
@@ -50,6 +57,7 @@ export type RuntimeTransportOptions = {
   principalId?: string
   ids?: RuntimeIdSource
   chmod?: typeof chmod
+  catalog?: MethodRegistry
 }
 
 export class RuntimeUdsServer {
@@ -60,6 +68,7 @@ export class RuntimeUdsServer {
   readonly #ids: RuntimeIdSource
   readonly #methods = new Map<string, StoredMethod>()
   readonly #chmod: typeof chmod
+  readonly #catalog?: MethodRegistry
   #server: ReturnType<typeof Bun.serve> | undefined
   #bootstrapToken: string | undefined
   #ownsCredential = false
@@ -72,9 +81,11 @@ export class RuntimeUdsServer {
     this.#principalId = options.principalId ?? "mcp"
     this.#ids = options.ids ?? randomIdSource
     this.#chmod = options.chmod ?? chmod
+    this.#catalog = options.catalog
   }
 
   register<Input, Result>(name: string, definition: RuntimeMethodDefinition<Input, Result>): void {
+    if (this.#catalog !== undefined) throw new Error("Production catalog owns method registration")
     if (!/^[a-z][a-z0-9._-]{0,127}$/.test(name)) throw new Error("Недопустимое имя runtime method")
     if (this.#methods.has(name)) throw new Error(`Runtime method уже зарегистрирован: ${name}`)
     this.#methods.set(name, definition as StoredMethod)
@@ -144,6 +155,23 @@ export class RuntimeUdsServer {
       }
 
       const session = this.#authenticate(request)
+      if (request.method === "GET" && url.pathname === "/v1/catalog") {
+        if (this.#catalog === undefined) return json({ error: "catalog-unavailable" }, 503)
+        return json(this.#catalog.descriptors())
+      }
+      const methodMatch = /^\/v1\/tools\/([^/]+)$/.exec(url.pathname)
+      if (request.method === "POST" && methodMatch !== null) {
+        if (this.#catalog === undefined) return json({ error: "catalog-unavailable" }, 503)
+        const body = parseWireJson(z.record(z.string(), z.json()), await readBoundedText(request, 8 * 1024 * 1024), { maxBytes: 8 * 1024 * 1024, maxDepth: 32 })
+        const result = await this.#catalog.dispatch(session, decodeURIComponent(methodMatch[1]!), body, request.signal)
+        return json(result)
+      }
+      const frameMatch = /^\/v1\/frames\/([^/]+)$/.exec(url.pathname)
+      if (request.method === "GET" && frameMatch !== null) {
+        const frame = this.#core.frames.get(decodeURIComponent(frameMatch[1]!), this.#core.clients.lineage(session))
+        return frame === undefined ? json({ error: "frame-not-found" }, 404)
+          : new Response(frame, { headers: { "content-type": "image/png", "cache-control": "no-store" } })
+      }
       if (request.method === "GET" && url.pathname === "/v1/health") {
         return json({
           ok: true,
@@ -267,6 +295,60 @@ export class RuntimeUdsClient {
     return this.#request("/v1/health")
   }
 
+  async listTools(): Promise<RuntimeToolDescriptor[]> {
+    const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog"))
+    return catalog.tools as RuntimeToolDescriptor[]
+  }
+
+  async callTool(name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<RuntimeToolResult> {
+    try {
+      const result = methodResponseSchema.parse(await this.#request(`/v1/tools/${encodeURIComponent(name)}`, {
+        method: "POST", body: args, signal,
+      }))
+      const content: RuntimeToolResult["content"] = [{ type: "text", text: JSON.stringify(result.data) }]
+      for (const frameRef of result.frameRefs) {
+        const bytes = await this.readFrame(frameRef, signal)
+        content.push({ type: "image", mimeType: "image/png", data: Buffer.from(bytes).toString("base64") })
+      }
+      return { content, structuredContent: result.data, ...(result.isError === undefined ? {} : { isError: result.isError }) }
+    } catch (error) {
+      if (typeof args.clientRequestId === "string") {
+        const operation = await this.getOperationByRequest(args.clientRequestId).catch(() => undefined)
+        if (operation !== undefined) return {
+          isError: true,
+          content: [{ type: "text", text: "Tool response не получен; используйте operation status, не повторяйте действие" }],
+          structuredContent: { operation },
+        }
+      }
+      return { isError: true, content: [{ type: "text", text: error instanceof RuntimeUdsHttpError
+        ? error.message : "Runtime transport failed; outcome может требовать status lookup" }] }
+    }
+  }
+
+  async readFrame(frameRef: string, signal?: AbortSignal): Promise<Uint8Array> {
+    const response = await this.#raw(`/v1/frames/${encodeURIComponent(frameRef)}`, { signal })
+    if (!response.ok) throw new RuntimeUdsHttpError(response.status, await readResponseJson(response, this.#timeoutMs))
+    if (response.headers.get("content-type") !== "image/png") throw new Error("Runtime frame response имеет другой MIME")
+    const bytes = await readBoundedBinary(response, 64 * 1024 * 1024, this.#timeoutMs)
+    return bytes
+  }
+
+  subscribeCatalogChanged(listener: () => void): () => void {
+    const controller = new AbortController()
+    let revision: number | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const poll = async () => {
+      try {
+        const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog", { signal: controller.signal }))
+        if (revision !== undefined && catalog.revision !== revision) listener()
+        revision = catalog.revision
+      } catch { /* Переподключение каталога повторится на следующем ограниченном запросе. */ }
+      if (!controller.signal.aborted) timer = setTimeout(() => void poll(), 1000)
+    }
+    void poll()
+    return () => { controller.abort(); if (timer !== undefined) clearTimeout(timer) }
+  }
+
   async invoke<Result>(method: string, intent: RuntimeOperationIntent, payload: unknown): Promise<RuntimeExecution<Result>> {
     try {
       return await this.#request(`/v1/invoke/${encodeURIComponent(method)}`, {
@@ -311,7 +393,7 @@ export class RuntimeUdsClient {
 
   async #request(
     path: string,
-    options: { method?: string, body?: unknown, bootstrap?: boolean } = {},
+    options: { method?: string, body?: unknown, bootstrap?: boolean, signal?: AbortSignal } = {},
   ): Promise<unknown> {
     const response = await this.#raw(path, options)
     const body = await readResponseJson(response, this.#timeoutMs)
@@ -321,7 +403,7 @@ export class RuntimeUdsClient {
 
   #raw(
     path: string,
-    options: { method?: string, body?: unknown, bootstrap?: boolean } = {},
+    options: { method?: string, body?: unknown, bootstrap?: boolean, signal?: AbortSignal } = {},
   ): Promise<Response> {
     const token = options.bootstrap ? this.#bootstrapToken : this.#bearerToken
     if (token === undefined) throw new Error("Runtime UDS client не аутентифицирован")
@@ -333,12 +415,24 @@ export class RuntimeUdsClient {
         ...(options.body === undefined ? {} : { "content-type": "application/json" }),
       },
       ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
-      signal: AbortSignal.timeout(this.#timeoutMs),
+      signal: options.signal === undefined ? AbortSignal.timeout(this.#timeoutMs)
+        : AbortSignal.any([options.signal, AbortSignal.timeout(this.#timeoutMs)]),
     })
   }
 }
 
 const sessionOpenSchema = z.strictObject({ clientName: z.string().min(1).max(128) })
+const methodResponseSchema = z.strictObject({ data: z.record(z.string(), z.json()), frameRefs: z.array(z.string().min(1).max(127)).max(4), isError: z.boolean().optional() })
+const catalogResponseSchema = z.strictObject({
+  revision: z.number().int().nonnegative(),
+  tools: z.array(z.strictObject({
+    name: z.string(), title: z.string(), description: z.string(),
+    inputSchema: z.object({ type: z.literal("object") }).passthrough(),
+    outputSchema: z.object({ type: z.literal("object") }).passthrough(),
+    annotations: z.strictObject({ readOnlyHint: z.boolean(), destructiveHint: z.boolean(), openWorldHint: z.boolean() }),
+    _meta: z.strictObject({ maxRequestBytes: z.number().int(), maxResponseBytes: z.number().int() }).optional(),
+  })).max(256),
+})
 const sessionResumeSchema = z.strictObject({ resumptionToken: z.string().min(1).max(256) })
 const cancelSchema = z.strictObject({ reason: z.string().min(1).max(1_024) })
 const bootstrapCredentialSchema = z.strictObject({
@@ -421,9 +515,13 @@ async function readResponseJson(response: Response, timeoutMs: number): Promise<
 }
 
 export async function readBoundedResponseText(response: Response, maxBytes: number, timeoutMs: number): Promise<string> {
+  return new TextDecoder().decode(await readBoundedBinary(response, maxBytes, timeoutMs))
+}
+
+async function readBoundedBinary(response: Response, maxBytes: number, timeoutMs: number): Promise<Uint8Array> {
   const contentLength = Number(response.headers.get("content-length") ?? 0)
   if (Number.isFinite(contentLength) && contentLength > maxBytes) throw new Error("Runtime response превышает byte limit")
-  if (response.body === null) return ""
+  if (response.body === null) return new Uint8Array()
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let bytes = 0
@@ -464,7 +562,7 @@ export async function readBoundedResponseText(response: Response, maxBytes: numb
     joined.set(chunk, offset)
     offset += chunk.byteLength
   }
-  return new TextDecoder().decode(joined)
+  return joined
 }
 
 function bearerToken(request: Request): string {
