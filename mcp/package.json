@@ -4,8 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "bun src/launcher.ts",
-    "server": "bun src/index.ts",
+    "start": "bun src/installed-launcher.ts",
+    "server": "bun src/runtime-mcp.ts",
     "runtime-server": "bun src/runtime-mcp.ts",
     "test": "bun test"
   },
