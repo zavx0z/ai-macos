@@ -97,7 +97,7 @@ source checkpoint. Обозначения исходного состояния:
 | `input.drag` | REST | input/native | Траектория, modifiers/button, bounded cancel/release | F05, F11 |
 | `input.keyboard` | Частично | input/native | Text/key/shortcut, Unicode, preconditions и partial outcome | F03–F05 |
 | `input.readiness` | Частично | native/runtime | Probe movement/readback/restore отдельно, без false permission result | F10 |
-| `input.interaction` | Нет | runtime | Многошаговый focus session без закрытия popup между вызовами | F09, F16 |
+| `input.interaction` | Отложено | runtime | Не входит в selected profile; вместо focus session используется одноразовое наблюдение, без автоматического restore | F09, F16 |
 | `input.clipboard` | Частично | input/runtime | Явный доступ, версия/лимиты, без содержимого в логах | F06, F16 |
 | `browser.instances` | REST | chrome/runtime | Несколько профилей и browser epochs, provenance | F12, F16 |
 | `browser.targets` | REST | chrome | Exact open/close/navigate/activate по instance + target | F12, F16 |
@@ -256,8 +256,8 @@ requested/actual target, operation/observation IDs, ожидаемый и фак
 | A09 | Runtime crash при живом helper | Helper watchdog останавливает будущие events; ledger и cleanup видимы после reconnect | Fault injection |
 | A10 | Старый fence после runtime/helper restart | Отказ по epoch/generation, даже при том же counter/PID | Native fixture |
 | A11 | Reply потерян, клиент повторяет request ID | Возвращается прежняя операция, payload mismatch отклонён | Contract |
-| A12 | Человек работает во время interaction | User takeover отзывает lease; старый focus автоматически не восстанавливается | Live |
-| A13 | Event observer unavailable/revoked | Health degraded, one-shot/no extension, restore не предполагает отсутствие человека | Contract + live |
+| A12 | Человек работает между observe и действием или во время ввода | Наблюдение отзывается, следующие события прекращаются; старый focus автоматически не восстанавливается | Contract + live |
+| A13 | Event observer unavailable/revoked | Health degraded, защищённые действия недоступны; отсутствие человека не предполагается | Contract + live |
 | A14 | Hidden/minimized/offscreen/other-Space window | Запись inventory с известными/unknown состояниями; exact show или конкретная невозможность | Live |
 | A15 | Процесс без окон / AX timeout / denied AX | Три различимых ответа; incomplete не выдаётся за complete empty | Contract + live |
 | A16 | Одинаковые title/frame/PID окна | Неоднозначность CG↔AX не скрыта; никакого first-match | Native fixture + live |

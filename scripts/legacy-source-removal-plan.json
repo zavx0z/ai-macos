@@ -359,8 +359,9 @@
         "native/tests/window-adapter.test.ts",
         "native/tests/command-loop.test.ts",
         "runtime/tests/window-methods.test.ts",
-        "runtime/tests/interaction.test.ts",
-        "tests/computer-use/fixtures/app/main.m"
+        "tests/computer-use/fixtures/app/main.m",
+        "runtime/tests/agent-view-guard.test.ts",
+        "runtime/tests/agent-view-bindings.test.ts"
       ]
     },
     {

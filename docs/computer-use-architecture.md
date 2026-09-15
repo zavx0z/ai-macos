@@ -290,20 +290,23 @@ OS-focus/показ/перестановка окон/ввод сериализ�
 Несколько ресурсов захватываются runtime в фиксированном порядке, чтобы не
 получить взаимную блокировку. Просроченные координатные действия не ставятся в очередь.
 
-`begin_interaction(targetRef)` даёт ограниченную сессию фокуса. Это решает
-Cmd+L → ввод → Enter и Save/Open без возврата фокуса к Codex после каждого шага.
-Начальные пределы: idle lease до 30 секунд, полный срок до 120 секунд;
-продление возможно только при живом клиенте и отсутствии вмешательства человека.
-Продление и автоматический restore разрешены только при `eventObservation: ready`.
-Если observer недоступен, режим становится one-shot/non-extendable, а отсутствие
-человеческого вмешательства не предполагается. Restore пропускается с причиной.
-Истечение запрещает новые действия и завершает взаимодействие после остановки
-уже выполняющегося native шага. Глобальная блокировка не удерживается бессрочно
-при ожидании решения пользователя.
+Выбранный агентский API использует цикл `observe` → одно действие → `observe`.
+`AgentViewGuard` связывает наблюдение с непрерывной историей одного observer;
+`AgentViewBindings` связывает его с точным client request и операцией Core.
+Native проверяет неизменность этой истории непосредственно перед первым
+событием после медленных проверок цели. Между вызовами desktop lease не
+удерживается, а прежний focus автоматически не восстанавливается.
+
+`type_text` и `press_shortcut` могут отправлять несколько событий внутри одной
+операции. Между отдельными операциями доверие не продлевается. Отдельные
+`begin_interaction`/`end_interaction` и capability `input.interaction` отложены;
+они не входят в профиль `desktop-browser-selected`. Неиспользуемый прототип
+`RuntimeInteractionAuthority` удалён вместе с неиспользуемой реализацией
+отдельной сессии фокуса.
 
 Native observer отслеживает фактический фокус, структуру окна и внешний ввод.
 События самого helper маркируются. При обнаруженном вмешательстве человека
-сессия отзывается, следующие события не отправляются, автоматический возврат
+наблюдение отзывается, следующие события не отправляются, автоматический возврат
 старого фокуса запрещён. Уведомления помогают обнаружению, но не дают абсолютной
 атомарности с физическим пользователем. Если источник события или маршрутизация
 не доказаны, результат сохраняет неопределённость.
@@ -311,9 +314,8 @@ Sleep, logout/fast user switching, lock screen и потеря observation capab
 также отзывают leases. После wake нужен новый snapshot и readiness; накопленные
 до сна координатные действия не исполняются на login screen.
 
-`end_interaction` восстанавливает предыдущий фокус только если текущий всё ещё
-принадлежит этой сессии и человек его не менял. Иначе возвращает
-`restoration: skipped-external-change`. Screen/input adapters сами focus не восстанавливают.
+При потере observer защищённые действия недоступны до восстановления наблюдения.
+Screen/input adapters сами focus не восстанавливают.
 
 ## 6. Действие, отмена и результат
 
@@ -394,21 +396,22 @@ Secure Input и password-like AX values не читаются и не обход
 
 ## 7. Агентский MCP-контракт
 
-Имена ниже — целевые. Каждое действие принимает `clientRequestId`; targetRefs
-проверяются runtime, строковые selector hints служат только инвентаризации.
+Основной интерфейс описан в [high-level-agent-api.md](high-level-agent-api.md).
+Короткие методы принимают `targetId`; private `clientRequestId`, полные refs,
+inventory, leases и fences создаёт runtime. Специализированные методы сохраняют
+собственные схемы. Состав установленного каталога определяется capabilities.
 
 | Группа | Инструменты | Контракт |
 | --- | --- | --- |
-| Готовность | `system_health`, `input_readiness` | Пассивная проверка отдельно от активного probe и отдельно от разрешений |
-| Обнаружение | `list_displays`, `list_applications`, `list_windows`, `inspect_ui` | Полнота, состояния, причины недоступности, bounded AX snapshot |
-| Окна | `show_window`, `focus_window`, `set_window_bounds`, `minimize_window`, `close_window` | Exact ref, requested/actual state, отсутствие launch/retarget |
+| Готовность | `system_health`, `check_input` | Пассивная проверка отдельно от активного probe и отдельно от разрешений |
+| Обнаружение | `get_state`, `get_tabs`, `list_displays` | Полнота, состояния и причины недоступности |
+| Окна | `show_window`, специализированный `window_transition` | Exact identity, requested/actual state, отсутствие launch/retarget |
 | Приложения | `launch_application`, `quit_application` | Отдельный явный intent; unsaved dialog возвращает новое состояние, не discard |
-| Наблюдения | `capture_desktop`, `capture_window`, `get_observation` | Image + coordinate transform + freshness + source + ownership |
-| Последовательности | `begin_interaction`, `end_interaction` | Ограниченная сессия, user takeover, условное восстановление фокуса |
-| Pointer | `mouse_move`, `mouse_click`, `mouse_scroll`, `mouse_drag` | Кадр/точка/anchor; display-level target для Dock/menu, window target для окна |
-| Клавиатура/AX | `keyboard_type`, `keyboard_key`, `keyboard_shortcut`, `perform_ui_action` | Native target, доступное AX action, отсутствие произвольного native script |
+| Наблюдения | `observe`; специализированные `capture_desktop`, `capture_window`, `get_observation` | Image + coordinate transform + source + ownership |
+| Pointer | `hover`, `click`, `scroll`, `drag` | Точка исходного кадра; явный display-level target для Dock/menu |
+| Клавиатура/AX | `type_text`, `press_key`, `press_shortcut`, `click` по elementId | Exact target и snapshot; одно наблюдение на операцию |
 | Clipboard | `clipboard_read`, `clipboard_write` | Только явная работа с clipboard; лимит, версия содержимого, без текста в логах |
-| Исполнение | `get_operation`, `cancel_operation` | Восстановление после потери ответа без повторной отправки действия |
+| Исполнение | `get_target_status`, `cancel_target`; специализированные `get_operation`, `cancel_operation` | Восстановление после потери ответа без повторной отправки действия |
 | Администрирование | `recover_input` | Явное восстановление quarantined input; диагностический план перед mutation |
 | Представление | `open_screenshot_pip`, `latest_capture` | Необязательный viewer; latest scoped к сессии и обновляется после action capture |
 
