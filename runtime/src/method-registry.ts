@@ -17,6 +17,8 @@ export type RuntimeMethodContext = {
   signal: AbortSignal
 }
 
+export type RuntimeMethodVisibility = "public" | "internal"
+
 export type MethodDefinition<Input, Output> = {
   title: string
   description: string
@@ -31,6 +33,7 @@ export type MethodDefinition<Input, Output> = {
   maxRequestBytes?: number
   maxResponseBytes?: number
   availableDuringDrain?: boolean
+  visibility?: RuntimeMethodVisibility
   isError?(output: Output): boolean
 }
 
@@ -42,27 +45,43 @@ export type RuntimeMethodResponse = {
 
 type StoredMethod = {
   descriptor: RuntimeToolDescriptor
+  visibility: RuntimeMethodVisibility
   requiredCapabilities: readonly CapabilityId[]
   availableDuringDrain: boolean
   invoke(context: RuntimeMethodContext, input: unknown): Promise<RuntimeMethodResponse>
 }
 
+export type InternalMethodRegistry = Readonly<{
+  descriptors(): { revision: number, tools: RuntimeToolDescriptor[] }
+  dispatch(session: RuntimeClientSession, name: string, input: unknown, signal: AbortSignal): Promise<RuntimeMethodResponse>
+}>
+
 export class MethodRegistry {
   readonly #runtime: RuntimeCore
   readonly #methods = new Map<string, StoredMethod>()
   readonly #listeners = new Set<() => void>()
+  readonly internal: InternalMethodRegistry
   #revision = 0
+  #internalRevision = 0
 
   constructor(runtime: RuntimeCore) {
     this.#runtime = runtime
-    runtime.subscribeCapabilities(() => this.#changed())
-    runtime.subscribeAdmission(() => this.#changed())
+    this.internal = Object.freeze({
+      descriptors: () => this.#descriptors("internal"),
+      dispatch: (session, name, input, signal) => this.#dispatch(session, name, input, signal, "internal"),
+    })
+    runtime.subscribeCapabilities(() => this.#changed("both"))
+    runtime.subscribeAdmission(() => this.#changed("both"))
   }
 
   register<Input, Output>(name: string, definition: MethodDefinition<Input, Output>): void {
     if (!/^[a-z][a-z0-9_]{0,126}$/.test(name) || this.#methods.has(name)) throw new Error("Duplicate/invalid method name")
     if (definition.readOnly && definition.destructive) throw new Error("Read-only method не может быть destructive")
+    if (definition.visibility !== undefined && !["public", "internal"].includes(definition.visibility)) {
+      throw new Error("Method visibility должна быть public или internal")
+    }
     const frozen = Object.freeze({ ...definition, input: definition.input.clone(), output: definition.output.clone(),
+      visibility: definition.visibility ?? "public",
       requiredCapabilities: Object.freeze([...(definition.requiredCapabilities ?? [])]) })
     const execute = frozen.execute.bind(frozen)
     const frames = frozen.frames?.bind(frozen)
@@ -78,6 +97,7 @@ export class MethodRegistry {
     }
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new Error("Method timeout вне bounds")
     this.#methods.set(name, {
+      visibility: frozen.visibility,
       descriptor: {
         name, title: frozen.title, description: frozen.description,
         inputSchema: inputSchema as RuntimeToolDescriptor["inputSchema"],
@@ -119,11 +139,17 @@ export class MethodRegistry {
         }
       },
     })
-    this.#changed()
+    this.#changed(frozen.visibility)
   }
 
   descriptors(): { revision: number, tools: RuntimeToolDescriptor[] } {
-    const catalog = { revision: this.#revision, tools: [...this.#methods.values()]
+    return this.#descriptors("public")
+  }
+
+  #descriptors(visibility: RuntimeMethodVisibility): { revision: number, tools: RuntimeToolDescriptor[] } {
+    const catalog = { revision: visibility === "public" ? this.#revision : this.#internalRevision,
+      tools: [...this.#methods.values()]
+      .filter(method => visibility === "internal" || method.visibility === "public")
       .filter(method => !this.#runtime.admissionSealed || method.availableDuringDrain)
       .filter(method => method.requiredCapabilities.every(id => capabilityIsReady(this.#runtime.capabilities, id)))
       .map(method => structuredClone(method.descriptor)) }
@@ -132,10 +158,22 @@ export class MethodRegistry {
   }
 
   async dispatch(session: RuntimeClientSession, name: string, input: unknown, signal: AbortSignal): Promise<RuntimeMethodResponse> {
+    return this.#dispatch(session, name, input, signal, "public")
+  }
+
+  async #dispatch(
+    session: RuntimeClientSession,
+    name: string,
+    input: unknown,
+    signal: AbortSignal,
+    visibility: RuntimeMethodVisibility,
+  ): Promise<RuntimeMethodResponse> {
     await this.#runtime.clients.assertActive(session, new Date())
     if (signal.aborted) throw new RuntimeContractError("cancelled", "Method отменён до dispatch", "method-registry")
     const method = this.#methods.get(name)
-    if (method === undefined) throw new RuntimeContractError("unsupported-capability", "Method не зарегистрирован", "method-registry")
+    if (method === undefined || visibility === "public" && method.visibility === "internal") {
+      throw new RuntimeContractError("unsupported-capability", "Method не зарегистрирован", "method-registry")
+    }
     if (this.#runtime.admissionSealed && !method.availableDuringDrain) throw new RuntimeContractError("capability-unavailable", "Runtime admission sealed", "method-registry")
     if (!method.requiredCapabilities.every(id => capabilityIsReady(this.#runtime.capabilities, id))) throw new RuntimeContractError("capability-unavailable", "Required capabilities unavailable", "method-registry")
     return method.invoke({ session, signal }, input)
@@ -146,7 +184,9 @@ export class MethodRegistry {
     return () => { this.#listeners.delete(listener) }
   }
 
-  #changed(): void {
+  #changed(visibility: RuntimeMethodVisibility | "both"): void {
+    this.#internalRevision++
+    if (visibility === "internal") return
     this.#revision++
     for (const listener of this.#listeners) listener()
   }

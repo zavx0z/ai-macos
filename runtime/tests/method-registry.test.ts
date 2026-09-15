@@ -72,6 +72,129 @@ test("catalog advertisement и dispatch используют тот же actual 
   expect(calls).toBe(1)
 })
 
+test("internal visibility скрывает method от external catalogue и guessed dispatch", async () => {
+  const core = new RuntimeCore({
+    generation: { runtimeEpoch: "runtime:visibility", loginSessionId: "login:visibility" },
+    runtimeBuildId: "build:visibility",
+  })
+  const registry = new MethodRegistry(core)
+  let publicChanges = 0
+  let internalCalls = 0
+  registry.subscribeCatalogChanged(() => { publicChanges++ })
+  registry.register("public_method", {
+    title: "Public",
+    description: "Public test method",
+    input: z.strictObject({ value: z.string() }),
+    output: z.strictObject({ value: z.string() }),
+    readOnly: true,
+    async execute(_context, input) { return input },
+  })
+  const internalDefinition = {
+    title: "Internal",
+    description: "Internal test method",
+    input: z.strictObject({ value: z.string() }),
+    output: z.strictObject({ value: z.string() }),
+    readOnly: true,
+    visibility: "internal" as const,
+    requiredCapabilities: ["desktop.windows.all" as const],
+    async execute(_context: unknown, input: { value: string }) {
+      internalCalls++
+      return input
+    },
+  }
+  registry.register("internal_method", internalDefinition)
+  internalDefinition.visibility = "public" as never
+
+  expect(registry.descriptors().tools.map(tool => tool.name)).toEqual(["public_method"])
+  expect(registry.internal.descriptors().tools.map(tool => tool.name)).toEqual(["public_method"])
+  expect(publicChanges).toBe(1)
+  const client = core.openClient("principal:visibility")
+  await expect(registry.dispatch(
+    client.session,
+    "internal_method",
+    { value: "guessed" },
+    new AbortController().signal,
+  )).rejects.toMatchObject({ contract: { code: "unsupported-capability" } })
+  await expect(registry.internal.dispatch(
+    client.session,
+    "internal_method",
+    { value: "blocked" },
+    new AbortController().signal,
+  )).rejects.toThrow("capabilities unavailable")
+  expect(internalCalls).toBe(0)
+
+  core.updateCapabilities(composeHostCapabilities("host:visibility", {
+    schemaVersion: "1",
+    scope: "adapter",
+    producerRef: "native:visibility",
+    capabilities: [
+      { id: "desktop.applications", state: "ready" },
+      { id: "desktop.windows.all", state: "ready" },
+      { id: "desktop.displays", state: "ready" },
+    ],
+  }))
+  expect(registry.descriptors().tools.map(tool => tool.name)).toEqual(["public_method"])
+  expect(registry.internal.descriptors().tools.map(tool => tool.name)).toEqual(["public_method", "internal_method"])
+  expect(await registry.internal.dispatch(
+    client.session,
+    "internal_method",
+    { value: "trusted" },
+    new AbortController().signal,
+  )).toEqual({ data: { value: "trusted" }, frameRefs: [] })
+  expect(internalCalls).toBe(1)
+
+  core.clients.disconnect(client.session.clientSessionId)
+  await expect(registry.internal.dispatch(
+    client.session,
+    "internal_method",
+    { value: "disconnected" },
+    new AbortController().signal,
+  )).rejects.toThrow("отключена")
+  expect(internalCalls).toBe(1)
+})
+
+test("internal dispatch сохраняет общий drain gate и допускает только declared recovery method", async () => {
+  const core = new RuntimeCore({
+    generation: { runtimeEpoch: "runtime:internal-drain", loginSessionId: "login:internal-drain" },
+    runtimeBuildId: "build:internal-drain",
+  })
+  const registry = new MethodRegistry(core)
+  let calls = 0
+  for (const [name, availableDuringDrain] of [
+    ["internal_normal", false],
+    ["internal_recovery", true],
+  ] as const) {
+    registry.register(name, {
+      title: name,
+      description: name,
+      input: z.strictObject({}),
+      output: z.strictObject({ ok: z.boolean() }),
+      readOnly: false,
+      visibility: "internal",
+      availableDuringDrain,
+      async execute() { calls++; return { ok: true } },
+    })
+  }
+  const session = core.openClient("principal:internal-drain").session
+  core.sealAdmission()
+
+  expect(registry.descriptors().tools).toEqual([])
+  expect(registry.internal.descriptors().tools.map(tool => tool.name)).toEqual(["internal_recovery"])
+  await expect(registry.internal.dispatch(
+    session,
+    "internal_normal",
+    {},
+    new AbortController().signal,
+  )).rejects.toThrow("sealed")
+  expect(await registry.internal.dispatch(
+    session,
+    "internal_recovery",
+    {},
+    new AbortController().signal,
+  )).toEqual({ data: { ok: true }, frameRefs: [] })
+  expect(calls).toBe(1)
+})
+
 test("host singleton защищает запуск helper и drain закрывает catalogue admission", async () => {
   const directory = await mkdtemp(join(tmpdir(), "host-singleton-"))
   const options = { socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
