@@ -52,6 +52,7 @@ import { registerAgentMethods } from "./agent-methods.ts"
 import { registerAgentActionMethods } from "./agent-action-methods.ts"
 import { registerAgentPointerMethods } from "./agent-pointer-methods.ts"
 import { registerAgentAxMethods } from "./agent-ax-methods.ts"
+import { recentOperationsInputSchema, recentOperationsResultSchema } from "./recent-operations.ts"
 
 export type RuntimeHostOptions = {
   socketPath: string
@@ -324,6 +325,13 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
         } }
       } catch (error) { return { ...doctor(), permissionsUnavailable: error instanceof Error ? error.message : "Native permissions unavailable" } }
     },
+  })
+  catalog.register("list_recent_operations", {
+    title: "Недавние операции",
+    description: "Возвращает bounded receipts текущей подтверждённой lineage, включая восстановленные после restart. Payload и вводимый текст не возвращаются; действия не повторяются.",
+    input: recentOperationsInputSchema, output: recentOperationsResultSchema,
+    readOnly: true, availableDuringDrain: true, requiredCapabilities: ["runtime.operations"], maxResponseBytes: 64 * 1024,
+    execute: (context, input) => core.listRecentOperations(context.session, input.limit),
   })
   catalog.register("get_operation", {
     title: "Состояние операции", description: "Чтение operation receipt текущей client lineage без повтора действия.",

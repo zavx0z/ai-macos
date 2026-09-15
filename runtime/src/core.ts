@@ -62,6 +62,7 @@ import type { PersistentOperationJournal, StoredOperationEvidence } from "./stor
 import type { StoredClientSession } from "./client-sessions.ts"
 import type { NativePointEvidenceProvider } from "./authorities.ts"
 import { ClientDisconnectGrace } from "./client-grace.ts"
+import { recentOperationsInputSchema, type RecentOperationsResult } from "./recent-operations.ts"
 import type { PersistentLifetimeStore } from "./lifetime-state.ts"
 
 type JournalEntry = {
@@ -781,6 +782,17 @@ export class RuntimeCore implements RuntimeAdapter {
     if (entry === undefined) return undefined
     this.#assertJournalAuthority(session, entry.record)
     return entry.record
+  }
+
+  async listRecentOperations(session: RuntimeClientSession, limit = 20): Promise<RecentOperationsResult> {
+    await this.clients.assertActive(session, this.#clock.now())
+    const requested = recentOperationsInputSchema.parse({ limit }).limit
+    const lineageId = this.clients.lineage(session)
+    const records = [...this.#journal.values()].filter(entry => entry.lineageId === lineageId && entry.record.principalId === session.principalId)
+      .map(entry => entry.record).sort((left, right) => Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
+        || left.context.operationId.localeCompare(right.context.operationId))
+    return { operations: records.slice(0, requested).map(record => ({ operationId: record.context.operationId, state: record.state,
+      targetKind: record.context.target.kind, updatedAt: record.updatedAt, cleanup: record.outcome.cleanup.state })), truncated: records.length > requested }
   }
 
   async getOperationByRequest(session: RuntimeClientSession, clientRequestId: string): Promise<OperationRecord | undefined> {

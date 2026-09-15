@@ -238,7 +238,7 @@ test("Runtime host serves schema catalogue, method health and per-lineage frames
     expect(await client.adminInspect()).toMatchObject({ running: true, runtimeBuildId: "build:host", activeOperations: 0 })
     await expect(client.adminDrain({ runtimeEpoch: host.core.generation.runtimeEpoch, buildId: "build:host" })).rejects.toThrow("Native build")
     await client.open("host-test")
-    expect((await client.listTools()).map(tool => tool.name)).toEqual(["get_state", "observe", "get_target_status", "cancel_target", "recover_startup_input", "system_health", "get_operation", "cancel_operation"])
+    expect((await client.listTools()).map(tool => tool.name)).toEqual(["get_state", "observe", "get_target_status", "cancel_target", "recover_startup_input", "system_health", "list_recent_operations", "get_operation", "cancel_operation"])
     const health = await client.callTool("system_health", {}, new AbortController().signal)
     expect(health.structuredContent).toMatchObject({ runtime: { buildId: "build:host" }, native: { state: "unavailable" } })
     const png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"))

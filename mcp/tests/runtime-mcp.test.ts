@@ -48,6 +48,7 @@ test("thin MCP exposes authenticated runtime health/status/cancel catalog withou
     "cancel_target",
     "recover_startup_input",
     "system_health",
+    "list_recent_operations",
     "get_operation",
     "cancel_operation",
   ])
