@@ -736,6 +736,14 @@ bool meta_executor_finish(MetaExecutor *executor) {
   return true;
 }
 
+bool meta_executor_fail(MetaExecutor *executor, const char *checkpoint) {
+  if (executor == NULL || !executor->active || checkpoint == NULL ||
+      checkpoint[0] == '\0') return false;
+  copy_text(executor->status.last_checkpoint,
+            sizeof(executor->status.last_checkpoint), checkpoint);
+  return stop_for_reason(executor, META_EXECUTOR_FAILED);
+}
+
 bool meta_executor_cancel(MetaExecutor *executor) {
   if (executor == NULL || !executor->active) return false;
   executor->status.cancellation_requested = true;

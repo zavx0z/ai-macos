@@ -439,6 +439,9 @@ bool meta_executor_set_event_flags(MetaExecutor *executor,
                                    uint64_t flags,
                                    const char *checkpoint);
 bool meta_executor_finish(MetaExecutor *executor);
+// Известный отказ текущей операции: сохраняет фактический dispatch и очищает
+// только принадлежащие живому executor удержания, не выдумывая события.
+bool meta_executor_fail(MetaExecutor *executor, const char *checkpoint);
 bool meta_executor_cancel(MetaExecutor *executor);
 bool meta_executor_cancel_operation(MetaExecutor *executor,
                                     const char *operation_id,

@@ -114,6 +114,34 @@ static MetaFence fence(const char *runtime_epoch,
   return value;
 }
 
+static void test_known_failure_preserves_actual_dispatch(void) {
+  FakeBackend backend = {.now = 100, .target_valid = true};
+  MetaExecutor *value = executor(&backend, "native-1");
+  assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+  assert(meta_executor_begin(value, "not-ready", "window-1",
+                             fence("runtime-1", "native-1", 1), 1000));
+  assert(meta_executor_fail(value, "readiness-precondition"));
+  MetaExecutorStatus status = meta_executor_status(value);
+  assert(status.execution == META_EXECUTOR_FAILED);
+  assert(status.dispatch == META_DISPATCH_NONE && status.dispatch_attempts == 0);
+  assert(status.cleanup == META_CLEANUP_COMPLETE && !status.quarantined);
+  assert(!status.cancellation_requested && status.held_count == 0);
+  assert(strcmp(status.last_checkpoint, "readiness-precondition") == 0);
+  assert(backend.event_count == 0 && backend.persist_calls == 0);
+  assert(!meta_executor_fail(value, "repeat"));
+  assert(!meta_executor_finish(value));
+  assert(meta_executor_begin(value, "failed-after-down", "window-1",
+                             fence("runtime-1", "native-1", 2), 1000));
+  assert(meta_executor_post_down(value, META_EVENT_KEY, 55));
+  assert(meta_executor_fail(value, "known-refusal"));
+  status = meta_executor_status(value);
+  assert(status.execution == META_EXECUTOR_FAILED);
+  assert(status.dispatch == META_DISPATCH_PARTIAL && status.dispatch_attempts > 0);
+  assert(status.cleanup == META_CLEANUP_COMPLETE && status.held_count == 0);
+  assert(backend.event_count == 2 && backend.cleanup_count == 1);
+  meta_executor_destroy(value);
+}
+
 static void test_cancel_before_first_event(void) {
   FakeBackend backend = {.now = 100, .target_valid = true};
   MetaExecutor *value = executor(&backend, "native-1");
@@ -539,6 +567,7 @@ static void test_external_action_uses_same_fence(void) {
 }
 
 int main(void) {
+  test_known_failure_preserves_actual_dispatch();
   test_external_action_uses_same_fence();
   test_cancel_before_first_event();
   test_cancel_releases_confirmed_down();
