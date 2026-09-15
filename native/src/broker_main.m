@@ -25,6 +25,7 @@
 #include "cursor-display/meta_cursor_display.h"
 #include "ax-actions/meta_ax_retained_snapshot.h"
 #include "ax-actions/meta_ax_press.h"
+#include "recovery-domain/meta_recovery_domain.h"
 #include <time.h>
 #include <math.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -43,6 +44,7 @@
 - (NSDictionary *)applicationRecord:(NSDictionary *)reference;
 - (BOOL)ensureApplications:(NSDictionary *)request;
 - (NSDictionary *)recoveryInfo;
+- (BOOL)inputRiskAllowed:(MetaInputPrimitiveRisk)risk code:(uint32_t)code;
 @end
 
 @interface MetaInspectionBorrowContext : NSObject
@@ -166,6 +168,10 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
   return true;
 }
 
+static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code) {
+  return [(__bridge MetaSystemCommandBackend *)context inputRiskAllowed:risk code:code];
+}
+
 @implementation MetaSystemCommandBackend {
   MetaMacOSBackend *_windows;
   MetaCaptureRouter *_captures;
@@ -182,6 +188,7 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
   MetaMacOSInput *_input;
   MetaInputExecutor *_inputExecutor;
   MetaAXRetainedSnapshotRegistry *_axSnapshots;
+  NSDictionary *_activeInputRecoveryDescriptor;
   MetaApplicationBundles *_bundles;
   MetaApplicationCommandBinder *_applications;
   MetaApplicationBackend _applicationBackend;
@@ -198,6 +205,7 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
     _applicationTaskRefs = [NSMutableDictionary dictionary];
     _captures = meta_capture_router_create(generation.UTF8String, meta_capture_router_default_backend());
     _input = meta_macos_input_create();
+    if (!meta_macos_input_set_risk_validator(_input, (__bridge void *)self, input_risk)) return nil;
     _axSnapshots = [[MetaAXRetainedSnapshotRegistry alloc] initWithClock:^uint64_t { return native_millis(); }
       ttlMillis:120000 maxSnapshots:64 maxNodes:1500];
     _applicationBackend = meta_application_system_backend();
@@ -265,6 +273,28 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
   NSDictionary *identity = meta_code_identity_read(&failure);
   if (identity != nil) result[@"codeIdentity"] = identity;
   return result;
+}
+
+- (NSString *)recoveryDomainVersion { return @"1"; }
+- (BOOL)validateRecoveryRequest:(NSDictionary *)request {
+  return meta_recovery_domain_validate_request(request, @META_NATIVE_BUILD_ID, NULL, NULL);
+}
+- (BOOL)prepareInputRisk:(NSDictionary *)request {
+  _activeInputRecoveryDescriptor = nil;
+  NSDictionary *descriptor = nil;
+  if (!meta_recovery_domain_validate_request(request, @META_NATIVE_BUILD_ID, &descriptor, NULL)) return NO;
+  _activeInputRecoveryDescriptor = descriptor;
+  return YES;
+}
+- (BOOL)inputRiskAllowed:(MetaInputPrimitiveRisk)risk code:(uint32_t)code {
+  if (_activeInputRecoveryDescriptor == nil) return NO;
+  if (risk == META_INPUT_RISK_NO_HELD_INPUT) return YES;
+  NSString *kind = risk == META_INPUT_RISK_KEY ? @"key" : risk == META_INPUT_RISK_BUTTON ? @"button" : nil;
+  if (kind == nil) return NO;
+  for (NSDictionary *hold in _activeInputRecoveryDescriptor[@"possibleHolds"]) {
+    if ([hold[@"kind"] isEqual:kind] && [hold[@"code"] unsignedIntValue] == code) return YES;
+  }
+  return NO;
 }
 
 - (NSArray<NSDictionary *> *)capabilityCatalog {
@@ -529,6 +559,7 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
       [job.operation[@"inventoryRevision"] unsignedLongLongValue] != snapshot->revision ||
       ![job.operation[@"target"][@"kind"] isEqual:@"display"] ||
       ![job.operation[@"target"][@"ref"] isEqual:expected]) return nil;
+  if (![self prepareInputRisk:request]) return nil;
   NSDictionary *generation = @{@"runtimeEpoch": request[@"runtimeEpoch"], @"loginSessionId": request[@"loginSessionId"],
     @"nativeGeneration": request[@"nativeGeneration"]};
   MetaObserverCommandBinder *observer = _observerCommands;
@@ -570,6 +601,7 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
       return outcome.result;
     }];
   meta_executor_set_observer_state(executor, META_OBSERVER_UNAVAILABLE);
+  _activeInputRecoveryDescriptor = nil;
   if (execution[@"value"] == nil || execution[@"status"] == nil) return nil;
   NSMutableDictionary *value = [execution[@"value"] mutableCopy];
   if (![execution[@"finished"] boolValue] && [value[@"inputReady"] boolValue]) {
@@ -993,6 +1025,7 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
     if (!matches) return nil;
   }
   _inputLoginSession = operation[@"loginSessionId"];
+  if (![self prepareInputRisk:request]) return nil;
   MetaInputObserverBinding *binding = [[MetaInputObserverBinding alloc] initWithObserver:_observerCommands
     observerInstanceRef:_observerInstance operationId:operation[@"operationId"] target:scope interactionId:nil];
   [job setObserverCoverageProvider:^NSDictionary * { return [binding currentCoverage]; }];
@@ -1009,6 +1042,7 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
   [binding stop];
   [_inputExecutor setInputObserverAfterBegin:nil poll:nil];
   meta_executor_set_observer_state(executor, META_OBSERVER_UNAVAILABLE);
+  _activeInputRecoveryDescriptor = nil;
   return result;
 }
 

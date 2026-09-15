@@ -59,6 +59,7 @@ mkdir -p "$(dirname -- "$CANDIDATE_OUTPUT")"
   native/src/cursor-display/meta_cursor_display.m \
   native/src/ax-actions/meta_ax_retained_snapshot.m \
   native/src/ax-actions/meta_ax_press.m \
+  native/src/recovery-domain/meta_recovery_domain.m \
   -framework Foundation -framework AppKit -framework ApplicationServices \
   -framework CoreGraphics -framework CoreImage -framework CoreMedia \
   -framework CoreVideo -framework ImageIO -framework ScreenCaptureKit \

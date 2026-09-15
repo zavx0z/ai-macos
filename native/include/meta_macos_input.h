@@ -5,8 +5,22 @@
 
 typedef struct MetaMacOSInput MetaMacOSInput;
 
+typedef enum {
+  META_INPUT_RISK_NO_HELD_INPUT,
+  META_INPUT_RISK_KEY,
+  META_INPUT_RISK_BUTTON,
+} MetaInputPrimitiveRisk;
+typedef bool (*MetaInputRiskValidator)(void *context,
+                                       MetaInputPrimitiveRisk risk,
+                                       uint32_t code);
+
 MetaMacOSInput *meta_macos_input_create(void);
 void meta_macos_input_destroy(MetaMacOSInput *input);
+// Устанавливается один раз production broker. Отсутствующий descriptor должен
+// отвергаться callback; cleanup UP живого executor использует отдельный путь.
+bool meta_macos_input_set_risk_validator(MetaMacOSInput *input,
+                                        void *context,
+                                        MetaInputRiskValidator validate);
 bool meta_macos_input_preflight(void);
 bool meta_macos_input_set_flags(void *context, uint64_t flags);
 bool meta_macos_input_post_held(void *context, MetaHeldEventKind kind,

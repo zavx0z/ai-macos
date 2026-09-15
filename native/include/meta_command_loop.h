@@ -24,6 +24,8 @@
 - (NSDictionary *)executeApplication:(NSDictionary *)request job:(MetaInputJob *)job;
 - (BOOL)beginRotation;
 @optional
+- (NSString *)recoveryDomainVersion;
+- (BOOL)validateRecoveryRequest:(NSDictionary *)request;
 - (NSDictionary *)cursorDisplay:(NSDictionary *)request;
 - (NSDictionary *)executeAxPress:(NSDictionary *)request job:(MetaInputJob *)job;
 - (NSArray<NSDictionary *> *)capabilityCatalog;

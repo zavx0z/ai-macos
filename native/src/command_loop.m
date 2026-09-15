@@ -81,6 +81,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   BOOL _sealed;
   BOOL _busy;
   BOOL _observerCommandPending;
+  BOOL _requiresRecoveryDomain;
   NSString *_activeOperation;
   MetaInputJob *_job;
   MetaOperationReceipts *_receipts;
@@ -221,13 +222,19 @@ static NSDictionary *failure(NSString *code, NSString *message) {
         @[@{@"id": @"runtime.identity", @"state": @"ready"}];
     NSDictionary *capabilities = @{@"schemaVersion": @"1", @"scope": @"adapter", @"producerRef": _generation,
       @"capabilities": catalog};
-    [self send:@"handshake" payload:@{
+    NSString *recoveryVersion = [_backend respondsToSelector:@selector(recoveryDomainVersion)] &&
+        [_backend respondsToSelector:@selector(validateRecoveryRequest:)] ? [_backend recoveryDomainVersion] : nil;
+    _requiresRecoveryDomain = [recoveryVersion isEqual:@"1"];
+    if (payload[@"requiredRecoveryDomainVersion"] != nil && ![payload[@"requiredRecoveryDomainVersion"] isEqual:recoveryVersion]) _admitted = NO;
+    NSMutableDictionary *handshake = [@{
       @"kind": @"handshake-response", @"protocolVersion": @"1", @"requestId": requestId,
       @"runtimeEpoch": _runtimeEpoch, @"loginSessionId": _loginSessionId, @"nativeGeneration": _generation,
       @"nativeBuildId": _buildId, @"capabilitySchemaVersion": @"1", @"installRoot": _installRoot,
       @"process": @{@"pid": @(getpid()), @"startedAt": _startedAt, @"nonce": _nonce}, @"capabilities": capabilities,
       @"session": session,
-    }];
+    } mutableCopy];
+    if (recoveryVersion != nil) handshake[@"recoveryDomainVersion"] = recoveryVersion;
+    [self send:@"handshake" payload:handshake];
     return;
   }
   if (!_admitted || ![identityPayload[@"runtimeEpoch"] isEqual:_runtimeEpoch] || ![identityPayload[@"loginSessionId"] isEqual:_loginSessionId]
@@ -410,7 +417,10 @@ static NSDictionary *failure(NSString *code, NSString *message) {
       dispatch_sync(self->_control, ^{ allowed = !self->_sealed && self->_requestedExit < 0; });
       NSDictionary *result = nil;
       if (allowed && future_deadline(payload[@"deadlineAt"])) {
-        result = axPress ? [self->_backend executeAxPress:payload job:job] : cursorDisplay ? [self->_backend cursorDisplay:payload] : readiness ? [self->_backend executeReadiness:payload job:job] : input ? [self->_backend executeInput:payload job:job] : window ? [self->_backend executeWindow:payload job:job] : capture ? [self->_backend startCapture:payload job:job] : application ? [self->_backend executeApplication:payload job:job] : clipboard ? [self->_backend clipboard:command] :
+        BOOL mutation = [payload[@"intent"] isEqual:@"mutation"] || (clipboard && [command[@"method"] isEqual:@"clipboard.write"]);
+        if (self->_requiresRecoveryDomain && mutation && ![self->_backend validateRecoveryRequest:payload]) {
+          result = @{@"nativeError": failure(@"request-payload-mismatch", @"RecoveryDomain grant не подтверждает actual primitive plan; dispatch не начат")};
+        } else result = axPress ? [self->_backend executeAxPress:payload job:job] : cursorDisplay ? [self->_backend cursorDisplay:payload] : readiness ? [self->_backend executeReadiness:payload job:job] : input ? [self->_backend executeInput:payload job:job] : window ? [self->_backend executeWindow:payload job:job] : capture ? [self->_backend startCapture:payload job:job] : application ? [self->_backend executeApplication:payload job:job] : clipboard ? [self->_backend clipboard:command] :
             inspection ? [self->_backend inspect:payload] : applicationResolution ? [self->_backend resolveApplication:payload] : hitTest ? [self->_backend hitTest:payload] : [self->_backend inventory];
       }
       dispatch_async(self->_control, ^{

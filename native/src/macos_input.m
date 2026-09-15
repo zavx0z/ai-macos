@@ -12,7 +12,15 @@ struct MetaMacOSInput {
   MetaPointerButton button;
   uint64_t flags;
   int64_t click_state;
+  void *risk_context;
+  MetaInputRiskValidator risk_validator;
 };
+
+static bool risk_allowed(MetaMacOSInput *input,
+                          MetaInputPrimitiveRisk risk, uint32_t code) {
+  return input != NULL && (input->risk_validator == NULL ||
+      input->risk_validator(input->risk_context, risk, code));
+}
 
 static CGMouseButton cg_button(MetaPointerButton button) {
   if (button == META_POINTER_RIGHT) return kCGMouseButtonRight;
@@ -35,6 +43,15 @@ void meta_macos_input_destroy(MetaMacOSInput *input) {
   free(input);
 }
 
+bool meta_macos_input_set_risk_validator(MetaMacOSInput *input,
+                                        void *context,
+                                        MetaInputRiskValidator validate) {
+  if (input == NULL || validate == NULL || input->risk_validator != NULL) return false;
+  input->risk_context = context;
+  input->risk_validator = validate;
+  return true;
+}
+
 bool meta_macos_input_preflight(void) {
   return AXIsProcessTrusted() && CGPreflightPostEventAccess();
 }
@@ -51,6 +68,8 @@ bool meta_macos_input_post_held(void *context, MetaHeldEventKind kind,
                                 uint64_t synthetic_tag) {
   MetaMacOSInput *input = context;
   if (input == NULL || synthetic_tag == 0) return false;
+  if (kind != META_EVENT_KEY && kind != META_EVENT_BUTTON) return false;
+  if (!risk_allowed(input, kind == META_EVENT_KEY ? META_INPUT_RISK_KEY : META_INPUT_RISK_BUTTON, code)) return false;
   CGEventRef event = NULL;
   if (kind == META_EVENT_KEY) {
     if (code > UINT16_MAX) return false;
@@ -124,11 +143,12 @@ bool meta_macos_input_post_cleanup_up(void *context, MetaHeldEventKind kind,
 bool meta_macos_input_post_text(void *context, const uint16_t *utf16_units,
                                 size_t utf16_count,
                                 uint64_t synthetic_tag) {
-  (void)context;
+  MetaMacOSInput *input = context;
   if (utf16_units == NULL || utf16_count == 0 || utf16_count > 10000 ||
       synthetic_tag == 0) {
     return false;
   }
+  if (!risk_allowed(input, META_INPUT_RISK_KEY, 0)) return false;
   CGEventRef down = CGEventCreateKeyboardEvent(NULL, 0, true);
   CGEventRef up = CGEventCreateKeyboardEvent(NULL, 0, false);
   if (down == NULL || up == NULL) {
@@ -157,6 +177,8 @@ bool meta_macos_input_post_pointer(void *context,
       synthetic_tag == 0) {
     return false;
   }
+  if (!risk_allowed(input, event->kind == META_POINTER_DRAG ? META_INPUT_RISK_BUTTON : META_INPUT_RISK_NO_HELD_INPUT,
+      event->kind == META_POINTER_DRAG ? (uint32_t)event->button : 0)) return false;
   input->x = event->x;
   input->y = event->y;
   input->button = event->button;
@@ -187,6 +209,7 @@ bool meta_macos_input_post_scroll(void *context,
       synthetic_tag == 0) {
     return false;
   }
+  if (!risk_allowed(input, META_INPUT_RISK_NO_HELD_INPUT, 0)) return false;
   input->x = event->x;
   input->y = event->y;
   input->flags = event->flags;
