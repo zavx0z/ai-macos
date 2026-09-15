@@ -12,7 +12,10 @@ import {
   type TargetResolution,
   type TargetResolutionRequest,
 } from "@meta/shared/contracts"
-import { prepareInputAction } from "../src/authorization.ts"
+import {
+  admitPreparedInputBudget,
+  prepareInputAction,
+} from "../src/authorization.ts"
 
 const runtimeEpoch = "runtime:1"
 const loginSessionId = "login:1"
@@ -394,17 +397,32 @@ describe("C2 input authorization", () => {
     }
   })
 
-  test("не авторизует drag, известная длительность которого больше остатка budget", async () => {
+  test("physical drag budget начинается после point authorization и остаётся bounded operation deadline", async () => {
     const value = fixture({
-      wire: { ...wire, deadlineAt: "2026-09-15T10:00:01.100Z" },
+      wire: { ...wire, deadlineAt: "2026-09-15T10:00:09.000Z" },
     })
-    await expect(prepareInputAction(host, value.services, value.context, {
+    const prepared = await prepareInputAction(host, value.services, value.context, {
       kind: "drag",
       points: [{ x: 10, y: 10 }, { x: 20, y: 20 }],
       durationMs: 5_000,
       button: "left",
       modifiers: [],
-    }, now)).rejects.toMatchObject({ contract: { code: "deadline-exceeded", stage: "input-budget-admission" } })
-    expect(value.resolvedPoints()).toBe(0)
+    }, now)
+    const afterOneSecondPreflight = new Date("2026-09-15T10:00:02.000Z")
+    expect(admitPreparedInputBudget(
+      prepared,
+      value.context.wire.deadlineAt,
+      afterOneSecondPreflight,
+    )).toEqual({
+      startedAtMs: afterOneSecondPreflight.getTime(),
+      deadlineAtMs: new Date("2026-09-15T10:00:07.000Z").getTime(),
+      limitMs: 5_000,
+    })
+    expect(() => admitPreparedInputBudget(
+      prepared,
+      value.context.wire.deadlineAt,
+      new Date("2026-09-15T10:00:04.001Z"),
+    )).toThrow("physical action budget")
+    expect(value.resolvedPoints()).toBe(2)
   })
 })

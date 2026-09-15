@@ -26,7 +26,11 @@ import {
   type InputAction,
   type InputActionResult,
 } from "./actions.ts"
-import { prepareInputAction, type PreparedInputAction } from "./authorization.ts"
+import {
+  admitPreparedInputBudget,
+  prepareInputAction,
+  type PreparedInputAction,
+} from "./authorization.ts"
 import { compileNativeInputAction } from "./native-action.ts"
 
 export type InputAdapterOptions = Readonly<{
@@ -57,9 +61,11 @@ export class DesktopInputAdapter implements SharedInputAdapter<InputAction, Inpu
     action: InputAction,
   ): Promise<AdapterResult<InputActionResult>> {
     let prepared: PreparedInputAction
+    let budget
     try {
       prepared = await prepareInputAction(this.host, this.services, context, action, this.#now())
       await context.control.checkpoint("input.compile-native-action")
+      budget = admitPreparedInputBudget(prepared, context.wire.deadlineAt, this.#now())
     } catch (error) {
       return preDispatchFailure(context, error)
     }
@@ -83,7 +89,7 @@ export class DesktopInputAdapter implements SharedInputAdapter<InputAction, Inpu
       method: "input.execute",
       operation: context.wire,
       payload: {
-        actionDeadlineAt: new Date(prepared.budget.deadlineAtMs).toISOString(),
+        actionDeadlineAt: new Date(budget.deadlineAtMs).toISOString(),
         action: nativeAction,
       },
     })

@@ -45,7 +45,6 @@ export class InputPreparationError extends Error {
 export type PreparedInputAction = Readonly<{
   action: InputAction
   plan: InputActionPlan
-  budget: ActionBudget
   target: TargetResolution
   authorizedPoints: readonly AuthorizedObservationPoint[]
 }>
@@ -119,29 +118,14 @@ export async function prepareInputAction(
     throwInput(error, "target-stale", "input-target")
   }
 
-  const typing = action.kind === "text"
-  let budget: ActionBudget
   let plan: InputActionPlan
   try {
-    budget = planActionBudget(
-      typing ? "typing" : ["hover", "click", "scroll", "drag"].includes(action.kind) ? "pointer" : "keyboard",
-      Date.parse(context.wire.deadlineAt),
-      now.getTime(),
-    )
     plan = planInputAction(action)
   } catch (error) {
     const code = error instanceof InputPlanError && error.code === "budget-exceeded"
       ? inputBudgetErrorCode(error)
       : "invalid-request"
     throwInput(error, code, "input-plan")
-  }
-  const knownDurationMs = knownPlanDurationMs(plan)
-  if (knownDurationMs > remainingActionBudget(budget, now.getTime())) {
-    throwInput(
-      new Error(`Известная длительность ${knownDurationMs} мс не помещается в оставшийся action budget`),
-      "deadline-exceeded",
-      "input-budget-admission",
-    )
   }
   assertTargetResolution(context, target)
   const authorizedPoints = isPointerAction(action)
@@ -153,7 +137,34 @@ export async function prepareInputAction(
   } catch (error) {
     throwInput(error, "cancelled", "input-ready-dispatch")
   }
-  return { action, plan, budget, target, authorizedPoints }
+  return { action, plan, target, authorizedPoints }
+}
+
+export function admitPreparedInputBudget(
+  prepared: PreparedInputAction,
+  operationDeadlineAt: string,
+  now: Date,
+): ActionBudget {
+  let budget: ActionBudget
+  try {
+    const kind = prepared.action.kind === "text"
+      ? "typing"
+      : ["hover", "click", "scroll", "drag"].includes(prepared.action.kind)
+        ? "pointer"
+        : "keyboard"
+    budget = planActionBudget(kind, Date.parse(operationDeadlineAt), now.getTime())
+  } catch (error) {
+    throwInput(error, "deadline-exceeded", "input-budget-admission")
+  }
+  const knownDurationMs = knownPlanDurationMs(prepared.plan)
+  if (knownDurationMs > remainingActionBudget(budget, now.getTime())) {
+    throwInput(
+      new Error(`Известная длительность ${knownDurationMs} мс не помещается в оставшийся physical action budget`),
+      "deadline-exceeded",
+      "input-budget-admission",
+    )
+  }
+  return budget
 }
 
 function planInputAction(action: InputAction): InputActionPlan {
