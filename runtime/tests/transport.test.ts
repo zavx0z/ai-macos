@@ -31,9 +31,14 @@ test("admin UDS требует отдельный credential и exact epoch/buil
   const credentialPath = join(directory, "credential.json")
   const runtime = new RuntimeCore({ generation, runtimeBuildId: "build:admin" })
   let drains = 0
+  let recoveries = 0
   let activeOperations = 1
   const server = new RuntimeUdsServer({ socketPath, credentialPath, core: runtime, admin: {
     inspect: () => ({ running: true, runtimeEpoch: generation.runtimeEpoch, runtimeBuildId: "build:admin", nativeBuildId: "build:native", activeOperations, quarantinedResources: 0 }),
+    async recover() {
+      recoveries++
+      return { resolved: 1, unresolved: 0, remainingOperations: 0, admissionSealed: false }
+    },
     async drain() {
       drains++
       activeOperations = 0
@@ -56,6 +61,10 @@ test("admin UDS требует отдельный credential и exact epoch/buil
     await expect(client.adminDrain({ runtimeEpoch: generation.runtimeEpoch, buildId: "build:other" })).rejects.toThrow("mismatch")
     await expect(client.adminDrain({ runtimeEpoch: generation.runtimeEpoch, buildId: "build:admin", nativeBuildId: "native:other" })).rejects.toThrow("mismatch")
     expect(drains).toBe(0)
+    await expect(client.adminRecover({ runtimeEpoch: "runtime:other", buildId: "build:admin" })).rejects.toThrow("mismatch")
+    expect(recoveries).toBe(0)
+    expect(await client.adminRecover({ runtimeEpoch: generation.runtimeEpoch, buildId: "build:admin", operationId: "operation:old" })).toMatchObject({ resolved: 1, unresolved: 0 })
+    expect(recoveries).toBe(1)
     expect(await client.adminDrain({ runtimeEpoch: generation.runtimeEpoch, buildId: "build:admin", nativeBuildId: "build:native" })).toMatchObject({ cleanup: "complete", activeOperations: 0 })
     expect(drains).toBe(1)
   } finally { await server.stop(); await rm(directory, { recursive: true, force: true }) }

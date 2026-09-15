@@ -13,7 +13,7 @@ const browserCapabilities: readonly CapabilityId[] = [
   "browser.instances", "browser.targets", "browser.observe", "browser.readiness", "browser.resources", "android.chrome",
 ]
 
-export function composeHostCapabilities(producerRef: string, native?: CapabilitySet, unavailableReason = "Native backend unavailable", browser?: CapabilitySet): CapabilitySet {
+export function composeHostCapabilities(producerRef: string, native?: CapabilitySet, unavailableReason = "Native backend unavailable", browser?: CapabilitySet, observerReady = false): CapabilitySet {
   const statuses = new Map(CAPABILITY_IDS.map(id => [id, {
     id, state: "unavailable" as "ready" | "unavailable" | "degraded" | "unsupported" | "unknown",
     reason: "Capability implementation не подключена к host",
@@ -30,6 +30,8 @@ export function composeHostCapabilities(producerRef: string, native?: Capability
     if (!browserCapabilities.includes(capability.id)) throw new Error("Browser composition не может объявлять чужую capability")
     statuses.set(capability.id, { ...capability, reason: capability.reason ?? "Configured browser implementation" })
   }
+  if (native !== undefined && observerReady) statuses.set("runtime.user-interference", { id: "runtime.user-interference", state: "ready", reason: "Native observer PUSH continuity connected" })
+  if (!observerReady) statuses.set("input.keyboard", { id: "input.keyboard", state: "unavailable", reason: "Native observer continuity не подтверждена" })
   for (let pass = 0; pass < CAPABILITY_IDS.length; pass++) {
     for (const id of CAPABILITY_IDS) {
       const current = statuses.get(id)!

@@ -4,13 +4,14 @@ import { atomicReplace } from "./storage/atomic-file.ts"
 import { readStorageFile, assertRecordCapacity } from "./storage/common.ts"
 import { canonicalJson, sha256 } from "./primitives.ts"
 
-const actorSchema = z.strictObject({
+export const nativeActorRecordSchema = z.strictObject({
   format: z.literal("meta-native-actor"), version: z.literal(1),
   runtimeEpoch: z.string().min(1).max(64), loginSessionId: z.string().min(1).max(64), nativeGeneration: z.string().min(1).max(64),
   nativeBuildId: z.string().min(1).max(127), helperPath: z.string().min(1).max(4096).startsWith("/"),
   process: nativeHandshakeResponseSchema.shape.process,
   recordedAt: z.iso.datetime({ offset: true }), exitedAt: z.iso.datetime({ offset: true }).optional(),
 })
+const actorSchema = nativeActorRecordSchema
 const envelopeSchema = z.strictObject({ actor: actorSchema, checksum: z.string().regex(/^[a-f0-9]{64}$/) })
 export type NativeActorRecord = z.infer<typeof actorSchema>
 export type NativeActorQuiescence = { state: "exited", source: "owned-exit" | "process-absent", actor: NativeActorRecord }

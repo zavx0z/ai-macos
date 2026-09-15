@@ -10,6 +10,31 @@ startup recovery receipts и управляемая rotation; pointer readiness 
 
 ## Последующий проверенный integration slice
 
+Следующий внутренний host/recovery срез:
+
+- Managed rotation подключена к `META_RUNTIME_MANAGED=true`: Native budget
+  8500, frame reference budget 9000 или 23 часа вызывают seal → подтверждённый
+  drain/close → exit. Без supervisor остаётся `restart-needed`; drain/close
+  coalesce, а неизвестный cleanup запрещает замену процесса.
+- UDS поднимается до observer preparation. Host сначала получает свежую native
+  inventory, затем готовит sole PUSH binding и проверяет coverage. Health
+  различает preparing/ready/unavailable; continuity не выдаётся за unlocked.
+- Startup-held recovery сохраняет отдельный immutable receipt в audit partition.
+  Original ledger snapshots не меняются. Требуются exact ledger digest/revision,
+  подтверждённый actor exit и свежий Native ALL-UP с положительными permission,
+  active-console, SecureInput и observer predicates.
+- Core обновляет только cleanup старой desktop-input operation, сохраняя effect
+  и историческую неопределённость. Повторный startup использует receipt без
+  нового probe. Historical unknown effect с complete cleanup не блокирует admission.
+- Внутренний owner-scoped recovery и отдельный admin recovery проверяют authority;
+  public naming не фиксируется до нового CUA-compatible façade основной задачи.
+- Targeted recovery/rotation/transport: **13 pass / 77 assertions**; дополнительный
+  host/registry/crash/capability run: **9 pass / 55 assertions**.
+  Diff-check прошёл. Последний общий typecheck остановился на трёх ошибках
+  в параллельно изменяемом native/tests/capture-command-loop.test.ts
+  (`AsyncIterable.next/return`, `coverage.startCursor`). Durable lifetime и полное readiness/
+  interaction wiring продолжаются в согласованных владельцах.
+
 - State физически разделён по `state/login-<sha256(audit)>/`: credentials,
   operations, held-input и native-actors не смешиваются между login sessions.
   Старые flat development files не удаляются и не импортируются автоматически.

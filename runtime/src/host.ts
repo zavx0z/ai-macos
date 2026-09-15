@@ -36,6 +36,10 @@ import { NativeApplicationAdapter } from "@meta/native/application-adapter"
 import { registerApplicationMethods } from "./application-methods.ts"
 import { NativeActorJournal, type NativeActorRecord } from "./native-actor.ts"
 import { RuntimeNativePointHitProvider } from "./input-hit-test.ts"
+import { startRuntimeRotation } from "./rotation.ts"
+import { StartupHeldRecovery } from "./startup-held-recovery.ts"
+import { FileLifetimeStore } from "./lifetime-state.ts"
+import { createNativeObserverBinding, type NativeObserverBinding } from "./native-observer-binding.ts"
 
 export type RuntimeHostOptions = {
   socketPath: string
@@ -50,6 +54,8 @@ export type RuntimeHostOptions = {
   transportFactory?: () => NativeTransport
   stateDirectory?: string
   browser?: BrowserHostConfig
+  managed?: boolean
+  exitAfterRotation?: () => void
 }
 
 export async function createRuntimeHost(options: RuntimeHostOptions) {
@@ -87,8 +93,15 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   let clipboard: RuntimeClipboardHandler | undefined
   let draining = false
   let heartbeat: ReturnType<typeof startRuntimeHeartbeat> | undefined
+  let rotation: ReturnType<typeof startRuntimeRotation> | undefined
+  const startedAt = Date.now()
   let clientSweep: ReturnType<typeof setInterval> | undefined
   let browserHost: ReturnType<typeof createBrowserHostComposition> | undefined
+  let observerBinding: NativeObserverBinding | undefined
+  let observerState: "unavailable" | "preparing" | "ready" = "unavailable"
+  let observerReason = "Observer не подготовлен"
+  let backendPreparation: Promise<void> | undefined
+  let windowAdapter: NativeWindowAdapter | undefined
   const revokeNative = (reason: string) => {
     nativeError = reason
     runtime?.updateCapabilities(composeHostCapabilities("host:runtime", undefined, reason, browserHost?.capabilitySet))
@@ -154,9 +167,13 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     }
   }
   try {
+  const startupRecovery = new StartupHeldRecovery({ directory: join(auditStateDirectory, "held-recovery"),
+    generation, ledgers: heldLedger, actors: actorJournal, ...(native === undefined ? {} : { native }) })
   runtime = new RuntimeCore({
     generation, runtimeBuildId: options.runtimeBuildId,
     operationJournal: journal,
+    lifetimeStore: new FileLifetimeStore(join(auditStateDirectory, "lifetimes")),
+    startupRecovery,
     secret: Buffer.from(clientIdentity.secretHex, "hex"), hmacKeyGeneration: clientIdentity.keyGeneration,
     clientPersistence: { sessions: clientIdentity.sessions, persist: sessions => clientState.persist(sessions) },
     completionVerifier: { async verify(context, result) {
@@ -169,10 +186,6 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     }),
   })
   await runtime.initializeRecovery()
-  const heldEvidence = (await heldLedger.loadAll()).filter(evidence => evidence.snapshot.loginSessionId === loginSessionId)
-  if (heldEvidence.some(evidence => evidence.snapshot.entries.some(entry => entry.state !== "released"))) {
-    runtime.quarantineStartup("Durable native held-input ledger требует explicit recovery")
-  }
   if (native !== undefined && handshake !== undefined) {
     runtime.bindPointEvidenceProvider(new RuntimeNativePointHitProvider({ native }).provide)
     runtime.evidence.registerSourceExtractor({ adapterInstanceRef, backendBuildId: handshake.nativeBuildId, nativeGeneration: handshake.nativeGeneration }, extractNativeEvidenceReports)
@@ -180,8 +193,31 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   const core = runtime
   browserHost = createBrowserHostComposition(core, options.browser ?? {})
-  core.updateCapabilities(composeHostCapabilities("host:runtime", native === undefined ? undefined : handshake?.capabilities, undefined, browserHost.capabilitySet))
+  await core.browserLifetime.restorePersisted()
+  const refreshCapabilities = () => core.updateCapabilities(composeHostCapabilities("host:runtime",
+    native === undefined || nativeError !== undefined ? undefined : handshake?.capabilities,
+    nativeError, browserHost?.capabilitySet, observerState === "ready"))
+  refreshCapabilities()
   const catalog = new MethodRegistry(core)
+  const recoverStartup = async (operationId?: string, signal?: AbortSignal) => {
+    signal?.throwIfAborted()
+    const result = await startupRecovery.recover(operationId, signal)
+    signal?.throwIfAborted()
+    await core.refreshStartupRecovery(!draining)
+    return { ...result, remainingOperations: core.recoveryEvidence().length, admissionSealed: core.admissionSealed }
+  }
+  catalog.register("recover_startup_input", {
+    title: "Восстановить завершённый input actor",
+    description: "Пассивно проверяет точный старый held-input ledger своей lineage. События ввода не отправляются; без actor exit и ALL-UP quarantine сохраняется.",
+    input: z.strictObject({ operationId: opaqueIdSchema }),
+    output: z.strictObject({ resolved: z.number().int().min(0), unresolved: z.number().int().min(0), remainingOperations: z.number().int().min(0), admissionSealed: z.boolean() }),
+    readOnly: false, destructive: false, availableDuringDrain: true, timeoutMs: 10_000, requiredCapabilities: ["runtime.operations"],
+    async execute(context, input) {
+      if (await core.getOperation(context.session, input.operationId) === undefined) throw new Error("Operation недоступна этой lineage")
+      return recoverStartup(input.operationId, context.signal)
+    },
+    isError: output => output.unresolved > 0 || output.remainingOperations > 0,
+  })
   registerBrowserMethods(catalog, core, browserHost.bindings)
   if (native !== undefined && handshake !== undefined) {
     if (handshake.capabilities.capabilities.some(capability => capability.id === "desktop.application.lifecycle" && capability.state === "ready")) {
@@ -196,7 +232,9 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     machine: { hostname: hostname(), matchesExpected: hostname() === options.expectedHostname },
     runtime: { buildId: options.runtimeBuildId, ...generation, draining,
       admissionSealed: core.admissionSealed, recoveryOperations: core.recoveryEvidence().length,
-      recoveryReasons: [...core.startupRecoveryReasons()], clients: core.clientLifecycleStatus() },
+      recoveryReasons: [...core.startupRecoveryReasons()], clients: core.clientLifecycleStatus(),
+      rotation: rotation?.status() ?? { state: "running" as const } },
+    observer: { state: observerState, reason: observerReason },
     native: native === undefined || handshake === undefined
       ? { state: "unavailable" as const, reason: nativeError ?? "native helper not configured" }
       : nativeError !== undefined ? { state: "unavailable" as const, reason: nativeError }
@@ -205,10 +243,12 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     activeOperations: core.activeOperationCount(), quarantinedResources: core.resources.quarantinedCount(),
   })
   const doctorSchema = z.strictObject({
+    observer: z.strictObject({ state: z.enum(["unavailable", "preparing", "ready"]), reason: z.string() }),
     machine: z.strictObject({ hostname: z.string(), matchesExpected: z.boolean() }),
     runtime: z.strictObject({ buildId: z.string(), runtimeEpoch: z.string(), loginSessionId: z.string(), draining: z.boolean(),
       admissionSealed: z.boolean(), recoveryOperations: z.number().int().min(0), recoveryReasons: z.array(z.string()),
-      clients: z.strictObject({ pendingGrace: z.number().int().min(0), cleanupFailures: z.number().int().min(0) }) }),
+      clients: z.strictObject({ pendingGrace: z.number().int().min(0), cleanupFailures: z.number().int().min(0) }),
+      rotation: z.strictObject({ state: z.enum(["running", "restart-needed", "draining", "blocked", "restarting"]), reason: z.string().optional() }) }),
     native: z.union([
       z.strictObject({ state: z.literal("unavailable"), reason: z.string() }),
       z.strictObject({ state: z.literal("compatible"), buildId: z.string(), generation: z.string() }),
@@ -257,6 +297,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   })
   if (native !== undefined) {
     const windows = new NativeWindowAdapter({ native, services: core.services })
+    windowAdapter = windows
     registerWindowMethods(catalog, core, {
       host: windows.host, services: windows.services, capabilities: windows.capabilities,
       transition: windows.transition.bind(windows), inspect: windows.inspect.bind(windows),
@@ -286,7 +327,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       })
     }
   }
-  const drain = async (signal?: AbortSignal) => {
+  const performDrain = async (signal?: AbortSignal) => {
     draining = true
     core.sealAdmission()
     if (clientSweep !== undefined) clearInterval(clientSweep)
@@ -294,6 +335,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     await core.drainOperations()
     await core.drainClientGrace()
     await core.browserLifetime.shutdownLineage(undefined, signal)
+    await backendPreparation
+    await observerBinding?.close()
     if (core.recoveryEvidence().length > 0 || core.startupRecoveryReasons().length > 0) throw new Error("Startup recovery не завершена")
     if (native === undefined || handshake === undefined) return { cleanup: "complete" as const }
     const control = AbortSignal.any([AbortSignal.timeout(1000), ...(signal === undefined ? [] : [signal])])
@@ -302,8 +345,17 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     if (ack.cleanup !== "complete" || ack.quarantined || ack.activeOperationIds.length > 0) throw new Error("Native drain не подтверждён")
     return ack
   }
+  let drainingPromise: ReturnType<typeof performDrain> | undefined
+  const drain = (signal?: AbortSignal) => {
+    drainingPromise ??= performDrain(signal).catch(error => {
+      drainingPromise = undefined
+      throw error
+    })
+    return drainingPromise
+  }
   const uds = new RuntimeUdsServer({ socketPath: options.socketPath, credentialPath: options.credentialPath, core, catalog,
     admin: {
+      recover: (expected, signal) => recoverStartup(expected.operationId, signal),
       inspect: () => ({ running: true, runtimeEpoch: generation.runtimeEpoch, runtimeBuildId: options.runtimeBuildId,
         ...(handshake === undefined ? {} : { nativeBuildId: handshake.nativeBuildId }),
         activeOperations: core.activeOperationCount(), quarantinedResources: core.resources.quarantinedCount() }),
@@ -315,8 +367,24 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       },
     },
   })
+  let closing: Promise<void> | undefined
+  const close = () => {
+    closing ??= (async () => {
+      rotation?.stop()
+      core.sealAdmission()
+      if (clientSweep !== undefined) clearInterval(clientSweep)
+      await core.closeClientLifecycle()
+      await backendPreparation
+      await observerBinding?.close()
+      await heartbeat?.stop()
+      await uds.stop()
+      await closeNative()
+      await releaseLock()
+    })()
+    return closing
+  }
   return {
-    core, catalog, doctor,
+    core, catalog, doctor, recoverStartup,
     async start() {
       try {
         if (native !== undefined && handshake !== undefined) heartbeat = startRuntimeHeartbeat({ native,
@@ -324,21 +392,51 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
           onFailure(error) { core.quarantineStartup(`Native heartbeat unavailable: ${error.message}`); revokeNative("Native heartbeat unavailable") },
         })
         await uds.start()
+        if (native !== undefined && windowAdapter !== undefined) {
+          const source = native
+          const windows = windowAdapter
+          observerState = "preparing"
+          observerReason = "Подготовка свежего Native AX index"
+          refreshCapabilities()
+          backendPreparation = (async () => {
+            try {
+              const signal = AbortSignal.timeout(6000)
+              await windows.inventory({ signal, checkpoint() { signal.throwIfAborted() } })
+              observerBinding = await createNativeObserverBinding({ native: source, onGap(error) {
+                observerState = "unavailable"
+                observerReason = error.message
+                refreshCapabilities()
+              } })
+              const coverage = await observerBinding.coverage()
+              observerState = coverage.state === "ready" ? "ready" : "unavailable"
+              observerReason = coverage.reason ?? "Native PUSH coverage подтверждено; session/SecureInput проверяются отдельно"
+            } catch (error) {
+              observerState = "unavailable"
+              observerReason = error instanceof Error ? error.message : "Observer preparation failed"
+            }
+            refreshCapabilities()
+          })()
+        }
         clientSweep = setInterval(() => core.sweepClientExpiries(), 1000)
         clientSweep.unref?.()
+        rotation = startRuntimeRotation({
+          managed: options.managed === true,
+          reason() {
+            if (native !== undefined && native.sessionState.requestsUsed >= 8500) return "Native request budget требует нового процесса"
+            if (Date.now() - startedAt >= 23 * 60 * 60 * 1000) return "Runtime достиг rotation horizon"
+            if (core.frames.stats().issuedRefs >= 9000) return "Frame reference budget требует нового процесса"
+            return undefined
+          },
+          seal: () => core.sealAdmission(),
+          async drain(signal) { await drain(signal) },
+          close,
+          exit: options.exitAfterRotation ?? (() => process.exit(0)),
+        })
       }
       catch (error) { core.sealAdmission(); await heartbeat?.stop(); await closeNative(); await releaseLock(); throw error }
     },
     drain,
-    async close() {
-      core.sealAdmission()
-      if (clientSweep !== undefined) clearInterval(clientSweep)
-      await core.closeClientLifecycle()
-      await heartbeat?.stop()
-      await uds.stop()
-      await closeNative()
-      await releaseLock()
-    },
+    close,
   }
   } catch (error) { await closeNative(); throw error }
 }

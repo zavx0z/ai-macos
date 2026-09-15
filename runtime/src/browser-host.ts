@@ -26,6 +26,7 @@ import {
 } from "@meta/android/adapter"
 import type { RuntimeCore } from "./core.ts"
 import type { BrowserCaptureMethodRequest, BrowserMethodBindings, DeviceCaptureMethodRequest } from "./browser-methods.ts"
+import { lifetimeConfigFingerprint } from "./lifetime-state.ts"
 
 export type ChromeInstanceConfig = {
   browserInstanceRef: string
@@ -106,6 +107,20 @@ export function createBrowserHostComposition(
       domain: "browser",
       adapter: browser,
       verifier: verifier(rawBrowser, drivers, proof),
+      persistence: chrome.instances.map(item => ({
+        owner: { kind: "browser" as const, browserInstanceRef: item.browserInstanceRef },
+        configFingerprint: lifetimeConfigFingerprint({
+          endpointHost: item.endpointHost,
+          endpointPort: item.endpointPort,
+          profilePath: item.profilePath,
+        }),
+        physicalOwnershipKey: {
+          kind: "chrome-cdp" as const,
+          endpointHost: item.endpointHost,
+          endpointPort: item.endpointPort,
+          profilePath: item.profilePath,
+        },
+      })),
     })
     bindings.browser = {
       bindingId: chrome.bindingId,
@@ -153,6 +168,25 @@ export function createBrowserHostComposition(
       domain: "device",
       adapter: device,
       verifier: deviceVerifier(rawDevice, driver, proof, item.serial, item.localPort),
+      persistence: [{
+        owner: {
+          kind: "device-browser",
+          deviceRef: item.deviceRef,
+          serial: item.serial,
+          browserInstanceRef: item.browserInstanceRef,
+        },
+        configFingerprint: lifetimeConfigFingerprint({
+          serial: item.serial,
+          localPort: item.localPort,
+          remoteSocket: "localabstract:chrome_devtools_remote",
+        }),
+        physicalOwnershipKey: {
+          kind: "android-forward",
+          serial: item.serial,
+          localPort: item.localPort,
+          remoteSocket: "localabstract:chrome_devtools_remote",
+        },
+      }],
     })
     bindings.device = {
       bindingId: item.bindingId,

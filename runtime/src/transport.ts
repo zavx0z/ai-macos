@@ -65,12 +65,16 @@ const adminDrainReceiptSchema = z.strictObject({
   runtimeEpoch: z.string().min(1).max(64), runtimeBuildId: z.string().min(1).max(127), nativeBuildId: z.string().min(1).max(127),
   cleanup: z.literal("complete"), activeOperations: z.literal(0), quarantinedResources: z.literal(0),
 })
+const adminRecoveryRequestSchema = adminDrainRequestSchema.extend({ operationId: z.string().min(1).max(127).optional() })
+const adminRecoveryResultSchema = z.strictObject({ resolved: z.number().int().min(0), unresolved: z.number().int().min(0),
+  remainingOperations: z.number().int().min(0), admissionSealed: z.boolean() })
 export type RuntimeAdminInspection = z.infer<typeof adminInspectionSchema>
 export type RuntimeAdminDrainRequest = z.infer<typeof adminDrainRequestSchema>
 export type RuntimeAdminDrainReceipt = z.infer<typeof adminDrainReceiptSchema>
 export type RuntimeAdminBinding = {
   inspect(): RuntimeAdminInspection
   drain(expected: RuntimeAdminDrainRequest, signal: AbortSignal): Promise<RuntimeAdminDrainReceipt>
+  recover?(expected: z.infer<typeof adminRecoveryRequestSchema>, signal: AbortSignal): Promise<z.infer<typeof adminRecoveryResultSchema>>
 }
 
 export type RuntimeTransportOptions = {
@@ -110,6 +114,7 @@ export class RuntimeUdsServer {
     this.#catalog = options.catalog
     this.#admin = options.admin === undefined ? undefined : Object.freeze({
       inspect: options.admin.inspect.bind(options.admin), drain: options.admin.drain.bind(options.admin),
+      ...(options.admin.recover === undefined ? {} : { recover: options.admin.recover.bind(options.admin) }),
     })
   }
 
@@ -181,6 +186,13 @@ export class RuntimeUdsServer {
         if (this.#admin === undefined) return json({ error: "admin-unavailable" }, 503)
         const current = adminInspectionSchema.parse(this.#admin.inspect())
         if (request.method === "GET" && url.pathname === "/v1/admin/inspect") return json(current)
+        if (request.method === "POST" && url.pathname === "/v1/admin/recover") {
+          if (this.#admin.recover === undefined) return json({ error: "recovery-unavailable" }, 503)
+          const expected = await readJson(request, adminRecoveryRequestSchema)
+          if (current.runtimeEpoch !== expected.runtimeEpoch || current.runtimeBuildId !== expected.buildId
+            || expected.nativeBuildId !== undefined && current.nativeBuildId !== expected.nativeBuildId) throw new Error("Admin recovery generation/build mismatch")
+          return json(adminRecoveryResultSchema.parse(await this.#admin.recover(expected, request.signal)))
+        }
         if (request.method === "POST" && url.pathname === "/v1/admin/drain") {
           const expected = await readJson(request, adminDrainRequestSchema)
           if (current.runtimeEpoch !== expected.runtimeEpoch || current.runtimeBuildId !== expected.buildId
@@ -388,6 +400,12 @@ export class RuntimeUdsClient {
   async adminDrain(expected: RuntimeAdminDrainRequest, signal?: AbortSignal): Promise<RuntimeAdminDrainReceipt> {
     return adminDrainReceiptSchema.parse(await this.#request("/v1/admin/drain", {
       method: "POST", admin: true, body: adminDrainRequestSchema.parse(expected), signal,
+    }))
+  }
+
+  async adminRecover(expected: z.infer<typeof adminRecoveryRequestSchema>, signal?: AbortSignal) {
+    return adminRecoveryResultSchema.parse(await this.#request("/v1/admin/recover", {
+      method: "POST", admin: true, body: adminRecoveryRequestSchema.parse(expected), signal,
     }))
   }
 

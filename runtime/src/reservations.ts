@@ -34,6 +34,13 @@ import {
 } from "@meta/shared/contracts"
 import { ClientSessionRegistry } from "./client-sessions.ts"
 import { canonicalJson, randomIdSource, systemClock, type RuntimeClock, type RuntimeIdSource } from "./primitives.ts"
+import {
+  lifetimeBindingPersistenceSchema,
+  type LifetimeBindingPersistence,
+  type LifetimeStateRecord,
+  type LifetimeStableOwner,
+  type PersistentLifetimeStore,
+} from "./lifetime-state.ts"
 
 type Request = BrowserOperationRequest | DeviceBrowserOperationRequest
 type Result = BrowserOperationResult | DeviceBrowserOperationResult
@@ -67,6 +74,7 @@ type Binding = {
   domain: "browser" | "device"
   adapter: BrowserAdapter | DeviceBrowserAdapter
   verifier: Readonly<BrowserLifetimeVerifier>
+  persistence?: readonly LifetimeBindingPersistence[]
 }
 
 type Slot = {
@@ -80,6 +88,7 @@ type Slot = {
   children: Set<string>
   disconnecting?: string
   operationIds: Set<string>
+  durable?: LifetimeStateRecord
 }
 
 export class BrowserLifetimeCoordinator {
@@ -94,6 +103,8 @@ export class BrowserLifetimeCoordinator {
   readonly #byId = new Map<string, Slot>()
   readonly #ttlMs: number
   readonly #shutdownStepMs: number
+  readonly #store?: PersistentLifetimeStore
+  readonly #durableByPhysical = new Map<string, LifetimeStateRecord>()
   readonly #stageRecovered: (operationIds: readonly string[]) => Promise<() => void>
   readonly authority: LifetimeReservationAuthority & {
     resume(session: RuntimeClientSession, reservationId: string): Promise<LifetimeReservationHandle>
@@ -109,6 +120,7 @@ export class BrowserLifetimeCoordinator {
     ids?: RuntimeIdSource
     ttlMs?: number
     shutdownStepMs?: number
+    store?: PersistentLifetimeStore
     stageRecovered: (operationIds: readonly string[]) => Promise<() => void>
   }) {
     this.#generation = options.generation
@@ -119,6 +131,7 @@ export class BrowserLifetimeCoordinator {
     this.#ids = options.ids ?? randomIdSource
     this.#ttlMs = options.ttlMs ?? 120_000
     this.#shutdownStepMs = options.shutdownStepMs ?? 5_000
+    this.#store = options.store
     this.#stageRecovered = options.stageRecovered
     if (!Number.isSafeInteger(this.#ttlMs) || this.#ttlMs < 1 || this.#ttlMs > 86_400_000) throw new Error("Reservation TTL вне допустимого диапазона")
     if (!Number.isSafeInteger(this.#shutdownStepMs) || this.#shutdownStepMs < 1 || this.#shutdownStepMs > 30_000) throw new Error("Reservation shutdown budget вне допустимого диапазона")
@@ -132,6 +145,21 @@ export class BrowserLifetimeCoordinator {
   configure(id: string, binding: Binding): void {
     if (this.#bindings.has(id)) throw new Error("Lifetime binding immutable: уже зарегистрирован")
     if (!structurallyEqual(binding.adapter.host.generation, this.#generation)) throw new Error("Adapter принадлежит другой runtime generation")
+    const persistence = binding.persistence === undefined
+      ? undefined
+      : binding.persistence.map(value => lifetimeBindingPersistenceSchema.parse(value))
+    if (this.#store !== undefined && persistence === undefined) throw new Error("Durable lifetime binding требует persistence metadata")
+    if (persistence !== undefined) {
+      if (persistence.length < 1 || persistence.length > 128) throw new Error("Durable binding требует 1..128 persistence entries")
+      const physical = persistence.map(physicalKey)
+      const owners = persistence.map(value => canonicalJson(value.owner))
+      if (new Set(physical).size !== physical.length || new Set(owners).size !== owners.length) {
+        throw new Error("Durable binding содержит duplicate owner/physical key")
+      }
+      if ([...this.#bindings.values()].some(existing => existing.persistence?.some(value => physical.includes(physicalKey(value))))) {
+        throw new Error("Physical lifetime ownership key уже настроен другим binding")
+      }
+    }
     this.#bindings.set(id, {
       domain: binding.domain,
       adapter: binding.adapter,
@@ -141,7 +169,53 @@ export class BrowserLifetimeCoordinator {
         verifyCompletion: binding.verifier.verifyCompletion.bind(binding.verifier),
         recoverRemoval: binding.verifier.recoverRemoval.bind(binding.verifier),
       }),
+      ...(persistence === undefined ? {} : { persistence: Object.freeze(persistence.map(value => Object.freeze(value))) }),
     })
+  }
+
+  async restorePersisted(): Promise<readonly LifetimeStateRecord[]> {
+    if (this.#store === undefined) return []
+    const restored: LifetimeStateRecord[] = []
+    for (const loaded of await this.#store.loadAll()) {
+      this.#durableByPhysical.set(physicalKey(loaded), loaded)
+      if (loaded.state === "released") continue
+      const binding = this.#bindings.get(loaded.bindingId)
+      const persistence = binding === undefined ? undefined : persistenceForOwner(binding, loaded.owner)
+      if (persistence === undefined
+        || persistence.configFingerprint !== loaded.configFingerprint
+        || physicalKey(persistence) !== physicalKey(loaded)) {
+        throw new Error("Persisted lifetime binding/config/physical ownership mismatch")
+      }
+      const quarantined = await this.#store.persist({
+        ...loaded,
+        state: "quarantined",
+        ...(loaded.handle === undefined ? {} : {
+          handle: {
+            ...loaded.handle,
+            state: "quarantined",
+            statusRevision: loaded.handle.statusRevision + 1,
+          },
+        }),
+        revision: loaded.revision + 1,
+        updatedAt: this.#clock.now().toISOString(),
+      })
+      const slot: Slot = {
+        operationId: quarantined.operationId,
+        lineageId: quarantined.lineageId,
+        target: structuredClone(quarantined.target),
+        state: "quarantined",
+        bindingId: quarantined.bindingId,
+        ...(quarantined.handle === undefined ? {} : { handle: structuredClone(quarantined.handle) }),
+        children: new Set(),
+        operationIds: new Set(quarantined.operationIds),
+        durable: quarantined,
+      }
+      this.#slots.set(stableKey(slot.target), slot)
+      if (slot.handle !== undefined) this.#byId.set(slot.handle.reservationId, slot)
+      this.#durableByPhysical.set(physicalKey(quarantined), quarantined)
+      restored.push(structuredClone(quarantined))
+    }
+    return restored
   }
 
   async execute(
@@ -174,6 +248,13 @@ export class BrowserLifetimeCoordinator {
         const existing = this.#slots.get(key)
         if (existing !== undefined) this.#expire(existing)
         if (request.kind === "connect-instance") {
+          const persistence = persistenceForTarget(binding, instance)
+          if (persistence !== undefined) {
+            const durable = this.#durableByPhysical.get(physicalKey(persistence))
+            if (durable !== undefined && durable.state !== "released") {
+              throw new Error("Physical lifetime ownership остаётся active/quarantined после прежней generation")
+            }
+          }
           if (existing !== undefined && existing.state !== "released") throw new Error("Exclusive lifetime reservation уже занята до connect")
           slot = {
             operationId: received.wire.operationId,
@@ -184,6 +265,7 @@ export class BrowserLifetimeCoordinator {
             children: new Set(),
             operationIds: new Set([received.wire.operationId]),
           }
+          await this.#persistSlot(slot, binding, "connecting")
           this.#slots.set(key, slot)
         } else {
           if (existing === undefined || existing.bindingId !== bindingId || existing.state !== "active"
@@ -198,6 +280,7 @@ export class BrowserLifetimeCoordinator {
           existing.children.add(received.wire.operationId)
           existing.operationIds.add(received.wire.operationId)
           slot = existing
+          await this.#persistSlot(existing, binding, existing.state)
         }
       },
       stage: async (record, result) => {
@@ -214,10 +297,13 @@ export class BrowserLifetimeCoordinator {
           else assertDeviceBrowserResultMatchesRequest(request as DeviceBrowserOperationRequest, parsed.value as DeviceBrowserOperationResult)
         }
         await binding.verifier.verifyCompletion(request, parsed as AdapterResult<Result>, context.control.signal)
-        if (!parsed.ok) return () => {
+        if (!parsed.ok) {
+          await this.#persistSlot(slot, binding, "quarantined")
+          return () => {
           slot!.children.delete(record.context.operationId)
           delete slot!.disconnecting
           this.#quarantine(slot!)
+          }
         }
         if (request.kind === "connect-instance") {
           if (parsed.value.value.kind !== "instance-connected") throw new Error("Connect не вернул actual instance")
@@ -242,6 +328,7 @@ export class BrowserLifetimeCoordinator {
             state: "active",
             statusRevision: 1,
           })
+          await this.#persistSlot(slot, binding, "active", actual, handle)
           return () => {
             slot!.target = structuredClone(actual)
             slot!.handle = structuredClone(handle)
@@ -262,6 +349,11 @@ export class BrowserLifetimeCoordinator {
             cleanupEvidenceRef: record.context.operationId,
             issuedAt: this.#clock.now().toISOString(),
             state: "released",
+          })
+          await this.#persistSlot(slot, binding, "released", slot.target, {
+            ...slot.handle,
+            state: "released",
+            statusRevision: receipt.statusRevision,
           })
           return () => {
             slot!.state = "released"
@@ -301,7 +393,7 @@ export class BrowserLifetimeCoordinator {
       if (slot.children.size > 0 || slot.disconnecting !== undefined) {
         throw new Error("Lifetime shutdown требует drained child operations и отсутствие disconnect in-flight")
       }
-      if (slot.state === "connecting" || slot.handle === undefined) {
+      if (slot.state === "connecting") {
         this.#quarantine(slot)
         throw new Error("Lifetime shutdown обнаружил незавершённый connect без reservation handle")
       }
@@ -316,21 +408,29 @@ export class BrowserLifetimeCoordinator {
           await binding.verifier.recoverRemoval(slot.target, boundedSignal)
           await binding.verifier.verifyRemoved(slot.target, boundedSignal)
           const commitPrevious = await this.#stageRecovered([...slot.operationIds])
-          const receipt = reservationCleanupReceiptSchema.parse({
+          const receipt = slot.handle === undefined ? undefined : reservationCleanupReceiptSchema.parse({
             receiptId: this.#ids.next("reservation-shutdown"),
-            reservationId: slot.handle!.reservationId,
-            reservationGeneration: slot.handle!.reservationGeneration,
-            externalGeneration: slot.handle!.externalGeneration,
-            statusRevision: slot.handle!.statusRevision + 1,
+            reservationId: slot.handle.reservationId,
+            reservationGeneration: slot.handle.reservationGeneration,
+            externalGeneration: slot.handle.externalGeneration,
+            statusRevision: slot.handle.statusRevision + 1,
             cleanupEvidenceRef: slot.disconnecting!,
             issuedAt: this.#clock.now().toISOString(),
             state: "released",
           })
+          const releasedHandle = slot.handle === undefined || receipt === undefined ? undefined : {
+            ...slot.handle,
+            state: "released" as const,
+            statusRevision: receipt.statusRevision,
+          }
+          await this.#persistSlot(slot, binding, "released", slot.target, releasedHandle)
           return () => {
             commitPrevious()
             slot.state = "released"
-            slot.receipt = receipt
-            slot.handle = { ...slot.handle!, state: "released", statusRevision: receipt.statusRevision }
+            if (receipt !== undefined && releasedHandle !== undefined) {
+              slot.receipt = receipt
+              slot.handle = releasedHandle
+            }
             delete slot.disconnecting
           }
         }, signal)
@@ -353,6 +453,40 @@ export class BrowserLifetimeCoordinator {
       || slot.lineageId !== this.#clients.lineage(request.session)
       || !structurallyEqual(slot.target, target)) throw new Error("Child не допущен runtime lifetime coordinator")
     return structuredClone(slot.handle)
+  }
+
+  async #persistSlot(
+    slot: Slot,
+    binding: Binding,
+    state: LifetimeStateRecord["state"],
+    target: InstanceTarget = slot.target,
+    handle: LifetimeReservationHandle | undefined = slot.handle,
+  ): Promise<void> {
+    if (this.#store === undefined) return
+    const persistence = persistenceForTarget(binding, target)
+    if (persistence === undefined) throw new Error("Durable lifetime binding metadata отсутствует для exact instance")
+    const key = physicalKey(persistence)
+    const previous = slot.durable ?? this.#durableByPhysical.get(key)
+    const sameLifetime = previous !== undefined && previous.state !== "released"
+    const record = await this.#store.persist({
+      runtimeEpoch: sameLifetime ? previous.runtimeEpoch : this.#generation.runtimeEpoch,
+      loginSessionId: sameLifetime ? previous.loginSessionId : this.#generation.loginSessionId,
+      bindingId: slot.bindingId,
+      owner: persistence.owner,
+      configFingerprint: persistence.configFingerprint,
+      physicalOwnershipKey: persistence.physicalOwnershipKey,
+      lineageId: sameLifetime ? previous.lineageId : slot.lineageId,
+      operationId: sameLifetime ? previous.operationId : slot.operationId,
+      initialTarget: sameLifetime ? previous.initialTarget : slot.target,
+      target,
+      ...(handle === undefined ? {} : { handle }),
+      state,
+      revision: (previous?.revision ?? 0) + 1,
+      operationIds: [...slot.operationIds],
+      updatedAt: this.#clock.now().toISOString(),
+    })
+    slot.durable = record
+    this.#durableByPhysical.set(key, record)
   }
 
   async #boundedShutdown<T>(work: (signal: AbortSignal) => Promise<T>, external?: AbortSignal): Promise<T> {
@@ -424,6 +558,14 @@ export class BrowserLifetimeCoordinator {
         await binding.verifier.verifyRemoved(target, context.control.signal)
         await this.#clients.assertActive(session, this.#clock.now())
         const commitPrevious = await this.#stageRecovered([...slot.operationIds])
+        const recoveredBinding = this.#bindings.get(slot.bindingId)
+        if (recoveredBinding === undefined) throw new Error("Recovery binding исчез")
+        const nextHandle = slot.handle === undefined ? undefined : {
+          ...slot.handle,
+          state: "released" as const,
+          statusRevision: slot.handle.statusRevision + 1,
+        }
+        await this.#persistSlot(slot, recoveredBinding, "released", slot.target, nextHandle)
         return () => {
           commitPrevious()
           slot!.state = "released"
@@ -499,4 +641,24 @@ function stableKey(target: InstanceTarget): string {
   return target.kind === "browser-instance"
     ? canonicalJson([target.kind, target.ref.browserInstanceRef])
     : canonicalJson([target.kind, target.ref.deviceRef, target.ref.serial])
+}
+
+function physicalKey(value: LifetimeBindingPersistence | LifetimeStateRecord): string {
+  return canonicalJson(value.physicalOwnershipKey)
+}
+
+function persistenceForTarget(binding: Binding, target: InstanceTarget): LifetimeBindingPersistence | undefined {
+  const owner: LifetimeStableOwner = target.kind === "browser-instance"
+    ? { kind: "browser", browserInstanceRef: target.ref.browserInstanceRef }
+    : {
+        kind: "device-browser",
+        deviceRef: target.ref.deviceRef,
+        serial: target.ref.serial,
+        browserInstanceRef: target.ref.browserInstanceRef,
+      }
+  return persistenceForOwner(binding, owner)
+}
+
+function persistenceForOwner(binding: Binding, owner: LifetimeStableOwner): LifetimeBindingPersistence | undefined {
+  return binding.persistence?.find(value => structurallyEqual(value.owner, owner))
 }

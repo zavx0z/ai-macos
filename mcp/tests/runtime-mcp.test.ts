@@ -42,6 +42,7 @@ test("thin MCP exposes authenticated runtime health/status/cancel catalog withou
 
   const tools = await client.listTools()
   expect(tools.tools.map(tool => tool.name)).toEqual([
+    "recover_startup_input",
     "system_health",
     "get_operation",
     "cancel_operation",

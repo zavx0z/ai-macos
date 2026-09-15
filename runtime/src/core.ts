@@ -4,6 +4,7 @@ import {
   browserExecutionContextSchema,
   capabilitySetSchema,
   cleanupOutcomeSchema,
+  cleanupAuthorityReceiptSchema,
   clipboardExecutionContextSchema,
   deviceExecutionContextSchema,
   nativeExecutionContextSchema,
@@ -55,6 +56,7 @@ import type { PersistentOperationJournal, StoredOperationEvidence } from "./stor
 import type { StoredClientSession } from "./client-sessions.ts"
 import type { NativePointEvidenceProvider } from "./authorities.ts"
 import { ClientDisconnectGrace } from "./client-grace.ts"
+import type { PersistentLifetimeStore } from "./lifetime-state.ts"
 
 type JournalEntry = {
   session?: RuntimeClientSession
@@ -80,6 +82,10 @@ export interface BackendCompletionVerifier {
 export type RuntimeNativeDeliveryAuthority = Readonly<{
   register(wire: NativeExecutionContext): void
   assertNeverAttempted(wire: NativeExecutionContext): void
+}>
+export type StartupRecoveryAuthority = Readonly<{
+  receiptFor(record: OperationRecord): Promise<CleanupAuthorityReceipt | undefined>
+  unresolvedHeld(): Promise<number>
 }>
 
 export type LateCleanupReport = {
@@ -110,6 +116,8 @@ export type RuntimeCoreOptions = {
   clientPersistence?: { sessions: readonly StoredClientSession[], persist(sessions: readonly StoredClientSession[]): Promise<void> }
   clientGraceMs?: number
   nativeDelivery?: RuntimeNativeDeliveryAuthority
+  startupRecovery?: StartupRecoveryAuthority
+  lifetimeStore?: PersistentLifetimeStore
 }
 
 export type ReserveCapturePublicationRequest = Pick<ObservationPublication,
@@ -166,12 +174,18 @@ export class RuntimeCore implements RuntimeAdapter {
   #storageInitialized: boolean
   #recoveryEvidence: StoredOperationEvidence[] = []
   readonly #startupRecoveryReasons: string[] = []
+  readonly #startupRecovery?: StartupRecoveryAuthority
+  #startupPendingHeld = 0
   #fenceCounter = 0
 
   constructor(options: RuntimeCoreOptions) {
     this.generation = options.generation
     this.#runtimeBuildId = options.runtimeBuildId
     this.#nativeGeneration = options.nativeGeneration
+    this.#startupRecovery = options.startupRecovery === undefined ? undefined : Object.freeze({
+      receiptFor: options.startupRecovery.receiptFor.bind(options.startupRecovery),
+      unresolvedHeld: options.startupRecovery.unresolvedHeld.bind(options.startupRecovery),
+    })
     this.#nativeDelivery = options.nativeDelivery === undefined ? undefined : Object.freeze({
       register: options.nativeDelivery.register.bind(options.nativeDelivery),
       assertNeverAttempted: options.nativeDelivery.assertNeverAttempted.bind(options.nativeDelivery),
@@ -201,6 +215,7 @@ export class RuntimeCore implements RuntimeAdapter {
       clock: this.#clock,
       ids: this.#ids,
       ttlMs: options.reservationTtlMs,
+      store: options.lifetimeStore,
       lookup: id => this.#journal.get(id)?.record,
       stageRecovered: ids => this.#stageLifetimeRecovery(ids),
       run: (session, intent, request, execute, lifecycle, signal) => this.#runOperation(session, intent, request, execute, lifecycle, signal),
@@ -420,7 +435,8 @@ export class RuntimeCore implements RuntimeAdapter {
     if (this.#storageInitialized) return structuredClone(this.#recoveryEvidence)
     this.sealAdmission()
     this.#recoveryEvidence = (await this.#operationJournal.loadRecoveryEvidence())
-      .filter(evidence => evidence.record.context.loginSessionId === this.generation.loginSessionId)
+      .filter(evidence => evidence.record.context.loginSessionId === this.generation.loginSessionId
+        && (!isTerminal(evidence.record) || evidence.record.outcome.cleanup.state !== "complete"))
     if (this.#clientPersistence !== undefined && this.#operationJournal.loadAll !== undefined) {
       for (const { record, revision } of await this.#operationJournal.loadAll()) {
         const lineageId = this.clients.historicalLineage(record.clientSessionId, record.principalId)
@@ -436,18 +452,53 @@ export class RuntimeCore implements RuntimeAdapter {
       }
     }
     this.#storageInitialized = true
-    if (this.#recoveryEvidence.length === 0) this.unsealAdmission()
+    await this.refreshStartupRecovery(true)
     return structuredClone(this.#recoveryEvidence)
   }
 
   recoveryEvidence(): readonly StoredOperationEvidence[] { return structuredClone(this.#recoveryEvidence) }
+
+  async refreshStartupRecovery(reopen = false): Promise<void> {
+    if (this.#startupRecovery !== undefined && this.#operationJournal !== undefined) {
+      const remaining: StoredOperationEvidence[] = []
+      for (const evidence of this.#recoveryEvidence) {
+        const candidate = await this.#startupRecovery.receiptFor(structuredClone(evidence.record))
+        if (candidate === undefined) {
+          remaining.push(evidence)
+          continue
+        }
+        const receipt = cleanupAuthorityReceiptSchema.parse(candidate)
+        const record = evidence.record
+        if (receipt.operationId !== record.context.operationId || receipt.runtimeEpoch !== record.context.runtimeEpoch
+          || receipt.loginSessionId !== record.context.loginSessionId || receipt.state !== "complete"
+          || receipt.leases.length !== record.resources.length || record.resources.some(handle => !receipt.leases.some(lease =>
+            lease.leaseId === handle.leaseId && lease.leaseGeneration === handle.leaseGeneration))) throw new Error("Startup cleanup receipt не соответствует old operation")
+        const restored = operationRecordSchema.parse({ ...record,
+          state: isTerminal(record) ? record.state : "interrupted-unknown",
+          outcome: { ...record.outcome, cleanup: releasedCleanup(record.resources) }, updatedAt: receipt.issuedAt })
+        const entry = this.#journal.get(record.context.operationId)
+        if (entry !== undefined) {
+          await this.#persist(entry, restored, receipt)
+          entry.record = restored
+        } else {
+          await this.#awaitDurable(this.#operationJournal.persist(restored, evidence.revision + 1, { cleanupReceipt: receipt }))
+        }
+      }
+      this.#recoveryEvidence = remaining
+      this.#startupPendingHeld = await this.#startupRecovery.unresolvedHeld()
+    }
+    if (this.#recoveryEvidence.length > 0 || this.#startupPendingHeld > 0) this.sealAdmission()
+    else if (reopen && this.#startupRecoveryReasons.length === 0 && !this.#storagePoisoned) this.unsealAdmission()
+  }
 
   quarantineStartup(reason: string): void {
     this.#startupRecoveryReasons.push(reason)
     this.sealAdmission()
   }
 
-  startupRecoveryReasons(): readonly string[] { return [...this.#startupRecoveryReasons] }
+  startupRecoveryReasons(): readonly string[] {
+    return [...this.#startupRecoveryReasons, ...(this.#startupPendingHeld > 0 ? ["Durable held-input ledger требует подтверждённого startup recovery"] : [])]
+  }
 
   sealAdmission(): void {
     if (this.#admissionSealed) return
@@ -457,7 +508,7 @@ export class RuntimeCore implements RuntimeAdapter {
 
   unsealAdmission(): void {
     if (!this.#admissionSealed) return
-    if (this.#storagePoisoned || !this.#storageInitialized || this.#recoveryEvidence.length > 0 || this.#startupRecoveryReasons.length > 0 || this.activeOperationCount() !== 0 || this.resources.quarantinedCount() !== 0) throw new Error("Runtime admission нельзя открыть при active/unknown operations")
+    if (this.#storagePoisoned || !this.#storageInitialized || this.#recoveryEvidence.length > 0 || this.#startupPendingHeld > 0 || this.#startupRecoveryReasons.length > 0 || this.activeOperationCount() !== 0 || this.resources.quarantinedCount() !== 0) throw new Error("Runtime admission нельзя открыть при active/unknown operations")
     this.#admissionSealed = false
     for (const listener of this.#admissionListeners) listener()
   }
