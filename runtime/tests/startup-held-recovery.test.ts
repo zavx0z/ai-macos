@@ -21,7 +21,7 @@ test("restart recovery оставляет ledger immutable, held блокиру�
   const oldGeneration = { runtimeEpoch: "runtime:old-held", loginSessionId }
   const oldNative = "native:old-held"
   const old = new RuntimeCore({ generation: oldGeneration, runtimeBuildId: "build:held", nativeGeneration: oldNative,
-    native: {} as NativeAdapter, operationJournal: journal })
+    native: {} as NativeAdapter, operationJournal: journal, nativeRecovery: { policyVersion: "1", nativeBuildId: "build:held" } })
   await old.initializeRecovery()
   const credential = old.openClient("principal:held")
   const target = { kind: "display" as const, ref: { ...oldGeneration, nativeGeneration: oldNative, displayRef: "display:held", displayLayoutRevision: 0 } }
@@ -30,13 +30,18 @@ test("restart recovery оставляет ledger immutable, held блокиру�
     const interrupted = await old.runOperation(credential.session, runtimeOperationIntentSchema.parse({ intent: "mutation", clientRequestId: "request:held",
       precondition: { target, inventoryId: "inventory:held", inventoryRevision: 0 }, deadlineAt: new Date(Date.now() + 5000).toISOString(),
       requestedResources: [{ kind: "desktop-input", resourceRef: "desktop" }],
-    }), {}, async () => { throw new Error("injected crash boundary") })
+    }), {}, async context => {
+      if (context.wire.kind !== "native") throw new Error("Native context expected")
+      await old.authorizeNativeMutation(context.wire, { policyVersion: "1", nativeBuildId: "build:held", method: "input.execute",
+        domain: "possible-held-input", possibleHolds: [{ kind: "key", code: 56 }] })
+      throw new Error("injected crash boundary")
+    })
     const operationId = interrupted.operation.context.operationId
     await ledgers.persist("ledger:old", { canonicalVersion: "1", ...oldGeneration, nativeGeneration: oldNative,
       operationId, revision: 1, entries: [{ sequence: 1, kind: "key", code: 56, state: "pending-down" }] })
     const originalLedger = JSON.stringify(await ledgers.loadAll())
     await actors.register(nativeHandshakeResponseSchema.parse({ kind: "handshake-response", protocolVersion: "1", requestId: "handshake:held",
-      ...oldGeneration, nativeGeneration: oldNative, nativeBuildId: "build:held", capabilitySchemaVersion: "1", installRoot: "/tmp/held-fixture",
+      ...oldGeneration, nativeGeneration: oldNative, nativeBuildId: "build:held", recoveryDomainVersion: "1", capabilitySchemaVersion: "1", installRoot: "/tmp/held-fixture",
       process: { pid: 100, startedAt: new Date().toISOString(), nonce: "nonce:held" },
       session: { verified: true, source: "darwin-audit", uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 1 },
       capabilities: { scope: "adapter", schemaVersion: "1", producerRef: "native:held", capabilities: [] },

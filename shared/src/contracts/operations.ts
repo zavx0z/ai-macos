@@ -22,6 +22,7 @@ import {
   type CleanupAuthorityReceipt,
 } from "./resources.ts"
 import { isoTimestampSchema } from "./schema.ts"
+import { nativeRecoveryStateSchema } from "./recovery-domain.ts"
 
 export const runtimeClientSessionSchema = z.strictObject({
   clientSessionId: opaqueIdSchema,
@@ -248,10 +249,24 @@ export const operationRecordSchema = z.strictObject({
   outcome: operationOutcomeSchema,
   resources: z.array(runtimeResourceHandleSchema).max(16),
   payloadReceipt: payloadReceiptSchema,
+  nativeRecovery: nativeRecoveryStateSchema.optional(),
   registeredAt: isoTimestampSchema,
   updatedAt: isoTimestampSchema,
   error: contractErrorSchema.optional(),
 }).superRefine((record, context) => {
+  if (record.nativeRecovery !== undefined) {
+    if (record.context.kind !== "native" && record.context.kind !== "clipboard") {
+      context.addIssue({ code: "custom", path: ["nativeRecovery"], message: "Native recovery gate требует native-backed context" })
+    } else {
+      const recovery = record.nativeRecovery
+      const generation = recovery.phase === "not-authorized" ? recovery.nativeGeneration : recovery.grant.nativeGeneration
+      if (record.context.kind === "native" && generation !== record.context.nativeGeneration || recovery.phase === "send-authorized" && (
+        recovery.grant.operationId !== record.context.operationId || recovery.grant.runtimeEpoch !== record.context.runtimeEpoch
+        || recovery.grant.loginSessionId !== record.context.loginSessionId)) {
+        context.addIssue({ code: "custom", path: ["nativeRecovery"], message: "Native recovery gate принадлежит другой operation/generation" })
+      }
+    }
+  }
   if (
     record.clientSessionId !== record.context.clientSessionId
     || record.principalId !== record.context.principalId

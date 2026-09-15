@@ -5,6 +5,7 @@ import {
   canTransitionOperation,
   cleanupAuthorityReceiptSchema,
   operationRecordSchema,
+  canonicalRecoveryJson,
   z,
   type CleanupAuthorityReceipt,
   type OperationRecord,
@@ -88,6 +89,7 @@ export class FileOperationJournal implements PersistentOperationJournal {
       const key = operationKey(record)
       const path = this.#path(key)
       const existing = await this.#readEnvelope(path)
+      if (existing === undefined && record.nativeRecovery?.phase === "send-authorized") throw new Error("Authorized gate требует предыдущий durable not-authorized marker")
       if (existing !== undefined) {
         if (revision < existing.revision) {
           throw new Error("Operation journal revision ниже durable revision")
@@ -115,6 +117,7 @@ export class FileOperationJournal implements PersistentOperationJournal {
           existing.record,
           record,
           options.cleanupReceipt,
+          revision,
         )
       }
       await assertRecordCapacity(this.#directory, path)
@@ -250,7 +253,24 @@ function assertMonotonicOperationFacts(
   previous: OperationRecord,
   next: OperationRecord,
   cleanupReceipt: CleanupAuthorityReceipt | undefined,
+  revision: number,
 ): void {
+  const before = previous.nativeRecovery
+  const after = next.nativeRecovery
+  if (before === undefined && after !== undefined) throw new Error("Legacy operation не получает retrospectively trusted send gate")
+  if (before !== undefined) {
+    if (after === undefined) throw new Error("Native recovery gate не может исчезнуть")
+    if (before.phase === "send-authorized") {
+      if (canonicalRecoveryJson(before) !== canonicalRecoveryJson(after)) throw new Error("Authorized recovery descriptor immutable")
+    } else if (after.phase === "not-authorized") {
+      if (canonicalRecoveryJson(before) !== canonicalRecoveryJson(after)) throw new Error("Native recovery gate binding immutable")
+    } else {
+      if (TERMINAL_OPERATION_STATES.includes(previous.state)) throw new Error("Terminal operation не может получить новое send authorization")
+      if (after.grant.descriptor.nativeBuildId !== before.nativeBuildId || after.grant.nativeGeneration !== before.nativeGeneration
+        || after.grant.journalRevision !== revision || after.grant.contextSha256 !== sha256(canonicalRecoveryJson(next.context))
+        || after.grant.descriptorSha256 !== sha256(canonicalRecoveryJson(after.grant.descriptor))) throw new Error("Native recovery grant не соответствует durable transition")
+    }
+  }
   if (next.outcome.dispatchAttempts < previous.outcome.dispatchAttempts) {
     throw new Error("Operation journal revision откатывает dispatchAttempts")
   }

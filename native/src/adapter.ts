@@ -7,6 +7,10 @@ import {
   nativeResponseMatchesRequest,
   nativeStatusMatchesRequest,
   nativeExecutionContextSchema,
+  clipboardExecutionContextSchema,
+  nativeRecoveryGrantSchema,
+  nativeRecoveryDescriptorSchema,
+  canonicalRecoveryJson,
   opaqueIdSchema,
   parseWireValue,
   type AdapterControl,
@@ -27,6 +31,9 @@ import {
   type NativeHeartbeatRequest,
   type NativeOperationStatus,
   type NativeExecutionContext,
+  type ClipboardExecutionContext,
+  type NativeRecoveryDescriptor,
+  type NativeRecoveryGrant,
   type NativeStatusRequest,
   type ObservedEvent,
   type z,
@@ -54,6 +61,33 @@ import { nativeHitTestRequestSchema, nativeHitTestResponseSchema, nativeHitTestR
   type NativeHitTestRequest, type NativeHitTestResponse } from "./hit-test-protocol.ts"
 import { nativeInputReadinessRequestSchema, nativeInputReadinessResponseSchema, nativeInputReadinessResultMatches,
   type NativeInputReadinessRequest, type NativeInputReadinessResponse } from "./readiness-protocol.ts"
+import { classifyNativeRecoveryDescriptor } from "./recovery-domain-classifier.ts"
+
+export type NativeRecoveryAuthorizer = (
+  wire: NativeExecutionContext | ClipboardExecutionContext,
+  descriptor: NativeRecoveryDescriptor,
+) => Promise<NativeRecoveryGrant>
+
+function recoveryDigest(value: unknown): string {
+  return new Bun.CryptoHasher("sha256").update(canonicalRecoveryJson(value)).digest("hex")
+}
+
+async function waitForRecoveryGrant(work: Promise<NativeRecoveryGrant>, signal: AbortSignal, deadlineAt: string): Promise<NativeRecoveryGrant> {
+  signal.throwIfAborted()
+  const remaining = Date.parse(deadlineAt) - Date.now()
+  if (remaining <= 0) throw new Error("Recovery authorization deadline истёк до send")
+  return await new Promise((resolve, reject) => {
+    const done = () => {
+      clearTimeout(timer)
+      signal.removeEventListener("abort", abort)
+    }
+    const abort = () => { done(); reject(signal.reason ?? new Error("Recovery authorization отменена")) }
+    const timer = setTimeout(() => { done(); reject(new Error("Recovery authorization deadline истёк до send")) }, remaining)
+    signal.addEventListener("abort", abort, { once: true })
+    void work.then(value => { done(); resolve(value) }, error => { done(); reject(error) })
+    if (signal.aborted) abort()
+  })
+}
 
 export interface NativeTransport {
   send(frame: NativeTransportRequestFrame): Promise<void>
@@ -111,6 +145,10 @@ export class NativeBrokerAdapter implements NativeAdapter {
   #sourceResponses: NativeSourceResponseRegistrar | undefined
   #evidencePublisher: BoundNativeEvidencePublisher | undefined
   #loadedBuildId: string | undefined
+  #recoveryDomainVersion: "1" | undefined
+  #recoveryAuthorizer: NativeRecoveryAuthorizer | undefined
+  #pendingRecoveryAuthorizations = 0
+  #anyMutationAttempted = false
   readonly #readerAbort = new AbortController()
   readonly #pending = new Map<string, PendingResponse>()
   readonly #expired = new Map<string, number>()
@@ -152,7 +190,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
     return {
       state: this.#poisoned !== undefined ? "poisoned" as const : this.#closed ? "closed" as const : this.#rotationSealed ? "draining" as const : rotationRequired ? "rotation-required" as const : "ready" as const,
       requestsUsed: this.#seenRequestIds.size,
-      pendingRequests: this.#pending.size,
+      pendingRequests: this.#pending.size + this.#pendingRecoveryAuthorizations,
       pendingBinaries: this.#binary.size + this.#binaryWaiters.size,
       pendingLedgerWrites: this.#ledgerWrites,
     }
@@ -160,7 +198,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
 
   sealForRotation(): void {
     if (this.#closed || this.#rotationSealed) throw new Error("Native session уже закрыта или дренируется")
-    if (this.#pending.size || this.#binary.size || this.#binaryWaiters.size || this.#ledgerWrites) {
+    if (this.#pending.size || this.#pendingRecoveryAuthorizations || this.#binary.size || this.#binaryWaiters.size || this.#ledgerWrites) {
       throw new Error("Native rotation требует завершённых requests/binaries/ledger writes")
     }
     this.#rotationSealed = true
@@ -208,6 +246,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
       nativeGeneration: response.payload.nativeGeneration,
     }
     this.#loadedBuildId = response.payload.nativeBuildId
+    this.#recoveryDomainVersion = response.payload.recoveryDomainVersion
     const evidence = this.#bindEvidence({
       adapterInstanceRef: this.adapterInstanceRef,
       loadedBuildId: this.#loadedBuildId,
@@ -216,6 +255,52 @@ export class NativeBrokerAdapter implements NativeAdapter {
     this.#evidencePublisher = evidence.publisher
     this.#sourceResponses = evidence.sourceResponses
     return response.payload
+  }
+
+  configureRecoveryAuthority(authorize: NativeRecoveryAuthorizer): void {
+    if (typeof authorize !== "function" || this.#closed || this.#recoveryAuthorizer !== undefined || this.#pendingRecoveryAuthorizations > 0
+      || this.#anyMutationAttempted) {
+      throw new Error("Recovery authority задаётся один раз до mutation send")
+    }
+    this.#recoveryAuthorizer = authorize
+  }
+
+  async #authorizeRecoveryFrame(frame: NativeTransportRequestFrame, control: AdapterControl): Promise<NativeTransportRequestFrame> {
+    const mutation = frame.channel === "request" && frame.payload.intent === "mutation"
+      ? frame.payload
+      : frame.channel === "clipboard" && frame.payload.command.method === "clipboard.write" ? frame.payload : undefined
+    if (mutation === undefined) return frame
+    if (mutation.recoveryGrant !== undefined) throw new Error("Caller recoveryGrant не является durable authority")
+    if (this.#recoveryDomainVersion !== "1") return frame
+    const authorize = this.#recoveryAuthorizer
+    if (authorize === undefined) throw new Error("Native RecoveryDomain v1 требует configured durable authority до send")
+    control.signal.throwIfAborted()
+    if (this.#closed || this.#rotationSealed || this.#pending.size + this.#pendingRecoveryAuthorizations >= 128) {
+      throw new Error("Native session не принимает recovery authorization")
+    }
+    const descriptor = classifyNativeRecoveryDescriptor(mutation, this.loadedBuildId)
+    const contextSha256 = recoveryDigest(mutation.operation)
+    const descriptorSha256 = recoveryDigest(descriptor)
+    const wire = mutation.operation.kind === "native"
+      ? parseWireValue(nativeExecutionContextSchema, mutation.operation)
+      : parseWireValue(clipboardExecutionContextSchema, mutation.operation)
+    this.#pendingRecoveryAuthorizations += 1
+    const work = Promise.resolve().then(async () => {
+      control.signal.throwIfAborted()
+      return await authorize(wire, nativeRecoveryDescriptorSchema.parse(descriptor))
+    }).finally(() => { this.#pendingRecoveryAuthorizations -= 1 })
+    void work.catch(() => undefined)
+    const grant = nativeRecoveryGrantSchema.parse(await waitForRecoveryGrant(work, control.signal, mutation.deadlineAt))
+    if (grant.runtimeEpoch !== mutation.runtimeEpoch || grant.loginSessionId !== mutation.loginSessionId
+      || grant.nativeGeneration !== mutation.nativeGeneration || grant.operationId !== mutation.operation.operationId
+      || grant.contextSha256 !== contextSha256 || grant.descriptorSha256 !== descriptorSha256
+      || recoveryDigest(grant.descriptor) !== descriptorSha256 || canonicalRecoveryJson(grant.descriptor) !== canonicalRecoveryJson(descriptor)) {
+      throw new Error("Durable recovery grant не совпадает с actual context или primitive descriptor")
+    }
+    control.signal.throwIfAborted()
+    await control.checkpoint("native-after-recovery-authority")
+    if (this.#closed || this.#rotationSealed) throw new Error("Native session закрылась до authorized send")
+    return nativeTransportRequestFrameSchema.parse({ ...frame, payload: { ...mutation, recoveryGrant: grant } })
   }
 
   async request<RequestSchema extends z.ZodType, ResponseSchema extends z.ZodType>(
@@ -233,10 +318,10 @@ export class NativeBrokerAdapter implements NativeAdapter {
       operation?: { operationId: string }
     }
     this.#assertGeneration(parsedRequest)
-    const frame = nativeTransportRequestFrameSchema.parse({
+    const frame = await this.#authorizeRecoveryFrame(nativeTransportRequestFrameSchema.parse({
       channel: "request",
       payload: parsedRequest,
-    })
+    }), control)
     const response = await this.#exchange(
       "response",
       frame,
@@ -341,7 +426,8 @@ export class NativeBrokerAdapter implements NativeAdapter {
     const parsed = parseWireValue(nativeClipboardRequestSchema, request, { maxBytes: NATIVE_CLIPBOARD_WIRE_BYTES, maxDepth: 32 })
     this.#assertGeneration(parsed)
     await control.checkpoint("native-before-clipboard")
-    const response = await this.#exchange("clipboard", { channel: "clipboard", payload: parsed }, parsed.requestId, control.signal, parsed.deadlineAt)
+    const frame = await this.#authorizeRecoveryFrame({ channel: "clipboard", payload: parsed }, control)
+    const response = await this.#exchange("clipboard", frame, parsed.requestId, control.signal, parsed.deadlineAt)
     if (response.channel !== "clipboard") throw new Error("Native clipboard response channel mismatch")
     const value = parseWireValue(nativeClipboardResponseSchema, response.payload, { maxBytes: NATIVE_CLIPBOARD_WIRE_BYTES, maxDepth: 32 })
     if (!clipboardResponseMatches(parsed, value)) throw new Error("Native clipboard response identity mismatch")
@@ -561,6 +647,8 @@ export class NativeBrokerAdapter implements NativeAdapter {
         reject,
       })
       try {
+        if ((frame.channel === "request" && frame.payload.intent === "mutation")
+          || (frame.channel === "clipboard" && frame.payload.command.method === "clipboard.write")) this.#anyMutationAttempted = true
         if (frame.channel === "request" && frame.payload.intent === "mutation") this.#deliveryEntry(frame.payload.operation).attempted = true
       } catch (error) {
         this.#pending.delete(key)

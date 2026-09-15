@@ -9,6 +9,7 @@ import {
 } from "./identities.ts"
 import { nativeExecutionContextSchema } from "./operations.ts"
 import { isoTimestampSchema, utf8ByteLength } from "./schema.ts"
+import { nativeRecoveryGrantSchema } from "./recovery-domain.ts"
 
 export const MAX_NATIVE_ENVELOPE_BYTES = 1024 * 1024
 export const MAX_NATIVE_JSON_DEPTH = 32
@@ -37,6 +38,7 @@ export const nativeHandshakeRequestSchema = z.strictObject({
   loginSessionId: generationIdSchema,
   runtimeBuildId: opaqueIdSchema,
   expectedNativeBuildId: opaqueIdSchema,
+  requiredRecoveryDomainVersion: z.literal("1").optional(),
   capabilitySchemaVersion: z.literal(CAPABILITY_SCHEMA_VERSION),
 })
 export type NativeHandshakeRequest = z.infer<typeof nativeHandshakeRequestSchema>
@@ -49,6 +51,7 @@ export const nativeHandshakeResponseSchema = z.strictObject({
   loginSessionId: generationIdSchema,
   nativeGeneration: generationIdSchema,
   nativeBuildId: opaqueIdSchema,
+  recoveryDomainVersion: z.literal("1").optional(),
   capabilitySchemaVersion: z.literal(CAPABILITY_SCHEMA_VERSION),
   installRoot: z.string().min(1).max(4_096).refine(path => path.startsWith("/"), "installRoot должен быть абсолютным"),
   process: processInstanceSchema,
@@ -95,8 +98,15 @@ export function createNativeMutationRequestEnvelopeSchema<Method extends string,
     intent: z.literal("mutation"),
     method: z.literal(method),
     operation: nativeExecutionContextSchema,
+    recoveryGrant: nativeRecoveryGrantSchema.optional(),
     payload,
   }).superRefine((request, context) => {
+    const grant = request.recoveryGrant
+    if (grant !== undefined && (grant.runtimeEpoch !== request.runtimeEpoch || grant.loginSessionId !== request.loginSessionId
+      || grant.nativeGeneration !== request.nativeGeneration || grant.operationId !== request.operation.operationId
+      || grant.descriptor.method !== request.method)) {
+      context.addIssue({ code: "custom", path: ["recoveryGrant"], message: "Recovery grant не соответствует native mutation" })
+    }
     if (
       request.operation.operationId === ""
       || request.operation.runtimeEpoch !== request.runtimeEpoch
@@ -138,6 +148,9 @@ export function nativeHandshakeCompatibility(
   request: NativeHandshakeRequest,
   response: NativeHandshakeResponse,
 ): ContractError | undefined {
+  if (request.requiredRecoveryDomainVersion !== undefined && response.recoveryDomainVersion !== request.requiredRecoveryDomainVersion) {
+    return mismatch("Native recovery domain protocol не поддержан", "apply-compatible-update")
+  }
   if (
     request.requestId !== response.requestId
     || request.runtimeEpoch !== response.runtimeEpoch

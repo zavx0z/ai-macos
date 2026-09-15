@@ -3,6 +3,7 @@ import {
   createNativeResponseEnvelopeSchema,
   isoTimestampSchema,
   nativeResponseBaseSchema,
+  nativeRecoveryGrantSchema,
   structurallyEqual,
   z,
 } from "@meta/shared/contracts"
@@ -25,11 +26,18 @@ export const nativeClipboardRequestSchema = nativeResponseBaseSchema.omit({ oper
   deadlineAt: isoTimestampSchema,
   operation: clipboardExecutionContextSchema,
   command: clipboardMethodSchema,
+  recoveryGrant: nativeRecoveryGrantSchema.optional(),
 }).strict().superRefine((request, context) => {
   if (request.runtimeEpoch !== request.operation.runtimeEpoch
     || request.loginSessionId !== request.operation.loginSessionId
     || request.deadlineAt !== request.operation.deadlineAt) {
     context.addIssue({ code: "custom", message: "Clipboard operation не совпадает с transport runtime/login/deadline" })
+  }
+  const grant = request.recoveryGrant
+  if (grant !== undefined && (request.command.method !== "clipboard.write" || grant.operationId !== request.operation.operationId
+    || grant.runtimeEpoch !== request.runtimeEpoch || grant.loginSessionId !== request.loginSessionId
+    || grant.nativeGeneration !== request.nativeGeneration)) {
+    context.addIssue({ code: "custom", path: ["recoveryGrant"], message: "Clipboard recovery grant не совпадает с mutation envelope" })
   }
 })
 

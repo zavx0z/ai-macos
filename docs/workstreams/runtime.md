@@ -10,6 +10,30 @@ startup recovery receipts и управляемая rotation; pointer readiness 
 
 ## Последующий проверенный integration slice
 
+RecoveryDomain v1 — первый внутренний checkpoint:
+
+- В operation journal добавлен atomic gate `not-authorized` → `send-authorized`.
+  Grant содержит descriptor, SHA exact context/descriptor и durable revision;
+  Native получает его только после fsync и повторной проверки active context.
+- Legacy operation не может задним числом получить доверенный marker;
+  authorized descriptor неизменяем, переход назад и выдача нового grant terminal
+  operation запрещены. Plaintext input не входит в descriptor.
+- Actor metadata сохраняет negotiated recovery version. `not-authorized`
+  допускает no-send recovery; no-held authorization требует доказанного actor exit.
+  Effect не становится verified, для незавершённого authorized dispatch
+  restoration/dispatch остаются unknown. Старый cursor не восстанавливается.
+- Existing ledger probe подходит только если реальный ledger покрывает весь
+  declared risk set. Missing marker, несогласованный ledger и Unicode key0 без
+  нужного domain probe не превращаются в cleanup complete.
+- `retainForRecoveryRestart` и отдельный `prepareQuarantinedRestart` сохраняют
+  quarantine перед завершением owned helper. Receipt называется
+  `restart-safe-quarantined` и не содержит ложного `cleanup:complete`.
+- Положительные process-crash/no-ledger и retention/late-exit проверки входят
+  в **29 pass / 148 assertions**; scoped runtime typecheck и diff-check прошли.
+- Native before-send/C-validator, domain risk-set probe и production Host activation
+  ещё согласуются с владельцем. Production marker до этой связки не включается;
+  per-character fsync и unsafe legacy inference не добавлены.
+
 Следующий внутренний host/recovery срез:
 
 - Managed rotation подключена к `META_RUNTIME_MANAGED=true`: Native budget

@@ -5,6 +5,11 @@ import {
   capabilitySetSchema,
   cleanupOutcomeSchema,
   cleanupAuthorityReceiptSchema,
+  nativeRecoveryDescriptorSchema,
+  nativeRecoveryGrantSchema,
+  canonicalRecoveryJson,
+  type NativeRecoveryDescriptor,
+  type NativeRecoveryGrant,
   clipboardExecutionContextSchema,
   deviceExecutionContextSchema,
   nativeExecutionContextSchema,
@@ -48,7 +53,7 @@ import { ClientSessionRegistry, type RuntimeClientCredential } from "./client-se
 import { RuntimeContractError, contractErrorFrom } from "./errors.ts"
 import { FrameStore, NativeEvidenceAuthority, ObservationRegistry, ProofRegistry, TargetRegistry } from "./authorities.ts"
 import type { NativeEvidenceBinding } from "./authorities.ts"
-import { canonicalJson, hmacSha256, randomIdSource, systemClock, type RuntimeClock, type RuntimeIdSource } from "./primitives.ts"
+import { canonicalJson, hmacSha256, randomIdSource, sha256, systemClock, type RuntimeClock, type RuntimeIdSource } from "./primitives.ts"
 import { ResourceRegistry } from "./resources.ts"
 import { NativeContinuationRegistry } from "./continuations.ts"
 import { BrowserLifetimeCoordinator, type CoordinatedLifecycle } from "./reservations.ts"
@@ -72,6 +77,7 @@ type JournalEntry = {
   lastNativeStatus?: NativeOperationStatus
   durableRevision: number
   durableTail: Promise<void>
+  recoveryPending?: Promise<NativeRecoveryGrant>
 }
 
 export interface BackendCompletionVerifier {
@@ -118,6 +124,7 @@ export type RuntimeCoreOptions = {
   nativeDelivery?: RuntimeNativeDeliveryAuthority
   startupRecovery?: StartupRecoveryAuthority
   lifetimeStore?: PersistentLifetimeStore
+  nativeRecovery?: Readonly<{ policyVersion: "1", nativeBuildId: string }>
 }
 
 export type ReserveCapturePublicationRequest = Pick<ObservationPublication,
@@ -145,6 +152,7 @@ export class RuntimeCore implements RuntimeAdapter {
   readonly #runtimeBuildId: string
   readonly #nativeGeneration?: string
   readonly #nativeDelivery?: RuntimeNativeDeliveryAuthority
+  readonly #nativeRecovery?: RuntimeCoreOptions["nativeRecovery"]
   readonly #clock: RuntimeClock
   readonly #ids: RuntimeIdSource
   readonly #secret: Uint8Array
@@ -182,6 +190,8 @@ export class RuntimeCore implements RuntimeAdapter {
     this.generation = options.generation
     this.#runtimeBuildId = options.runtimeBuildId
     this.#nativeGeneration = options.nativeGeneration
+    this.#nativeRecovery = options.nativeRecovery === undefined ? undefined : Object.freeze({ ...options.nativeRecovery })
+    if (this.#nativeRecovery !== undefined && (options.operationJournal === undefined || options.nativeGeneration === undefined)) throw new Error("Native recovery gate требует durable journal и native generation")
     this.#startupRecovery = options.startupRecovery === undefined ? undefined : Object.freeze({
       receiptFor: options.startupRecovery.receiptFor.bind(options.startupRecovery),
       unresolvedHeld: options.startupRecovery.unresolvedHeld.bind(options.startupRecovery),
@@ -324,6 +334,43 @@ export class RuntimeCore implements RuntimeAdapter {
       await checkpoint()
       return receipt
     })
+  }
+
+  async authorizeNativeMutation(wire: NativeExecutionContext | ClipboardExecutionContext, descriptorValue: NativeRecoveryDescriptor): Promise<NativeRecoveryGrant> {
+    const descriptor = nativeRecoveryDescriptorSchema.parse(descriptorValue)
+    const entry = this.#journal.get(wire.operationId)
+    const check = async () => {
+      if (this.#nativeRecovery === undefined || this.#storagePoisoned || entry === undefined || entry.settled
+        || entry.session === undefined || !entry.adapterStarted || canonicalRecoveryJson(entry.record.context) !== canonicalRecoveryJson(wire)
+        || descriptor.nativeBuildId !== this.#nativeRecovery.nativeBuildId
+        || wire.kind === "native" && wire.nativeGeneration !== this.#nativeGeneration) throw new Error("Recovery authorization не принадлежит active registered operation")
+      entry.controller.signal.throwIfAborted()
+      const now = this.#clock.now()
+      if (now.getTime() >= Date.parse(wire.deadlineAt)) throw new Error("Recovery authorization deadline")
+      await this.clients.assertActive(entry.session, now)
+      for (const handle of entry.record.resources) await this.resources.assertActive({ handle, operationId: wire.operationId,
+        clientSessionId: entry.session.clientSessionId, principalId: entry.session.principalId, ...this.generation, now })
+    }
+    await check()
+    const authorize = async () => {
+      const current = entry!.record.nativeRecovery
+      if (current?.phase !== "not-authorized") throw new Error("Native send gate не зарегистрирован")
+      const grant = nativeRecoveryGrantSchema.parse({ policyVersion: "1", ...this.generation,
+        nativeGeneration: this.#nativeGeneration, operationId: wire.operationId,
+        contextSha256: sha256(canonicalRecoveryJson(wire)), descriptor,
+        descriptorSha256: sha256(canonicalRecoveryJson(descriptor)), journalRevision: entry!.durableRevision + 1, durable: true })
+      const nativeRecovery = { phase: "send-authorized" as const, grant }
+      await this.#persist(entry!, operationRecordSchema.parse({ ...entry!.record, nativeRecovery,
+        updatedAt: this.#clock.now().toISOString() }))
+      entry!.record = operationRecordSchema.parse({ ...entry!.record, nativeRecovery })
+      await check()
+      return grant
+    }
+    entry!.recoveryPending ??= authorize()
+    const grant = await entry!.recoveryPending
+    if (canonicalRecoveryJson(grant.descriptor) !== canonicalRecoveryJson(descriptor)) throw new Error("Native operation получил conflicting recovery descriptor")
+    await check()
+    return structuredClone(grant)
   }
 
   async #persistCredential(create: () => RuntimeClientCredential): Promise<RuntimeClientCredential> {
@@ -475,7 +522,9 @@ export class RuntimeCore implements RuntimeAdapter {
             lease.leaseId === handle.leaseId && lease.leaseGeneration === handle.leaseGeneration))) throw new Error("Startup cleanup receipt не соответствует old operation")
         const restored = operationRecordSchema.parse({ ...record,
           state: isTerminal(record) ? record.state : "interrupted-unknown",
-          outcome: { ...record.outcome, cleanup: releasedCleanup(record.resources) }, updatedAt: receipt.issuedAt })
+          outcome: { ...record.outcome,
+            ...(!isTerminal(record) && record.nativeRecovery?.phase === "send-authorized" ? { dispatch: "unknown", restoration: "unknown" } : {}),
+            cleanup: releasedCleanup(record.resources) }, updatedAt: receipt.issuedAt })
         const entry = this.#journal.get(record.context.operationId)
         if (entry !== undefined) {
           await this.#persist(entry, restored, receipt)
@@ -524,6 +573,28 @@ export class RuntimeCore implements RuntimeAdapter {
     for (const entry of active) entry.controller.abort("runtime drain")
     await Promise.all(active.map(entry => entry.promise?.catch(() => undefined)))
     if (this.resources.quarantinedCount() > 0 || this.activeOperationCount() > 0) throw new Error("Runtime drain оставил unknown/active operations")
+  }
+
+  async retainForRecoveryRestart(): Promise<{ journalDurable: true, operationIds: readonly string[] }> {
+    this.sealAdmission()
+    const active = [...this.#journal.values()].filter(entry => !entry.settled)
+    for (const entry of active) entry.controller.abort("recovery restart")
+    await Promise.all(active.map(entry => entry.promise?.catch(() => undefined)))
+    if (this.activeOperationCount() !== 0 || this.#operationJournal === undefined) throw new Error("Recovery restart требует остановленные operations и journal")
+    const operationIds: string[] = []
+    for (const entry of this.#journal.values()) {
+      const record = entry.record
+      if (record.context.runtimeEpoch !== this.generation.runtimeEpoch || record.outcome.cleanup.state === "complete") continue
+      if (!["native", "clipboard"].includes(record.context.kind)) throw new Error("Unknown non-native cleanup требует своего recovery domain")
+      let stored: StoredOperationEvidence | undefined
+      await this.#awaitDurable(this.#operationJournal.read({ runtimeEpoch: record.context.runtimeEpoch,
+        loginSessionId: record.context.loginSessionId, operationId: record.context.operationId }).then(value => { stored = value }))
+      if (stored === undefined || stored.record.nativeRecovery === undefined
+        || canonicalRecoveryJson(stored.record.context) !== canonicalRecoveryJson(record.context)
+        || canonicalRecoveryJson(stored.record.resources) !== canonicalRecoveryJson(record.resources)) throw new Error("Recovery restart не имеет exact durable native send gate")
+      operationIds.push(record.context.operationId)
+    }
+    return { journalDurable: true, operationIds }
   }
 
   async runOperation<TRequest, TResult>(
@@ -626,6 +697,10 @@ export class RuntimeCore implements RuntimeAdapter {
         keyGeneration: this.#hmacKeyGeneration,
         hmacSha256: digest,
       },
+      ...(!["native", "clipboard"].includes(wire.kind) || this.#nativeRecovery === undefined ? {} : {
+        nativeRecovery: { phase: "not-authorized", policyVersion: "1", nativeBuildId: this.#nativeRecovery.nativeBuildId,
+          nativeGeneration: this.#nativeGeneration },
+      }),
       registeredAt: now.toISOString(),
       updatedAt: now.toISOString(),
     })
@@ -937,6 +1012,7 @@ export class RuntimeCore implements RuntimeAdapter {
       this.#settle(entry, execution)
       return execution
     } catch (error) {
+      await entry.recoveryPending?.catch(() => undefined)
       if (entry.result !== undefined) return entry.result as RuntimeExecution<TResult>
       lifecycle?.failed(entry.adapterStarted)
       const contractError = contractErrorFrom(error, "runtime-execute")

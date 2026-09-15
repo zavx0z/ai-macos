@@ -1,6 +1,7 @@
 import { join } from "node:path"
 import {
   cleanupAuthorityReceiptSchema, heldInputLedgerDigest, z,
+  canonicalRecoveryJson,
   type CleanupAuthorityReceipt, type OperationRecord, type RuntimeGeneration,
 } from "@meta/shared/contracts"
 import type { NativeBrokerAdapter } from "@meta/native/adapter"
@@ -47,16 +48,53 @@ export class StartupHeldRecovery {
   }
 
   async receiptFor(record: OperationRecord): Promise<CleanupAuthorityReceipt | undefined> {
-    if (record.context.kind !== "native" || record.context.loginSessionId !== this.#generation.loginSessionId
-      || record.resources.length === 0 || record.resources.some(handle => handle.kind !== "desktop-input")) return undefined
+    if (!["native", "clipboard"].includes(record.context.kind) || record.context.loginSessionId !== this.#generation.loginSessionId
+      || record.context.runtimeEpoch === this.#generation.runtimeEpoch || record.resources.length === 0
+      || record.resources.some(handle => !["desktop-input", "capture-stream", "clipboard"].includes(handle.kind))) return undefined
+    const gate = record.nativeRecovery
+    if (gate === undefined) return undefined
+    const nativeGeneration = gate?.phase === "not-authorized" ? gate.nativeGeneration
+      : gate?.phase === "send-authorized" ? gate.grant.nativeGeneration
+        : record.context.kind === "native" ? record.context.nativeGeneration : undefined
+    if (nativeGeneration === undefined) return undefined
+    if (gate !== undefined) {
+      const actor = await this.#actors.read(record.context.runtimeEpoch, nativeGeneration)
+      const buildId = gate.phase === "not-authorized" ? gate.nativeBuildId : gate.grant.descriptor.nativeBuildId
+      if (actor?.recoveryDomainVersion !== "1" || actor.nativeBuildId !== buildId) return undefined
+      if (gate.phase === "not-authorized") {
+        const contradictory = await this.#ledgers.read({ runtimeEpoch: record.context.runtimeEpoch, loginSessionId: record.context.loginSessionId,
+          nativeGeneration, operationId: record.context.operationId })
+        if (contradictory?.snapshot.entries.length) throw new Error("Not-authorized gate противоречит native ledger")
+        return this.#cleanupReceipt(record, `not-authorized:${sha256(canonicalRecoveryJson(gate))}`, new Date().toISOString())
+      }
+      if (gate.grant.contextSha256 !== sha256(canonicalRecoveryJson(record.context))
+        || gate.grant.descriptorSha256 !== sha256(canonicalRecoveryJson(gate.grant.descriptor))) throw new Error("Recovery domain digest mismatch")
+      if (gate.grant.descriptor.domain === "no-held-input") {
+        const contradictory = await this.#ledgers.read({ runtimeEpoch: record.context.runtimeEpoch, loginSessionId: record.context.loginSessionId,
+          nativeGeneration, operationId: record.context.operationId })
+        if (contradictory?.snapshot.entries.length) throw new Error("No-hold descriptor противоречит held ledger")
+        const gone = await this.#actors.quiescence(record.context.runtimeEpoch, nativeGeneration)
+        if (gone.state !== "exited") return undefined
+        return this.#cleanupReceipt(record, `actor-exited:${gate.grant.descriptorSha256}`, new Date().toISOString())
+      }
+    }
+    if (record.resources.some(handle => handle.kind !== "desktop-input")) return undefined
     const evidence = await this.#ledgers.read({ runtimeEpoch: record.context.runtimeEpoch, loginSessionId: record.context.loginSessionId,
-      nativeGeneration: record.context.nativeGeneration, operationId: record.context.operationId })
+      nativeGeneration, operationId: record.context.operationId })
     if (evidence === undefined) return undefined
+    if (gate.phase === "send-authorized" && evidence.snapshot.entries.some(entry => !gate.grant.descriptor.possibleHolds.some(hold =>
+      hold.kind === entry.kind && hold.code === entry.code))) throw new Error("Held ledger выходит за declared recovery domain")
+    if (gate.phase !== "send-authorized" || gate.grant.descriptor.possibleHolds.some(hold => !evidence.snapshot.entries.some(entry =>
+      entry.state !== "released" && entry.kind === hold.kind && entry.code === hold.code))) return undefined
     const receipt = await this.#read(evidence)
     if (receipt === undefined) return undefined
-    return cleanupAuthorityReceiptSchema.parse({ receiptId: `startup-held:${sha256(canonicalJson(receipt))}`,
+    return this.#cleanupReceipt(record, sha256(canonicalJson(receipt)), receipt.acceptedAt)
+  }
+
+  #cleanupReceipt(record: OperationRecord, evidenceId: string, issuedAt: string): CleanupAuthorityReceipt {
+    return cleanupAuthorityReceiptSchema.parse({ receiptId: `startup-held:${sha256(evidenceId)}`,
       authorityRef: "runtime:startup-held-recovery", operationId: record.context.operationId,
-      runtimeEpoch: record.context.runtimeEpoch, loginSessionId: record.context.loginSessionId, issuedAt: receipt.acceptedAt,
+      runtimeEpoch: record.context.runtimeEpoch, loginSessionId: record.context.loginSessionId, issuedAt,
       state: "complete", leases: record.resources.map(handle => ({ leaseId: handle.leaseId, leaseGeneration: handle.leaseGeneration })) })
   }
 
