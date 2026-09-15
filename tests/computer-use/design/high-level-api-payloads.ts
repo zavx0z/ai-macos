@@ -84,7 +84,7 @@ const readAccessibilityRequest = {
 } as const
 contracts.browserOperationRequestSchema.parse(readAccessibilityRequest)
 
-const scenarios: Record<string, ScenarioCalls> = {
+const scenarios = {
   hiddenChrome: {
     currentTraceStatus: "expressible-current-api",
     current: [
@@ -268,7 +268,7 @@ const scenarios: Record<string, ScenarioCalls> = {
       }
     ]
   }
-}
+} satisfies Record<string, ScenarioCalls>
 
 const forbiddenFacadeKeys = new Set([
   "runtimeEpoch",
@@ -315,7 +315,8 @@ function bytes(value: unknown): number {
 }
 
 export function highLevelPayloadReport() {
-  return Object.fromEntries(Object.entries(scenarios).map(([name, scenario]) => {
+  return Object.fromEntries(Object.entries(scenarios).map(([name, scenarioValue]) => {
+    const scenario: ScenarioCalls = scenarioValue
     for (const call of scenario.proposed) assertProposedPayload(call)
     const measure = (calls: ModelCall[]) => ({
       modelVisibleCalls: calls.length,
