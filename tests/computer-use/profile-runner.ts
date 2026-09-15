@@ -7,13 +7,28 @@ import {
 
 export type AcceptanceProfileStatus = "pass" | "fail" | "not-run"
 
-export type AcceptanceProbeId = "contracts" | "native" | "runtime" | "host-mcp"
+export type AcceptanceProbeId =
+  | "contracts"
+  | "native"
+  | "native-window"
+  | "native-command-loop"
+  | "runtime"
+  | "host-mcp"
+
+export interface AcceptanceTestSummary {
+  passed: number
+  failed: number
+  skipped: number
+}
 
 export interface AcceptanceProbeOutcome {
   probeId: AcceptanceProbeId
   status: "pass" | "fail"
   durationMs: number
   command: string
+  tests: AcceptanceTestSummary
+  failureReason?: string
+  outputTruncated?: boolean
   outputTail?: string
 }
 
@@ -28,11 +43,15 @@ interface ScenarioProbeLink {
 export const acceptanceProfileProbes: Array<{
   probeId: AcceptanceProbeId
   path: string
+  timeoutMs: number
+  maxOutputBytes: number
 }> = [
-  { probeId: "contracts", path: "tests/computer-use/contracts-sut.test.ts" },
-  { probeId: "native", path: "tests/computer-use/native-sut.test.ts" },
-  { probeId: "runtime", path: "tests/computer-use/runtime-sut.test.ts" },
-  { probeId: "host-mcp", path: "tests/computer-use/host-mcp-sut.test.ts" }
+  { probeId: "contracts", path: "tests/computer-use/contracts-sut.test.ts", timeoutMs: 10_000, maxOutputBytes: 128 * 1024 },
+  { probeId: "native", path: "tests/computer-use/native-sut.test.ts", timeoutMs: 15_000, maxOutputBytes: 128 * 1024 },
+  { probeId: "native-window", path: "native/tests/window-adapter.test.ts", timeoutMs: 15_000, maxOutputBytes: 256 * 1024 },
+  { probeId: "native-command-loop", path: "native/tests/command-loop.test.ts", timeoutMs: 30_000, maxOutputBytes: 256 * 1024 },
+  { probeId: "runtime", path: "tests/computer-use/runtime-sut.test.ts", timeoutMs: 10_000, maxOutputBytes: 128 * 1024 },
+  { probeId: "host-mcp", path: "tests/computer-use/host-mcp-sut.test.ts", timeoutMs: 15_000, maxOutputBytes: 256 * 1024 }
 ]
 
 const scenarioProbeLinks: ScenarioProbeLink[] = [
@@ -48,6 +67,8 @@ const scenarioProbeLinks: ScenarioProbeLink[] = [
   { probeId: "native", scenarioId: "A09", evidenceRef: "native-sut.test.ts#A09", satisfies: ["fault-injection"], note: "Watchdog и recovery ledger" },
   { probeId: "native", scenarioId: "A10", evidenceRef: "native-sut.test.ts#A10", satisfies: ["native-fixture"], note: "Epoch/login/native fence high-water" },
   { probeId: "native", scenarioId: "A16", evidenceRef: "native-sut.test.ts#A16", satisfies: ["native-fixture"], note: "2 AX к 1 CG ambiguous; live часть не запускалась" },
+  { probeId: "native-window", scenarioId: "A18", evidenceRef: "native/tests/window-adapter.test.ts#hidden-ax-only", satisfies: ["native-fixture"], note: "Hidden AX-only identity; обязательная live часть не запускалась" },
+  { probeId: "native-command-loop", scenarioId: "A45", evidenceRef: "native/tests/command-loop.test.ts#slow-inventory-control-drain", satisfies: ["fault-injection"], note: "Actual production command loop сохраняет control lane при slow inventory и bounded drain" },
   { probeId: "runtime", scenarioId: "A03", evidenceRef: "runtime-sut.test.ts#A03", satisfies: ["integration"], note: "Два real Runtime client sessions и один desktop resource" },
   { probeId: "runtime", scenarioId: "A05", evidenceRef: "runtime-sut.test.ts#A05", satisfies: [], note: "Runtime deadline/cancel ACK; actual UDS caller timeout открыт" },
   { probeId: "runtime", scenarioId: "A11", evidenceRef: "runtime-sut.test.ts#A11", satisfies: [], note: "Resumption/dedup дополняет contract evidence" },
@@ -109,31 +130,211 @@ export function buildAcceptanceProfile(outcomes: AcceptanceProbeOutcome[]) {
   }
 }
 
+function lastCount(output: string, label: "pass" | "fail" | "skip" | "todo"): number {
+  const matches = [...output.matchAll(new RegExp(`^\\s*(\\d+)\\s+${label}(?:ped|ed)?\\s*$`, "gmi"))]
+  const value = matches.at(-1)?.[1]
+  return value === undefined ? 0 : Number.parseInt(value, 10)
+}
+
+export function classifyProbeExecution(input: {
+  exitCode: number
+  stdout: string
+  stderr: string
+  timedOut: boolean
+  outputTruncated: boolean
+}): {
+  status: "pass" | "fail"
+  tests: AcceptanceTestSummary
+  failureReason?: string
+} {
+  const output = `${input.stdout}\n${input.stderr}`
+  const tests = {
+    passed: lastCount(output, "pass"),
+    failed: lastCount(output, "fail"),
+    skipped: lastCount(output, "skip") + lastCount(output, "todo")
+  }
+  let failureReason: string | undefined
+  if (input.timedOut) failureReason = "probe-timeout"
+  else if (input.outputTruncated) failureReason = "probe-output-limit"
+  else if (input.exitCode !== 0) failureReason = `probe-exit-${input.exitCode}`
+  else if (tests.failed > 0) failureReason = "probe-reported-failures"
+  else if (tests.skipped > 0) failureReason = "probe-reported-skips"
+  else if (tests.passed === 0) failureReason = "probe-reported-zero-tests"
+  return {
+    status: failureReason === undefined ? "pass" : "fail",
+    tests,
+    ...(failureReason === undefined ? {} : { failureReason })
+  }
+}
+
+function createCappedReader(
+  stream: ReadableStream<Uint8Array>,
+  maximumBytes: number,
+  onLimit: () => void
+) {
+  const reader = stream.getReader()
+  const decoder = new TextDecoder()
+  let bytes = 0
+  let text = ""
+  let cancelled = false
+  const promise = (async () => {
+    try {
+      while (true) {
+        const item = await reader.read()
+        if (item.done) break
+        const remaining = maximumBytes - bytes
+        if (item.value.byteLength > remaining) {
+          if (remaining > 0) {
+            text += decoder.decode(item.value.subarray(0, remaining))
+          }
+          onLimit()
+          await reader.cancel("acceptance output limit")
+          break
+        }
+        bytes += item.value.byteLength
+        text += decoder.decode(item.value, { stream: true })
+      }
+      text += decoder.decode()
+    } catch (error) {
+      if (!cancelled) throw error
+    } finally {
+      reader.releaseLock()
+    }
+  })()
+  return {
+    promise,
+    snapshot: () => text,
+    cancel() {
+      if (cancelled) return
+      cancelled = true
+      void reader.cancel("acceptance subprocess deadline").catch(() => undefined)
+    }
+  }
+}
+
+export async function runBoundedCommand(options: {
+  command: string[]
+  cwd: string
+  timeoutMs: number
+  maxOutputBytes: number
+  termGraceMs?: number
+  readerGraceMs?: number
+}) {
+  const startedAt = performance.now()
+  const child = Bun.spawn(options.command, {
+    cwd: options.cwd,
+    stdout: "pipe",
+    stderr: "pipe"
+  })
+  let timedOut = false
+  let outputTruncated = false
+  let terminationStarted = false
+  let childExited = false
+  let childExitCode: number | undefined
+  let killTimer: ReturnType<typeof setTimeout> | undefined
+  let forceTimer: ReturnType<typeof setTimeout> | undefined
+  let forceDone: (() => void) | undefined
+  const forced = new Promise<void>((done) => { forceDone = done })
+  const termGraceMs = options.termGraceMs ?? 250
+  const readerGraceMs = options.readerGraceMs ?? 250
+  let stdoutReader: ReturnType<typeof createCappedReader>
+  let stderrReader: ReturnType<typeof createCappedReader>
+  const beginTermination = (reason: "timeout" | "output-limit") => {
+    if (reason === "timeout") timedOut = true
+    if (reason === "output-limit") outputTruncated = true
+    if (terminationStarted) return
+    terminationStarted = true
+    if (!childExited) child.kill("SIGTERM")
+    killTimer = setTimeout(() => {
+      if (!childExited) child.kill("SIGKILL")
+    }, termGraceMs)
+    forceTimer = setTimeout(() => {
+      if (!childExited) child.kill("SIGKILL")
+      stdoutReader.cancel()
+      stderrReader.cancel()
+      forceDone?.()
+    }, termGraceMs + readerGraceMs)
+  }
+  stdoutReader = createCappedReader(
+    child.stdout,
+    options.maxOutputBytes,
+    () => beginTermination("output-limit")
+  )
+  stderrReader = createCappedReader(
+    child.stderr,
+    options.maxOutputBytes,
+    () => beginTermination("output-limit")
+  )
+  const exit = child.exited.then((code) => {
+    childExited = true
+    childExitCode = code
+  })
+  const timeoutTimer = setTimeout(
+    () => beginTermination("timeout"),
+    options.timeoutMs
+  )
+  try {
+    await Promise.race([
+      Promise.all([exit, stdoutReader.promise, stderrReader.promise]),
+      forced
+    ])
+  } finally {
+    clearTimeout(timeoutTimer)
+    if (killTimer !== undefined) clearTimeout(killTimer)
+    if (forceTimer !== undefined) clearTimeout(forceTimer)
+    if (terminationStarted && !childExited) child.kill("SIGKILL")
+    stdoutReader.cancel()
+    stderrReader.cancel()
+  }
+  return {
+    exitCode: childExitCode ?? -1,
+    stdout: stdoutReader.snapshot(),
+    stderr: stderrReader.snapshot(),
+    timedOut,
+    outputTruncated,
+    durationMs: Math.round(performance.now() - startedAt)
+  }
+}
+
 async function runProbe(
   repositoryRoot: string,
   probe: (typeof acceptanceProfileProbes)[number]
 ): Promise<AcceptanceProbeOutcome> {
   const command = `bun test ${probe.path}`
-  const startedAt = performance.now()
-  const child = Bun.spawn([process.execPath, "test", probe.path], {
+  const execution = await runBoundedCommand({
+    command: [process.execPath, "test", probe.path],
     cwd: repositoryRoot,
-    stdout: "pipe",
-    stderr: "pipe"
+    timeoutMs: probe.timeoutMs,
+    maxOutputBytes: probe.maxOutputBytes
   })
-  const [exitCode, stdout, stderr] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).text(),
-    new Response(child.stderr).text()
-  ])
+  const {
+    exitCode,
+    stdout,
+    stderr,
+    timedOut,
+    outputTruncated
+  } = execution
   const combined = `${stdout}\n${stderr}`.trim()
+  const classification = classifyProbeExecution({
+    exitCode,
+    stdout,
+    stderr,
+    timedOut,
+    outputTruncated
+  })
   return {
     probeId: probe.probeId,
-    status: exitCode === 0 ? "pass" : "fail",
-    durationMs: Math.round(performance.now() - startedAt),
+    status: classification.status,
+    durationMs: execution.durationMs,
     command,
-    ...(exitCode === 0
+    tests: classification.tests,
+    ...(classification.failureReason === undefined
       ? {}
-      : { outputTail: combined.slice(Math.max(0, combined.length - 4000)) })
+      : {
+          failureReason: classification.failureReason,
+          ...(outputTruncated ? { outputTruncated: true } : {}),
+          outputTail: combined.slice(Math.max(0, combined.length - 4000))
+        })
   }
 }
 

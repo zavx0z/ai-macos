@@ -41,7 +41,8 @@ security and durable restart pending**.
   `RuntimeHost → UDS → dynamic MCP` path с двумя client lineages, scoped frame,
   unavailable capability gate, native disconnect/catalogChanged и bounded drain.
 - `tests/computer-use/profile-runner.ts` — executable safe profile A01–A45 с
-  evidence refs, missing evidence и честными `pass/fail/not-run`.
+  evidence refs, missing evidence, bounded subprocess/output и честными
+  `pass/fail/not-run`.
 - `tests/computer-use/profile-runner.test.ts` — защита от fiction pass и
   проверка распространения реального probe failure.
 - `tests/computer-use/matrix.ts` — все A01–A45 и отдельный реестр реально
@@ -110,17 +111,30 @@ cross-user/forged-socket security не закрыты. `createRuntimeMcpServer`
 импортируется из текущего owner source, поскольку `@meta/mcp` не публикует
 package export для test factory.
 
-Executable profile запускает четыре safe SUT probes. Текущий результат:
-7 pass, 0 fail, 38 not-run. Полностью зелёные строки текущего профиля: A03,
-A06, A08, A09, A10, A11, A38. Для остальных partial refs сохраняются, но
-missing live/transport/durable evidence не превращается в pass.
+Executable profile запускает шесть safe SUT probes. Native window adapter test
+даёт A18 native-fixture evidence, но строка остаётся `not-run` без live. Actual
+production command-loop test закрывает fault-injection A45: slow inventory не
+блокирует control heartbeat, а drain проходит sealed-pending → complete.
+
+Каждый probe ограничен timeout 10–30 секунд и output cap 128–256 КиБ на stdout
+и stderr. Exit 0 без passed tests, с `skip/todo`, с truncation или timeout
+отвергается как evidence. Unit tests runner проверяют fiction-pass guard и
+распространение probe failure. Termination выполняется только для exact child:
+SIGTERM → bounded grace → SIGKILL. Отдельный force-deadline отменяет readers и
+возвращает bounded snapshot, если descendant удерживает inherited pipe.
+Behavioral test запускает TERM-ignoring child с краткоживущим descendant и
+подтверждает возврат runner примерно за 180 мс, не ожидая закрытия pipe.
+
+Текущий результат: 8 pass, 0 fail, 37 not-run. Полностью зелёные строки текущего
+профиля: A03, A06, A08, A09, A10, A11, A38, A45. Для остальных partial refs
+сохраняются, но missing live/transport/durable evidence не превращается в pass.
 
 ## Проверки
 
-- `bun test tests/computer-use` — 30 pass, 0 fail, 81 assertions. Compilation C
+- `bun test tests/computer-use` — 33 pass, 0 fail, 88 assertions. Compilation C
   binary с `-Wall -Wextra -Werror` успешна.
-- `bun tests/computer-use/profile-runner.ts` — 7 pass, 0 fail, 38 not-run;
-  четыре probe commands завершились успешно.
+- `bun tests/computer-use/profile-runner.ts` — 8 pass, 0 fail, 37 not-run;
+  шесть probe commands завершились без fail/skip/zero-test.
 - Targeted TypeScript acceptance check — exit 0.
 - Root typecheck по указанию ведущего повторно не запускался; Android сейчас
   редактирует его владелец.
@@ -148,6 +162,10 @@ Package export `@meta/shared/contracts` используется из dependency
    проверены этим in-process subset.
 6. Live части A01/A04/A07/A16 и остальная live matrix остаются за C3/C4 и не
    закрываются native binary или parser tests.
+7. A18 имеет native fixture evidence, но actual AX request-builder composition
+   сейчас исправляет native owner: ранее обязательный `inventory_id` не доходил
+   до production inspector. До behavioral seam test и live evidence A18 не
+   получает pass.
 
 ## Следующий шаг
 

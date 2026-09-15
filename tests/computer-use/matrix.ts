@@ -19,6 +19,8 @@ export interface AcceptanceScenario {
 export type AcceptanceSutEvidence =
   | "contract-parser"
   | "native-c"
+  | "native-window-adapter"
+  | "native-command-loop"
   | "runtime-core"
   | "runtime-host-mcp"
 
@@ -85,8 +87,10 @@ export const acceptanceSutEvidence: Partial<
   A10: ["contract-parser", "native-c"],
   A11: ["contract-parser", "runtime-core"],
   A16: ["native-c"],
+  A18: ["native-window-adapter"],
   A38: ["contract-parser", "runtime-host-mcp"],
   A41: ["runtime-host-mcp"],
   A42: ["runtime-core", "runtime-host-mcp"],
-  A43: ["runtime-host-mcp"]
+  A43: ["runtime-host-mcp"],
+  A45: ["native-command-loop"]
 }

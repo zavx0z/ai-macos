@@ -80,6 +80,15 @@ JSON с `pass`, `fail` или `not-run` для каждой строки A01–A
 missing evidence записываются отдельно. Частичная зелёная проверка не превращает
 строку с отсутствующим live/transport/durable evidence в `pass`.
 
-Текущий safe profile: 7 pass, 0 fail, 38 not-run. Pass получают только A03,
-A06, A08, A09, A10, A11 и A38. Runner ничего не записывает на диск и не
-запускает live desktop.
+Каждый subprocess имеет явный timeout 10–30 секунд и output cap 128–256 КиБ на
+stream. Exit 0 принимается только при ненулевом `pass`, нулевых `fail` и нулевых
+`skip/todo`; timeout, truncation, skipped или zero-test suite становятся `fail`.
+При timeout/output overflow exact child получает SIGTERM, затем после короткого
+grace — SIGKILL; отдельный global deadline отменяет stdout/stderr readers, даже
+если pipe удерживает descendant. Process group и посторонние процессы не
+сигнализируются. Это проверяется реальным TERM-ignoring subprocess fixture.
+
+Текущий safe profile: 8 pass, 0 fail, 37 not-run. Pass получают только A03,
+A06, A08, A09, A10, A11, A38 и A45. A18 получает зелёное native-fixture
+evidence, но остаётся `not-run` из-за обязательной live-части. Runner ничего не
+записывает на диск и не запускает live desktop.
