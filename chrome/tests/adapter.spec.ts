@@ -74,7 +74,29 @@ const services: AdapterServices = {
   frames: { async publish() {} },
   observations: { async resolvePoint() { throw new Error("not used") } },
   continuations: { async issue() { throw new Error("not used") }, async registerAcceptedTask() { throw new Error("not used") }, async advanceVerifiedStatus() { throw new Error("not used") }, async markVerifiedTerminal() { throw new Error("not used") } },
-  reservations: { async assertChild() { throw new Error("not used") } },
+  reservations: {
+    async assertChild(request) {
+      if (request.target.kind !== "browser-instance" && request.target.kind !== "browser-target") throw new Error("browser target expected")
+      const ref = request.target.ref
+      const instance = "targetId" in ref
+        ? (({ targetId: _target, resourceRef: _resource, ...value }) => value)(ref)
+        : ref
+      return {
+        reservationId: "reservation:fixture",
+        reservationGeneration: "reservation-generation:1",
+        runtimeEpoch: request.session.runtimeEpoch,
+        loginSessionId: request.session.loginSessionId,
+        principalId: request.session.principalId,
+        lineageRef: "lineage:fixture",
+        target: { kind: "browser-instance", ref: instance },
+        externalGeneration: { kind: "browser", browserTransportGeneration: instance.transportGeneration },
+        createdAt: "2026-09-15T00:00:00.000Z",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        state: "active",
+        statusRevision: 1,
+      }
+    },
+  },
 }
 
 function resource(kind: RuntimeResourceHandle["kind"], resourceRef: string): RuntimeResourceHandle {
@@ -228,6 +250,18 @@ describe("RuntimeBrowserAdapter identity", () => {
     expect(result.outcome.dispatch).toBe("finished")
     expect(result.outcome.dispatchAttempts).toBe(1)
     expect(result.outcome.cleanup.state).toBe("complete")
+  })
+
+  test("recovery меняет logical state только после verified physical disconnect", async () => {
+    const subject = adapter(fakeDriver())
+    const initial = (await subject.listInstances({ signal: new AbortController().signal, checkpoint() {} })).instances[0]!.ref
+    const connected = await connect(subject, initial)
+    if (!connected.ok || connected.value.value.kind !== "instance-connected") throw new Error("Expected connected")
+    const ref = connected.value.value.instance.ref
+    await expect(subject.recoverDisconnected(ref, async () => { throw new Error("physical disconnect failed") })).rejects.toThrow("physical disconnect failed")
+    subject.assertConnectedExact(ref)
+    await subject.recoverDisconnected(ref, async () => {})
+    subject.assertDisconnectedExact(ref)
   })
 })
 

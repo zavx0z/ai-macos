@@ -177,7 +177,16 @@ function registerChromeMethods(registry: MethodRegistry, runtime: RuntimeCore, b
       const intent = input.request.kind === "capture-target"
         ? runtimeOperationIntentSchema.parse({ ...input.intent, requestedResources: browserOperationResources(request) })
         : input.intent
-      return await runtime.browserLifetime.execute(context.session, binding.bindingId, intent, request, context.signal)
+      const execution = await runtime.browserLifetime.execute(context.session, binding.bindingId, intent, request, context.signal)
+      if (request.kind === "capture-target" && execution.result.ok
+        && execution.result.value.value.kind === "target-captured") {
+        await runtime.commitCaptureObservation(
+          context.session,
+          request.capture.publication,
+          execution.result.value.value.capture.observation,
+        )
+      }
+      return execution
     },
     frames: output => frameRefs(output.result),
     isError: output => !output.result.ok,
@@ -249,7 +258,16 @@ function registerAndroidMethods(registry: MethodRegistry, runtime: RuntimeCore, 
       const intent = input.request.kind === "capture-target"
         ? runtimeOperationIntentSchema.parse({ ...input.intent, requestedResources: deviceBrowserOperationResources(request) })
         : input.intent
-      return await runtime.browserLifetime.execute(context.session, binding.bindingId, intent, request, context.signal)
+      const execution = await runtime.browserLifetime.execute(context.session, binding.bindingId, intent, request, context.signal)
+      if (request.kind === "capture-target" && execution.result.ok
+        && execution.result.value.value.kind === "target-captured") {
+        await runtime.commitCaptureObservation(
+          context.session,
+          request.capture.publication,
+          execution.result.value.value.capture.observation,
+        )
+      }
+      return execution
     },
     frames: output => frameRefs(output.result),
     isError: output => !output.result.ok,

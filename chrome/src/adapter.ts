@@ -28,6 +28,7 @@ import {
   type RuntimeProcessRef,
   type RuntimeResourceHandle,
   verifyAndPublishBinaryFrame,
+  structurallyEqual,
 } from "@meta/shared/contracts"
 import {
   cdpCaptureScreenshot,
@@ -93,6 +94,7 @@ export class RuntimeBrowserAdapter implements BrowserAdapter {
   private inventoryRevision = 0
   private inventorySequence = 0
   private readonly targetFingerprints = new Map<string, string>()
+  private readonly recoveredRefs = new Set<string>()
 
   constructor(
     readonly host: AdapterHostContext,
@@ -178,6 +180,34 @@ export class RuntimeBrowserAdapter implements BrowserAdapter {
         error: contractError(error, deliveryUnknown || transportUnknown),
         outcome: failureOutcome(cleanup, dispatch.stage),
       }
+    }
+  }
+
+  async recoverDisconnected(
+    reference: BrowserInstanceRecord["ref"],
+    verifyPhysicalDisconnect: () => Promise<void>,
+  ): Promise<void> {
+    const instance = this.instances.get(reference.browserInstanceRef)
+    if (!instance) throw new Error("Browser recovery instance not configured")
+    await verifyPhysicalDisconnect()
+    instance.state = "disconnected"
+    instance.reason = "recovered-physical-disconnect"
+    this.recoveredRefs.add(JSON.stringify(reference))
+    this.inventoryRevision += 1
+  }
+
+  assertConnectedExact(reference: BrowserInstanceRecord["ref"]): void {
+    const instance = this.instances.get(reference.browserInstanceRef)
+    if (!instance || !structurallyEqual(instance.ref, reference) || instance.state !== "connected") {
+      throw new Error("Exact Browser instance is not connected")
+    }
+  }
+
+  assertDisconnectedExact(reference: BrowserInstanceRecord["ref"]): void {
+    if (this.recoveredRefs.has(JSON.stringify(reference))) return
+    const instance = this.instances.get(reference.browserInstanceRef)
+    if (!instance || !structurallyEqual(instance.ref, reference) || instance.state === "connected") {
+      throw new Error("Exact Browser instance physical disconnect is not verified")
     }
   }
 
@@ -313,8 +343,10 @@ export class RuntimeBrowserAdapter implements BrowserAdapter {
 
   private snapshotBase() {
     this.inventorySequence += 1
+    this.inventoryRevision += 1
     return {
       inventoryId: `browser-inventory:${this.inventorySequence}`,
+      inventoryRevision: this.inventoryRevision,
       ...this.host.generation,
       capturedAt: this.now().toISOString(),
       complete: true,

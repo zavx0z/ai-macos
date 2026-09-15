@@ -69,6 +69,7 @@ export const browserTargetRecordSchema = z.strictObject({
 export type BrowserTargetRecord = z.infer<typeof browserTargetRecordSchema>
 
 const inventoryBaseShape = {
+  inventoryRevision: z.number().int().safe().min(0),
   inventoryId: opaqueIdSchema,
   runtimeEpoch: generationIdSchema,
   loginSessionId: generationIdSchema,
