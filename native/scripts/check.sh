@@ -188,6 +188,21 @@ fi
   -framework CoreGraphics \
   -o "$CHECK_DIR/broker-core-test"
 
+/usr/bin/clang \
+  -fobjc-arc \
+  -fblocks \
+  -mmacosx-version-min=13.0 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/src/permissions-request \
+  native/src/permissions-request/meta_permissions_request.m \
+  native/src/permissions-request/meta_permissions_request_test.m \
+  -framework Foundation \
+  -framework ApplicationServices \
+  -framework CoreGraphics \
+  -o "$CHECK_DIR/permissions-request-test"
+
 "$CHECK_DIR/registry-test"
 "$CHECK_DIR/executor-test"
 "$CHECK_DIR/ledger-test"
@@ -195,6 +210,7 @@ fi
 "$CHECK_DIR/serialization-test"
 "$CHECK_DIR/capture-router-test"
 "$CHECK_DIR/broker-core-test"
+"$CHECK_DIR/permissions-request-test"
 
 /usr/bin/clang \
   -fobjc-arc \

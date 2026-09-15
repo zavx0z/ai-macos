@@ -55,6 +55,8 @@ test("production command loop: verified handshake → coherent clipboard method 
     expect(permissions.accessibility).toBe(true)
     expect(permissions.postEvents).toBe(false)
     expect(permissions.screenRecording).toBe(false)
+    expect(permissions.inputMonitoring).toBe(false)
+    expect(permissions.capabilities.producerRef).toBe(adapter.generation!.nativeGeneration)
     expect(permissions.codeIdentity).toEqual({ helperPath: "/tmp/command-fixture", cdhash: "1111111111111111111111111111111111111111" })
     const response = await adapter.clipboard({
       kind: "request", protocolVersion: "1", requestId: "clipboard", ...generation, deadlineAt,

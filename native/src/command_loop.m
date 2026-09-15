@@ -133,6 +133,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
 - (void)shutdown:(int)code {
   if (_requestedExit >= 0) return;
   _sealed = YES;
+  if ([_backend respondsToSelector:@selector(sealPermissionRequests)]) [_backend sealPermissionRequests];
   _requestedExit = code;
   [_job channelDisconnected];
   if (!_busy && _maintenanceCount == 0) {
@@ -267,14 +268,40 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     NSDictionary *permissions = [_backend permissions];
     if (![permissions[@"accessibility"] isKindOfClass:NSNumber.class] ||
         ![permissions[@"postEvents"] isKindOfClass:NSNumber.class] ||
-        ![permissions[@"screenRecording"] isKindOfClass:NSNumber.class]) { [self shutdown:70]; return; }
+        ![permissions[@"screenRecording"] isKindOfClass:NSNumber.class] ||
+        ![permissions[@"inputMonitoring"] isKindOfClass:NSNumber.class]) { [self shutdown:70]; return; }
+    NSArray *catalog = [_backend respondsToSelector:@selector(capabilityCatalog)] ? [_backend capabilityCatalog] :
+        @[@{@"id": @"runtime.identity", @"state": @"ready"}];
+    NSDictionary *capabilities = @{@"schemaVersion": @"1", @"scope": @"adapter", @"producerRef": _generation,
+      @"capabilities": catalog};
     NSMutableDictionary *result = [identity mutableCopy];
     [result addEntriesFromDictionary:@{@"kind": @"permissions-response", @"protocolVersion": @"1", @"nativeBuildId": _buildId,
       @"accessibility": [permissions[@"accessibility"] boolValue] ? @YES : @NO,
       @"postEvents": [permissions[@"postEvents"] boolValue] ? @YES : @NO,
-      @"screenRecording": [permissions[@"screenRecording"] boolValue] ? @YES : @NO}];
+      @"screenRecording": [permissions[@"screenRecording"] boolValue] ? @YES : @NO,
+      @"inputMonitoring": [permissions[@"inputMonitoring"] boolValue] ? @YES : @NO,
+      @"capabilities": capabilities}];
     if ([permissions[@"codeIdentity"] isKindOfClass:NSDictionary.class]) result[@"codeIdentity"] = permissions[@"codeIdentity"];
     [self send:channel payload:result];
+    return;
+  }
+  if ([channel isEqual:@"permissions-request"]) {
+    if (![payload[@"kind"] isEqual:@"permissions-request"] || ![payload[@"protocolVersion"] isEqual:@"1"] ||
+        ![@[@"request-missing", @"status"] containsObject:payload[@"command"]] ||
+        ![_backend respondsToSelector:@selector(permissionsRequest:)]) { [self shutdown:65]; return; }
+    if (_sealed && [payload[@"command"] isEqual:@"request-missing"]) { [self shutdown:65]; return; }
+    [self maintenance:payload work:^NSDictionary * { return [self->_backend permissionsRequest:payload]; } completed:^(NSDictionary *status) {
+      if (![status isKindOfClass:NSDictionary.class]) { [self shutdown:70]; return; }
+      NSArray *catalog = [self->_backend respondsToSelector:@selector(capabilityCatalog)] ? [self->_backend capabilityCatalog] :
+          @[@{@"id": @"runtime.identity", @"state": @"ready"}];
+      NSMutableDictionary *result = [identity mutableCopy];
+      [result addEntriesFromDictionary:status];
+      [result addEntriesFromDictionary:@{@"kind": @"permissions-request-response", @"protocolVersion": @"1",
+        @"command": payload[@"command"], @"nativeBuildId": self->_buildId, @"observedAt": timestamp(),
+        @"capabilities": @{@"schemaVersion": @"1", @"scope": @"adapter", @"producerRef": self->_generation,
+          @"capabilities": catalog}}];
+      [self send:channel payload:result];
+    }];
     return;
   }
   if ([channel isEqual:@"domain-recovery"]) {

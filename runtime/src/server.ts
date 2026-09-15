@@ -5,6 +5,18 @@ import { parseBrowserHostConfig } from "./browser-config.ts"
 declare const __META_RUNTIME_BUILD_ID__: string | undefined
 const embeddedBuildId = typeof __META_RUNTIME_BUILD_ID__ === "undefined" ? undefined : __META_RUNTIME_BUILD_ID__
 
+export type RuntimeShutdownHost = { drain(): Promise<unknown>, close(): Promise<void> }
+
+/** Close выполняется независимо от результата drain; clean shutdown не подменяет ошибку drain. */
+export async function shutdownRuntimeHost(host: RuntimeShutdownHost): Promise<void> {
+  const errors: Error[] = []
+  try { await host.drain() }
+  catch (cause) { errors.push(new Error("Runtime drain не подтверждён", { cause })) }
+  try { await host.close() }
+  catch (cause) { errors.push(new Error("Runtime close не подтверждён", { cause })) }
+  if (errors.length > 0) throw new AggregateError(errors, "Runtime shutdown завершил доступные этапы с ошибками")
+}
+
 export async function main(): Promise<void> {
   const required = (name: string): string => {
     const value = process.env[name]
@@ -25,8 +37,10 @@ export async function main(): Promise<void> {
     socketPath: required("META_RUNTIME_SOCKET"), credentialPath: required("META_RUNTIME_CREDENTIAL"),
     runtimeBuildId: embeddedBuildId ?? required("META_RUNTIME_BUILD_ID"),
     expectedNativeBuildId: required("META_NATIVE_BUILD_ID"),
+    expectedNativeCdhash: required("META_NATIVE_CDHASH"),
     browser: parseBrowserHostConfig(process.env.META_RUNTIME_BROWSER_CONFIG),
     managed: process.env.META_RUNTIME_MANAGED === "true",
+    startupPermissions: { mode: "request-missing" },
     ...(process.env.META_RUNTIME_STATE_DIR === undefined ? {} : { stateDirectory: process.env.META_RUNTIME_STATE_DIR }),
     expectedHostname: required("AI_MACOS_EXPECTED_HOSTNAME"), helperPath: required("META_NATIVE_HELPER"),
   })
@@ -35,7 +49,7 @@ export async function main(): Promise<void> {
   const stop = () => {
     if (stopping) return
     stopping = true
-    void host.drain().then(() => host.close()).catch(error => {
+    void shutdownRuntimeHost(host).catch(error => {
       console.error(error instanceof Error ? error.message : String(error))
       process.exitCode = 1
     })

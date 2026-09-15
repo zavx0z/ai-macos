@@ -437,8 +437,8 @@ async function applyRuntimeInstallLocked(
   paths: RuntimeInstallPaths,
 ): Promise<RuntimeInstallResult> {
   await options.failpoint?.("after-installer-lock")
-  const plist = launchAgentPlist(plan)
-  const release = await ensureRelease(plan, options, plist)
+  const release = await ensureRelease(plan, options)
+  const { plist } = release
   await assertNativeBuildStableAcrossConfiguration(plan, release.manifest)
   await assertSourceUnchanged(plan, options)
   if (await exists(pendingUpdatePath(paths))) {
@@ -571,17 +571,19 @@ function installSteps(
   ]
 }
 
-async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOptions, plist: string) {
+async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOptions) {
   const releasePath = plan.release.releasePath
   const manifestPath = join(releasePath, "manifest.json")
   if (await exists(manifestPath)) {
     const manifest = parseManifest(JSON.parse(await readFile(manifestPath, "utf8")))
+    const plist = launchAgentPlist(plan, manifestNativeCdhash(manifest))
     assertManifestMatchesPlan(manifest, plan, sha256(plist))
     await verifyReleaseArtifacts(releasePath, manifest, options.runner, plan)
     return {
       manifest,
       manifestSha256: sha256(stableJson(manifest)),
       nativeHelperPath: join(releasePath, manifest.artifacts.nativeHelper.path),
+      plist,
     }
   }
 
@@ -632,6 +634,7 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
       artifact(runtimePath),
       artifact(nativeHelperPath),
     ])
+    const plist = launchAgentPlist(plan, signature.cdhash)
     const manifest: ReleaseManifest = {
       format: RELEASE_FORMAT,
       releaseId: plan.release.releaseId,
@@ -660,7 +663,8 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
     await rename(staging, releasePath)
     await syncDirectory(dirname(releasePath))
     await chmod(releasePath, 0o555)
-    return { manifest, manifestSha256: sha256(stableJson(manifest)), nativeHelperPath: join(releasePath, "native-helper") }
+    return { manifest, manifestSha256: sha256(stableJson(manifest)),
+      nativeHelperPath: join(releasePath, "native-helper"), plist }
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => undefined)
     throw error
@@ -898,12 +902,13 @@ async function installedReleaseMatches(plan: RuntimeInstallPlan): Promise<boolea
     const current = await readLinkIfPresent(join(plan.paths.installRoot, "current"))
     if (current !== plan.release.releasePath) return false
     const manifest = parseManifest(JSON.parse(await readFile(join(current, "manifest.json"), "utf8")))
-    assertManifestMatchesPlan(manifest, plan, sha256(launchAgentPlist(plan)))
+    const expectedPlist = launchAgentPlist(plan, manifestNativeCdhash(manifest))
+    assertManifestMatchesPlan(manifest, plan, sha256(expectedPlist))
     const helperSha256 = await hashIfPresent(plan.paths.stableHelperPath)
     const plist = await readRegularFileIfPresent(plan.paths.launchAgentPath)
     return helperSha256 === manifest.artifacts.nativeHelper.sha256
       && plist !== undefined
-      && new TextDecoder().decode(plist) === launchAgentPlist(plan)
+      && new TextDecoder().decode(plist) === expectedPlist
   } catch { return false }
 }
 
@@ -1110,13 +1115,14 @@ async function boundedDelay(ms: number): Promise<void> {
   await new Promise(resolveDelay => setTimeout(resolveDelay, ms))
 }
 
-function launchAgentPlist(plan: RuntimeInstallPlan): string {
+function launchAgentPlist(plan: RuntimeInstallPlan, nativeCdhash?: string): string {
   const runtime = join(plan.paths.installRoot, "current", "runtime")
   const environment: Record<string, string> = {
     META_RUNTIME_SOCKET: join(plan.paths.runRoot, "runtime.sock"),
     META_RUNTIME_CREDENTIAL: join(plan.paths.runRoot, "credential.json"),
     META_NATIVE_HELPER: plan.paths.stableHelperPath,
     META_NATIVE_BUILD_ID: plan.release.nativeBuildId,
+    ...(nativeCdhash === undefined ? {} : { META_NATIVE_CDHASH: nativeCdhash }),
     META_RUNTIME_BUILD_ID: plan.release.runtimeBuildId,
     META_RUNTIME_BROWSER_CONFIG: plan.configuration.browserJson,
     META_RUNTIME_MANAGED: "true",
@@ -1146,6 +1152,12 @@ ${environmentXml}
 </dict>
 </plist>
 `
+}
+
+function manifestNativeCdhash(manifest: ReleaseManifest): string | undefined {
+  return (manifest.tcc.requiredPassiveChecks as readonly string[]).includes("post-events")
+    ? manifest.artifacts.nativeHelper.cdhash
+    : undefined
 }
 
 function normalizePaths(value: RuntimeInstallPaths): RuntimeInstallPaths {

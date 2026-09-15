@@ -24,6 +24,8 @@
 - (NSDictionary *)executeApplication:(NSDictionary *)request job:(MetaInputJob *)job;
 - (BOOL)beginRotation;
 @optional
+- (NSDictionary *)permissionsRequest:(NSDictionary *)request;
+- (BOOL)sealPermissionRequests;
 - (NSString *)viewAdmissionVersion;
 - (NSDictionary *)domainRecovery:(NSDictionary *)request owner:(NSDictionary *)owner;
 - (NSString *)recoveryDomainVersion;

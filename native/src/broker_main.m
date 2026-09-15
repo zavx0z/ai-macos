@@ -28,6 +28,7 @@
 #include "recovery-domain/meta_recovery_domain.h"
 #include "domain-recovery/meta_domain_recovery.h"
 #include "view-admission/meta_view_admission.h"
+#include "permissions-request/meta_permissions_request.h"
 #include <time.h>
 #include <math.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -181,6 +182,7 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
   MetaCaptureCommandBinder *_captureCommands;
   MetaObserverCommandBinder *_observerCommands;
   MetaViewAdmissionController *_viewAdmissions;
+  MetaPermissionsRequestController *_permissionRequests;
   NSDictionary *_observerRequest;
   NSString *_observerInstance;
   NSDate *_observerMainDeadline;
@@ -208,6 +210,7 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
     _applicationTaskRefs = [NSMutableDictionary dictionary];
     _captures = meta_capture_router_create(generation.UTF8String, meta_capture_router_default_backend());
     _input = meta_macos_input_create();
+    _permissionRequests = [[MetaPermissionsRequestController alloc] initWithBackend:meta_permissions_system_backend()];
     if (!meta_macos_input_set_risk_validator(_input, (__bridge void *)self, input_risk)) return nil;
     _axSnapshots = [[MetaAXRetainedSnapshotRegistry alloc] initWithClock:^uint64_t { return native_millis(); }
       ttlMillis:120000 maxSnapshots:64 maxNodes:1500];
@@ -255,7 +258,7 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
     _captureCommands = [[MetaCaptureCommandBinder alloc] initWithRouter:_captures inventoryProvider:^const MetaInventorySnapshot * {
       return meta_macos_backend_snapshot(windows);
     } nativeGeneration:generation nativeBuildId:@META_NATIVE_BUILD_ID];
-    if (_windows == NULL || _captures == NULL || _input == NULL || _inputExecutor == nil || _core == NULL || _captureCommands == nil || _axSnapshots == nil) return nil;
+    if (_windows == NULL || _captures == NULL || _input == NULL || _inputExecutor == nil || _core == NULL || _captureCommands == nil || _axSnapshots == nil || _permissionRequests == nil) return nil;
   }
   return self;
 }
@@ -271,12 +274,18 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
 
 - (NSDictionary *)permissions {
   NSMutableDictionary *result = [@{@"accessibility": AXIsProcessTrusted() ? @YES : @NO, @"postEvents": CGPreflightPostEventAccess() ? @YES : @NO,
-           @"screenRecording": meta_capture_preflight_screen_recording() ? @YES : @NO} mutableCopy];
+           @"screenRecording": meta_capture_preflight_screen_recording() ? @YES : @NO,
+           @"inputMonitoring": CGPreflightListenEventAccess() ? @YES : @NO} mutableCopy];
   MetaCodeIdentityFailure failure = MetaCodeIdentityFailureNone;
   NSDictionary *identity = meta_code_identity_read(&failure);
   if (identity != nil) result[@"codeIdentity"] = identity;
   return result;
 }
+
+- (NSDictionary *)permissionsRequest:(NSDictionary *)request {
+  return [_permissionRequests handleCommand:request[@"command"]];
+}
+- (BOOL)sealPermissionRequests { return [_permissionRequests seal]; }
 
 - (NSString *)recoveryDomainVersion { return @"1"; }
 - (NSString *)viewAdmissionVersion { return @"1"; }
@@ -1170,6 +1179,7 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
 
 - (BOOL)beginRotation {
   _sealed = YES;
+  BOOL permissionsReady = [_permissionRequests seal];
   [self stopObserver];
   meta_broker_core_begin_rotation(_core);
   for (NSString *operation in [self pendingOperationIds]) {
@@ -1183,7 +1193,7 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
   }
   BOOL coreReady = meta_broker_core_begin_rotation(_core) == META_BROKER_ROTATION_READY;
   BOOL applicationsReady = _applications == nil || [[_applications drainLaunchesUntil:_applicationBackend.monotonic_millis(_applicationBackend.context)][@"cleanup"] isEqual:@"complete"];
-  return coreReady && applicationsReady && _observerInstance == nil;
+  return coreReady && applicationsReady && permissionsReady && _observerInstance == nil;
 }
 @end
 

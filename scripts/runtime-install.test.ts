@@ -1,4 +1,5 @@
 import { afterEach, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
 import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { hostname } from "node:os"
 import { join } from "node:path"
@@ -51,10 +52,36 @@ test("dry-run строит reviewable plan без login identity и execute пу
   const plist = await readFile(fixture.options.paths.launchAgentPath, "utf8")
   expect(plist).toContain(`<string>${RUNTIME_SERVICE_LABEL}</string>`)
   expect(plist).toContain("META_NATIVE_HELPER")
+  expect(plist).toContain("META_NATIVE_CDHASH")
+  expect(plist).toContain(`<string>${manifest.artifacts.nativeHelper.cdhash}</string>`)
+  expect(manifest.launchAgent.sha256).toBe(sha256(plist))
   expect(plist).toContain("META_RUNTIME_BROWSER_CONFIG")
   expect(plist).toContain("META_RUNTIME_MANAGED")
   expect(plist).not.toContain("META_LOGIN_SESSION_ID")
   expect(await readFile(fixture.options.paths.stableHelperPath, "utf8")).toContain(plan.release.nativeBuildId)
+})
+
+test("immutable release отклоняет plist cdhash, не совпадающий с signed helper", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(plan, fixture.options)
+  const manifestPath = join(plan.release.releasePath, "manifest.json")
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
+  const installedPlist = await readFile(fixture.options.paths.launchAgentPath, "utf8")
+  const tamperedCdhash = "d".repeat(40)
+  const tamperedPlist = installedPlist.replace(manifest.artifacts.nativeHelper.cdhash, tamperedCdhash)
+  manifest.artifacts.nativeHelper.cdhash = tamperedCdhash
+  manifest.tcc.candidateCdhash = tamperedCdhash
+  manifest.launchAgent.sha256 = sha256(tamperedPlist)
+  await chmod(plan.release.releasePath, 0o700)
+  await chmod(manifestPath, 0o600)
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
+  await chmod(manifestPath, 0o444)
+  await chmod(plan.release.releasePath, 0o555)
+  const repeated = await planRuntimeInstall(fixture.options)
+
+  await expect(applyRuntimeInstall(repeated, fixture.options))
+    .rejects.toThrow("codesign identity не совпадает с manifest")
 })
 
 test("loaded update требует exact drain, повтор того же release идемпотентен", async () => {
@@ -130,6 +157,45 @@ test("failed doctor атомарно возвращает previous helper, relea
   expect(await readlink(join(options.paths.installRoot, "current"))).toBe(firstPlan.release.releasePath)
   expect(await readFile(options.paths.stableHelperPath)).toEqual(firstHelper)
   expect(await readFile(options.paths.launchAgentPath)).toEqual(firstPlist)
+})
+
+test("rollback принимает старый manifest и plist без META_NATIVE_CDHASH", async () => {
+  const fixture = await createFixture()
+  const firstPlan = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(firstPlan, fixture.options)
+  const manifestPath = join(firstPlan.release.releasePath, "manifest.json")
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
+  const currentPlist = await readFile(fixture.options.paths.launchAgentPath, "utf8")
+  const legacyPlist = currentPlist.replace(
+    `    <key>META_NATIVE_CDHASH</key>\n    <string>${manifest.artifacts.nativeHelper.cdhash}</string>\n`,
+    "",
+  )
+  manifest.tcc.requiredPassiveChecks = ["accessibility", "screen-recording"]
+  manifest.launchAgent.sha256 = sha256(legacyPlist)
+  await chmod(firstPlan.release.releasePath, 0o700)
+  await chmod(manifestPath, 0o600)
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
+  await chmod(manifestPath, 0o444)
+  await chmod(firstPlan.release.releasePath, 0o555)
+  await writeFile(fixture.options.paths.launchAgentPath, legacyPlist)
+
+  fixture.runner.commit = "9".repeat(40)
+  fixture.runner.loaded = true
+  const inspection: RuntimeInspection = {
+    running: true,
+    runtimeEpoch: "runtime:legacy-rollback",
+    runtimeBuildId: firstPlan.release.runtimeBuildId,
+    nativeBuildId: firstPlan.release.nativeBuildId,
+    activeOperations: 0,
+    quarantinedResources: 0,
+  }
+  const options = { ...fixture.options, runtimeAdmin: successfulAdmin(inspection) }
+  const update = await planRuntimeInstall(options)
+  fixture.runner.failDoctorForBuild = update.release.runtimeBuildId
+
+  await expect(applyRuntimeInstall(update, options)).rejects.toThrow("doctor")
+  expect(await readFile(options.paths.launchAgentPath, "utf8")).toBe(legacyPlist)
+  expect(await readlink(join(options.paths.installRoot, "current"))).toBe(firstPlan.release.releasePath)
 })
 
 test("installer пассивно ждёт startup permissions и после ready проверяет observer/view", async () => {
@@ -697,3 +763,4 @@ class FakeRunner implements CommandRunner {
 
 function ok(stdout = ""): CommandResult { return { stdout, stderr: "", exitCode: 0 } }
 function fail(stderr: string): CommandResult { return { stdout: "", stderr, exitCode: 1 } }
+function sha256(value: string): string { return createHash("sha256").update(value).digest("hex") }

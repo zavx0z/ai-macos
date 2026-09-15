@@ -10,6 +10,36 @@ startup recovery receipts и управляемая rotation; pointer readiness 
 
 ## Последующий проверенный integration slice
 
+Startup permission orchestration:
+
+- Actual installed Runtime до любого inventory/observer/input вызывает один
+  `permissions-request/request-missing` для четырёх обязательных прав:
+  Accessibility, Screen Recording, Post Events и Input Monitoring. Уже выданные
+  права дают ноль official request calls; после первого запроса используются
+  только passive status checks каждые 500 мс.
+- До запроса Runtime пассивно проверяет exact helper realpath, signed self cdhash,
+  build и generation. `META_NATIVE_CDHASH` обязателен в installed server.
+  Несовпадение оставляет admission sealed и не вызывает системный диалог.
+- UDS и `system_health` доступны во время ожидания. Health показывает
+  `startup.permissions` со state, missing set, deadline, request/restart facts;
+  health сам никогда не вызывает request API. Отмена отдельного health call не
+  отменяет background startup flow и не повторяет prompt.
+- Общий wait budget — 600 секунд, отдельный poll — 500 мс. Finished SDK call без
+  grant остаётся waiting: пользователь может включить право вручную. Unsupported
+  или failed official API завершают state `failed`; restart `unknown` не запускает
+  автоматический restart. Только доказанный `required` отображается отдельно.
+- Core admission остаётся sealed до всех grants и готового observer/view gate.
+  После grants начинается прежняя inventory/observer preparation; active input
+  readiness автоматически не запускается. Drain/close отменяют ожидание bounded.
+- SIGTERM/SIGINT всегда выполняет `close` после попытки `drain`. Ошибка drain
+  сохраняется, ошибки close агрегируются, поэтому незавершённый SDK request не
+  оставляет UDS/owned child/lock только из-за short-circuit promise chain и не
+  выдаётся за clean drain.
+- Runtime/Host/controller/acceptance: **23 pass / 160 assertions**; полный
+  runtime + thin MCP: **289 pass / 1383 assertions**; общий typecheck и
+  diff-check прошли. Native отдельно сообщил permission suite, typecheck и broker
+  compile; live prompts и installed activation остаются root acceptance stage.
+
 Базовая high-level Host composition подключена:
 
 - Один AgentTargetRegistry и один AgentViewGuard/AgentViewBindings используют

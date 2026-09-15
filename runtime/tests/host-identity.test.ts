@@ -1,10 +1,11 @@
 import { expect, test } from "bun:test"
-import { mkdtemp, rm, stat } from "node:fs/promises"
+import { mkdtemp, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir, hostname } from "node:os"
 import { join } from "node:path"
 import type { NativeTransport } from "@meta/native/adapter"
 import type { NativeTransportPacket, NativeTransportRequestFrame } from "@meta/native/protocol"
 import type { NativePermissionsResponse } from "@meta/native/protocol"
+import type { NativeStartupPermissionsRequest } from "@meta/native/protocol"
 import { createRuntimeHost } from "../src/host.ts"
 import { CAPABILITY_IDS } from "@meta/shared/contracts"
 import { acquireHostLock } from "../src/host-lock.ts"
@@ -50,6 +51,13 @@ class AuditTransport implements NativeTransport {
   fullView = false
   viewVersion: "1" | undefined
   mutationCalls = 0
+  startupPermissionCommands: string[] = []
+  startupPermissionGranted?: boolean
+  startupPermissionRequested = false
+  grantStartupPermissions(): void {
+    this.startupPermissionGranted = true
+    this.permissions = { accessibility: true, screenRecording: true, postEvents: true, inputMonitoring: true }
+  }
   inventoryStarted?: () => void
   #packet: Promise<NativeTransportPacket>
   #resolve!: (packet: NativeTransportPacket) => void
@@ -60,6 +68,13 @@ class AuditTransport implements NativeTransport {
     this.#packet = new Promise(resolve => { this.#resolve = resolve })
   }
   async send(frame: NativeTransportRequestFrame) {
+    if (frame.channel === "permissions-request") {
+      this.startupPermissionCommands.push(frame.payload.command)
+      if (frame.payload.command === "request-missing") this.startupPermissionRequested = true
+      this.#resolve({ kind: "message", frame: { channel: "permissions-request",
+        payload: startupPermissionResponse(frame.payload, this.startupPermissionGranted === true, this.startupPermissionRequested) } })
+      return
+    }
     if (frame.channel === "request" && frame.payload.intent === "mutation") this.mutationCalls++
     if (this.fullView && frame.channel === "request" && frame.payload.method === "window.inventory") {
       const request = frame.payload
@@ -111,7 +126,15 @@ class AuditTransport implements NativeTransport {
       const { deadlineAt: _, ...identity } = frame.payload
       this.#resolve({ kind: "message", frame: { channel: "permissions", payload: {
         ...identity, kind: "permissions-response", nativeBuildId: "build:native-audit",
-        accessibility: true, postEvents: true, screenRecording: false,
+        accessibility: true, postEvents: true, screenRecording: false, inputMonitoring: true,
+        capabilities: { scope: "adapter", schemaVersion: "1", producerRef: "native:audit", capabilities: [
+          { id: "desktop.applications", state: "ready" }, { id: "desktop.windows.all", state: "ready" }, { id: "desktop.displays", state: "ready" },
+          { id: "input.clipboard", state: "ready" },
+          ...(this.readinessState === undefined ? [] : [{ id: "input.readiness" as const, state: this.readinessState,
+            ...(this.readinessState === "ready" ? {} : { reason: "Fixture readiness implementation pending" }) }]),
+          ...(this.fullView ? CAPABILITY_IDS.filter(id => !["desktop.applications", "desktop.windows.all", "desktop.displays", "input.clipboard", "input.readiness"].includes(id))
+            .map(id => ({ id, state: "ready" as const })) : []),
+        ] },
         codeIdentity: { helperPath: "/tmp/signed-self-helper", cdhash: "a".repeat(40) }, ...this.permissions,
       } } })
       return
@@ -151,6 +174,25 @@ class AuditTransport implements NativeTransport {
   }
 }
 
+function startupPermissionResponse(request: NativeStartupPermissionsRequest, granted: boolean, requested: boolean) {
+  const status = granted
+    ? { beforeGranted: !requested, currentGranted: true, requestState: requested ? "finished" as const : "not-needed" as const,
+        promptRequested: requested, requestFinished: requested,
+        ...(requested ? { requestReturnedGranted: true } : {}), restartNeeded: false, restartState: "not-required" as const }
+    : requested
+      ? { beforeGranted: false, currentGranted: false, requestState: "queued" as const, promptRequested: false,
+          requestFinished: false, restartNeeded: false, restartState: "not-required" as const }
+      : { beforeGranted: false, currentGranted: false, requestState: "not-requested" as const, promptRequested: false,
+          requestFinished: false, restartNeeded: false, restartState: "not-required" as const }
+  const permissions = { accessibility: status, screenRecording: status, postEvents: status, inputMonitoring: status }
+  return { kind: "permissions-request-response" as const, protocolVersion: "1" as const, requestId: request.requestId,
+    runtimeEpoch: request.runtimeEpoch, loginSessionId: request.loginSessionId, nativeGeneration: request.nativeGeneration,
+    command: request.command, nativeBuildId: "build:native-audit", observedAt: new Date().toISOString(),
+    requestsFinished: granted, allGranted: granted, restartNeeded: false, restartState: "not-required" as const,
+    permissions, capabilities: { scope: "adapter" as const, schemaVersion: "1" as const, producerRef: request.nativeGeneration,
+      capabilities: CAPABILITY_IDS.map(id => ({ id, state: "ready" as const })) } }
+}
+
 for (const guarded of [false, true]) {
   test(`Host high-level protected catalogue требует negotiated view gate: ${guarded}`, async () => {
     const directory = await mkdtemp(join(tmpdir(), "host-view-gate-"))
@@ -180,6 +222,115 @@ for (const guarded of [false, true]) {
   })
 }
 
+test("startup уже с grants не вызывает request API и активирует observer после passive status", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-permission-granted-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 130 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.startupPermissionGranted = true
+  transport.grantStartupPermissions()
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:permissions-granted", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport,
+    startupPermissions: { mode: "request-missing", waitMs: 5000, pollMs: 100 } })
+  try {
+    await host.start()
+    await host.ready()
+    expect(transport.startupPermissionCommands).toEqual(["status"])
+    expect(host.doctor()).toMatchObject({ startup: { permissions: { state: "ready", requestIssued: false, missing: [] } },
+      observer: { state: "ready", viewReady: true }, runtime: { admissionSealed: false } })
+    expect(transport.mutationCalls).toBe(0)
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test("startup запрашивает missing grants один раз, health polling passive, activation только после grants", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-permission-request-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 131 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.startupPermissionGranted = false
+  transport.permissions = { accessibility: false, screenRecording: false, postEvents: false, inputMonitoring: false }
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:permissions-request", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport,
+    startupPermissions: { mode: "request-missing", waitMs: 5000, pollMs: 500 } })
+  try {
+    await host.start()
+    while (!transport.startupPermissionCommands.includes("request-missing")) await Promise.resolve()
+    expect(transport.startupPermissionCommands.filter(command => command === "request-missing")).toHaveLength(1)
+    expect(host.core.admissionSealed).toBe(true)
+    expect(host.catalog.descriptors().tools.some(tool => tool.name === "get_state")).toBe(false)
+    const healthClient = await host.core.openClientDurable("principal:permission-health")
+    const health = async () => host.catalog.dispatch(healthClient.session, "system_health", {}, new AbortController().signal)
+    expect((await health()).data).toMatchObject({ startup: { permissions: { state: "waiting", requestIssued: true,
+      missing: ["accessibility", "screenRecording", "postEvents", "inputMonitoring"] } } })
+    expect(transport.startupPermissionCommands.filter(command => command === "request-missing")).toHaveLength(1)
+    transport.grantStartupPermissions()
+    expect((await health()).data).toMatchObject({ startup: { permissions: { state: "ready", requestIssued: true, missing: [] } } })
+    await host.ready()
+    expect(host.doctor()).toMatchObject({ observer: { state: "ready", viewReady: true }, runtime: { admissionSealed: false } })
+    expect(host.catalog.descriptors().tools.some(tool => tool.name === "get_state")).toBe(true)
+    expect(transport.startupPermissionCommands.filter(command => command === "request-missing")).toHaveLength(1)
+    expect(transport.mutationCalls).toBe(0)
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test("host close отменяет ожидание permission response без повторного prompt", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-permission-close-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 132 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.startupPermissionGranted = false
+  const options = { socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:permissions-close", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session } }
+  const host = await createRuntimeHost({ ...options, transport,
+    startupPermissions: { mode: "request-missing", waitMs: 5000, pollMs: 500 } })
+  try {
+    await host.start()
+    while (!transport.startupPermissionCommands.includes("request-missing")) await Promise.resolve()
+    await Promise.race([host.close(), new Promise<never>((_, reject) => setTimeout(() => reject(new Error("Host close waited for permission timeout")), 1000))])
+    expect(transport.startupPermissionCommands.filter(command => command === "request-missing")).toHaveLength(1)
+    expect(transport.mutationCalls).toBe(0)
+    await expect(stat(options.socketPath)).rejects.toThrow()
+  } finally {
+    await host.close().catch(() => undefined)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
+test("startup не запрашивает TCC при чужом helper cdhash и health не обходит owner check", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-permission-owner-"))
+  const helperPath = join(directory, "meta-native-helper")
+  await writeFile(helperPath, "fixture")
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 133 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.startupPermissionGranted = true
+  transport.permissions = { codeIdentity: { helperPath, cdhash: "a".repeat(40) } }
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:permission-owner", expectedNativeBuildId: "build:native-audit", expectedNativeCdhash: "b".repeat(40),
+    expectedHostname: hostname(), helperPath, metadata: { session }, transport,
+    startupPermissions: { mode: "request-missing", waitMs: 5000, pollMs: 100 } })
+  try {
+    await host.start()
+    await host.ready()
+    expect(host.doctor()).toMatchObject({ startup: { permissions: { state: "failed", requestIssued: false } },
+      runtime: { admissionSealed: true }, observer: { state: "unavailable", viewReady: false } })
+    expect(transport.startupPermissionCommands).toEqual([])
+    const client = await host.core.openClientDurable("principal:owner-health")
+    const health = await host.catalog.dispatch(client.session, "system_health", {}, new AbortController().signal)
+    expect(health.data).toMatchObject({ startup: { permissions: { state: "failed" } } })
+    expect(transport.startupPermissionCommands).toEqual([])
+    expect(transport.mutationCalls).toBe(0)
+  } finally { await host.close().catch(() => undefined); await rm(directory, { recursive: true, force: true }) }
+})
+
 test("host health использует fresh passive grants и signed loaded identity", async () => {
   const directory = await mkdtemp(join(tmpdir(), "host-permissions-"))
   const session = { verified: true as const, source: "darwin-audit" as const,
@@ -194,6 +345,7 @@ test("host health использует fresh passive grants и signed loaded ide
       accessibility: { granted: true, helperPath: "/tmp/signed-self-helper", cdhash: "a".repeat(40) },
       screenRecording: { granted: false, ownerPath: "/tmp/signed-self-helper", cdhash: "a".repeat(40) },
       postEvents: { granted: true, helperPath: "/tmp/signed-self-helper", cdhash: "a".repeat(40) },
+      inputMonitoring: { granted: true, helperPath: "/tmp/signed-self-helper", cdhash: "a".repeat(40) },
     })
     transport.permissions = { accessibility: false }
     expect((await read()).permissions).toMatchObject({ accessibility: { granted: false } })
@@ -202,6 +354,7 @@ test("host health использует fresh passive grants и signed loaded ide
     transport.permissions = { nativeGeneration: "native:wrong" }
     expect((await read()).permissions).toBeUndefined()
     expect(transport.permissionCalls).toBe(4)
+    expect(transport.startupPermissionCommands).toEqual([])
   } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
 })
 

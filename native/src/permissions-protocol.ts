@@ -1,4 +1,4 @@
-import { generationIdSchema, opaqueIdSchema, z } from "@meta/shared/contracts"
+import { capabilitySetSchema, generationIdSchema, opaqueIdSchema, z } from "@meta/shared/contracts"
 
 const identity = {
   protocolVersion: z.literal("1"), requestId: opaqueIdSchema,
@@ -9,11 +9,16 @@ export const nativePermissionsRequestSchema = z.strictObject({
 })
 export const nativePermissionsResponseSchema = z.strictObject({
   ...identity, kind: z.literal("permissions-response"), nativeBuildId: opaqueIdSchema,
-  accessibility: z.boolean(), postEvents: z.boolean(), screenRecording: z.boolean(),
+  accessibility: z.boolean(), postEvents: z.boolean(), screenRecording: z.boolean(), inputMonitoring: z.boolean(),
+  capabilities: capabilitySetSchema,
   codeIdentity: z.strictObject({
     helperPath: z.string().min(1).max(4096).startsWith("/"),
     cdhash: z.string().regex(/^[a-fA-F0-9]{40,64}$/),
   }).optional(),
+}).superRefine((response, context) => {
+  if (response.capabilities.scope !== "adapter" || response.capabilities.producerRef !== response.nativeGeneration) {
+    context.addIssue({ code: "custom", path: ["capabilities"], message: "Passive permission capabilities принадлежат другому Native producer" })
+  }
 })
 export type NativePermissionsRequest = z.infer<typeof nativePermissionsRequestSchema>
 export type NativePermissionsResponse = z.infer<typeof nativePermissionsResponseSchema>

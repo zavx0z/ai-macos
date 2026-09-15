@@ -52,6 +52,8 @@ import { registerAgentMethods } from "./agent-methods.ts"
 import { registerAgentActionMethods } from "./agent-action-methods.ts"
 import { registerAgentPointerMethods } from "./agent-pointer-methods.ts"
 import { registerAgentAxMethods } from "./agent-ax-methods.ts"
+import { RuntimeStartupPermissions, notRequiredStartupPermissions, startupPermissionsStateSchema,
+  type StartupPermissionsState } from "./startup-permissions.ts"
 import { recentOperationsInputSchema, recentOperationsResultSchema } from "./recent-operations.ts"
 
 export type RuntimeHostOptions = {
@@ -59,6 +61,7 @@ export type RuntimeHostOptions = {
   credentialPath: string
   runtimeBuildId: string
   expectedNativeBuildId: string
+  expectedNativeCdhash?: string
   loginSessionId?: string
   expectedHostname: string
   helperPath?: string
@@ -69,6 +72,7 @@ export type RuntimeHostOptions = {
   browser?: BrowserHostConfig
   managed?: boolean
   exitAfterRotation?: () => void
+  startupPermissions?: { mode: "request-missing" | "passive", waitMs?: number, pollMs?: number }
 }
 
 export async function createRuntimeHost(options: RuntimeHostOptions) {
@@ -119,6 +123,19 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   let backendPreparation: Promise<void> | undefined
   const preparationAbort = new AbortController()
   let windowAdapter: NativeWindowAdapter | undefined
+  let nativeCapabilities = handshake?.capabilities
+  let permissionFlow: RuntimeStartupPermissions | undefined
+  let permissionPreparation: Promise<StartupPermissionsState> | undefined
+  const permissionMode = options.startupPermissions?.mode ?? (options.helperPath === undefined ? "passive" : "request-missing")
+  if (permissionMode === "request-missing" && options.helperPath !== undefined && options.expectedNativeCdhash === undefined) {
+    throw new Error("Actual startup permission request требует expected Native cdhash")
+  }
+  if (options.expectedNativeCdhash !== undefined && !/^[a-f0-9]{40,64}$/i.test(options.expectedNativeCdhash)) throw new Error("Expected Native cdhash invalid")
+  let permissionFallback = permissionMode === "passive" ? notRequiredStartupPermissions()
+    : startupPermissionsStateSchema.parse({ state: "checking",
+        required: ["accessibility", "screenRecording", "postEvents", "inputMonitoring"], missing: [],
+        requestIssued: false, requestsFinished: false, restartNeeded: false, restartState: "not-required" })
+  let beginBackendPreparation: () => Promise<void> = async () => undefined
   const revokeNative = (reason: string) => {
     nativeError = reason
     runtime?.updateCapabilities(composeHostCapabilities("host:runtime", undefined, reason, browserHost?.capabilitySet))
@@ -167,6 +184,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       handshake = await native.handshake(request, AbortSignal.timeout(5000))
       const mismatch = nativeHandshakeCompatibility(request, handshake)
       if (mismatch !== undefined) throw new Error(mismatch.message)
+      nativeCapabilities = handshake.capabilities
       if (session !== undefined && (!session.verified || !structurallyEqual(handshake.session, session))) throw new Error("Live helper audit session не совпадает с metadata")
       if (ownedProcess !== undefined && options.helperPath !== undefined) {
         if (ownedProcess.processStatus.pid !== handshake.process.pid || ownedProcess.processStatus.exitConfirmed) throw new Error("Native handshake не принадлежит живому owned child")
@@ -227,9 +245,45 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   browserHost = createBrowserHostComposition(core, options.browser ?? {})
   await core.browserLifetime.restorePersisted()
   const refreshCapabilities = () => core.updateCapabilities(composeHostCapabilities("host:runtime",
-    native === undefined || nativeError !== undefined ? undefined : handshake?.capabilities,
+    native === undefined || nativeError !== undefined ? undefined : nativeCapabilities,
     nativeError, browserHost?.capabilitySet, observerState === "ready", viewReady))
   refreshCapabilities()
+  const readPassivePermissions = async (signal: AbortSignal) => {
+    if (native === undefined || handshake === undefined) throw new Error("Native helper unavailable")
+    const response = await native.permissions({ kind: "permissions", protocolVersion: "1", requestId: `permissions:${crypto.randomUUID()}`,
+      ...generation, nativeGeneration: handshake.nativeGeneration, deadlineAt: new Date(Date.now() + 1000).toISOString(),
+    }, { signal, checkpoint() { signal.throwIfAborted() } })
+    nativeCapabilities = response.capabilities
+    refreshCapabilities()
+    return response
+  }
+  if (permissionMode === "request-missing") {
+    if (native === undefined) {
+      permissionFallback = startupPermissionsStateSchema.parse({ ...permissionFallback, state: "failed",
+        reason: nativeError ?? "Verified Native helper недоступен для startup permission request" })
+    } else {
+      permissionFlow = new RuntimeStartupPermissions({
+        native,
+        ...(options.startupPermissions?.waitMs === undefined ? {} : { waitMs: options.startupPermissions.waitMs }),
+        ...(options.startupPermissions?.pollMs === undefined ? {} : { pollMs: options.startupPermissions.pollMs }),
+        onCapabilities(capabilities) { nativeCapabilities = capabilities; refreshCapabilities() },
+        onReady() { void beginBackendPreparation() },
+        onBlocked() {
+          core.sealAdmission()
+          viewReady = false
+          void viewGuard?.close()
+          refreshCapabilities()
+        },
+        async verifyOwner(signal) {
+          const response = await readPassivePermissions(signal)
+          if (response.codeIdentity === undefined) throw new Error("Native signed self identity unavailable до permission request")
+          const { helperPath, cdhash } = response.codeIdentity
+          if (options.helperPath !== undefined && await realpath(options.helperPath) !== await realpath(helperPath)) throw new Error("Permission owner path не совпадает с configured helper")
+          if (options.expectedNativeCdhash !== undefined && cdhash.toLowerCase() !== options.expectedNativeCdhash.toLowerCase()) throw new Error("Permission owner cdhash не совпадает с release manifest")
+        },
+      })
+    }
+  }
   const catalog = new MethodRegistry(core)
   const agentMethods = registerAgentMethods(catalog, core, agentTargets, { views: {
     observe: (session, targetId, target, capture, complete) => viewBindings === undefined
@@ -273,6 +327,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       new ProtocolNativeCaptureDriver(new NativeCaptureClient(native, core.continuations))))
   }
   const doctor = () => ({
+    startup: { permissions: permissionFlow?.snapshot() ?? permissionFallback },
     machine: { hostname: hostname(), matchesExpected: hostname() === options.expectedHostname },
     runtime: { buildId: options.runtimeBuildId, ...generation, draining,
       admissionSealed: core.admissionSealed, recoveryOperations: core.recoveryEvidence().length,
@@ -287,6 +342,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     activeOperations: core.activeOperationCount(), quarantinedResources: core.resources.quarantinedCount(),
   })
   const doctorSchema = z.strictObject({
+    startup: z.strictObject({ permissions: startupPermissionsStateSchema }),
     observer: z.strictObject({ state: z.enum(["unavailable", "preparing", "ready"]), reason: z.string(), viewReady: z.boolean() }),
     machine: z.strictObject({ hostname: z.string(), matchesExpected: z.boolean() }),
     runtime: z.strictObject({ buildId: z.string(), runtimeEpoch: z.string(), loginSessionId: z.string(), draining: z.boolean(),
@@ -302,6 +358,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       accessibility: z.strictObject({ granted: z.boolean(), helperPath: z.string(), cdhash: z.string() }),
       screenRecording: z.strictObject({ granted: z.boolean(), ownerPath: z.string(), cdhash: z.string() }),
       postEvents: z.strictObject({ granted: z.boolean(), helperPath: z.string(), cdhash: z.string() }),
+      inputMonitoring: z.strictObject({ granted: z.boolean(), helperPath: z.string(), cdhash: z.string() }),
     }).optional(),
     permissionsUnavailable: z.string().optional(),
   })
@@ -312,9 +369,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       if (native === undefined || handshake === undefined) return { ...doctor(), permissionsUnavailable: "Native helper unavailable" }
       try {
         const signal = AbortSignal.any([context.signal, AbortSignal.timeout(1000)])
-        const response = await native.permissions({ kind: "permissions", protocolVersion: "1", requestId: `permissions:${crypto.randomUUID()}`,
-          ...generation, nativeGeneration: handshake.nativeGeneration, deadlineAt: new Date(Date.now() + 1000).toISOString(),
-        }, { signal, checkpoint() { signal.throwIfAborted() } })
+        if (permissionFlow !== undefined && permissionFlow.snapshot().state !== "ready") await permissionFlow.refreshStatus(signal)
+        const response = await readPassivePermissions(signal)
         if (response.codeIdentity === undefined) throw new Error("Native signed self identity unavailable")
         const { helperPath, cdhash } = response.codeIdentity
         if (options.helperPath !== undefined && await realpath(options.helperPath) !== await realpath(helperPath)) throw new Error("Loaded helper path не совпадает с configured artifact")
@@ -322,6 +378,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
           accessibility: { granted: response.accessibility, helperPath, cdhash },
           screenRecording: { granted: response.screenRecording, ownerPath: helperPath, cdhash },
           postEvents: { granted: response.postEvents, helperPath, cdhash },
+          inputMonitoring: { granted: response.inputMonitoring, helperPath, cdhash },
         } }
       } catch (error) { return { ...doctor(), permissionsUnavailable: error instanceof Error ? error.message : "Native permissions unavailable" } }
     },
@@ -403,6 +460,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     await core.drainOperations()
     await core.drainClientGrace()
     await core.browserLifetime.shutdownLineage(undefined, signal)
+    await permissionPreparation?.catch(() => undefined)
     await backendPreparation
     await viewGuard?.close()
     viewReady = false
@@ -464,6 +522,55 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       },
     })
   }
+  beginBackendPreparation = () => {
+    if (backendPreparation !== undefined) return backendPreparation
+    if (native === undefined || windowAdapter === undefined) return Promise.resolve()
+    const source = native
+    const windows = windowAdapter
+    observerState = "preparing"
+    observerReason = "Подготовка свежего Native AX index"
+    refreshCapabilities()
+    backendPreparation = (async () => {
+      try {
+        const signal = AbortSignal.any([AbortSignal.timeout(6000), preparationAbort.signal])
+        await windows.inventory({ signal, checkpoint() { signal.throwIfAborted() } })
+        signal.throwIfAborted()
+        observerBinding = await createNativeObserverBinding({ native: source, signal: preparationAbort.signal, onGap(error) {
+          observerState = "unavailable"
+          viewReady = false
+          void viewGuard?.close()
+          observerReason = error.message
+          refreshCapabilities()
+        } })
+        if (preparationAbort.signal.aborted) {
+          await observerBinding.close()
+          preparationAbort.signal.throwIfAborted()
+        }
+        const coverage = await observerBinding.coverage()
+        observerState = coverage.state === "ready" ? "ready" : "unavailable"
+        observerReason = coverage.reason ?? "Native PUSH coverage подтверждено; session/SecureInput проверяются отдельно"
+        if (observerState === "ready" && handshake?.viewAdmissionVersion === "1" && handshake.recoveryDomainVersion === "1") {
+          viewGuard = new AgentViewGuard({ generation: { ...generation, nativeGeneration: handshake.nativeGeneration }, observer: observerBinding.hub,
+            resolveTarget: (lineage, targetId) => agentTargets.forLineage(lineage).resolveAction(targetId) })
+          await viewGuard.start()
+          preparationAbort.signal.throwIfAborted()
+          viewBindings = new AgentViewBindings(core, viewGuard)
+          viewReady = true
+          const pointer = registerAgentPointerMethods(catalog, agentMethods)
+          registerAgentAxMethods(catalog, core, agentTargets, agentMethods, agentMethods.operations, pointer)
+          if (permissionMode === "request-missing") {
+            try { core.unsealAdmission() }
+            catch { /* Startup recovery сохраняет admission sealed независимо от выданных TCC grants. */ }
+          }
+        }
+      } catch (error) {
+        observerState = "unavailable"
+        observerReason = error instanceof Error ? error.message : "Observer preparation failed"
+      }
+      refreshCapabilities()
+    })()
+    return backendPreparation
+  }
   const close = () => {
     closing ??= (async () => {
       rotation?.stop()
@@ -476,6 +583,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
         catch (cause) { errors.push(new Error(`Runtime close: ${stage} не подтверждён`, { cause })) }
       }
       await attempt("client lifecycle", () => core.closeClientLifecycle())
+      await permissionPreparation?.catch(() => undefined)
       await attempt("backend preparation", () => backendPreparation)
       await attempt("view guard", () => viewGuard?.close())
       viewReady = false
@@ -494,56 +602,17 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   return {
     core, catalog, doctor, recoverStartup, prepareRecoveryRestart,
-    async ready() { await backendPreparation },
+    async ready() { await permissionPreparation; await backendPreparation },
     async start() {
       try {
+        if (permissionFlow !== undefined) core.sealAdmission()
         if (native !== undefined && handshake !== undefined) heartbeat = startRuntimeHeartbeat({ native,
           generation: { ...generation, nativeGeneration: handshake.nativeGeneration },
           onFailure(error) { core.quarantineStartup(`Native heartbeat unavailable: ${error.message}`); revokeNative("Native heartbeat unavailable") },
         })
         await uds.start()
-        if (native !== undefined && windowAdapter !== undefined) {
-          const source = native
-          const windows = windowAdapter
-          observerState = "preparing"
-          observerReason = "Подготовка свежего Native AX index"
-          refreshCapabilities()
-          backendPreparation = (async () => {
-            try {
-              const signal = AbortSignal.any([AbortSignal.timeout(6000), preparationAbort.signal])
-              await windows.inventory({ signal, checkpoint() { signal.throwIfAborted() } })
-              signal.throwIfAborted()
-              observerBinding = await createNativeObserverBinding({ native: source, signal: preparationAbort.signal, onGap(error) {
-                observerState = "unavailable"
-                viewReady = false
-                void viewGuard?.close()
-                observerReason = error.message
-                refreshCapabilities()
-              } })
-              if (preparationAbort.signal.aborted) {
-                await observerBinding.close()
-                preparationAbort.signal.throwIfAborted()
-              }
-              const coverage = await observerBinding.coverage()
-              observerState = coverage.state === "ready" ? "ready" : "unavailable"
-              observerReason = coverage.reason ?? "Native PUSH coverage подтверждено; session/SecureInput проверяются отдельно"
-              if (observerState === "ready" && handshake?.viewAdmissionVersion === "1" && handshake.recoveryDomainVersion === "1") {
-                viewGuard = new AgentViewGuard({ generation: { ...generation, nativeGeneration: handshake.nativeGeneration }, observer: observerBinding.hub,
-                  resolveTarget: (lineage, targetId) => agentTargets.forLineage(lineage).resolveAction(targetId) })
-                await viewGuard.start()
-                preparationAbort.signal.throwIfAborted()
-                viewBindings = new AgentViewBindings(core, viewGuard)
-                viewReady = true
-                const pointer = registerAgentPointerMethods(catalog, agentMethods)
-                registerAgentAxMethods(catalog, core, agentTargets, agentMethods, agentMethods.operations, pointer)
-              }
-            } catch (error) {
-              observerState = "unavailable"
-              observerReason = error instanceof Error ? error.message : "Observer preparation failed"
-            }
-            refreshCapabilities()
-          })()
-        }
+        if (permissionFlow === undefined) void beginBackendPreparation()
+        else permissionPreparation = permissionFlow.start(preparationAbort.signal)
         clientSweep = setInterval(() => core.sweepClientExpiries(), 1000)
         clientSweep.unref?.()
         rotation = startRuntimeRotation({

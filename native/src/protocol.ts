@@ -37,6 +37,8 @@ import { nativeClipboardRequestSchema, nativeClipboardResponseSchema, NATIVE_CLI
 export * from "./clipboard-protocol.ts"
 import { nativePermissionsRequestSchema, nativePermissionsResponseSchema } from "./permissions-protocol.ts"
 export * from "./permissions-protocol.ts"
+import { nativeStartupPermissionsRequestSchema, nativeStartupPermissionsResponseSchema } from "./permissions-request-protocol.ts"
+export * from "./permissions-request-protocol.ts"
 import { nativeHeldRecoveryRequestSchema, nativeHeldRecoveryResponseSchema } from "./recovery-protocol.ts"
 export * from "./recovery-protocol.ts"
 import { nativeDomainRecoveryRequestSchema, nativeDomainRecoveryResponseSchema } from "./domain-recovery-protocol.ts"
@@ -753,6 +755,7 @@ export const nativeMethodResponseSchema = z.union([
 ])
 
 export const nativeTransportRequestFrameSchema = z.discriminatedUnion("channel", [
+  z.strictObject({ channel: z.literal("permissions-request"), payload: nativeStartupPermissionsRequestSchema }),
   z.strictObject({ channel: z.literal("domain-recovery"), payload: nativeDomainRecoveryRequestSchema }),
   z.strictObject({ channel: z.literal("held-recovery"), payload: nativeHeldRecoveryRequestSchema }),
   z.strictObject({ channel: z.literal("observer"), payload: nativeObserverRequestSchema }),
@@ -769,6 +772,7 @@ export const nativeTransportRequestFrameSchema = z.discriminatedUnion("channel",
 ])
 
 export const nativeTransportResponseFrameSchema = z.discriminatedUnion("channel", [
+  z.strictObject({ channel: z.literal("permissions-request"), payload: nativeStartupPermissionsResponseSchema }),
   z.strictObject({ channel: z.literal("domain-recovery"), payload: nativeDomainRecoveryResponseSchema }),
   z.strictObject({ channel: z.literal("held-recovery"), payload: nativeHeldRecoveryResponseSchema }),
   z.strictObject({ channel: z.literal("observer"), payload: nativeObserverResponseSchema }),

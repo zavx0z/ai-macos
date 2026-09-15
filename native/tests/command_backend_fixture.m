@@ -48,7 +48,7 @@ static bool fixtureScroll(void *context, const MetaScrollEvent *event, uint64_t 
   return self;
 }
 - (NSDictionary *)permissions {
-  return @{@"accessibility": @1, @"postEvents": @0, @"screenRecording": @0,
+  return @{@"accessibility": @1, @"postEvents": @0, @"screenRecording": @0, @"inputMonitoring": @0,
     @"codeIdentity": @{@"helperPath": @"/tmp/command-fixture", @"cdhash": @"1111111111111111111111111111111111111111"}};
 }
 - (NSDictionary *)inventory {

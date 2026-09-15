@@ -30,6 +30,7 @@ class RotationTransport implements NativeTransport {
       await this.writer.write({ kind: "message", frame: { channel: "permissions", payload: {
         kind: "permissions-response", protocolVersion: "1", requestId: frame.payload.requestId, ...generation,
         nativeBuildId: "native-build", accessibility: false, postEvents: false, screenRecording: false,
+        inputMonitoring: false, capabilities: { ...host.capabilities, producerRef: this.generationId },
       } } })
     } else if (frame.channel === "heartbeat") {
       await this.writer.write({ kind: "message", frame: { channel: "heartbeat", payload: {
