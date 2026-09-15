@@ -14,7 +14,7 @@ test("launch использует установленный bundle до поя�
 })
 
 test("bundle resolution сохраняет native snapshot и точную файловую identity", () => {
-  const result = applicationBundleResolutionSchema.parse({ sourceResponseRef: "source:app", inventoryId: "inventory:app",
+  const result = applicationBundleResolutionSchema.parse({ requestedPath: bundle.path, sourceResponseRef: "source:app", inventoryId: "inventory:app",
     inventoryRevision: 1, observedAt: new Date().toISOString(), target: { kind: "application-bundle", ref: bundle } })
   expect(result.target.ref.modifiedAtNs).toBe(bundle.modifiedAtNs)
   expect(applicationLaunchRequestSchema.safeParse({ bundle: { ...bundle, path: "Fixture.app" } }).success).toBe(false)

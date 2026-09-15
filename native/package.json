@@ -8,6 +8,7 @@
     ".": "./src/index.ts",
     "./protocol": "./src/protocol.ts",
     "./adapter": "./src/adapter.ts",
+    "./application-adapter": "./src/application-adapter.ts",
     "./capture-client": "./src/capture-client.ts",
     "./evidence-extractor": "./src/evidence-extractor.ts",
     "./window-adapter": "./src/window-adapter.ts"
