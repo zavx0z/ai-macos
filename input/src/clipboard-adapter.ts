@@ -49,7 +49,7 @@ const clipboardTextMetadataShape = {
   bytes: z.number().int().safe().min(0).max(NATIVE_CLIPBOARD_MAX_UTF8_BYTES),
 }
 
-export const clipboardResultSchema = z.union([
+export const clipboardReadResultSchema = z.union([
   z.strictObject({
     kind: z.literal("read"),
     status: z.literal("ok"),
@@ -65,15 +65,19 @@ export const clipboardResultSchema = z.union([
     afterChangeCount: z.number().int().safe().min(0),
     version: clipboardVersionSchema,
   }),
-  z.strictObject({
-    kind: z.literal("write"),
-    status: z.literal("written"),
-    beforeChangeCount: z.number().int().safe().min(0),
-    declaredChangeCount: z.number().int().safe().min(0),
-    afterChangeCount: z.number().int().safe().min(0),
-    atomicPrecondition: z.literal(false),
-    ...clipboardTextMetadataShape,
-  }),
+])
+export const clipboardWriteResultSchema = z.strictObject({
+  kind: z.literal("write"),
+  status: z.literal("written"),
+  beforeChangeCount: z.number().int().safe().min(0),
+  declaredChangeCount: z.number().int().safe().min(0),
+  afterChangeCount: z.number().int().safe().min(0),
+  atomicPrecondition: z.literal(false),
+  ...clipboardTextMetadataShape,
+})
+export const clipboardResultSchema = z.union([
+  clipboardReadResultSchema,
+  clipboardWriteResultSchema,
 ])
 export type ClipboardResult = z.infer<typeof clipboardResultSchema>
 
