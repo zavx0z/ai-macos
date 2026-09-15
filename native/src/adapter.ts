@@ -6,6 +6,7 @@ import {
   nativeLifecycleAckMatches,
   nativeResponseMatchesRequest,
   nativeStatusMatchesRequest,
+  nativeOperationStatusSchema,
   nativeExecutionContextSchema,
   clipboardExecutionContextSchema,
   nativeRecoveryGrantSchema,
@@ -44,9 +45,12 @@ import {
   NativeTransportStreamDecoder,
   encodeNativeFrame,
   nativeTransportRequestFrameSchema,
+  nativeStatusErrorMatchesRequest,
+  nativeStatusErrorSchema,
   type NativeTransportPacket,
   type NativeTransportRequestFrame,
   type NativeTransportResponseFrame,
+  type NativeStatusError,
 } from "./protocol.ts"
 import {
   clipboardResponseMatches, nativeClipboardRequestSchema, nativeClipboardResponseSchema,
@@ -68,6 +72,13 @@ import { nativeHitTestRequestSchema, nativeHitTestResponseSchema, nativeHitTestR
 import { nativeInputReadinessRequestSchema, nativeInputReadinessResponseSchema, nativeInputReadinessResultMatches,
   type NativeInputReadinessRequest, type NativeInputReadinessResponse } from "./readiness-protocol.ts"
 import { classifyNativeRecoveryDescriptor } from "./recovery-domain-classifier.ts"
+
+export class NativeStatusQueryError extends Error {
+  constructor(readonly response: NativeStatusError) {
+    super(response.error.message)
+    this.name = "NativeStatusQueryError"
+  }
+}
 
 export type NativeRecoveryAuthorizer = (
   wire: NativeExecutionContext | ClipboardExecutionContext,
@@ -544,10 +555,21 @@ export class NativeBrokerAdapter implements NativeAdapter {
       channel: "status",
       payload: request,
     }, request.requestId, signal, request.deadlineAt)
-    if (response.channel !== "status" || !nativeStatusMatchesRequest(request, response.payload)) {
+    if (response.channel !== "status") {
       throw new Error("Native status не коррелирует с request")
     }
-    return response.payload
+    const error = nativeStatusErrorSchema.safeParse(response.payload)
+    if (error.success) {
+      if (!nativeStatusErrorMatchesRequest(request, error.data)) {
+        throw new Error("Native status error не коррелирует с request")
+      }
+      throw new NativeStatusQueryError(error.data)
+    }
+    const status = parseWireValue(nativeOperationStatusSchema, response.payload)
+    if (!nativeStatusMatchesRequest(request, status)) {
+      throw new Error("Native status не коррелирует с request")
+    }
+    return status
   }
 
   async cancel(request: NativeCancelRequest, control: AdapterControl): Promise<NativeCancelAck> {

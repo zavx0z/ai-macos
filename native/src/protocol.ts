@@ -23,6 +23,7 @@ import {
   nativeResponseBaseSchema,
   nativeTargetMappingSchema,
   fenceTokenSchema,
+  generationIdSchema,
   nativeStatusRequestSchema,
   nativeTextChunkSchema,
   observedEventSchema,
@@ -658,6 +659,33 @@ export const nativeWindowTransitionRequestSchema = createNativeMutationRequestEn
 )
 export const nativeWindowTransitionResponseSchema = createNativeResponseEnvelopeSchema(nativeWindowTransitionResultSchema)
 
+export const nativeStatusErrorSchema = z.strictObject({
+  kind: z.literal("status-error"),
+  requestId: opaqueIdSchema,
+  runtimeEpoch: generationIdSchema,
+  loginSessionId: generationIdSchema,
+  nativeGeneration: generationIdSchema,
+  operationId: opaqueIdSchema.optional(),
+  error: contractErrorSchema,
+})
+export type NativeStatusError = z.infer<typeof nativeStatusErrorSchema>
+
+export const nativeStatusResponseSchema = z.union([
+  nativeOperationStatusSchema,
+  nativeStatusErrorSchema,
+])
+
+export function nativeStatusErrorMatchesRequest(
+  request: z.infer<typeof nativeStatusRequestSchema>,
+  response: NativeStatusError,
+): boolean {
+  return request.requestId === response.requestId
+    && request.runtimeEpoch === response.runtimeEpoch
+    && request.loginSessionId === response.loginSessionId
+    && request.nativeGeneration === response.nativeGeneration
+    && request.operationId === response.operationId
+}
+
 export const nativeAxInspectionRequestSchema = createNativeReadRequestEnvelopeSchema(
   "ax.inspect",
   axInspectionRequestSchema,
@@ -833,7 +861,7 @@ export const nativeTransportResponseFrameSchema = z.discriminatedUnion("channel"
   z.strictObject({ channel: z.literal("clipboard"), payload: nativeClipboardResponseSchema }),
   z.strictObject({ channel: z.literal("handshake"), payload: nativeHandshakeResponseSchema }),
   z.strictObject({ channel: z.literal("response"), payload: nativeMethodResponseSchema }),
-  z.strictObject({ channel: z.literal("status"), payload: nativeOperationStatusSchema }),
+  z.strictObject({ channel: z.literal("status"), payload: nativeStatusResponseSchema }),
   z.strictObject({ channel: z.literal("heartbeat"), payload: nativeHeartbeatAckSchema }),
   z.strictObject({ channel: z.literal("cancel"), payload: nativeCancelAckSchema }),
   z.strictObject({ channel: z.literal("drain"), payload: nativeDrainAckSchema }),

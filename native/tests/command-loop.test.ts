@@ -2,7 +2,7 @@ import { afterAll, beforeAll, expect, test } from "bun:test"
 import { mkdtemp, rm } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { NativeBrokerAdapter, NativeProcessTransport } from "../src/adapter.ts"
+import { NativeBrokerAdapter, NativeProcessTransport, NativeStatusQueryError } from "../src/adapter.ts"
 import { nativeInventoryRequestSchema, nativeInventoryResponseSchema } from "../src/protocol.ts"
 import { nativeAxInspectionRequestSchema, nativeAxInspectionResponseSchema } from "../src/protocol.ts"
 import { nativeInputExecutionRequestSchema, nativeInputExecutionResponseSchema, type NativeInputExecutionPayload } from "../src/protocol.ts"
@@ -10,6 +10,7 @@ import { heldInputLedgerDigest, type HeldInputLedgerSink, type HeldInputLedgerSn
 import { nativeClipboardRequestSchema } from "../src/clipboard-protocol.ts"
 import { nativeWindowTransitionRequestSchema, nativeWindowTransitionResponseSchema } from "../src/protocol.ts"
 import { NativeTransportStreamDecoder, encodeNativeFrame, type NativeTransportRequestFrame, type NativeTransportResponseFrame } from "../src/protocol.ts"
+import { nativeStatusErrorMatchesRequest } from "../src/protocol.ts"
 
 let directory = ""
 let binary = ""
@@ -480,6 +481,43 @@ test("legacy Native backend не подтверждает неприменённ
       payload: { priority: { app: "Fixture" } },
     }, nativeInventoryResponseSchema, { signal: new AbortController().signal, checkpoint: () => undefined })
     expect(response.ok).toBe(false)
+  } finally { await adapter.close() }
+})
+
+test("unknown status возвращает correlated typed error и actor остаётся жив", async () => {
+  const adapter = createAdapter()
+  try {
+    await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "handshake", runtimeEpoch: "runtime", loginSessionId: "login",
+      runtimeBuildId: "runtime-build", expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" })
+    const request = {
+      requestId: "missing-status",
+      ...adapter.generation!,
+      operationId: "operation-never-started",
+      deadlineAt: new Date(Date.now() + 1_000).toISOString(),
+    }
+    let failure: unknown
+    try { await adapter.status(request) } catch (error) { failure = error }
+    expect(failure).toBeInstanceOf(NativeStatusQueryError)
+    const response = (failure as NativeStatusQueryError).response
+    expect(response).toMatchObject({
+      kind: "status-error",
+      requestId: request.requestId,
+      operationId: request.operationId,
+      error: { code: "operation-outcome-unknown", stage: "native-status" },
+    })
+    expect(nativeStatusErrorMatchesRequest(request, response)).toBe(true)
+    expect(nativeStatusErrorMatchesRequest({ ...request, requestId: "foreign" }, response)).toBe(false)
+    expect(nativeStatusErrorMatchesRequest({ ...request, nativeGeneration: "native-foreign" }, response)).toBe(false)
+    const heartbeat = await adapter.heartbeat({ requestId: "after-missing-status", ...adapter.generation!,
+      deadlineAt: new Date(Date.now() + 1_000).toISOString() }, {
+      signal: new AbortController().signal, checkpoint: () => undefined,
+    })
+    expect(heartbeat.accepted).toBe(true)
+    const permissions = await adapter.permissions({ kind: "permissions", protocolVersion: "1", requestId: "permissions-after-status",
+      ...adapter.generation!, deadlineAt: new Date(Date.now() + 1_000).toISOString() }, {
+      signal: new AbortController().signal, checkpoint: () => undefined,
+    })
+    expect(permissions.accessibility).toBe(true)
   } finally { await adapter.close() }
 })
 

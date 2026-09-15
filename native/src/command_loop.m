@@ -380,7 +380,21 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   }
   if ([channel isEqual:@"status"]) {
     NSDictionary *status = [self statusForOperation:payload[@"operationId"] requestId:requestId];
-    if (status == nil) { [self shutdown:65]; return; }
+    if (status == nil) {
+      NSMutableDictionary *missing = [identity mutableCopy];
+      missing[@"kind"] = @"status-error";
+      if (payload[@"operationId"] != nil) missing[@"operationId"] = payload[@"operationId"];
+      missing[@"error"] = @{
+        @"code" : @"operation-outcome-unknown",
+        @"message" : @"Native status receipt для operation отсутствует",
+        @"stage" : @"native-status",
+        @"retryable" : @NO,
+        @"replayAllowed" : @NO,
+        @"recoveryAction" : @"get-operation",
+      };
+      [self send:channel payload:missing];
+      return;
+    }
     if (_busy) [self send:channel payload:status];
     else [self maintenance:payload work:^NSDictionary * { return [self->_backend reconcileStatus:status]; } completed:^(NSDictionary *value) {
       if (value == nil) [self shutdown:70];
