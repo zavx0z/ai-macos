@@ -65,6 +65,13 @@ static MetaWindowTransition transition(void) {
   };
 }
 
+static void test_focus_success_uses_actual_state_only(void) {
+  assert(meta_window_focus_state_confirmed(true, META_TRUE));
+  assert(!meta_window_focus_state_confirmed(false, META_TRUE));
+  assert(!meta_window_focus_state_confirmed(true, META_FALSE));
+  assert(!meta_window_focus_state_confirmed(true, META_UNKNOWN));
+}
+
 static void test_full_fresh_ax_absence_is_closed(void) {
   MetaApplicationRecord app = application(META_AX_NO_WINDOWS, 100);
   MetaWindowRecord original = window_record();
@@ -75,6 +82,44 @@ static void test_full_fresh_ax_absence_is_closed(void) {
   assert(result.presence == META_WINDOW_PRESENCE_CLOSED);
   assert(result.close_succeeded);
   assert(result.status == META_TRANSITION_SUCCEEDED);
+}
+
+static void test_partial_existing_requires_exact_live_target_proof(void) {
+  MetaApplicationRecord app = application(META_AX_READY, 100);
+  MetaWindowRecord original = window_record();
+  MetaWindowRecord current = original;
+  current.focused = META_TRUE;
+  MetaInventorySnapshot partial = snapshot(&app, 1, &current, 1, false);
+  MetaWindowTransition result = transition();
+  meta_window_classify_existing(&partial, &original, true, &result);
+  assert(result.presence == META_WINDOW_PRESENCE_EXISTING);
+  assert(result.focused == META_TRUE);
+
+  result = transition();
+  meta_window_classify_existing(&partial, &original, false, &result);
+  assert(result.presence == META_WINDOW_PRESENCE_UNKNOWN);
+
+  MetaWindowRecord duplicate[] = {current, current};
+  partial.windows = duplicate;
+  partial.window_count = 2;
+  result = transition();
+  meta_window_classify_existing(&partial, &original, true, &result);
+  assert(result.presence == META_WINDOW_PRESENCE_UNKNOWN);
+
+  partial.windows = &current;
+  partial.window_count = 1;
+  snprintf(current.application_ref, sizeof(current.application_ref), "%s",
+           "native-1:application:other");
+  result = transition();
+  meta_window_classify_existing(&partial, &original, true, &result);
+  assert(result.presence == META_WINDOW_PRESENCE_UNKNOWN);
+
+  current = original;
+  snprintf(current.target_ref, sizeof(current.target_ref), "%s",
+           "native-1:window:foreign-target");
+  result = transition();
+  meta_window_classify_existing(&partial, &original, true, &result);
+  assert(result.presence == META_WINDOW_PRESENCE_UNKNOWN);
 }
 
 static void test_partial_unrelated_is_closed_but_owner_gaps_are_unknown(void) {
@@ -177,7 +222,9 @@ static void test_absence_without_dispatch_is_not_closed(void) {
 }
 
 int main(void) {
+  test_focus_success_uses_actual_state_only();
   test_full_fresh_ax_absence_is_closed();
+  test_partial_existing_requires_exact_live_target_proof();
   test_partial_unrelated_is_closed_but_owner_gaps_are_unknown();
   test_only_exact_owner_sheet_is_reported();
   test_foreign_sheet_is_not_reported();

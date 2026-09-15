@@ -155,6 +155,9 @@ static MetaWindowTransition transition(const Fixture *fixture,
   MetaWindowTransition result = {
       .status = state,
       .presence = presence,
+      .application_hidden = META_UNKNOWN,
+      .minimized = META_UNKNOWN,
+      .focused = META_UNKNOWN,
   };
   snprintf(result.window_ref, sizeof(result.window_ref), "%s",
            fixture->original.window_ref);
@@ -232,6 +235,15 @@ static void test_unknown_is_partial_with_reason(void) {
   assert([result[@"partial"] isEqual:@YES]);
   assert([result[@"errors"] count] == 1);
   assert([result[@"actual"][@"reason"] isEqual:result[@"errors"][0]]);
+  NSString *reason = result[@"errors"][0];
+  assert([reason containsString:@"focusAttempted=false"]);
+  assert([reason containsString:@"focusSucceeded=false"]);
+  assert([reason containsString:@"raiseAttempted=false"]);
+  assert([reason containsString:@"raiseSucceeded=false"]);
+  assert([reason containsString:@"axError=0"]);
+  assert([reason containsString:@"hidden=unknown"]);
+  assert([reason containsString:@"minimized=unknown"]);
+  assert([reason containsString:@"focused=unknown"]);
 }
 
 static void test_exact_owned_sheet_is_new_surface(void) {

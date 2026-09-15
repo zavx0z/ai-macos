@@ -11,6 +11,7 @@
 #include "meta_ax_request.h"
 #include "code-identity/meta_code_identity.h"
 #include "window-actions/meta_window_actions.h"
+#include "window-actions/meta_window_readback.h"
 #include "window-actions/meta_window_result.h"
 #include "input-target/meta_point_target.h"
 #include "input-target/meta_geometry_probe.h"
@@ -1326,20 +1327,13 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
     refreshed = action.kind == META_WINDOW_ACTION_CLOSE ? transition.inventory_refreshed : meta_macos_refresh_inventory(windows, 5000);
     if (refreshed && action.kind != META_WINDOW_ACTION_CLOSE) {
       const MetaInventorySnapshot *after = meta_macos_backend_snapshot(windows);
-      if (after != NULL && after->complete) {
-        for (size_t index = 0; index < after->window_count; index += 1) {
-          const MetaWindowRecord *candidate = &after->windows[index];
-          if (candidate->surface_kind == META_SURFACE_WINDOW && strcmp(candidate->window_ref, original.window_ref) == 0 &&
-              strcmp(candidate->application_ref, original.application_ref) == 0 && candidate->pid == original.pid) transition.presence = META_WINDOW_PRESENCE_EXISTING;
-          if (transition.modal_or_sheet_observed && candidate->surface_kind != META_SURFACE_WINDOW &&
-              strcmp(candidate->owner_window_ref, original.window_ref) == 0 &&
-              strcmp(candidate->application_ref, original.application_ref) == 0 && candidate->pid == original.pid) {
-            snprintf(transition.new_surface_ref, sizeof(transition.new_surface_ref), "%s", candidate->surface_ref);
-          }
-        }
-      }
-      if (transition.presence == META_WINDOW_PRESENCE_UNKNOWN || transition.new_surface_ref[0] == '\0') transition.modal_or_sheet_observed = false;
-      if (transition.presence == META_WINDOW_PRESENCE_UNKNOWN) transition.new_surface_ref[0] = '\0';
+      MetaWindowRecord expected = original;
+      BOOL targetMatches = after != NULL &&
+          meta_macos_with_ax_target(windows, windowRef.UTF8String,
+              after->inventory_id, after->revision, after->native_generation,
+              verify_window_borrow, &expected) == META_AX_BORROW_OK;
+      meta_window_classify_existing(after, &original, targetMatches,
+                                    &transition);
     }
     return @{};
   }];

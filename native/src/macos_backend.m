@@ -1207,8 +1207,7 @@ static bool perform_focus(MetaMacOSBackend *backend, const char *window_ref,
         AXUIElementPerformAction(handle->element, kAXRaiseAction);
     result->raise_succeeded = raise_error == kAXErrorSuccess;
     result->focus_attempted = true;
-    const bool activated =
-        [running activateWithOptions:NSApplicationActivateIgnoringOtherApps];
+    (void)[running activateWithOptions:NSApplicationActivateIgnoringOtherApps];
     const AXError main_error = AXUIElementSetAttributeValue(
         handle->element, kAXMainAttribute, kCFBooleanTrue);
     const AXError focused_error = AXUIElementSetAttributeValue(
@@ -1225,8 +1224,8 @@ static bool perform_focus(MetaMacOSBackend *backend, const char *window_ref,
     const bool frontmost =
         NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier ==
         handle->pid;
-    result->focus_succeeded = activated && frontmost &&
-                              result->focused == META_TRUE;
+    result->focus_succeeded =
+        meta_window_focus_state_confirmed(frontmost, result->focused);
     const bool shown = !show ||
                        (result->application_hidden == META_FALSE &&
                         result->minimized != META_TRUE);
@@ -1234,7 +1233,7 @@ static bool perform_focus(MetaMacOSBackend *backend, const char *window_ref,
       result->status = META_TRANSITION_SUCCEEDED;
       return true;
     }
-    if (activated && shown && result->focused == META_FALSE) {
+    if (shown && result->focused == META_FALSE) {
       result->status = META_TRANSITION_SPACE_UNAVAILABLE;
       return false;
     }

@@ -132,27 +132,50 @@ static BOOL observable_state_changed(const MetaWindowRecord *original,
 
 static NSString *partial_reason(const MetaWindowTransition *transition,
                                 BOOL has_new_surface) {
+  NSString *reason = nil;
   if (transition->presence == META_WINDOW_PRESENCE_UNKNOWN) {
-    return @"Fresh window readback не подтвердил состояние target";
+    reason = @"Fresh window readback не подтвердил состояние target";
+  } else if (has_new_surface) {
+    reason = @"Окно осталось открытым; появилась принадлежащая ему surface";
+  } else {
+    switch (transition->status) {
+      case META_TRANSITION_TARGET_STALE:
+        reason = @"Window target устарел до завершения readback";
+        break;
+      case META_TRANSITION_SPACE_UNAVAILABLE:
+        reason = @"macOS не подтвердила переход окна в текущий Space";
+        break;
+      case META_TRANSITION_TIMED_OUT:
+        reason = @"Window transition превысил bounded readback timeout";
+        break;
+      case META_TRANSITION_UNAVAILABLE:
+        reason = @"Window transition недоступен для exact target";
+        break;
+      case META_TRANSITION_PARTIAL:
+        reason = @"Window transition выполнен частично";
+        break;
+      case META_TRANSITION_SUCCEEDED:
+        reason = @"Window transition readback не согласован с результатом";
+        break;
+    }
   }
-  if (has_new_surface) {
-    return @"Окно осталось открытым; появилась принадлежащая ему surface";
-  }
-  switch (transition->status) {
-    case META_TRANSITION_TARGET_STALE:
-      return @"Window target устарел до завершения readback";
-    case META_TRANSITION_SPACE_UNAVAILABLE:
-      return @"macOS не подтвердила переход окна в текущий Space";
-    case META_TRANSITION_TIMED_OUT:
-      return @"Window transition превысил bounded readback timeout";
-    case META_TRANSITION_UNAVAILABLE:
-      return @"Window transition недоступен для exact target";
-    case META_TRANSITION_PARTIAL:
-      return @"Window transition выполнен частично";
-    case META_TRANSITION_SUCCEEDED:
-      return @"Window transition readback не согласован с результатом";
-  }
-  return @"Window transition вернул неизвестный status";
+  if (reason == nil) reason = @"Window transition вернул неизвестный status";
+  NSString *(^triState)(MetaTriState) = ^NSString *(MetaTriState value) {
+    if (value == META_TRUE) return @"true";
+    if (value == META_FALSE) return @"false";
+    return @"unknown";
+  };
+  return [NSString stringWithFormat:
+      @"%@ [focusAttempted=%@ focusSucceeded=%@ raiseAttempted=%@ raiseSucceeded=%@ axError=%d hidden=%@ minimized=%@ focused=%@]",
+      reason,
+      transition->focus_attempted ? @"true" : @"false",
+      transition->focus_succeeded ? @"true" : @"false",
+      transition->raise_attempted ? @"true" : @"false",
+      transition->raise_succeeded ? @"true" : @"false",
+      transition->ax_error,
+      triState(transition->application_hidden),
+      triState(transition->minimized),
+      triState(transition->focused)];
 }
 
 NSDictionary *meta_window_transition_value(
