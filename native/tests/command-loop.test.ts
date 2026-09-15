@@ -8,6 +8,7 @@ import { nativeAxInspectionRequestSchema, nativeAxInspectionResponseSchema } fro
 import { nativeInputExecutionRequestSchema, nativeInputExecutionResponseSchema, type NativeInputExecutionPayload } from "../src/protocol.ts"
 import { heldInputLedgerDigest, type HeldInputLedgerSink } from "@meta/shared/contracts"
 import { nativeClipboardRequestSchema } from "../src/clipboard-protocol.ts"
+import { nativeWindowTransitionRequestSchema, nativeWindowTransitionResponseSchema } from "../src/protocol.ts"
 
 let directory = ""
 let binary = ""
@@ -47,6 +48,13 @@ test("production command loop: verified handshake → coherent clipboard method 
       reason: "Injected fixture не вызывает системный audit syscall" })
     const deadlineAt = new Date(Date.now() + 1_000).toISOString()
     const generation = adapter.generation!
+    const permissions = await adapter.permissions({
+      kind: "permissions", protocolVersion: "1", requestId: "passive-permissions", ...generation, deadlineAt,
+    }, { signal: new AbortController().signal, checkpoint: () => undefined })
+    expect(permissions.accessibility).toBe(true)
+    expect(permissions.postEvents).toBe(false)
+    expect(permissions.screenRecording).toBe(false)
+    expect(permissions.codeIdentity).toEqual({ helperPath: "/tmp/command-fixture", cdhash: "1111111111111111111111111111111111111111" })
     const response = await adapter.clipboard({
       kind: "request", protocolVersion: "1", requestId: "clipboard", ...generation, deadlineAt,
       operation: {
@@ -78,6 +86,32 @@ function inputRequest(action: NativeInputExecutionPayload["action"]) {
     payload: { actionDeadlineAt: deadlineAt, action },
   })
 }
+
+test("window transition и input используют один native fence high-water", async () => {
+  const adapter = createAdapter()
+  try {
+    await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "handshake", runtimeEpoch: "runtime", loginSessionId: "login",
+      runtimeBuildId: "runtime-build", expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" })
+    const input = inputRequest({ kind: "text", utf16Units: 1, clusters: [{ text: "A", utf16Units: 1, atMs: 0 }] })
+    const request = nativeWindowTransitionRequestSchema.parse({
+      ...input, requestId: "window-show", method: "window.transition",
+      operation: { ...input.operation, operationId: "window-operation" },
+      payload: { kind: "show", target: input.operation.target.ref },
+    })
+    const control = { signal: new AbortController().signal, checkpoint: () => undefined }
+    const result = await adapter.request(nativeWindowTransitionRequestSchema, request, nativeWindowTransitionResponseSchema, control)
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error("Window fixture не завершилась")
+    expect(result.result.status.dispatchAttempts).toBe(1)
+    expect(result.result.status.execution).toBe("finished")
+    const replay = await adapter.request(nativeInputExecutionRequestSchema, input, nativeInputExecutionResponseSchema, control)
+    expect(replay.ok).toBe(false)
+    const next = nativeInputExecutionRequestSchema.parse({ ...input, requestId: "input-next",
+      operation: { ...input.operation, operationId: "input-next-operation", fence: { ...input.operation.fence, counter: 2 } } })
+    const accepted = await adapter.request(nativeInputExecutionRequestSchema, next, nativeInputExecutionResponseSchema, control)
+    expect(accepted.ok).toBe(true)
+  } finally { await adapter.close() }
+})
 
 test("actual concurrent command loop: cancel останавливает C text executor между clusters", async () => {
   const adapter = createAdapter()
@@ -113,6 +147,26 @@ test("actual concurrent command loop: cancel останавливает C text e
     await Bun.sleep(40)
     const status = await adapter.status({ requestId: "status-after-stop", ...adapter.generation!, operationId: request.operation.operationId, deadlineAt: request.deadlineAt })
     expect(status.dispatchAttempts).toBe(before)
+  } finally { await adapter.close() }
+})
+
+test("shortcut проводит последовательность через C executor и durable ledger", async () => {
+  const adapter = createAdapter({ async persist(requestId, snapshot) {
+    return { requestId, operationId: snapshot.operationId, runtimeEpoch: snapshot.runtimeEpoch,
+      loginSessionId: snapshot.loginSessionId, nativeGeneration: snapshot.nativeGeneration, revision: snapshot.revision,
+      snapshotSha256: heldInputLedgerDigest(snapshot), persistedAt: new Date().toISOString(), durable: true }
+  } })
+  try {
+    await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "handshake", runtimeEpoch: "runtime", loginSessionId: "login",
+      runtimeBuildId: "runtime-build", expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" })
+    const request = inputRequest({ kind: "shortcut", strokes: [{ keyCode: 0, flags: 0 }, { keyCode: 1, flags: 0 }], delayMs: 10 })
+    const result = await adapter.request(nativeInputExecutionRequestSchema, request, nativeInputExecutionResponseSchema,
+      { signal: new AbortController().signal, checkpoint: () => undefined })
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error("Shortcut fixture не завершилась")
+    expect(result.result.completedSteps).toBe(2)
+    expect(result.result.dispatchAttempts).toBe(4)
+    expect(result.result.status.cleanup).toBe("complete")
   } finally { await adapter.close() }
 })
 

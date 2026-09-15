@@ -7,6 +7,14 @@
                               sink:(MetaExecutorBackend)sink
                             verify:(BOOL (^)(NSString *target))verify;
 - (NSDictionary *)execute:(NSDictionary *)request job:(MetaInputJob *)job;
+// Общий native mutation gate использует тот же executor/fence, что и input.
+// verify проверяет точный target либо подтверждённое postcondition после action.
+- (NSDictionary *)executeExternal:(NSDictionary *)request
+                               job:(MetaInputJob *)job
+                         targetRef:(NSString *)targetRef
+                            verify:(BOOL (^)(NSString *target))verify
+                            action:(NSDictionary *(^)(void))action;
+- (MetaExecutor *)executorOnActionWorker;
 - (BOOL)sealForRotation;
 @end
 #endif

@@ -614,6 +614,21 @@ bool meta_executor_post_scroll_event(MetaExecutor *executor,
   return executor->active;
 }
 
+bool meta_executor_dispatch_action(MetaExecutor *executor,
+                                   bool (*dispatch)(void *context),
+                                   void *context,
+                                   const char *checkpoint) {
+  if (executor == NULL || dispatch == NULL || !meta_executor_checkpoint(executor, checkpoint)) return false;
+  executor->status.dispatch_attempts += 1;
+  executor->status.dispatch = META_DISPATCH_ATTEMPTED;
+  if (!dispatch(context)) {
+    quarantine(executor);
+    return false;
+  }
+  executor->status.dispatch = META_DISPATCH_PARTIAL;
+  return executor->active;
+}
+
 bool meta_executor_set_event_flags(MetaExecutor *executor,
                                    uint64_t flags,
                                    const char *checkpoint) {

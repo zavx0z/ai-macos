@@ -33,7 +33,10 @@ static bool fixtureFlags(void *context, uint64_t flags) { (void)context; (void)f
   }
   return self;
 }
-- (NSDictionary *)permissions { return @{}; }
+- (NSDictionary *)permissions {
+  return @{@"accessibility": @1, @"postEvents": @0, @"screenRecording": @0,
+    @"codeIdentity": @{@"helperPath": @"/tmp/command-fixture", @"cdhash": @"1111111111111111111111111111111111111111"}};
+}
 - (NSDictionary *)inventory {
   usleep(500000);
   return nil;
@@ -71,6 +74,21 @@ static bool fixtureFlags(void *context, uint64_t flags) { (void)context; (void)f
 - (NSDictionary *)cancel:(NSDictionary *)request { (void)request; return nil; }
 - (BOOL)beginRotation { return [_input sealForRotation]; }
 - (NSDictionary *)executeInput:(NSDictionary *)request job:(MetaInputJob *)job { return [_input execute:request job:job]; }
+- (NSDictionary *)executeWindow:(NSDictionary *)request job:(MetaInputJob *)job {
+  NSString *target = request[@"payload"][@"target"][@"windowRef"];
+  NSDictionary *execution = [_input executeExternal:request job:job targetRef:target verify:^BOOL(NSString *value) {
+    return [value isEqual:@"window-fixture"];
+  } action:^NSDictionary * { return @{@"changed": @YES}; }];
+  if (execution == nil) return nil;
+  NSDictionary *actual = @{@"kind": @"ax-window", @"windowRef": target, @"applicationRef": @"application-fixture", @"ownerPid": @42,
+    @"title": @"Fixture", @"role": @"AXWindow", @"subrole": @"AXStandardWindow", @"frame": @{@"x": @0, @"y": @0, @"width": @100, @"height": @100},
+    @"applicationHidden": @"false", @"minimized": @"false", @"onScreen": @"true", @"spaceVisibility": @"current",
+    @"fullscreen": @"false", @"focused": @"true", @"main": @"true", @"mapping": @"unavailable", @"mappingReason": @"Injected AX-only fixture",
+    @"actionability": @"ax", @"advertisedActions": @[@"raise"], @"surfaces": @[]};
+  return @{@"sourceResponseRef": @"response-window-fixture", @"inventoryId": @"inventory-next", @"inventoryRevision": @2,
+    @"displayLayoutRevision": @0, @"observedAt": @"2026-09-15T00:00:00.000Z", @"displays": @[], @"targetRef": target,
+    @"actual": actual, @"changed": @YES, @"partial": @NO, @"errors": @[], @"status": execution[@"status"]};
+}
 @end
 
 int main(int argc, const char **argv) {

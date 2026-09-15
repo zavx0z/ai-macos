@@ -13,6 +13,12 @@ typedef enum {
   META_TRANSITION_TIMED_OUT,
 } MetaTransitionStatus;
 
+typedef enum {
+  META_WINDOW_PRESENCE_UNKNOWN,
+  META_WINDOW_PRESENCE_EXISTING,
+  META_WINDOW_PRESENCE_CLOSED,
+} MetaWindowPresence;
+
 typedef struct {
   MetaTransitionStatus status;
   char window_ref[META_NATIVE_REF_CAPACITY];
@@ -36,6 +42,9 @@ typedef struct {
   bool close_attempted;
   bool close_succeeded;
   bool modal_or_sheet_observed;
+  MetaWindowPresence presence;
+  bool inventory_refreshed;
+  char new_surface_ref[META_NATIVE_REF_CAPACITY];
   int32_t ax_error;
 } MetaWindowTransition;
 

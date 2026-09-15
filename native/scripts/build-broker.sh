@@ -34,7 +34,12 @@ mkdir -p "$(dirname -- "$CANDIDATE_OUTPUT")"
   native/src/session_identity.c -lbsm \
   native/src/accessibility/meta_ax_inspector.m \
   native/src/ax_request.m \
+  native/src/window-actions/meta_window_readback.c \
+  native/src/window-actions/meta_window_actions.c native/src/window-actions/meta_window_actions_macos.m \
+  native/src/window-actions/meta_window_result.m \
+  native/src/code-identity/meta_code_identity.m \
   -framework Foundation -framework AppKit -framework ApplicationServices \
   -framework CoreGraphics -framework CoreImage -framework CoreMedia \
   -framework CoreVideo -framework ImageIO -framework ScreenCaptureKit \
+  -framework Security \
   -o "$CANDIDATE_OUTPUT"

@@ -13,6 +13,7 @@
 - (NSDictionary *)status:(NSString *)operationId requestId:(NSString *)requestId;
 - (NSDictionary *)cancel:(NSDictionary *)request;
 - (NSDictionary *)executeInput:(NSDictionary *)request job:(MetaInputJob *)job;
+- (NSDictionary *)executeWindow:(NSDictionary *)request job:(MetaInputJob *)job;
 - (BOOL)beginRotation;
 @end
 

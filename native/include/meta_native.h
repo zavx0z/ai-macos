@@ -413,6 +413,12 @@ bool meta_executor_begin(MetaExecutor *executor, const char *operation_id,
                          const char *target_ref, MetaFence fence,
                          uint64_t deadline_millis);
 bool meta_executor_checkpoint(MetaExecutor *executor, const char *stage);
+// Один backend dispatch под существующим fence; callback выполняется только
+// на action worker и не создаёт отдельного executor или ledger.
+bool meta_executor_dispatch_action(MetaExecutor *executor,
+                                   bool (*dispatch)(void *context),
+                                   void *context,
+                                   const char *checkpoint);
 bool meta_executor_post_down(MetaExecutor *executor, MetaHeldEventKind kind,
                              uint32_t code);
 bool meta_executor_post_up(MetaExecutor *executor, MetaHeldEventKind kind,

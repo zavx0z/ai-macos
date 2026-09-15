@@ -237,6 +237,36 @@ sh native/scripts/build.sh /tmp/meta-native-build.*/libmeta-native.dylib
 
 ## Следующий шаг
 
+### Window / permissions executable checkpoint
+
+Production loop принимает `window.transition` на общей action queue. Window
+actions используют тот же `MetaExecutor`, fence high-water и cancellation job,
+что и keyboard/text; отдельного mutation executor нет. Добавлен bounded
+external-dispatch callback с собственным счётчиком попытки backend invocation.
+Exact inventory/ref/application/process borrow выполняется до window action;
+для hidden show не требуется предварительный focus. После действия возвращается
+fresh inventory readback. Close различает существующее окно, подтверждённое
+отсутствие и неизвестный результат; sheets проверяются по точному owner.
+При провале самого refresh не выдаётся старый snapshot как свежий.
+
+Добавлен пассивный long-lived `permissions` channel с actual loaded-code
+identity из `SecCodeCopySelf` и `kSecCodeInfoUnique`, а не из caller digest или
+пути другого candidate. Неподписанный/непроверенный code identity не объявляется
+известным. Settings и активный input probe этим каналом не вызываются.
+
+Shortcut подключён к C schedule и durable held-input ledger. Command-loop
+fixture: 12 tests / 52 assertions pass, включая один fence high-water для
+window и input, отказ повторного fence, следующий fence, shortcut и permissions.
+Fixture использует injected backend, не выполняет live desktop действия.
+Full temporary executable `native-window-permissions-check` собирается с
+`-Wall -Wextra -Werror`; production binary не запускался.
+
+Atomic binary transport уже передаёт один header+raw-bytes queue item, отдельно
+ограничивает binary budget и не допускает JSON interleaving. Capture command
+binder находится у capture-owner; observer/focus coverage module — у input-owner.
+Production capture/apps/pointer/observer/readiness/recovery wiring ещё не
+завершено; этот checkpoint не является installed cutover или live acceptance.
+
 ### Read-only AX handler checkpoint
 
 `ax.inspect` подключён к action worker через

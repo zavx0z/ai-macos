@@ -42,11 +42,16 @@ static bool flags(void *context, uint64_t value) {
   return sink.set_event_flags != NULL && sink.set_event_flags(sink.context, value);
 }
 static bool wait_bool(void *context, uint64_t until) { return wait_until(context, until); }
+static bool dispatch_external(void *context) {
+  BOOL (^action)(void) = (__bridge BOOL (^)(void))context;
+  return action();
+}
 
 @implementation MetaInputExecutor {
   MetaExecutor *_executor;
   MetaExecutorBackend _sink;
   BOOL (^_verify)(NSString *);
+  BOOL (^_externalVerify)(NSString *);
   MetaInputJob *_job;
 }
 - (instancetype)initWithGeneration:(NSString *)generation sink:(MetaExecutorBackend)sink verify:(BOOL (^)(NSString *))targetVerify {
@@ -66,13 +71,59 @@ static bool wait_bool(void *context, uint64_t until) { return wait_until(context
 - (BOOL)cancelled { return [_job cancelRequested]; }
 - (BOOL)verify:(const char *)target {
   [_job publishStatus:meta_executor_status(_executor)];
-  return _verify(@(target));
+  return _externalVerify != nil ? _externalVerify(@(target)) : _verify(@(target));
 }
 - (BOOL)persist:(const MetaLedgerPersistenceRequest *)request ack:(MetaLedgerPersistenceAck *)ack {
   [_job publishStatus:meta_executor_status(_executor)];
   return [_job persistLedger:request ack:ack];
 }
 - (BOOL)sealForRotation { return meta_executor_seal_for_rotation(_executor); }
+- (MetaExecutor *)executorOnActionWorker { return _executor; }
+
+- (NSDictionary *)executeExternal:(NSDictionary *)request job:(MetaInputJob *)job targetRef:(NSString *)targetRef
+                            verify:(BOOL (^)(NSString *))targetVerify action:(NSDictionary *(^)(void))action {
+  if (job == nil || targetVerify == nil || action == nil || ![targetRef isKindOfClass:NSString.class]) return nil;
+  NSDictionary *operation = job.operation;
+  NSDictionary *fence = operation[@"fence"];
+  MetaFence token = {0};
+  NSString *names[] = {@"runtimeEpoch", @"loginSessionId", @"nativeGeneration"};
+  char *destinations[] = {token.runtime_epoch, token.login_session_id, token.native_generation};
+  for (size_t index = 0; index < 3; index += 1) {
+    NSString *value = fence[names[index]];
+    if (![value isKindOfClass:NSString.class] || value.length == 0 || value.length > 64 ||
+        ![value isEqual:operation[names[index]]] || ![value isEqual:request[names[index]]]) return nil;
+    snprintf(destinations[index], META_NATIVE_REF_CAPACITY, "%s", value.UTF8String);
+  }
+  NSNumber *counter = fence[@"counter"];
+  if (![counter isKindOfClass:NSNumber.class] || counter.doubleValue != counter.longLongValue || counter.longLongValue < 1) return nil;
+  token.counter = counter.unsignedLongLongValue;
+  NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+  formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+  NSDate *deadlineDate = [formatter dateFromString:operation[@"deadlineAt"]];
+  double remaining = deadlineDate.timeIntervalSinceNow * 1000;
+  if (deadlineDate == nil || remaining <= 0 || ![operation[@"deadlineAt"] isEqual:request[@"deadlineAt"]]) return nil;
+  _job = job;
+  _externalVerify = [targetVerify copy];
+  __block NSDictionary *value = nil;
+  BOOL began = meta_executor_open_runtime_epoch(_executor, token.runtime_epoch, token.login_session_id) &&
+      meta_executor_begin(_executor, [operation[@"operationId"] UTF8String], targetRef.UTF8String,
+                           token, clock_now(NULL) + (uint64_t)MIN(remaining, 30000));
+  BOOL (^dispatch)(void) = ^BOOL { value = action(); return value != nil; };
+  BOOL finished = began && meta_executor_dispatch_action(_executor, dispatch_external, (__bridge void *)dispatch, "native-action") &&
+      meta_executor_finish(_executor);
+  if (began && !finished) meta_executor_cancel(_executor);
+  MetaExecutorStatus status = meta_executor_status(_executor);
+  NSDictionary *result = nil;
+  if (status.has_accepted_fence && strcmp(status.operation_id, [operation[@"operationId"] UTF8String]) == 0 && status.accepted_fence.counter == token.counter) {
+    [job publishStatus:status];
+    NSMutableDictionary *report = [@{@"finished": @(finished), @"status": [job statusForRequest:job.requestId]} mutableCopy];
+    if (value != nil) report[@"value"] = value;
+    result = report;
+  }
+  _job = nil;
+  _externalVerify = nil;
+  return result;
+}
 
 - (NSDictionary *)execute:(NSDictionary *)request job:(MetaInputJob *)job {
   _job = job;
@@ -125,6 +176,25 @@ static bool wait_bool(void *context, uint64_t until) { return wait_until(context
     if ([code isKindOfClass:NSNumber.class] && code.longLongValue >= 0 && code.longLongValue <= UINT16_MAX && [modifiers isKindOfClass:NSNumber.class]) {
       finished = meta_input_execute_key(_executor, code.unsignedIntValue, modifiers.unsignedLongLongValue);
       completed = finished ? 1 : 0;
+    }
+  } else if (began && [action[@"kind"] isEqual:@"shortcut"]) {
+    NSArray *strokes = action[@"strokes"];
+    NSNumber *delay = action[@"delayMs"];
+    if ([strokes isKindOfClass:NSArray.class] && strokes.count > 0 && strokes.count <= 64 &&
+        [delay isKindOfClass:NSNumber.class] && delay.doubleValue == delay.longLongValue && delay.longLongValue >= 0 && delay.longLongValue <= 5000) {
+      total = strokes.count;
+      MetaTimedKeyStroke schedule[64] = {0};
+      BOOL parsed = YES;
+      for (size_t index = 0; parsed && index < total; index += 1) {
+        NSDictionary *stroke = strokes[index];
+        if (![stroke isKindOfClass:NSDictionary.class]) { parsed = NO; break; }
+        NSNumber *code = stroke[@"keyCode"], *modifiers = stroke[@"flags"];
+        if (![code isKindOfClass:NSNumber.class] || code.doubleValue != code.longLongValue || code.longLongValue < 0 || code.longLongValue > UINT16_MAX ||
+            ![modifiers isKindOfClass:NSNumber.class] || modifiers.doubleValue != modifiers.longLongValue || modifiers.longLongValue < 0) { parsed = NO; break; }
+        schedule[index] = (MetaTimedKeyStroke){code.unsignedIntValue, modifiers.unsignedLongLongValue, index * delay.unsignedLongLongValue};
+      }
+      MetaInputBridgeClock clock = {.context = (__bridge void *)self, .monotonic_millis = clock_now, .wait_until = wait_bool};
+      if (parsed) finished = meta_input_execute_shortcut(_executor, schedule, total, deadline, clock, &completed);
     }
   } else if (began && isText) {
     NSArray *clusters = action[@"clusters"];

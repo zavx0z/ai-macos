@@ -164,6 +164,21 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   if (!_admitted || ![payload[@"runtimeEpoch"] isEqual:_runtimeEpoch] || ![payload[@"loginSessionId"] isEqual:_loginSessionId]
       || ![payload[@"nativeGeneration"] isEqual:_generation] || !future_deadline(payload[@"deadlineAt"])) { [self shutdown:65]; return; }
   NSDictionary *identity = @{@"requestId": requestId, @"runtimeEpoch": _runtimeEpoch, @"loginSessionId": _loginSessionId, @"nativeGeneration": _generation};
+  if ([channel isEqual:@"permissions"]) {
+    if (![payload[@"kind"] isEqual:@"permissions"] || ![payload[@"protocolVersion"] isEqual:@"1"]) { [self shutdown:65]; return; }
+    NSDictionary *permissions = [_backend permissions];
+    if (![permissions[@"accessibility"] isKindOfClass:NSNumber.class] ||
+        ![permissions[@"postEvents"] isKindOfClass:NSNumber.class] ||
+        ![permissions[@"screenRecording"] isKindOfClass:NSNumber.class]) { [self shutdown:70]; return; }
+    NSMutableDictionary *result = [identity mutableCopy];
+    [result addEntriesFromDictionary:@{@"kind": @"permissions-response", @"protocolVersion": @"1", @"nativeBuildId": _buildId,
+      @"accessibility": [permissions[@"accessibility"] boolValue] ? @YES : @NO,
+      @"postEvents": [permissions[@"postEvents"] boolValue] ? @YES : @NO,
+      @"screenRecording": [permissions[@"screenRecording"] boolValue] ? @YES : @NO}];
+    if ([permissions[@"codeIdentity"] isKindOfClass:NSDictionary.class]) result[@"codeIdentity"] = permissions[@"codeIdentity"];
+    [self send:channel payload:result];
+    return;
+  }
   if ([channel isEqual:@"status"]) {
     if (_job == nil || ![payload[@"operationId"] isEqual:_job.operation[@"operationId"]]) { [self shutdown:65]; return; }
     NSDictionary *status = [_job statusForRequest:requestId];
@@ -221,6 +236,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   }
   BOOL clipboard = [channel isEqual:@"clipboard"];
   BOOL input = [payload[@"method"] isEqual:@"input.execute"] && [payload[@"intent"] isEqual:@"mutation"];
+  BOOL window = [payload[@"method"] isEqual:@"window.transition"] && [payload[@"intent"] isEqual:@"mutation"];
   BOOL inventory = [payload[@"method"] isEqual:@"window.inventory"] && [payload[@"intent"] isEqual:@"read"] && operation == nil;
   BOOL inspection = [payload[@"method"] isEqual:@"ax.inspect"] && [payload[@"intent"] isEqual:@"read"] && operation == nil;
   NSDictionary *command = payload[@"command"];
@@ -232,12 +248,12 @@ static NSDictionary *failure(NSString *code, NSString *message) {
         || ![ref[@"runtimeEpoch"] isEqual:_runtimeEpoch] || ![ref[@"loginSessionId"] isEqual:_loginSessionId]
         || ![command isKindOfClass:NSDictionary.class]) { [self shutdown:65]; return; }
   }
-  if (input) {
+  if (input || window) {
     NSDictionary *actionPayload = payload[@"payload"];
     if (![operation[@"kind"] isEqual:@"native"] || ![operation[@"nativeGeneration"] isEqual:_generation]
         || ![operation[@"fence"] isKindOfClass:NSDictionary.class] || ![operation[@"target"] isKindOfClass:NSDictionary.class]
         || ![operation[@"target"][@"ref"] isKindOfClass:NSDictionary.class]
-        || ![actionPayload isKindOfClass:NSDictionary.class] || ![actionPayload[@"action"] isKindOfClass:NSDictionary.class]) { [self shutdown:65]; return; }
+        || ![actionPayload isKindOfClass:NSDictionary.class] || (input && ![actionPayload[@"action"] isKindOfClass:NSDictionary.class])) { [self shutdown:65]; return; }
     MetaBrokerTransport *transport = _transport;
     _job = [[MetaInputJob alloc] initWithRequest:payload emitter:^(NSDictionary *message) { return [transport enqueueFrame:message]; }];
   }
@@ -248,7 +264,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     if (![ref isKindOfClass:NSDictionary.class] || ![ref[@"runtimeEpoch"] isEqual:_runtimeEpoch] ||
         ![ref[@"loginSessionId"] isEqual:_loginSessionId] || ![ref[@"nativeGeneration"] isEqual:_generation]) { [self shutdown:65]; return; }
   }
-  if (!clipboard && !inventory && !input && !inspection) {
+  if (!clipboard && !inventory && !input && !inspection && !window) {
     response[@"ok"] = @NO;
     response[@"error"] = failure(@"unsupported-capability", @"Native command ещё не подключена к broker");
     [self send:responseChannel payload:response];
@@ -263,7 +279,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
       dispatch_sync(self->_control, ^{ allowed = !self->_sealed && self->_requestedExit < 0; });
       NSDictionary *result = nil;
       if (allowed && future_deadline(payload[@"deadlineAt"])) {
-        result = input ? [self->_backend executeInput:payload job:job] : clipboard ? [self->_backend clipboard:command] :
+        result = input ? [self->_backend executeInput:payload job:job] : window ? [self->_backend executeWindow:payload job:job] : clipboard ? [self->_backend clipboard:command] :
             inspection ? [self->_backend inspect:payload] : [self->_backend inventory];
       }
       dispatch_async(self->_control, ^{
@@ -274,6 +290,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
         if ([result[@"nativeError"] isKindOfClass:NSDictionary.class]) {
           response[@"ok"] = @NO;
           response[@"error"] = result[@"nativeError"];
+          if ([result[@"nativeStatus"] isKindOfClass:NSDictionary.class]) response[@"nativeStatus"] = result[@"nativeStatus"];
         } else if (input && result != nil) {
           NSMutableDictionary *report = [result mutableCopy];
           BOOL finished = [report[@"finished"] boolValue];

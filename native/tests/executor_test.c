@@ -349,7 +349,31 @@ static void test_advanced_fence_stops_old_operation_without_restore(void) {
   meta_executor_destroy(value);
 }
 
+static bool fake_action(void *context) {
+  size_t *count = context;
+  *count += 1;
+  return true;
+}
+
+static void test_external_action_uses_same_fence(void) {
+  FakeBackend backend = {.now = 100, .target_valid = true};
+  MetaExecutor *value = executor(&backend, "native-1");
+  size_t dispatches = 0;
+  assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+  assert(meta_executor_begin(value, "window-show", "window-1", fence("runtime-1", "native-1", 1), 1000));
+  assert(meta_executor_dispatch_action(value, fake_action, &dispatches, "window-show"));
+  assert(meta_executor_finish(value));
+  assert(dispatches == 1 && meta_executor_status(value).dispatch_attempts == 1);
+  assert(!meta_executor_begin(value, "replay", "window-1", fence("runtime-1", "native-1", 1), 1000));
+  assert(meta_executor_begin(value, "window-focus", "window-1", fence("runtime-1", "native-1", 2), 1000));
+  assert(meta_executor_cancel(value));
+  assert(!meta_executor_dispatch_action(value, fake_action, &dispatches, "cancelled"));
+  assert(dispatches == 1);
+  meta_executor_destroy(value);
+}
+
 int main(void) {
+  test_external_action_uses_same_fence();
   test_cancel_before_first_event();
   test_cancel_releases_confirmed_down();
   test_lost_ack_quarantines_without_blind_up();
