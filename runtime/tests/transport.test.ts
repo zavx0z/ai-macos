@@ -8,6 +8,7 @@ import {
   z,
 } from "@meta/shared/contracts"
 import { RuntimeCore } from "../src/core.ts"
+import { MethodRegistry } from "../src/method-registry.ts"
 import {
   RuntimeUdsClient,
   RuntimeUdsServer,
@@ -23,6 +24,65 @@ const fixtureTarget = {
     clipboardRef: "system" as const,
   },
 }
+
+test("admin UDS требует отдельный credential и exact epoch/build до drain", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "runtime-admin-"))
+  const socketPath = join(directory, "runtime.sock")
+  const credentialPath = join(directory, "credential.json")
+  const runtime = new RuntimeCore({ generation, runtimeBuildId: "build:admin" })
+  let drains = 0
+  let activeOperations = 1
+  const server = new RuntimeUdsServer({ socketPath, credentialPath, core: runtime, admin: {
+    inspect: () => ({ running: true, runtimeEpoch: generation.runtimeEpoch, runtimeBuildId: "build:admin", nativeBuildId: "build:native", activeOperations, quarantinedResources: 0 }),
+    async drain() {
+      drains++
+      activeOperations = 0
+      return { runtimeEpoch: generation.runtimeEpoch, runtimeBuildId: "build:admin", nativeBuildId: "build:native",
+        cleanup: "complete", activeOperations: 0, quarantinedResources: 0 }
+    },
+  } })
+  try {
+    await server.start()
+    const client = await RuntimeUdsClient.fromCredentialFile(socketPath, credentialPath)
+    expect((await client.adminInspect()).activeOperations).toBe(1)
+    const credential = JSON.parse(await readFile(credentialPath, "utf8"))
+    const session = runtime.openClient("principal:admin-test")
+    for (const token of [credential.bootstrapToken, session.bearerToken]) {
+      const response = await fetch("http://localhost/v1/admin/inspect", { unix: socketPath, headers: { authorization: `Bearer ${token}` } })
+      expect(response.status).toBe(401)
+      await response.text()
+    }
+    await expect(client.adminDrain({ runtimeEpoch: "runtime:other", buildId: "build:admin" })).rejects.toThrow("mismatch")
+    await expect(client.adminDrain({ runtimeEpoch: generation.runtimeEpoch, buildId: "build:other" })).rejects.toThrow("mismatch")
+    await expect(client.adminDrain({ runtimeEpoch: generation.runtimeEpoch, buildId: "build:admin", nativeBuildId: "native:other" })).rejects.toThrow("mismatch")
+    expect(drains).toBe(0)
+    expect(await client.adminDrain({ runtimeEpoch: generation.runtimeEpoch, buildId: "build:admin", nativeBuildId: "build:native" })).toMatchObject({ cleanup: "complete", activeOperations: 0 })
+    expect(drains).toBe(1)
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test("UDS callTool использует advertised method budget вместо короткого transport default", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "runtime-budget-"))
+  const socketPath = join(directory, "runtime.sock")
+  const credentialPath = join(directory, "credential.json")
+  const core = new RuntimeCore({ generation, runtimeBuildId: "build:budget" })
+  const catalog = new MethodRegistry(core)
+  let calls = 0
+  catalog.register("slow_read", {
+    title: "Медленное чтение", description: "Проверка бюджета", readOnly: true, timeoutMs: 500,
+    input: z.strictObject({}), output: z.strictObject({ done: z.literal(true) }),
+    async execute() { calls++; await Bun.sleep(100); return { done: true } },
+  })
+  const server = new RuntimeUdsServer({ socketPath, credentialPath, core, catalog })
+  try {
+    await server.start()
+    const client = await RuntimeUdsClient.fromCredentialFile(socketPath, credentialPath, { timeoutMs: 50 })
+    await client.open("method-budget")
+    expect((await client.listTools())[0]?._meta?.timeoutMs).toBe(500)
+    expect((await client.callTool("slow_read", {}, new AbortController().signal)).structuredContent).toEqual({ done: true })
+    expect(calls).toBe(1)
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }) }
+})
 
 test("private UDS authenticates clients before executor and preserves exact operation", async () => {
   const directory = await mkdtemp(join(tmpdir(), "meta-runtime-uds-"))

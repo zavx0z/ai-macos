@@ -50,6 +50,27 @@ export type RuntimeMethodDefinition<Input, Result> = {
 
 type StoredMethod = RuntimeMethodDefinition<unknown, unknown>
 
+const adminInspectionSchema = z.strictObject({
+  running: z.literal(true), runtimeEpoch: z.string().min(1).max(64), runtimeBuildId: z.string().min(1).max(127),
+  nativeBuildId: z.string().min(1).max(127).optional(),
+  activeOperations: z.number().int().min(0), quarantinedResources: z.number().int().min(0),
+})
+const adminDrainRequestSchema = z.strictObject({
+  runtimeEpoch: z.string().min(1).max(64), buildId: z.string().min(1).max(127),
+  nativeBuildId: z.string().min(1).max(127).optional(),
+})
+const adminDrainReceiptSchema = z.strictObject({
+  runtimeEpoch: z.string().min(1).max(64), runtimeBuildId: z.string().min(1).max(127), nativeBuildId: z.string().min(1).max(127),
+  cleanup: z.literal("complete"), activeOperations: z.literal(0), quarantinedResources: z.literal(0),
+})
+export type RuntimeAdminInspection = z.infer<typeof adminInspectionSchema>
+export type RuntimeAdminDrainRequest = z.infer<typeof adminDrainRequestSchema>
+export type RuntimeAdminDrainReceipt = z.infer<typeof adminDrainReceiptSchema>
+export type RuntimeAdminBinding = {
+  inspect(): RuntimeAdminInspection
+  drain(expected: RuntimeAdminDrainRequest, signal: AbortSignal): Promise<RuntimeAdminDrainReceipt>
+}
+
 export type RuntimeTransportOptions = {
   socketPath: string
   credentialPath: string
@@ -58,6 +79,7 @@ export type RuntimeTransportOptions = {
   ids?: RuntimeIdSource
   chmod?: typeof chmod
   catalog?: MethodRegistry
+  admin?: RuntimeAdminBinding
 }
 
 export class RuntimeUdsServer {
@@ -69,8 +91,10 @@ export class RuntimeUdsServer {
   readonly #methods = new Map<string, StoredMethod>()
   readonly #chmod: typeof chmod
   readonly #catalog?: MethodRegistry
+  readonly #admin?: RuntimeAdminBinding
   #server: ReturnType<typeof Bun.serve> | undefined
   #bootstrapToken: string | undefined
+  #adminToken: string | undefined
   #ownsCredential = false
   #ownsSocket = false
 
@@ -82,6 +106,9 @@ export class RuntimeUdsServer {
     this.#ids = options.ids ?? randomIdSource
     this.#chmod = options.chmod ?? chmod
     this.#catalog = options.catalog
+    this.#admin = options.admin === undefined ? undefined : Object.freeze({
+      inspect: options.admin.inspect.bind(options.admin), drain: options.admin.drain.bind(options.admin),
+    })
   }
 
   register<Input, Result>(name: string, definition: RuntimeMethodDefinition<Input, Result>): void {
@@ -98,16 +125,19 @@ export class RuntimeUdsServer {
     await mkdir(directory, { recursive: true, mode: 0o700 })
     await this.#chmod(directory, 0o700)
     const bootstrapToken = this.#ids.next("bootstrap")
+    const adminToken = this.#ids.next("admin")
     try {
       await writeFile(this.#credentialPath, JSON.stringify({
         protocolVersion: "1",
         ...this.#core.generation,
         principalId: this.#principalId,
         bootstrapToken,
+        adminToken,
       }), { encoding: "utf8", mode: 0o600, flag: "wx" })
       this.#ownsCredential = true
       await this.#chmod(this.#credentialPath, 0o600)
       this.#bootstrapToken = bootstrapToken
+      this.#adminToken = adminToken
       this.#server = Bun.serve({
         unix: this.#socketPath,
         fetch: request => this.#fetch(request),
@@ -122,6 +152,7 @@ export class RuntimeUdsServer {
       if (this.#ownsCredential) await unlink(this.#credentialPath).catch(() => undefined)
       this.#ownsCredential = false
       this.#bootstrapToken = undefined
+      this.#adminToken = undefined
       throw error
     }
   }
@@ -130,6 +161,7 @@ export class RuntimeUdsServer {
     const server = this.#server
     this.#server = undefined
     this.#bootstrapToken = undefined
+    this.#adminToken = undefined
     if (server !== undefined) server.stop(true)
     await Promise.all([
       this.#ownsSocket ? unlink(this.#socketPath).catch(() => undefined) : undefined,
@@ -142,6 +174,25 @@ export class RuntimeUdsServer {
   async #fetch(request: Request): Promise<Response> {
     try {
       const url = new URL(request.url)
+      if (url.pathname.startsWith("/v1/admin/")) {
+        if (this.#adminToken === undefined || bearerToken(request) !== this.#adminToken) throw new RuntimeContractError("unauthorized", "Неверный admin credential", "runtime-admin")
+        if (this.#admin === undefined) return json({ error: "admin-unavailable" }, 503)
+        const current = adminInspectionSchema.parse(this.#admin.inspect())
+        if (request.method === "GET" && url.pathname === "/v1/admin/inspect") return json(current)
+        if (request.method === "POST" && url.pathname === "/v1/admin/drain") {
+          const expected = await readJson(request, adminDrainRequestSchema)
+          if (current.runtimeEpoch !== expected.runtimeEpoch || current.runtimeBuildId !== expected.buildId
+            || expected.nativeBuildId !== undefined && current.nativeBuildId !== expected.nativeBuildId) throw new Error("Admin drain generation/build mismatch")
+          const receipt = adminDrainReceiptSchema.parse(await this.#admin.drain(expected, request.signal))
+          const after = adminInspectionSchema.parse(this.#admin.inspect())
+          if (receipt.runtimeEpoch !== current.runtimeEpoch || receipt.runtimeBuildId !== current.runtimeBuildId
+            || receipt.nativeBuildId !== current.nativeBuildId || after.runtimeEpoch !== current.runtimeEpoch
+            || after.runtimeBuildId !== current.runtimeBuildId || after.nativeBuildId !== current.nativeBuildId
+            || after.activeOperations !== 0 || after.quarantinedResources !== 0) throw new Error("Admin drain receipt не подтверждает inspected host")
+          return json(receipt)
+        }
+        return json({ error: "not-found" }, 404)
+      }
       if (request.method === "POST" && url.pathname === "/v1/session/open") {
         this.#assertBootstrap(request)
         const body = await readJson(request, sessionOpenSchema)
@@ -247,13 +298,15 @@ export class RuntimeUdsServer {
 export class RuntimeUdsClient {
   readonly #socketPath: string
   readonly #bootstrapToken: string
+  readonly #adminToken?: string
   #bearerToken: string | undefined
   #resumptionToken: string | undefined
   readonly #timeoutMs: number
 
-  private constructor(socketPath: string, bootstrapToken: string, timeoutMs: number) {
+  private constructor(socketPath: string, bootstrapToken: string, timeoutMs: number, adminToken?: string) {
     this.#socketPath = socketPath
     this.#bootstrapToken = bootstrapToken
+    this.#adminToken = adminToken
     this.#timeoutMs = timeoutMs
   }
 
@@ -265,7 +318,7 @@ export class RuntimeUdsClient {
     const credential = parseWireJson(bootstrapCredentialSchema, await readFile(credentialPath, "utf8"))
     const timeoutMs = options.timeoutMs ?? RUNTIME_TRANSPORT_TIMEOUT_MS
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error("Runtime client timeout должен быть 1..30000 ms")
-    return new RuntimeUdsClient(socketPath, credential.bootstrapToken, timeoutMs)
+    return new RuntimeUdsClient(socketPath, credential.bootstrapToken, timeoutMs, credential.adminToken)
   }
 
   async open(clientName: string): Promise<void> {
@@ -295,6 +348,16 @@ export class RuntimeUdsClient {
     return this.#request("/v1/health")
   }
 
+  async adminInspect(): Promise<RuntimeAdminInspection> {
+    return adminInspectionSchema.parse(await this.#request("/v1/admin/inspect", { admin: true }))
+  }
+
+  async adminDrain(expected: RuntimeAdminDrainRequest, signal?: AbortSignal): Promise<RuntimeAdminDrainReceipt> {
+    return adminDrainReceiptSchema.parse(await this.#request("/v1/admin/drain", {
+      method: "POST", admin: true, body: adminDrainRequestSchema.parse(expected), signal,
+    }))
+  }
+
   async listTools(): Promise<RuntimeToolDescriptor[]> {
     const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog"))
     return catalog.tools as RuntimeToolDescriptor[]
@@ -302,8 +365,12 @@ export class RuntimeUdsClient {
 
   async callTool(name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<RuntimeToolResult> {
     try {
+      const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog", { signal }))
+      const descriptor = catalog.tools.find(tool => tool.name === name)
+      if (descriptor === undefined) throw new Error("Method отсутствует в текущем runtime catalogue")
+      const timeoutMs = Math.max(this.#timeoutMs, (descriptor._meta?.timeoutMs ?? 5000) + 1000)
       const result = methodResponseSchema.parse(await this.#request(`/v1/tools/${encodeURIComponent(name)}`, {
-        method: "POST", body: args, signal,
+        method: "POST", body: args, signal, timeoutMs,
       }))
       const content: RuntimeToolResult["content"] = [{ type: "text", text: JSON.stringify(result.data) }]
       for (const frameRef of result.frameRefs) {
@@ -393,7 +460,7 @@ export class RuntimeUdsClient {
 
   async #request(
     path: string,
-    options: { method?: string, body?: unknown, bootstrap?: boolean, signal?: AbortSignal } = {},
+    options: { method?: string, body?: unknown, bootstrap?: boolean, admin?: boolean, signal?: AbortSignal, timeoutMs?: number } = {},
   ): Promise<unknown> {
     const response = await this.#raw(path, options)
     const body = await readResponseJson(response, this.#timeoutMs)
@@ -403,9 +470,10 @@ export class RuntimeUdsClient {
 
   #raw(
     path: string,
-    options: { method?: string, body?: unknown, bootstrap?: boolean, signal?: AbortSignal } = {},
+    options: { method?: string, body?: unknown, bootstrap?: boolean, admin?: boolean, signal?: AbortSignal, timeoutMs?: number } = {},
   ): Promise<Response> {
-    const token = options.bootstrap ? this.#bootstrapToken : this.#bearerToken
+    const token = options.admin ? this.#adminToken : options.bootstrap ? this.#bootstrapToken : this.#bearerToken
+    const timeoutMs = options.timeoutMs ?? this.#timeoutMs
     if (token === undefined) throw new Error("Runtime UDS client не аутентифицирован")
     return fetch(`http://localhost${path}`, {
       unix: this.#socketPath,
@@ -415,8 +483,8 @@ export class RuntimeUdsClient {
         ...(options.body === undefined ? {} : { "content-type": "application/json" }),
       },
       ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
-      signal: options.signal === undefined ? AbortSignal.timeout(this.#timeoutMs)
-        : AbortSignal.any([options.signal, AbortSignal.timeout(this.#timeoutMs)]),
+      signal: options.signal === undefined ? AbortSignal.timeout(timeoutMs)
+        : AbortSignal.any([options.signal, AbortSignal.timeout(timeoutMs)]),
     })
   }
 }
@@ -430,7 +498,7 @@ const catalogResponseSchema = z.strictObject({
     inputSchema: z.object({ type: z.literal("object") }).passthrough(),
     outputSchema: z.object({ type: z.literal("object") }).passthrough(),
     annotations: z.strictObject({ readOnlyHint: z.boolean(), destructiveHint: z.boolean(), openWorldHint: z.boolean() }),
-    _meta: z.strictObject({ maxRequestBytes: z.number().int(), maxResponseBytes: z.number().int() }).optional(),
+    _meta: z.strictObject({ maxRequestBytes: z.number().int(), maxResponseBytes: z.number().int(), timeoutMs: z.number().int().min(1).max(120_000).optional() }).optional(),
   })).max(256),
 })
 const sessionResumeSchema = z.strictObject({ resumptionToken: z.string().min(1).max(256) })
@@ -441,6 +509,7 @@ const bootstrapCredentialSchema = z.strictObject({
   loginSessionId: z.string().min(1).max(64),
   principalId: z.string().min(1).max(127),
   bootstrapToken: z.string().min(1).max(256),
+  adminToken: z.string().min(1).max(256).optional(),
 })
 const sessionCredentialSchema = z.strictObject({
   session: z.unknown(),

@@ -10,6 +10,22 @@ production cutover ещё впереди. Recovery и Android composition при
 
 ## Checkpoint durable core и host integration
 
+Следующий транспортный срез:
+
+- Отдельный adminToken из private credential разрешает только administrative
+  inspect/drain routes. Session bearer и bootstrapToken там отклоняются.
+  Drain проверяет exact epoch/runtime build и, если передан, native build до
+  callback; receipt и повторный inspect должны подтвердить тот же host и нулевые
+  active/quarantined ресурсы. Незавершённый startup recovery блокирует drain.
+- RuntimeUdsClient предоставляет adminInspect/adminDrain; host связывает их с
+  реальным native drain. Method descriptor содержит timeoutMs, и callTool
+  использует актуальный budget из каталога вместо фиксированных пяти секунд.
+- Native metadata stdout ограничен 1 MiB, stderr одновременно читается с
+  пределом 64 KiB; оба потока и subprocess имеют deadline, незавершённый child
+  завершается при выходе из probe. Payload stderr не включается в diagnostics.
+- Проверка transport/registry/clipboard/host: **18 pass / 131 assertions**;
+  root typecheck **exit 0**, diff-check **pass**.
+
 - Core записывает registered и dispatching до вызова adapter. Проверенный
   terminal record с cleanup receipt сохраняется до освобождения resource.
   Recovery старых browser operations использует тот же staged durable порядок.

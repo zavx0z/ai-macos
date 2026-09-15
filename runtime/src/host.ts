@@ -14,7 +14,7 @@ import { MethodRegistry } from "./method-registry.ts"
 import { RuntimeClipboardHandler } from "./clipboard-handler.ts"
 import { clipboardReadRequestSchema, clipboardWriteRequestSchema, clipboardReadResultSchema, clipboardWriteResultSchema } from "@meta/input/clipboard-adapter"
 import { adapterResultSchema } from "@meta/shared/contracts"
-import { RuntimeUdsServer } from "./transport.ts"
+import { RuntimeUdsServer, readBoundedResponseText } from "./transport.ts"
 import { acquireHostLock } from "./host-lock.ts"
 import { composeHostCapabilities } from "./host-capabilities.ts"
 import { FileHeldInputLedger, FileOperationJournal } from "./storage/index.ts"
@@ -208,23 +208,38 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       })
     }
   }
-  const uds = new RuntimeUdsServer({ socketPath: options.socketPath, credentialPath: options.credentialPath, core, catalog })
+  const drain = async (signal?: AbortSignal) => {
+    draining = true
+    core.sealAdmission()
+    await core.drainOperations()
+    if (core.recoveryEvidence().length > 0 || core.startupRecoveryReasons().length > 0) throw new Error("Startup recovery не завершена")
+    if (native === undefined || handshake === undefined) return { cleanup: "complete" as const }
+    const control = AbortSignal.any([AbortSignal.timeout(1000), ...(signal === undefined ? [] : [signal])])
+    const ack = await native.drain({ requestId: `drain:${crypto.randomUUID()}`, ...generation, nativeGeneration: handshake.nativeGeneration,
+      deadlineAt: new Date(Date.now() + 1000).toISOString() }, { signal: control, checkpoint() { control.throwIfAborted() } })
+    if (ack.cleanup !== "complete" || ack.quarantined || ack.activeOperationIds.length > 0) throw new Error("Native drain не подтверждён")
+    return ack
+  }
+  const uds = new RuntimeUdsServer({ socketPath: options.socketPath, credentialPath: options.credentialPath, core, catalog,
+    admin: {
+      inspect: () => ({ running: true, runtimeEpoch: generation.runtimeEpoch, runtimeBuildId: options.runtimeBuildId,
+        ...(handshake === undefined ? {} : { nativeBuildId: handshake.nativeBuildId }),
+        activeOperations: core.activeOperationCount(), quarantinedResources: core.resources.quarantinedCount() }),
+      async drain(_expected, signal) {
+        if (handshake === undefined) throw new Error("Native build для admin drain неизвестен")
+        await drain(signal)
+        return { runtimeEpoch: generation.runtimeEpoch, runtimeBuildId: options.runtimeBuildId, nativeBuildId: handshake.nativeBuildId,
+          cleanup: "complete", activeOperations: 0, quarantinedResources: 0 }
+      },
+    },
+  })
   return {
     core, catalog, doctor,
     async start() {
       try { await uds.start() }
       catch (error) { core.sealAdmission(); await native?.close(); await releaseLock(); throw error }
     },
-    async drain() {
-      draining = true
-      core.sealAdmission()
-      await core.drainOperations()
-      if (native === undefined || handshake === undefined) return { cleanup: "complete" as const }
-      const ack = await native.drain({ requestId: `drain:${crypto.randomUUID()}`, ...generation, nativeGeneration: handshake.nativeGeneration,
-        deadlineAt: new Date(Date.now() + 1000).toISOString() }, { signal: AbortSignal.timeout(1000), checkpoint() {} })
-      if (ack.cleanup !== "complete" || ack.quarantined || ack.activeOperationIds.length > 0) throw new Error("Native drain не подтверждён")
-      return ack
-    },
+    drain,
     async close() { core.sealAdmission(); await uds.stop(); await native?.close(); await releaseLock() },
   }
   } catch (error) { await native?.close(); throw error }
@@ -235,11 +250,17 @@ async function readNativeMetadata(helperPath: string): Promise<unknown> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     return await Promise.race([
-      Promise.all([new Response(child.stdout).text(), child.exited]).then(([text, code]) => {
+      Promise.all([
+        readBoundedResponseText(new Response(child.stdout), 1024 * 1024, 5000), child.exited,
+        readBoundedResponseText(new Response(child.stderr), 64 * 1024, 5000),
+      ]).then(([text, code]) => {
         if (code !== 0) throw new Error("Native metadata process failed")
         return parseWireJson(z.json(), text)
       }),
       new Promise<never>((_, reject) => { timer = setTimeout(() => { child.kill(); reject(new Error("Native metadata deadline")) }, 5000) }),
     ])
-  } finally { if (timer !== undefined) clearTimeout(timer) }
+  } finally {
+    if (timer !== undefined) clearTimeout(timer)
+    if (child.exitCode === null) child.kill()
+  }
 }

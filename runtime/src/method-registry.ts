@@ -9,7 +9,7 @@ export type RuntimeToolDescriptor = {
   inputSchema: { type: "object", properties?: Record<string, unknown>, required?: string[], [key: string]: unknown }
   outputSchema: { type: "object", [key: string]: unknown }
   annotations: { readOnlyHint: boolean, destructiveHint: boolean, openWorldHint: boolean }
-  _meta?: { maxRequestBytes: number, maxResponseBytes: number }
+  _meta?: { maxRequestBytes: number, maxResponseBytes: number, timeoutMs?: number }
 }
 
 export type RuntimeMethodContext = {
@@ -83,7 +83,7 @@ export class MethodRegistry {
         inputSchema: inputSchema as RuntimeToolDescriptor["inputSchema"],
         outputSchema: outputSchema as RuntimeToolDescriptor["outputSchema"],
         annotations: { readOnlyHint: frozen.readOnly, destructiveHint: frozen.destructive ?? false, openWorldHint: false },
-        _meta: { maxRequestBytes, maxResponseBytes },
+        _meta: { maxRequestBytes, maxResponseBytes, timeoutMs },
       },
       requiredCapabilities: frozen.requiredCapabilities,
       availableDuringDrain: frozen.availableDuringDrain ?? false,
