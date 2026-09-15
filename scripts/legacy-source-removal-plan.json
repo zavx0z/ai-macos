@@ -1,0 +1,457 @@
+{
+  "format": "meta-ai-macos-legacy-source-removal-plan-v1",
+  "generatedFromCommit": "8eabedf",
+  "state": "proposal-blocked-until-root-integration-and-api-contract",
+  "scope": "repository-source-only",
+  "preconditions": [
+    "Полный production RuntimeHost catalog и native binding проходят root integration без legacy REST.",
+    "Новый immutable runtime/native release установлен и подтвержден exact doctor receipt.",
+    "Актуальные consumers из docs/legacy-callers.md мигрированы либо имеют явный blocker.",
+    "A02 проверен отдельными runtime/MCP subprocesses, A31 проверен на private socket peer/token boundary, A43 проверен из свежей Codex задачи.",
+    "LegacyServiceRetirementCoordinator подтвердил exact ownership и завершение собственных listeners 7878-7882.",
+    "Chrome CDP LaunchAgent инвентаризирован и остановлен только при подтвержденном ownership.",
+    "Root подтвердил, что удаление source-controlled helper не удаляет installer-managed stable TCC pathname.",
+    "Завершено исследование actual bundled и official Computer Use API; внешний compatibility facade зафиксирован tests и не использует legacy REST/CLI как реализацию."
+  ],
+  "externalApiCompatibility": {
+    "goal": "Совместимая внешняя agent-facing поверхность с Computer Use API Codex/ChatGPT",
+    "contractStatus": "under-research",
+    "researchSources": [
+      "/Applications/ChatGPT.app bundled API inspected by root",
+      "https://learn.chatgpt.com/docs/computer-use"
+    ],
+    "requiredEvidence": [
+      "Точные request/result schemas и error semantics",
+      "Cancellation/deadline behavior",
+      "Image/frame transport semantics",
+      "Capability advertisement и unavailable behavior",
+      "Contract tests против подтвержденного external API"
+    ],
+    "constraint": "Не проектировать facade по предположению и не сохранять legacy REST/CLI как compatibility layer."
+  },
+  "reverseImportEvidence": [
+    {
+      "consumer": "runtime/src/host.ts",
+      "required": [
+        "@meta/native/adapter",
+        "@meta/native/window-adapter",
+        "@meta/native/application-adapter",
+        "@meta/native/capture-client",
+        "@meta/native/evidence-extractor",
+        "@meta/input/adapter",
+        "@meta/input/clipboard-adapter",
+        "@meta/screen/adapter",
+        "@meta/screen/native-driver"
+      ]
+    },
+    {
+      "consumer": "runtime/src/browser-host.ts",
+      "required": [
+        "@meta/chrome/adapter",
+        "@meta/android/adapter"
+      ]
+    },
+    {
+      "consumer": "input/src/adapter.ts",
+      "required": [
+        "input/src/action-plan.ts",
+        "input/src/actions.ts",
+        "input/src/authorization.ts",
+        "input/src/native-action.ts",
+        "input/src/keys.ts"
+      ]
+    },
+    {
+      "consumer": "runtime/src/clipboard-handler.ts",
+      "required": [
+        "input/src/clipboard-adapter.ts",
+        "input/src/native-clipboard-backend.ts"
+      ]
+    },
+    {
+      "consumer": "screen/src/native-driver.ts",
+      "required": [
+        "screen/src/adapter.ts",
+        "@meta/native/capture-client"
+      ]
+    },
+    {
+      "consumer": "chrome/src/adapter.ts",
+      "required": [
+        "chrome/src/cdp-mode.ts",
+        "chrome/src/wait-ready.ts"
+      ]
+    },
+    {
+      "consumer": "android/src/adapter.ts",
+      "required": [
+        "android/src/adb.ts",
+        "android selectCreatedTarget helper extracted from android/src/android.ts",
+        "@meta/chrome/adapter"
+      ]
+    },
+    {
+      "consumer": "mcp/src/runtime-mcp.ts",
+      "required": [
+        "mcp/src/catalog-server.ts",
+        "@meta/runtime"
+      ]
+    },
+    {
+      "consumer": "scripts/runtime-install.ts",
+      "required": [
+        "scripts/runtime-entry.ts",
+        "scripts/runtime-admin.ts",
+        "native/scripts/build-broker.sh",
+        "installer-managed input/bin/meta-input-helper stable pathname"
+      ]
+    }
+  ],
+  "keepFiles": [
+    "scripts/runtime-entry.ts",
+    "scripts/runtime-install.ts",
+    "scripts/runtime-install.test.ts",
+    "scripts/runtime-admin.ts",
+    "scripts/runtime-admin.test.ts",
+    "scripts/source-doctor.ts",
+    "native/scripts/build-broker.sh",
+    "native/scripts/check.sh",
+    "mcp/src/runtime-mcp.ts",
+    "mcp/src/catalog-server.ts",
+    "mcp/tests/runtime-mcp.test.ts",
+    "mcp/tests/catalog-server.test.ts",
+    "screen/src/adapter.ts",
+    "screen/src/native-driver.ts",
+    "input/src/action-plan.ts",
+    "input/src/actions.ts",
+    "input/src/authorization.ts",
+    "input/src/adapter.ts",
+    "input/src/keys.ts",
+    "input/src/native-action.ts",
+    "input/src/clipboard-adapter.ts",
+    "input/src/native-clipboard-backend.ts",
+    "chrome/src/adapter.ts",
+    "chrome/src/cdp-mode.ts",
+    "chrome/src/wait-ready.ts",
+    "android/src/adapter.ts",
+    "android/src/adb.ts"
+  ],
+  "deleteFiles": [
+    "http-client.env.json",
+    "tests/README.md",
+    "tests/scenarios.http",
+    "window/.claude/skills/macos-window/SKILL.md",
+    "window/API.md",
+    "window/API — копия.txt",
+    "window/package.json",
+    "window/tsconfig.json",
+    "window/src/adapter.ts",
+    "window/src/cli.ts",
+    "window/src/focus.ts",
+    "window/src/index.ts",
+    "window/src/pin.ts",
+    "window/src/windows.ts",
+    "window/tests/focus.test.ts",
+    "window/tests/window.http",
+    "screen/API.md",
+    "screen/src/index.ts",
+    "screen/src/cli.ts",
+    "screen/src/capture.ts",
+    "screen/src/restore-focus.ts",
+    "screen/src/restore.ts",
+    "screen/src/window-api.ts",
+    "screen/tests/capture-metadata.test.ts",
+    "screen/tests/restore-focus.test.ts",
+    "screen/tests/screen.http",
+    "input/bin/meta-input-helper",
+    "input/native/meta_input_helper.c",
+    "input/src/index.ts",
+    "input/src/bootstrap.ts",
+    "input/src/native.ts",
+    "input/src/mouse.ts",
+    "input/src/keyboard.ts",
+    "input/src/windows.ts",
+    "input/src/clipboard.ts",
+    "input/tests/README.md",
+    "input/tests/input.http",
+    "input/tests/window-selector.test.ts",
+    "input/tests/clipboard.test.ts",
+    "input/tests/clipboard-live-gate.ts",
+    "input/tests/clipboard-live-gate.test.ts",
+    "input/tests/clipboard.live.test.ts",
+    "chrome/API.md",
+    "chrome/src/index.ts",
+    "chrome/src/cli.ts",
+    "chrome/src/chrome.ts",
+    "chrome/src/session.ts",
+    "chrome/src/browser-processes.ts",
+    "chrome/src/session.test.ts",
+    "chrome/tests/browser-processes.spec.ts",
+    "chrome/tests/capture.spec.ts",
+    "chrome/tests/cdp-targets.spec.ts",
+    "chrome/tests/chrome.http",
+    "chrome/scripts/cdp-monitor.sh",
+    "chrome/scripts/cdp-service.sh",
+    "chrome/scripts/cdp.sh",
+    "android/src/index.ts",
+    "android/src/bootstrap.ts",
+    "android/src/cdp.ts",
+    "android/src/android.ts",
+    "android/tests/android.http",
+    "android/tests/bootstrap.test.ts",
+    "mcp/src/index.ts",
+    "mcp/src/launcher.ts",
+    "mcp/src/process-diagnostics.ts",
+    "mcp/src/screenshot-ui.ts",
+    "mcp/src/window-coordinates.ts",
+    "mcp/tests/stdio.test.ts",
+    "mcp/tests/live-window-id.ts",
+    "mcp/tests/window-coordinates.test.ts",
+    "native/scripts/build.sh",
+    "scripts/legacy-services.ts",
+    "scripts/legacy-services.test.ts"
+  ],
+  "migrationBeforeDelete": [
+    {
+      "file": "android/src/android.ts",
+      "action": "Перенести selectCreatedTarget в отдельный adapter-owned module и перевести android/src/adapter.ts и android/tests/targets.test.ts. Остальные legacy target helpers удалить."
+    },
+    {
+      "file": "android/tests/bootstrap.test.ts",
+      "action": "Перенести сохраняемые ADB parse/identity assertions в android/tests/adb.test.ts; bootstrap/auto-install assertions удалить."
+    },
+    {
+      "file": "chrome/src/cdp-mode.ts",
+      "action": "Сохранить только symbols, реально импортируемые chrome/src/adapter.ts: cdpCaptureScreenshot, cdpConsoleListen, cdpEval, cdpNavigate, cdpReload, cdpWaitReady и их private dependencies. Raw command/trace/performance/profile/viewport REST-only symbols удалить после symbol-level reverse import check."
+    },
+    {
+      "file": "chrome/scripts/cdp.sh",
+      "action": "Сначала назначить ownership запуска configured Chrome endpoint: runtime-admin capability либо явно внешний prerequisite. Удаление без решения оставит RuntimeBrowserAdapter без управляемого setup path."
+    },
+    {
+      "file": "input/bin/meta-input-helper",
+      "action": "Удалить старый source-controlled binary только после successful installer switch. Stable pathname остается управляемым scripts/runtime-install.ts и содержит новый broker для сохранения TCC identity."
+    },
+    {
+      "file": "scripts/legacy-services.ts",
+      "action": "Удалить последним после one-shot exact retirement, проверки отсутствия listeners 7878-7882 и сохранения receipt. Он не остается постоянным admin CLI."
+    },
+    {
+      "file": "mcp/tests/stdio.test.ts",
+      "action": "До удаления добавить новые A02/A43 subprocess tests для scripts/runtime-entry.ts --mcp и одного RuntimeHost. Legacy assertions не переносить как REST expectations."
+    }
+  ],
+  "jsonModificationProposals": [
+    {
+      "file": "package.json",
+      "remove": [
+        "module",
+        "workspaces entry window",
+        "scripts.dev",
+        "scripts.dev:android"
+      ],
+      "set": {
+        "scripts.mcp": "bun run --cwd mcp start"
+      },
+      "note": "Добавлять runtime/admin command names только из принятого owner entrypoint; не создавать shell/REST bypass."
+    },
+    {
+      "file": "runtime/package.json",
+      "remove": [
+        "dependencies.@meta/window"
+      ],
+      "set": {},
+      "note": "Остальные adapter package dependencies используются runtime host/browser host."
+    },
+    {
+      "file": "screen/package.json",
+      "remove": [
+        "main",
+        "exports[\".\"]",
+        "bin",
+        "scripts.dev",
+        "scripts.start",
+        "scripts.cli",
+        "scripts.build"
+      ],
+      "set": {},
+      "note": "Сохранить exports ./adapter и ./native-driver, test/typecheck и их dependencies."
+    },
+    {
+      "file": "input/package.json",
+      "remove": [
+        "main",
+        "exports[\".\"]",
+        "scripts.dev",
+        "scripts.start",
+        "scripts.build"
+      ],
+      "set": {},
+      "note": "Сохранить adapter/action/authorization/native-action/clipboard subpath exports, test/typecheck."
+    },
+    {
+      "file": "chrome/package.json",
+      "remove": [
+        "main",
+        "exports[\".\"]",
+        "bin",
+        "scripts.dev",
+        "scripts.start",
+        "scripts.cli",
+        "scripts.build",
+        "scripts.cdp",
+        "scripts.cdp:check"
+      ],
+      "set": {},
+      "note": "Сохранить export ./adapter, test/typecheck и shared dependency. cdp scripts удалять только после ownership migration."
+    },
+    {
+      "file": "android/package.json",
+      "remove": [
+        "main",
+        "exports[\".\"]",
+        "scripts.dev",
+        "scripts.start",
+        "scripts.build"
+      ],
+      "set": {
+        "scripts.test": "bun test"
+      },
+      "note": "Сохранить export ./adapter, typecheck и dependencies @meta/chrome/@meta/shared."
+    },
+    {
+      "file": "mcp/package.json",
+      "remove": [
+        "scripts.server",
+        "scripts.runtime-server",
+        "dependencies.zod",
+        "dependencies.@meta/shared"
+      ],
+      "set": {
+        "scripts.start": "bun src/runtime-mcp.ts"
+      },
+      "note": "Сохранить SDK и @meta/runtime; добавить package exports для test factories только если MCP owner подтверждает public API."
+    },
+    {
+      "file": "native/package.json",
+      "remove": [
+        "scripts.build"
+      ],
+      "set": {},
+      "note": "Installer напрямую использует native/scripts/build-broker.sh; test/typecheck используют check.sh."
+    },
+    {
+      "file": "bun.lock",
+      "remove": [],
+      "set": {},
+      "note": "Перегенерировать один раз после всех manifest changes; не редактировать вручную."
+    }
+  ],
+  "replacementCoverage": [
+    {
+      "legacy": [
+        "window/tests/focus.test.ts",
+        "window/tests/window.http",
+        "screen/tests/restore-focus.test.ts"
+      ],
+      "replacement": [
+        "native/tests/registry_test.c",
+        "native/tests/window-adapter.test.ts",
+        "native/tests/command-loop.test.ts",
+        "runtime/tests/window-methods.test.ts",
+        "runtime/tests/interaction.test.ts",
+        "tests/computer-use/fixtures/app/main.m"
+      ]
+    },
+    {
+      "legacy": [
+        "screen/tests/capture-metadata.test.ts",
+        "screen/tests/screen.http"
+      ],
+      "replacement": [
+        "screen/tests/adapter.test.ts",
+        "screen/tests/native-driver.test.ts",
+        "runtime/tests/native-capture-integration.test.ts",
+        "runtime/tests/capture-methods.test.ts",
+        "runtime/tests/capture-publication.test.ts",
+        "shared/src/contracts/observation-capture.test.ts"
+      ]
+    },
+    {
+      "legacy": [
+        "input/tests/input.http",
+        "input/tests/window-selector.test.ts",
+        "input/tests/clipboard.test.ts",
+        "input/tests/clipboard.live.test.ts"
+      ],
+      "replacement": [
+        "input/tests/adapter.test.ts",
+        "input/tests/authorization.test.ts",
+        "input/tests/native-action.test.ts",
+        "input/tests/native-integration.test.ts",
+        "input/tests/clipboard-adapter.test.ts",
+        "input/tests/native-clipboard-backend.test.ts",
+        "runtime/tests/input-methods.test.ts",
+        "runtime/tests/clipboard-handler.test.ts",
+        "native/tests/command-loop.test.ts"
+      ]
+    },
+    {
+      "legacy": [
+        "chrome/tests/browser-processes.spec.ts",
+        "chrome/tests/capture.spec.ts",
+        "chrome/tests/cdp-targets.spec.ts",
+        "chrome/src/session.test.ts",
+        "chrome/tests/chrome.http"
+      ],
+      "replacement": [
+        "chrome/tests/adapter.spec.ts",
+        "chrome/tests/cdp-driver.spec.ts",
+        "chrome/tests/wait-ready.spec.ts",
+        "runtime/tests/browser-config.test.ts",
+        "runtime/tests/browser-host.test.ts",
+        "runtime/tests/browser-methods.test.ts",
+        "runtime/tests/browser-reservation-integration.test.ts"
+      ]
+    },
+    {
+      "legacy": [
+        "android/tests/android.http",
+        "android/tests/bootstrap.test.ts"
+      ],
+      "replacement": [
+        "android/tests/adapter.test.ts",
+        "android/tests/targets.test.ts",
+        "android/tests/adb.test.ts proposed",
+        "runtime/tests/android-reservation-integration.test.ts"
+      ]
+    },
+    {
+      "legacy": [
+        "mcp/tests/stdio.test.ts",
+        "mcp/tests/window-coordinates.test.ts",
+        "mcp/tests/live-window-id.ts"
+      ],
+      "replacement": [
+        "mcp/tests/catalog-server.test.ts",
+        "mcp/tests/runtime-mcp.test.ts",
+        "tests/computer-use/host-mcp-sut.test.ts",
+        "A02/A43 subprocess test proposed"
+      ]
+    }
+  ],
+  "generatedArtifactsToClean": [
+    "chrome/dist/index.js if present and untracked",
+    "package dist directories produced only by removed legacy build scripts"
+  ],
+  "verification": [
+    "JSON plan parses successfully and every deleteFiles path is repository-relative.",
+    "Reverse import scan contains no consumer of deleted source outside files deleted in the same change.",
+    "rg Bun.serve finds no window/screen/input/chrome/android TCP server; runtime UDS remains the only server boundary.",
+    "Root/package manifests expose only new adapter subpaths and thin MCP/runtime entrypoints.",
+    "bun.lock is regenerated once after manifest changes.",
+    "New source/full acceptance passes with no skipped or zero-test evidence.",
+    "Installed doctor confirms matching runtime/native builds before and after source removal.",
+    "Fresh Codex task receives the dynamic MCP catalog; legacy REST, shell input and direct helper commands are absent from supported workflows."
+  ]
+}

@@ -1,8 +1,49 @@
 # План поставки computer use без незакрытых обходных путей
 
-Дата: 15 сентября 2026. **Проект реализации; этапы ниже ещё не выполнены.**
+Дата: 15 сентября 2026. **Реализация продолжается; принятые source blocks не
+означают installed/live готовность.**
 Основание: [ревью `bc4b6af`](reviews/2026-09-15-computer-use.md).
 Контракты и архитектурные решения: [computer-use-architecture.md](computer-use-architecture.md).
+
+## 0. Состояние реализации на Git baseline `8eabedf`
+
+Приняты и находятся в `origin/main`:
+
+- общие contracts, runtime core, client/resource authorities, operation journal,
+  cancellation/quarantine/recovery и bounded retention;
+- private UDS, dynamic MCP catalog и единый immutable runtime/MCP executable;
+- native broker с audit identity, framed command loop, окнами, вводом,
+  permissions, observer/delivery authority и capture transport;
+- Input point evidence, Capture publication, Applications lifecycle;
+- configured Chrome/Android adapters, browser lifetime и host shutdown recovery;
+- installer с immutable releases, code identity, readiness configuration,
+  drain и atomic rollback;
+- safe acceptance runner A01–A45, который сохраняет missing evidence как
+  `not-run`.
+- единый native observer, continuity при вытеснении истории, active delivery
+  probe, passive recovery и освобождение live-owned input при потере parent ACK.
+
+Основные Git checkpoints: `cc2fd8a`, `0a27d81`, `a2fc466`, `bedf0bf`,
+`4bd4c09`, `f901082`, `3ac1f57`, `06c613b`, `d8568a4`, `43ab9a6`,
+`8741017`, `2b724a4`, `13e6640`, `806a5b0`, `cc8241c`, `1a28b2b`,
+`8315c2e`, `8eabedf`.
+
+Не готовы и не получают статус `full`:
+
+- actual binding полного native catalog/capture/observer/readiness/interaction в
+  production RuntimeHost;
+- установка и doctor нового runtime/native комплекта на этом Mac;
+- миграция Codex/external callers, retirement REST listeners и удаление старых
+  CLI/bootstrap paths;
+- A02/A31/A43 и обязательная live/visual/native/device matrix.
+- внешний Computer Use compatibility facade: пользователь принял цель
+  совместимости, но точные методы/schemas/errors/cancellation/media semantics
+  ещё исследуются по actual bundled Codex/ChatGPT API и официальной
+  документации. До фиксации evidence-backed contract реализацию не угадывать.
+
+Точный proposal удаления source хранится в
+`scripts/legacy-source-removal-plan.json`. Он не является разрешением удалять
+файлы до root integration/cutover gates.
 
 ## 1. Граница готовности
 
@@ -22,16 +63,17 @@ top» циклы не входят в desktop computer use. Это явная г
 список скрытых незавершённых обещаний. Если нужный сценарий внутри обязательной
 границы не работает, релиз не считается завершённым.
 
-## 2. Матрица возможностей
+## 2. Исходная матрица возможностей
 
 ID ниже — **проектные локальные capability IDs**. Это не существующий platform
 inventory другого репозитория. Их должен реализовать registry ai-macos.
 
-Обозначения текущего состояния: **частично** — есть путь с ограничениями;
+Колонка ниже фиксирует состояние на момент исходного ревью, а не текущий
+source checkpoint. Обозначения исходного состояния: **частично** — есть путь с ограничениями;
 **нет** — нет нужного end-to-end контракта; **REST** — есть внутренний маршрут,
 но отсутствует direct MCP workflow; **ложный сигнал** — health не доказывает обещание.
 
-| Capability ID | Сейчас | Целевой владелец | Проверяемый результат | Findings |
+| Capability ID | На старте | Целевой владелец | Проверяемый результат | Findings |
 | --- | --- | --- | --- | --- |
 | `runtime.identity` | Частично | runtime/native | host + login/runtime/native epochs + process incarnations | F01, F15 |
 | `runtime.health` | Ложный сигнал | runtime | Loaded build IDs, protocol compatibility, permissions и reasons | F01, F10 |
@@ -181,6 +223,15 @@ capability объявляется после проверки именно на 
   MCP-каталог в настоящей задаче после подключений/обновления.
 - Native code, API docs, compiled build, capabilities и evidence относятся к
   одному комплекту; mixed generation не допускает mutation.
+- Применить exact file/manifest proposal из
+  `scripts/legacy-source-removal-plan.json` только после root integration,
+  caller migration, successful installed doctor и exact retirement собственных
+  legacy listeners. Сначала удаляются start/bypass paths, затем временный
+  retirement coordinator.
+- После завершения root research зафиксировать внешний compatibility facade и
+  проверить его contract tests против actual Computer Use API. Внутренний MCP
+  catalog может быть богаче, но поддерживаемая внешняя поверхность не должна
+  расходиться по обязательным request/result/cancel/image semantics.
 
 **Выход:** нет второго неуправляемого пути ввода, неизвестных работающих
 собственных старых сервисов и объявленных без доказательств возможностей.

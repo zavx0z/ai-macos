@@ -1,62 +1,73 @@
 # Текущий статус computer use
 
-Дата: 15 сентября 2026. Ведущий работает в каноническом checkout, ветка `main`.
-Каждый принятый этап сохраняется отдельным коммитом и отправляется в `origin/main`.
-Принятый этап исходного кода не означает готовность установленного продукта.
+Дата: 15 сентября 2026. Подтверждённый Git baseline: `8eabedf`, ветка `main`,
+`origin/main` совпадал с ним в начале этого прохода. Текущий working tree содержит
+следующий параллельный native/runtime этап; он не включён в принятые результаты
+до отдельного review, tests и commit.
 
-## Подтверждённые результаты
+## Принятые source blocks
 
-- Native transport: настоящий собранный helper вернул проверенную Darwin audit
-  session; runtime выполнил с ним совместимый handshake. Проверка пассивная,
-  без действий с окнами, вводом, снимками или clipboard.
-- Динамический MCP-каталог приходит из RuntimeHost через аутентифицированный UDS.
-  При недоступном runtime MCP оставляет только пассивную диагностику.
-- Native transport поддерживает bounded clipboard JSON profile; тест с миллионом
-  NUL-символов проходит через настоящий command loop с подставным clipboard.
-- Runtime регистрирует точную личность AX-only окна независимо от CG mapping.
-  Hidden window и sheet проверены через raw inventory и реальный evidence issuer.
-  Для снимка окна по-прежнему требуется отдельное CG-AX подтверждение.
-- Каталог окон и ввода передаёт точные refs, inventory и clientRequestId;
-  runtime сам выдаёт ресурсы и fence. Потерянный ответ не повторяет действие.
-- Приёмочный runner различает pass, fail и not-run. Отсутствующие live checks
-  не становятся pass после зелёных unit tests.
-
-## Работа владельцев
-
-| Задача | Принято | Следующий результат |
+| Область | Подтверждённый результат | Git evidence |
 | --- | --- | --- |
-| Computer use: runtime, контракты и MCP | Core authorities, arbitration, continuation, browser lifetime; UDS host и динамический каталог | Durable recovery, bounded storage, admin drain, interaction, общий host wiring |
-| Computer use: native broker и окна | Registry, exact identity, framed async key/text, audit identity, clipboard protocol | AX wiring, window transitions, pointer, observer/readiness, capture dispatch и приложения |
-| Computer use: ввод и interaction | Input adapter, Unicode compiler, clipboard backend, методы каталога | Граничные бюджеты, readiness/interaction через runtime authority, live |
-| Computer use: снимки и координаты | SCStream module, compositor, continuation/cleanup и capture adapter | Publication/commit через core, каталог и production wiring, live |
-| Computer use: Chrome и Android | Concrete adapters, bounded CDP/ADB, lifetime recovery | Методы каталога, отмена и idempotent capture, host composition, live |
-| Computer use: приёмочные проверки | Native/core fixtures, RuntimeHost → UDS → MCP isolation/catalog/drain | Process startup, durable restart, полная evidence matrix, live |
+| Контракты и runtime core | Общие schemas, authenticated client lineage, leases/fences, journal/dedup, bounded cancellation, quarantine, recovery и retention | `f901082`, `2b724a4` и предшествующие C1/C2 commits |
+| Runtime host и MCP | Private UDS, method registry, dynamic catalog, один immutable runtime/MCP executable, host crash/renewal/heartbeat и единый native observer | `cc8241c`, `8315c2e`, `0a27d81`, `a2fc466`, `4bd4c09`, `2d2c237`, `7678d60` |
+| Native broker | Audit identity, framed command loop, AX-only identity, окна/ввод/permissions, observer targets, passive recovery и release live-owned input при потере parent ACK | `8eabedf`, `806a5b0`, `cc2fd8a`, `bedf0bf`, `13ae782`, `e39e7d4`, `abd965a`, `8741017` |
+| Input | Observation-point authority, общий observer stream, physical budget после target proof и delivery probe в active executor | `1a28b2b`, `13e6640`, `a815fbc` |
+| Capture | Desktop layout, binary transport, runtime observations и bounded cleanup | `06c613b` |
+| Applications | Bundle resolution, exact lifecycle и сохранение позднего completion | `d8568a4`, `f2169c4` |
+| Browser/device | Несколько configured Chrome profiles, exact target/resources и host shutdown recovery | `3ac1f57`, `877a011` |
+| Installer | Immutable release, code identity, readiness config, drain/rollback и atomic failure recovery | `43ab9a6`, `73fc53a` |
+| Acceptance | Real contracts/native/runtime/RuntimeHost→UDS→MCP probes, bounded runner, A01–A45 с `pass/fail/not-run` | `4fffcd6`, `e7c084a`, `c777397` |
 
-Ведущий проверяет архитектурные стыки, коммитит и отправляет принятые изменения.
-Отдельный helper реализует installer с immutable releases, атомарным обновлением
-и rollback; до приёмки он не изменяет действующий сервис.
+Это source/test acceptance названных блоков. Она не подтверждает установленный
+artifact, фактические macOS permissions, visual result или полный live workflow.
 
-## Последние проверки ведущего
+Последние принятые проверки ведущего:
 
-- Native protocol + host + MCP: 43 tests, 168 assertions.
-- AX identity + core + evidence contracts: 17 tests, 97 assertions.
-- Каталог окон и ввода: 7 tests, 26 assertions.
-- Host/MCP и runner: 5 tests, 25 assertions.
-- AX inspector: 8 injected C/Objective-C cases; command loop и AX contract:
-  13 tests, 43 assertions. Production AX context wiring ещё проверяется отдельно.
-- Общий TypeScript check прошёл после каталога окон и ввода.
+- новый hub/long-stream slice: 12 tests, 40 assertions, TypeScript check pass;
+- cleanup slice: 23 tests, 101 assertion.
 
-Это проверки названных коммитов; во время параллельной работы текущий dirty tree
-может содержать следующий ещё не принятый этап.
+## Что ещё не принято
 
-## Эксплуатационный статус
+- Actual production host binding полного native catalog, capture, observer,
+  readiness, interaction и recovery продолжает собираться в dirty tree.
+- Текущий установленный helper, LaunchAgent и Codex MCP configuration ещё не
+  переключены на новый runtime комплект.
+- Старые REST listeners и их restart/CLI paths ещё находятся в source; наличие
+  нового UDS не удаляет обход автоматически.
+- A02 требует настоящих concurrent runtime/MCP subprocesses, A31 — проверки
+  peer identity/forged credential на private socket, A43 — вызова из свежей
+  реальной задачи Codex.
+- Полная live матрица окон, ввода, capture, Chrome и Android не выполнена.
+- Механическая сборка AppKit fixture не является visual/AX/input acceptance.
+- Пользователь принял дополнительную финальную цель: внешний агентский API
+  должен быть совместим с Computer Use API, доступным Codex/ChatGPT. Точный
+  интерфейс найден в bundled `@oai/cua` 0.2.4 приложения
+  `/Applications/ChatGPT.app` и зафиксирован в `docs/computer-use-api.md`.
+  Реализация JS facade, постоянной REPL и полного набора AX-действий начата;
+  совместимость ещё не принята.
 
-Установленные сервисы, helper и конфигурация Codex ещё не переключены.
-Текущий подключённый MCP остаётся 0.3.0. Финальная приёмка требует полного пути
-`discovery → show → observation → input → outcome → recovery` через direct MCP,
-включая существующий скрытый Chrome и несколько одноимённых процессов.
+## Граница готовности
 
-Случайный live clipboard test прежнего этапа восстановил текст в finally,
-но сохранность прежних non-text formats неизвестна. Инцидент сообщён Владимиру;
-live clipboard test теперь opt-in. Остальные проверки этой волны не используют
-пользовательский clipboard и не вводят данные в приложения.
+Текущий статус: **accepted source blocks, pre-cutover**. Нельзя заявлять
+`desktop.core full`, `browser.chrome full`, installed readiness или M7 complete.
+Финальный переход допустим только после:
+
+1. Полного RuntimeHost/native method binding и зелёного root integration.
+2. Установки одного совместимого runtime/native release и exact doctor receipt.
+3. Миграции актуальных callers из `docs/legacy-callers.md`.
+4. Exact retirement собственных listeners 7878–7882 без воздействия на чужие
+   или архивные процессы.
+5. Удаления legacy entrypoints/CLI/bootstrap по
+   `scripts/legacy-source-removal-plan.json`.
+6. Повторного source/full acceptance и обязательной live-проверки root.
+7. Фиксации и проверки внешнего compatibility facade после завершения API
+   research; внутренний runtime contract сам по себе этот gate не закрывает.
+
+## Эксплуатационные ограничения
+
+До cutover продолжает действовать подключённый старый MCP/runtime contour.
+Новые source capabilities не следует использовать как доказательство того, что
+установленная задача Codex уже видит новый catalog. Live input, clipboard,
+capture, browser, ADB и permission actions выполняет только root после отдельной
+проверки текущих grants и точных targets.
