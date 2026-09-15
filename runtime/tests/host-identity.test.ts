@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { mkdtemp, rm, stat } from "node:fs/promises"
 import { tmpdir, hostname } from "node:os"
 import { join } from "node:path"
 import type { NativeTransport } from "@meta/native/adapter"
@@ -7,6 +7,7 @@ import type { NativeTransportPacket, NativeTransportRequestFrame } from "@meta/n
 import type { NativePermissionsResponse } from "@meta/native/protocol"
 import { createRuntimeHost } from "../src/host.ts"
 import { CAPABILITY_IDS } from "@meta/shared/contracts"
+import { acquireHostLock } from "../src/host-lock.ts"
 
 test("host derives audit login identity and rejects different live helper session", async () => {
   const directory = await mkdtemp(join(tmpdir(), "host-audit-"))
@@ -52,6 +53,9 @@ class AuditTransport implements NativeTransport {
   inventoryStarted?: () => void
   #packet: Promise<NativeTransportPacket>
   #resolve!: (packet: NativeTransportPacket) => void
+  #end!: () => void
+  readonly #ended = new Promise<undefined>(resolve => { this.#end = () => resolve(undefined) })
+  disconnect(): void { this.#end() }
   constructor(readonly session: { verified: true, source: "darwin-audit", uid: number, effectiveUid: number, auditUserId: number, auditSessionId: number }) {
     this.#packet = new Promise(resolve => { this.#resolve = resolve })
   }
@@ -134,14 +138,17 @@ class AuditTransport implements NativeTransport {
     const aborted = new Promise<undefined>(resolve => { onAbort = () => resolve(undefined); signal.addEventListener("abort", onAbort, { once: true }) })
     try {
       while (!signal.aborted) {
-        const packet = await Promise.race([this.#packet, aborted])
+        const packet = await Promise.race([this.#packet, aborted, this.#ended])
         if (packet === undefined) return
         this.#packet = new Promise(resolve => { this.#resolve = resolve })
         yield packet
       }
     } finally { signal.removeEventListener("abort", onAbort) }
   }
-  async close() { this.closed = true }
+  async close() {
+    this.closed = true
+    this.disconnect()
+  }
 }
 
 for (const guarded of [false, true]) {
@@ -220,6 +227,40 @@ test("host close отменяет зависшую background inventory до obs
     await rm(directory, { recursive: true, force: true })
   }
 }, 1000)
+
+test("Native disconnect после ready observer не прерывает UDS/lock cleanup при failed stop RPC", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-disconnect-cleanup-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 129 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  const options = { socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:disconnect-cleanup", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session } }
+  const host = await createRuntimeHost({ ...options, transport })
+  try {
+    await host.start()
+    await host.ready()
+    expect(host.doctor().observer).toMatchObject({ state: "ready", viewReady: true })
+    expect(host.catalog.descriptors().tools.some(tool => tool.name === "get_state")).toBe(true)
+    const changed = new Promise<void>(resolve => {
+      const unsubscribe = host.core.subscribeCapabilities(() => {
+        if (host.doctor().native.state === "unavailable") { unsubscribe(); resolve() }
+      })
+    })
+    transport.disconnect()
+    await changed
+    await expect(host.close()).rejects.toThrow("часть подтверждений отсутствует")
+    expect(transport.closed).toBe(true)
+    await expect(stat(options.socketPath)).rejects.toThrow()
+    await expect(stat(options.credentialPath)).rejects.toThrow()
+    const release = await acquireHostLock(options.socketPath)
+    await release()
+  } finally {
+    await host.close().catch(() => undefined)
+    await rm(directory, { recursive: true, force: true })
+  }
+}, 5000)
 
 for (const readinessState of ["ready", "degraded", "unavailable"] as const) {
   test(`host readiness gate ${readinessState} не запускает active probe в startup/health`, async () => {

@@ -470,15 +470,25 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       core.sealAdmission()
       preparationAbort.abort("Runtime close отменил preparation")
       if (clientSweep !== undefined) clearInterval(clientSweep)
-      await core.closeClientLifecycle()
-      await backendPreparation
-      await viewGuard?.close()
+      const errors: Error[] = []
+      const attempt = async (stage: string, cleanup: () => Promise<unknown> | undefined) => {
+        try { await cleanup() }
+        catch (cause) { errors.push(new Error(`Runtime close: ${stage} не подтверждён`, { cause })) }
+      }
+      await attempt("client lifecycle", () => core.closeClientLifecycle())
+      await attempt("backend preparation", () => backendPreparation)
+      await attempt("view guard", () => viewGuard?.close())
       viewReady = false
-      await observerBinding?.close()
-      await heartbeat?.stop()
-      await uds.stop()
-      await closeNative()
-      await releaseLock()
+      await attempt("observer stop", () => observerBinding?.close())
+      await attempt("heartbeat", () => heartbeat?.stop())
+      await attempt("UDS", () => uds.stop())
+      await attempt("owned Native exit", closeNative)
+      if (ownedProcess === undefined || ownedProcess.processStatus.exitConfirmed) {
+        await attempt("host lock", releaseLock)
+      } else {
+        errors.push(new Error("Host lock сохранён: owned Native exit не подтверждён"))
+      }
+      if (errors.length > 0) throw new AggregateError(errors, "Runtime close завершил доступные cleanup steps; часть подтверждений отсутствует")
     })()
     return closing
   }

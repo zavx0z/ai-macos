@@ -6,7 +6,7 @@ import { NativeBrokerAdapter, NativeProcessTransport } from "../src/adapter.ts"
 import { nativeInventoryRequestSchema, nativeInventoryResponseSchema } from "../src/protocol.ts"
 import { nativeAxInspectionRequestSchema, nativeAxInspectionResponseSchema } from "../src/protocol.ts"
 import { nativeInputExecutionRequestSchema, nativeInputExecutionResponseSchema, type NativeInputExecutionPayload } from "../src/protocol.ts"
-import { heldInputLedgerDigest, type HeldInputLedgerSink } from "@meta/shared/contracts"
+import { heldInputLedgerDigest, type HeldInputLedgerSink, type HeldInputLedgerSnapshot } from "@meta/shared/contracts"
 import { nativeClipboardRequestSchema } from "../src/clipboard-protocol.ts"
 import { nativeWindowTransitionRequestSchema, nativeWindowTransitionResponseSchema } from "../src/protocol.ts"
 import { NativeTransportStreamDecoder, encodeNativeFrame, type NativeTransportRequestFrame, type NativeTransportResponseFrame } from "../src/protocol.ts"
@@ -257,18 +257,56 @@ test.each([false, true])("job heartbeat watchdog: keepalive=%s", async keepalive
   } finally { await adapter.close() }
 })
 
-test("ledger ACK wait не блокирует control heartbeat и cancel до event post", async () => {
+test("cancel до post после durable ACK закрывает ledger без событий и quarantine", async () => {
   let releaseAck!: () => void
   let notifyPending!: () => void
   const pending = new Promise<void>(resolve => { notifyPending = resolve })
   const release = new Promise<void>(resolve => { releaseAck = resolve })
-  const adapter = createAdapter({ async persist(requestId, snapshot) {
+  const persisted: HeldInputLedgerSnapshot[] = []
+  const child = Bun.spawn([binary, "--event-log"], { stdin: "pipe", stdout: "pipe", stderr: "pipe" })
+  const events = new Response(child.stderr).text()
+  const ledgerSink: HeldInputLedgerSink = { async persist(requestId, snapshot) {
     notifyPending()
     await release
+    persisted.push(structuredClone(snapshot))
     return { requestId, operationId: snapshot.operationId, runtimeEpoch: snapshot.runtimeEpoch,
       loginSessionId: snapshot.loginSessionId, nativeGeneration: snapshot.nativeGeneration, revision: snapshot.revision,
       snapshotSha256: heldInputLedgerDigest(snapshot), persistedAt: new Date().toISOString(), durable: true }
-  } })
+  } }
+  const adapter = new NativeBrokerAdapter({
+    host: { generation: { runtimeEpoch: "runtime", loginSessionId: "login" }, runtimeBuildId: "runtime-build",
+      capabilities: { schemaVersion: "1", scope: "adapter", producerRef: "command-test", capabilities: [] } },
+    adapterInstanceRef: "command-adapter", ledgerSink,
+    bindEvidence: () => ({ publisher: { publish: async () => { throw new Error("evidence не используется") } }, sourceResponses: { register: () => undefined } }),
+    transport: {
+      async send(frame) {
+        child.stdin.write(encodeNativeFrame(frame))
+        await child.stdin.flush()
+      },
+      async *packets(signal) {
+        const reader = child.stdout.getReader()
+        const decoder = new NativeTransportStreamDecoder()
+        const abort = () => void reader.cancel(signal.reason)
+        signal.addEventListener("abort", abort, { once: true })
+        try {
+          while (!signal.aborted) {
+            const chunk = await reader.read()
+            if (chunk.done) break
+            yield* decoder.push(chunk.value)
+          }
+          decoder.finish()
+        } finally {
+          signal.removeEventListener("abort", abort)
+          reader.releaseLock()
+        }
+      },
+      async close() {
+        child.stdin.end()
+        const timer = setTimeout(() => { if (child.exitCode === null) child.kill("SIGKILL") }, 1500)
+        try { await child.exited } finally { clearTimeout(timer) }
+      },
+    },
+  })
   try {
     await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "handshake", runtimeEpoch: "runtime", loginSessionId: "login",
       runtimeBuildId: "runtime-build", expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" })
@@ -284,10 +322,23 @@ test("ledger ACK wait не блокирует control heartbeat и cancel до e
     const result = await running
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error("Expected cancellation before post")
-    expect(result.nativeStatus?.dispatchAttempts).toBe(0)
-    expect(result.nativeStatus?.quarantined).toBe(true)
-    expect(result.error.code).toBe("resource-quarantined")
-  } finally { releaseAck(); await adapter.close() }
+    expect(result.nativeStatus).toMatchObject({
+      execution: "cancelled", dispatch: "none", dispatchAttempts: 0,
+      quarantined: false, cleanup: "complete", heldCount: 0, ledgerRevision: 2,
+    })
+    expect(result.error.code).toBe("cancelled")
+    expect(persisted.map(snapshot => ({ revision: snapshot.revision, entries: snapshot.entries }))).toEqual([
+      { revision: 1, entries: [{ sequence: 1, kind: "key", code: 37, state: "pending-down" }] },
+      { revision: 2, entries: [{ sequence: 1, kind: "key", code: 37, state: "released" }] },
+    ])
+    expect(persisted[1]?.previousSnapshotSha256).toBe(heldInputLedgerDigest(persisted[0]!))
+  } finally {
+    releaseAck()
+    await adapter.close()
+  }
+  const trace = await events
+  expect(trace.split("\n").filter(line => line.startsWith("held:"))).toEqual([])
+  expect(trace).toContain("terminal:cancelled:complete")
 })
 
 test.each([false, true])("focused sheet: exact surface=%s; parent target never substitutes sheet", async exactSurface => {
