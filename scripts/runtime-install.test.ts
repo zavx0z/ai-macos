@@ -28,6 +28,7 @@ afterEach(async () => {
 
 test("dry-run строит reviewable plan без login identity и execute публикует immutable release", async () => {
   const fixture = await createFixture()
+  fixture.runner.implicitRequirement = true
   const plan = await planRuntimeInstall(fixture.options)
   expect(plan.gates).toMatchObject({ sourceClean: true, exactHostname: true, permissionsRequested: false, liveDesktopProbe: false })
   expect(plan.steps.some(step => step.id === "build-native" && step.command?.args[2] === plan.release.nativeBuildId)).toBe(true)
@@ -41,7 +42,8 @@ test("dry-run строит reviewable plan без login identity и execute пу
   expect(manifest).toMatchObject({
     format: "meta-ai-macos-runtime-release-v1",
     builds: { runtimeBuildId: plan.release.runtimeBuildId, nativeBuildId: plan.release.nativeBuildId },
-    artifacts: { nativeHelper: { signingIdentifier: HELPER_SIGNING_IDENTIFIER } },
+    artifacts: { nativeHelper: { signingIdentifier: HELPER_SIGNING_IDENTIFIER,
+      designatedRequirement: `designated => cdhash H"${"c".repeat(40)}"` } },
     entrypoint: { source: "scripts/runtime-entry.ts", modes: ["runtime", "doctor", "mcp"], mcpTransport: "stdio" },
   })
   expect((await lstat(plan.release.releasePath)).mode & 0o777).toBe(0o555)
@@ -428,6 +430,7 @@ class FakeRunner implements CommandRunner {
   mutations = 0
   failDoctorForBuild: string | undefined
   foreignStableHelper = false
+  implicitRequirement = false
   failBootout = false
   appearAtPrint: number | undefined
   printCalls = 0
@@ -471,7 +474,10 @@ class FakeRunner implements CommandRunner {
       const identifier = this.foreignStableHelper && target.endsWith("input/bin/meta-input-helper")
         ? "foreign.helper"
         : HELPER_SIGNING_IDENTIFIER
-      return { stdout: "", stderr: `Identifier=${identifier}\nCDHash=${"c".repeat(40)}\ndesignated => identifier "${identifier}" and anchor apple generic\nSignature=adhoc\n`, exitCode: 0 }
+      const requirement = this.implicitRequirement
+        ? `# designated => cdhash H"${"c".repeat(40)}"`
+        : `designated => identifier "${identifier}" and anchor apple generic`
+      return { stdout: "", stderr: `Identifier=${identifier}\nCDHash=${"c".repeat(40)}\n${requirement}\nSignature=adhoc\n`, exitCode: 0 }
     }
     if (file === "/usr/bin/codesign" || file === "/usr/bin/plutil") {
       this.mutations++

@@ -1070,7 +1070,9 @@ async function inspectCodeSignature(runner: CommandRunner, path: string) {
   const lines = `${result.stdout}\n${result.stderr}`.split("\n").map(line => line.trim())
   const identifier = lines.find(line => line.startsWith("Identifier="))?.slice("Identifier=".length)
   const cdhash = lines.find(line => line.startsWith("CDHash="))?.slice("CDHash=".length).toLowerCase()
-  const designatedRequirement = lines.find(line => line.startsWith("designated =>"))
+  // codesign помечает вычисленное implicit requirement ad-hoc подписи символом #.
+  const designatedRequirement = lines.map(line => line.replace(/^#\s*(?=designated =>)/, ""))
+    .find(line => line.startsWith("designated =>"))
   if (identifier === undefined || cdhash === undefined || !/^[a-f0-9]{40,64}$/.test(cdhash)
     || designatedRequirement === undefined) throw new Error("Codesign metadata не содержит identifier/cdhash/designated requirement")
   return { identifier, cdhash, designatedRequirement }
