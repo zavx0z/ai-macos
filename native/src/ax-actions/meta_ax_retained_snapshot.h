@@ -36,6 +36,9 @@ typedef BOOL (^MetaAXRetainedElementConsumer)(id borrowedElement);
 
 // Consumer выполняется синхронно на action worker. Ссылка действительна только
 // во время callback и не может сохраняться или передаваться другому executor.
+// inventoryId/revision описывают уже проверенную caller'ом current inventory;
+// revision не может быть старше immutable inspection provenance. Borrow не
+// обновляет provenance, snapshot identity или TTL.
 - (MetaAXRetainedBorrowStatus)withPressElement:(NSDictionary *)elementRef
                                         target:(NSDictionary *)target
                                    inventoryId:(NSString *)inventoryId

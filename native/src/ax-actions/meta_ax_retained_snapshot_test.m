@@ -64,13 +64,20 @@ static void test_exact_press_and_latest_snapshot(void) {
   __block id received = nil;
   assert([registry withPressElement:element(@"snapshot-1", @"ax-node:1")
                               target:target(@"window-1")
-                         inventoryId:@"inventory-1"
-                   inventoryRevision:7
+                         inventoryId:@"inventory-2"
+                   inventoryRevision:8
                              consume:^BOOL(id borrowedElement) {
                                received = borrowedElement;
                                return YES;
                              }] == META_AX_RETAINED_BORROW_OK);
   assert(received == button);
+  assert([registry withPressElement:element(@"snapshot-1", @"ax-node:1")
+                              target:target(@"window-1")
+                         inventoryId:@"inventory-older"
+                   inventoryRevision:6
+                             consume:^BOOL(__unused id borrowedElement) {
+                               return YES;
+                             }] == META_AX_RETAINED_BORROW_SNAPSHOT_STALE);
   assert([registry withPressElement:element(@"snapshot-1", @"ax-node:2")
                               target:target(@"window-1")
                          inventoryId:@"inventory-1"
@@ -82,6 +89,13 @@ static void test_exact_press_and_latest_snapshot(void) {
                               target:target(@"window-1")
                          inventoryId:@"inventory-1"
                    inventoryRevision:7
+                             consume:^BOOL(__unused id borrowedElement) {
+                               return YES;
+                             }] == META_AX_RETAINED_BORROW_SNAPSHOT_STALE);
+  assert([registry withPressElement:element(@"snapshot-1", @"ax-node:1")
+                              target:target(@"window-foreign")
+                         inventoryId:@"inventory-2"
+                   inventoryRevision:8
                              consume:^BOOL(__unused id borrowedElement) {
                                return YES;
                              }] == META_AX_RETAINED_BORROW_SNAPSHOT_STALE);
@@ -144,6 +158,14 @@ static void test_ttl_and_global_capacity_evict_oldest(void) {
                              consume:^BOOL(__unused id borrowedElement) {
                                return YES;
                              }] == META_AX_RETAINED_BORROW_SNAPSHOT_STALE);
+  now = 109;
+  assert([registry withPressElement:element(@"snapshot-2", @"ax-node:1")
+                              target:target(@"window-2")
+                         inventoryId:@"inventory-2-current"
+                   inventoryRevision:2
+                             consume:^BOOL(__unused id borrowedElement) {
+                               return YES;
+                             }] == META_AX_RETAINED_BORROW_OK);
   now = 110;
   assert([registry withPressElement:element(@"snapshot-2", @"ax-node:1")
                               target:target(@"window-2")

@@ -238,8 +238,7 @@ static NSArray<NSString *> *valid_actions(id value) {
   [_lock lock];
   [self pruneExpiredAt:now];
   MetaAXRetainedSnapshotEntry *entry = _snapshots[key];
-  if (entry == nil || ![entry.inventoryId isEqual:inventoryId] ||
-      entry.inventoryRevision != inventoryRevision ||
+  if (entry == nil || inventoryRevision < entry.inventoryRevision ||
       !same_element_authority(elementRef, target, entry.snapshotId)) {
     [_lock unlock];
     return META_AX_RETAINED_BORROW_SNAPSHOT_STALE;
