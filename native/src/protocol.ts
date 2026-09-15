@@ -637,7 +637,18 @@ export const nativeCaptureStartPayloadSchema = z.strictObject({
 
 export const nativeInventoryRequestSchema = createNativeReadRequestEnvelopeSchema(
   "window.inventory",
-  z.strictObject({}),
+  z.strictObject({
+    priority: z.strictObject({
+      app: z.string().min(1).max(1_024).optional(),
+      pid: z.number().int().min(1).max(0x7fffffff).optional(),
+      applicationRef: opaqueIdSchema.optional(),
+    }).superRefine((priority, context) => {
+      if (priority.app === undefined && priority.pid === undefined
+        && priority.applicationRef === undefined) {
+        context.addIssue({ code: "custom", message: "Inventory priority требует хотя бы один hint" })
+      }
+    }).optional(),
+  }),
 )
 export const nativeInventoryResponseSchema = createNativeResponseEnvelopeSchema(nativeInventoryResultSchema)
 

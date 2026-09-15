@@ -207,6 +207,34 @@ static BOOL unsigned_json_number(id value) {
       [value doubleValue] == [value unsignedLongLongValue];
 }
 
+static BOOL exact_application_priority(
+    const MetaInventorySnapshot *snapshot,
+    NSString *applicationRef,
+    int32_t expectedPid,
+    MetaInventoryPriority *priority) {
+  if (snapshot == NULL || ![applicationRef isKindOfClass:NSString.class] ||
+      priority == NULL) return NO;
+  const MetaApplicationRecord *match = NULL;
+  for (size_t index = 0; index < snapshot->application_count; index += 1) {
+    const MetaApplicationRecord *candidate = &snapshot->applications[index];
+    if ([applicationRef isEqual:@(candidate->application_ref)] &&
+        (expectedPid <= 0 || candidate->pid == expectedPid)) {
+      if (match != NULL) return NO;
+      match = candidate;
+    }
+  }
+  if (match == NULL || match->pid <= 0 || match->launch_time_micros == 0) {
+    return NO;
+  }
+  *priority = (MetaInventoryPriority){
+      .has_pid = true,
+      .pid = match->pid,
+      .has_launch_time = true,
+      .launch_time_micros = match->launch_time_micros,
+  };
+  return YES;
+}
+
 static bool verify_window_borrow(void *context, const MetaAXTargetBorrow *borrow) {
   const MetaWindowRecord *original = context;
   return borrow->target.surface_kind == META_SURFACE_WINDOW && original->pid == borrow->target.pid &&
@@ -437,14 +465,64 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
   return value;
 }
 
-- (NSDictionary *)inventory {
-  if (_sealed || !meta_macos_refresh_inventory(_windows, 5000)) return nil;
+- (NSDictionary *)inventoryRequest:(NSDictionary *)request {
+  NSDictionary *payload = request[@"payload"];
+  if (![payload isKindOfClass:NSDictionary.class] || payload.count > 1 ||
+      (payload.count == 1 && payload[@"priority"] == nil)) return nil;
+  NSDictionary *hint = payload[@"priority"];
+  MetaInventoryPriority priority = {0};
+  const MetaInventoryPriority *selected = NULL;
+  if (hint != nil) {
+    if (![hint isKindOfClass:NSDictionary.class] || hint.count == 0 ||
+        hint.count > 3) return nil;
+    NSSet *allowed = [NSSet setWithArray:@[@"app", @"pid", @"applicationRef"]];
+    for (id key in hint) if (![key isKindOfClass:NSString.class] ||
+                             ![allowed containsObject:key]) return nil;
+    NSString *applicationRef = hint[@"applicationRef"];
+    NSString *app = hint[@"app"];
+    NSNumber *pid = hint[@"pid"];
+    if ((app != nil && (![app isKindOfClass:NSString.class] || app.length == 0 || app.length > 1024)) ||
+        (pid != nil && (!unsigned_json_number(pid) || pid.unsignedLongLongValue == 0 ||
+                        pid.unsignedLongLongValue > INT32_MAX)) ||
+        (applicationRef != nil && (![applicationRef isKindOfClass:NSString.class] ||
+                                   applicationRef.length == 0 || applicationRef.length >= META_NATIVE_REF_CAPACITY))) return nil;
+    if (applicationRef != nil) {
+      const MetaInventorySnapshot *current = meta_macos_backend_snapshot(_windows);
+      BOOL exact = exact_application_priority(current, applicationRef,
+                                              pid == nil ? 0 : pid.intValue,
+                                              &priority);
+      if (exact && app != nil) {
+        const MetaApplicationRecord *record = NULL;
+        for (size_t index = 0; index < current->application_count; index += 1) {
+          if (current->applications[index].pid == priority.pid &&
+              current->applications[index].launch_time_micros == priority.launch_time_micros) {
+            record = &current->applications[index];
+            break;
+          }
+        }
+        exact = record != NULL && [app isEqual:@(record->name)];
+      }
+      if (!exact) {
+        priority = (MetaInventoryPriority){.has_pid = true, .pid = INT32_MIN};
+      }
+    } else {
+      if (pid != nil) { priority.has_pid = true; priority.pid = pid.intValue; }
+      if (app != nil) priority.name = app.UTF8String;
+    }
+    selected = &priority;
+  }
+  if (_sealed || !meta_macos_refresh_inventory_with_priority(
+                     _windows, 5000, selected)) return nil;
   NSString *source = [@"native-response-" stringByAppendingString:NSUUID.UUID.UUIDString];
   CFDataRef data = meta_inventory_copy_json(meta_macos_backend_snapshot(_windows), source.UTF8String);
   if (data == NULL) return nil;
   NSDictionary *result = [NSJSONSerialization JSONObjectWithData:(__bridge NSData *)data options:0 error:NULL];
   CFRelease(data);
   return result;
+}
+
+- (NSDictionary *)inventory {
+  return [self inventoryRequest:@{@"payload" : @{}}];
 }
 
 - (NSDictionary *)applicationRecord:(NSDictionary *)reference {
@@ -1294,6 +1372,9 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
         [ref[@"applicationRef"] isEqual:@(candidate->application_ref)]) { original = *candidate; found = YES; break; }
   }
   if (!found) return nil;
+  MetaInventoryPriority actionPriority = {0};
+  if (!exact_application_priority(snapshot, ref[@"applicationRef"],
+                                  original.pid, &actionPriority)) return nil;
   MetaWindowActionRequest action = {.window_ref = windowRef.UTF8String};
   NSString *kind = payload[@"kind"];
   if ([kind isEqual:@"show"]) action.kind = META_WINDOW_ACTION_SHOW;
@@ -1324,7 +1405,9 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
     MetaWindowActionBackend backend = meta_window_action_backend_macos(windows);
     MetaWindowActionDispatchStatus dispatched = meta_window_action_dispatch(&backend, &action, &transition);
     if (dispatched != META_WINDOW_ACTION_DISPATCHED) return nil;
-    refreshed = action.kind == META_WINDOW_ACTION_CLOSE ? transition.inventory_refreshed : meta_macos_refresh_inventory(windows, 5000);
+    refreshed = action.kind == META_WINDOW_ACTION_CLOSE ? transition.inventory_refreshed :
+        meta_macos_refresh_inventory_with_priority(windows, 5000,
+                                                   &actionPriority);
     if (refreshed && action.kind != META_WINDOW_ACTION_CLOSE) {
       const MetaInventorySnapshot *after = meta_macos_backend_snapshot(windows);
       MetaWindowRecord expected = original;

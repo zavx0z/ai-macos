@@ -435,8 +435,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       host: windows.host, services: windows.services, capabilities: windows.capabilities,
       transition: windows.transition.bind(windows), inspect: windows.inspect.bind(windows),
       press: windows.press.bind(windows),
-      async inventory(control) {
-        const inventory = await windows.inventory(control)
+      async inventory(control, priority) {
+        const inventory = await windows.inventory(control, priority)
         const permissionSuspected = inventory.errors.some(error => error.code === "permission-denied")
           || inventory.applications.some(app => app.axStatus === "denied")
         if (permissionSuspected) {

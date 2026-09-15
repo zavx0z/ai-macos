@@ -910,7 +910,12 @@ export class RuntimeAgentMethods {
     selected: AgentTargetActionResolution,
     signal: AbortSignal,
   ): Promise<FreshNative> {
-    const inventory = await this.#inventory(session, signal)
+    const applicationRef = selected.target.kind === "window" || selected.target.kind === "surface"
+      ? selected.target.ref.applicationRef
+      : undefined
+    const inventory = await this.#inventory(session, signal, applicationRef === undefined
+      ? {}
+      : { applicationRef })
     let result: Omit<FreshNative, "inventory" | "selected"> | undefined
     switch (selected.target.kind) {
       case "window": {
@@ -961,7 +966,7 @@ export class RuntimeAgentMethods {
   async #inventory(
     session: RuntimeClientSession,
     signal: AbortSignal,
-    filter: { app?: string, pid?: number } = {},
+    filter: { app?: string, pid?: number, applicationRef?: string } = {},
   ): Promise<DesktopInventorySnapshot> {
     return (await this.#dispatch(session, "list_windows", filter, signal)).data as DesktopInventorySnapshot
   }

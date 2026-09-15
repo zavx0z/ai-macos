@@ -24,6 +24,7 @@ import {
   type RuntimeResourceHandle,
   type SurfaceRecord,
   type WindowAdapter,
+  type WindowInventoryPriority,
   type WindowRecord,
   type WindowRef,
   type WindowTransitionRequest,
@@ -74,7 +75,10 @@ export class NativeWindowAdapter implements WindowAdapter {
     this.services = options.services
   }
 
-  async inventory(control: AdapterControl): Promise<DesktopInventorySnapshot> {
+  async inventory(
+    control: AdapterControl,
+    priority?: WindowInventoryPriority,
+  ): Promise<DesktopInventorySnapshot> {
     const generation = this.#generation()
     const nativeRequestId = requestId("inventory")
     const response = await this.#native.request(
@@ -87,7 +91,7 @@ export class NativeWindowAdapter implements WindowAdapter {
         ...generation,
         deadlineAt: new Date(Date.now() + 5_000).toISOString(),
         method: "window.inventory",
-        payload: {},
+        payload: priority === undefined ? {} : { priority },
       },
       nativeInventoryResponseSchema,
       control,

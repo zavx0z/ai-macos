@@ -41,6 +41,7 @@ mkdir -p "$(dirname -- "$CANDIDATE_OUTPUT")"
   native/src/code-identity/meta_code_identity.m \
   native/src/input-target/meta_point_target.m \
   native/src/input-target/meta_geometry_probe.m \
+  native/src/inventory-priority/meta_inventory_priority.c \
   native/src/operation-receipts/meta_operation_receipts.m \
   native/src/application-bundles/meta_application_bundles.m \
   native/src/applications/meta_application_controller.m native/src/applications/meta_application_launch_task.m \

@@ -154,6 +154,18 @@ fi
   -o "$CHECK_DIR/input-bridge-test"
 
 /usr/bin/clang \
+  -std=c17 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
+  -Inative/src/inventory-priority \
+  native/src/inventory-priority/meta_inventory_priority.c \
+  native/src/registry.c \
+  native/src/inventory-priority/meta_inventory_priority_test.c \
+  -o "$CHECK_DIR/inventory-priority-test"
+
+/usr/bin/clang \
   -fobjc-arc \
   -mmacosx-version-min=13.0 \
   -Wall \
@@ -354,6 +366,7 @@ fi
 "$CHECK_DIR/executor-test"
 "$CHECK_DIR/ledger-test"
 "$CHECK_DIR/input-bridge-test"
+"$CHECK_DIR/inventory-priority-test"
 "$CHECK_DIR/serialization-test"
 "$CHECK_DIR/capture-router-test"
 "$CHECK_DIR/capture-command-test"

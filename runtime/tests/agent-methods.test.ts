@@ -313,6 +313,8 @@ test("show_window делает один exact show, refresh и возвраща�
   const status = await methods.operations.getTargetStatus(client.session, id)
   expect(status.recent.map(operation => operation.action)).toEqual(["show-window-show"])
   expect(new Set(status.recent.map(operation => operation.operationId)).size).toBe(1)
+  expect(desktop.inventoryInputs.some(input =>
+    input.applicationRef === windowRef.applicationRef)).toBe(true)
 })
 
 test("partial show_window возвращает actual/error/operationId и не запускает orphan focus", async () => {
@@ -686,6 +688,7 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     actions: ["AXPress"],
   }]
   let inventoryCalls = 0
+  const inventoryInputs: Array<Record<string, unknown>> = []
   fixture.core.targets.register(
     { kind: "window", ref: windowRef },
     inventory.inventoryId,
@@ -695,12 +698,14 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     inventory.displayLayoutRevision,
   )
   fixture.registry.register("system_health", method(async () => ({ machine: { matchesExpected: true }, runtime: { draining: false, admissionSealed: false } })))
-  fixture.registry.register("list_windows", method(async () => {
+  fixture.registry.register("list_windows", method(async (_context, input) => {
     inventoryCalls++
+    inventoryInputs.push(structuredClone(input))
     return structuredClone(inventory)
   }, z.strictObject({
     app: z.string().min(1).max(1024).optional(),
     pid: z.number().int().min(1).max(0x7fffffff).optional(),
+    applicationRef: z.string().min(1).optional(),
   }), desktopInventorySnapshotSchema))
   fixture.registry.register("window_transition", { ...method(async (context, input) => {
     transitions.push(input)
@@ -802,6 +807,7 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     windowCaptureResults,
     desktopCaptureResults,
     inspectionRequests,
+    inventoryInputs,
     inventoryCalls: () => inventoryCalls,
     setInspectionNodes(nodes: AxInspectionResult["nodes"]) { inspectionNodes = structuredClone(nodes) },
     setCaptureFailure(error: ContractError | undefined) { captureFailure = error === undefined ? undefined : structuredClone(error) },

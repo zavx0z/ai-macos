@@ -469,6 +469,20 @@ test("slow inventory не блокирует control heartbeat; drain sealed-pen
   } finally { await adapter.close() }
 })
 
+test("legacy Native backend не подтверждает неприменённый inventory priority", async () => {
+  const adapter = createAdapter()
+  try {
+    await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "handshake", runtimeEpoch: "runtime", loginSessionId: "login",
+      runtimeBuildId: "runtime-build", expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" })
+    const response = await adapter.request(nativeInventoryRequestSchema, {
+      kind: "request", protocolVersion: "1", requestId: "priority", ...adapter.generation!,
+      deadlineAt: new Date(Date.now() + 1_000).toISOString(), intent: "read", method: "window.inventory",
+      payload: { priority: { app: "Fixture" } },
+    }, nativeInventoryResponseSchema, { signal: new AbortController().signal, checkpoint: () => undefined })
+    expect(response.ok).toBe(false)
+  } finally { await adapter.close() }
+})
+
 test("ax.inspect request проходит production action queue и сохраняет raw nodes", async () => {
   const adapter = createAdapter()
   try {

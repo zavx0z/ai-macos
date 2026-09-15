@@ -11,7 +11,7 @@ import type {
   NativeTransportPacket,
   NativeTransportRequestFrame,
 } from "../src/protocol.ts"
-import { nativeAxInspectionResultSchema, nativeInventoryResultSchema } from "../src/protocol.ts"
+import { nativeAxInspectionResultSchema, nativeInventoryRequestSchema, nativeInventoryResultSchema } from "../src/protocol.ts"
 import { NativeWindowAdapter } from "../src/window-adapter.ts"
 import { extractNativeEvidenceReports } from "../src/evidence-extractor.ts"
 import { createRuntimeNativeEvidenceBinder } from "../src/evidence-extractor.ts"
@@ -53,8 +53,33 @@ test("Native AX wire принимает только bounded scalar и отде�
   }).success)).toBe(true)
 })
 
+test("Native inventory priority strict и не принимает пустой hint", () => {
+  const request = {
+    kind: "request",
+    intent: "read",
+    protocolVersion: "1",
+    requestId: "inventory-priority",
+    ...generation,
+    deadlineAt: new Date(Date.now() + 1_000).toISOString(),
+    method: "window.inventory",
+    payload: {},
+  }
+  expect(nativeInventoryRequestSchema.safeParse(request).success).toBe(true)
+  expect([
+    { priority: {} },
+    { priority: { pid: true } },
+    { priority: { pid: 1.5 } },
+    { priority: { pid: 0x8000_0000 } },
+    { priority: { unknown: "value" } },
+  ].every(payload => !nativeInventoryRequestSchema.safeParse({
+    ...request,
+    payload,
+  }).success)).toBe(true)
+})
+
 class InventoryTransport implements NativeTransport {
   constructor(readonly hidden = false) {}
+  inventoryPriorities: unknown[] = []
   readonly #packets: NativeTransportPacket[] = []
   readonly #waiters: Array<(packet: NativeTransportPacket) => void> = []
 
@@ -85,6 +110,7 @@ class InventoryTransport implements NativeTransport {
       return
     }
     if (frame.channel === "request" && frame.payload.method === "window.inventory") {
+      this.inventoryPriorities.push(frame.payload.payload.priority)
       this.push({
         kind: "message",
         frame: {
@@ -389,7 +415,10 @@ describe("NativeWindowAdapter", () => {
     const inventory = await adapter.inventory({
       signal: new AbortController().signal,
       checkpoint: () => undefined,
-    })
+    }, { app: "Fixture", pid: 42, applicationRef: "application-1" })
+    expect(transport.inventoryPriorities).toEqual([{
+      app: "Fixture", pid: 42, applicationRef: "application-1",
+    }])
     expect(inventory.windows).toHaveLength(2)
     const window = inventory.windows[0]
     const unresolved = inventory.windows[1]
@@ -468,6 +497,7 @@ describe("NativeWindowAdapter", () => {
         nativeGeneration: generation.nativeGeneration,
       },
     })
+    const transport = new InventoryTransport(hidden)
     const native = new NativeBrokerAdapter({
       adapterInstanceRef: "native-adapter-real-runtime",
       host: {
@@ -480,7 +510,7 @@ describe("NativeWindowAdapter", () => {
           capabilities: [],
         },
       },
-      transport: new InventoryTransport(hidden),
+      transport,
       ledgerSink: { persist: async () => { throw new Error("ledger не ожидался") } },
       bindEvidence: createRuntimeNativeEvidenceBinder(runtime.evidence),
     })
@@ -498,6 +528,7 @@ describe("NativeWindowAdapter", () => {
       signal: new AbortController().signal,
       checkpoint: () => undefined,
     })
+    expect(transport.inventoryPriorities).toEqual([undefined])
     expect(inventory.desktopLayout?.mappingEvidence.state).toBe("confirmed")
     if (inventory.desktopLayout === undefined) throw new Error("Authoritative desktop layout отсутствует")
     const layoutResolution = await runtime.targets.resolve({

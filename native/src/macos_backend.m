@@ -668,6 +668,14 @@ const MetaInventorySnapshot *meta_macos_backend_snapshot(
 
 bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
                                   uint64_t total_budget_millis) {
+  return meta_macos_refresh_inventory_with_priority(
+      backend, total_budget_millis, NULL);
+}
+
+bool meta_macos_refresh_inventory_with_priority(
+    MetaMacOSBackend *backend,
+    uint64_t total_budget_millis,
+    const MetaInventoryPriority *priority) {
   if (backend == NULL || total_budget_millis == 0) return false;
   @autoreleasepool {
     backend->observer_snapshot_receipt = (MetaObserverSnapshotReceipt){0};
@@ -687,20 +695,41 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
     const pid_t foreground_pid = foreground_before.processIdentifier;
     const uint64_t foreground_launch_time =
         process_start_micros(foreground_pid);
+    NSArray<NSRunningApplication *> *unordered =
+        NSWorkspace.sharedWorkspace.runningApplications;
+    const size_t running_count = unordered.count;
+    MetaInventoryPriorityCandidate *candidates =
+        calloc(running_count, sizeof(*candidates));
+    size_t *order = calloc(running_count, sizeof(*order));
+    if ((running_count > 0 && (candidates == NULL || order == NULL))) {
+      free(candidates);
+      free(order);
+      return false;
+    }
+    for (size_t index = 0; index < running_count; index += 1) {
+      NSRunningApplication *application = unordered[index];
+      const pid_t pid = application.processIdentifier;
+      const uint64_t birth = process_start_micros(pid);
+      candidates[index] = (MetaInventoryPriorityCandidate){
+          .pid = pid,
+          .launch_time_micros = birth,
+          .name = application.localizedName.UTF8String,
+          .foreground = pid == foreground_pid,
+      };
+    }
+    if (!meta_inventory_priority_order(candidates, running_count, priority,
+                                       order, running_count)) {
+      free(candidates);
+      free(order);
+      return false;
+    }
     NSMutableArray<NSRunningApplication *> *running =
-        [NSWorkspace.sharedWorkspace.runningApplications mutableCopy];
-    NSUInteger foreground_index = NSNotFound;
-    for (NSUInteger index = 0; index < running.count; index += 1) {
-      if (running[index].processIdentifier == foreground_pid) {
-        foreground_index = index;
-        break;
-      }
+        [NSMutableArray arrayWithCapacity:running_count];
+    for (size_t index = 0; index < running_count; index += 1) {
+      [running addObject:unordered[order[index]]];
     }
-    if (foreground_index != NSNotFound && foreground_index != 0) {
-      NSRunningApplication *foreground = running[foreground_index];
-      [running removeObjectAtIndex:foreground_index];
-      [running insertObject:foreground atIndex:0];
-    }
+    free(candidates);
+    free(order);
     const size_t application_count = running.count;
     MetaApplicationInput *applications =
         calloc(application_count, sizeof(*applications));
@@ -1371,7 +1400,14 @@ bool meta_macos_close_window(MetaMacOSBackend *backend,
   result->ax_error = close_error == kAXErrorSuccess ? 0 : close_error;
   // После refresh старые record/handle недействительны. Отсутствие признаётся
   // только в полном свежем AX inventory того же process incarnation.
-  bool refreshed = meta_macos_refresh_inventory(backend, 5000);
+  MetaInventoryPriority priority = {
+      .has_pid = true,
+      .pid = original.pid,
+      .has_launch_time = true,
+      .launch_time_micros = launch_time,
+  };
+  bool refreshed = meta_macos_refresh_inventory_with_priority(
+      backend, 5000, &priority);
   const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(backend);
   meta_window_classify_close(refreshed ? snapshot : NULL, &original, launch_time,
       process_start_micros(original.pid) == launch_time, close_error == kAXErrorSuccess, result);

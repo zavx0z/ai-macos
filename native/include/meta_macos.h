@@ -2,6 +2,7 @@
 #define META_MACOS_H
 
 #include "meta_native.h"
+#include "../src/inventory-priority/meta_inventory_priority.h"
 #include <ApplicationServices/ApplicationServices.h>
 
 typedef enum {
@@ -114,6 +115,10 @@ const MetaInventorySnapshot *meta_macos_backend_snapshot(
     const MetaMacOSBackend *backend);
 bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
                                   uint64_t total_budget_millis);
+bool meta_macos_refresh_inventory_with_priority(
+    MetaMacOSBackend *backend,
+    uint64_t total_budget_millis,
+    const MetaInventoryPriority *priority);
 // Проверяет backend-owned receipt exact foreground AX slice для текущего
 // snapshot. Global snapshot.complete остаётся независимым строгим контрактом.
 bool meta_macos_observer_snapshot_ready(

@@ -54,21 +54,37 @@ export type RuntimeWindowAdapter = WindowAdapter & {
 
 /** Каталог использует точные refs из inventory; resources и fence выдаёт runtime. */
 export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCore, windows: RuntimeWindowAdapter, options: { internalAgentMethods?: boolean } = {}): void {
+  const listWindowsInput = z.strictObject({
+    app: z.string().min(1).max(1024).optional(),
+    pid: z.number().int().min(1).max(0x7fffffff).optional(),
+    ...(options.internalAgentMethods ? { applicationRef: opaqueIdSchema.optional() } : {}),
+  })
   registry.register("list_windows", {
     visibility: options.internalAgentMethods ? "internal" : "public",
     title: "Окна и приложения",
     description: "Полная инвентаризация AX и CG-only окон, включая скрытые и свёрнутые. app — точное системное имя; pid различает одноимённые процессы.",
-    input: z.strictObject({ app: z.string().min(1).max(1024).optional(), pid: z.number().int().min(1).max(0x7fffffff).optional() }),
+    input: listWindowsInput,
     output: desktopInventorySnapshotSchema,
     readOnly: true,
     timeoutMs: 6000,
     requiredCapabilities: ["desktop.windows.all", "desktop.applications", "desktop.displays"],
     async execute(context, input) {
-      const inventory = await windows.inventory(control(context.signal))
-      if (input.app === undefined && input.pid === undefined) return inventory
+      const applicationRef = "applicationRef" in input && typeof input.applicationRef === "string"
+        ? input.applicationRef
+        : undefined
+      const priority = input.app === undefined && input.pid === undefined && applicationRef === undefined
+        ? undefined
+        : {
+        ...(input.app === undefined ? {} : { app: input.app }),
+        ...(input.pid === undefined ? {} : { pid: input.pid }),
+        ...(applicationRef === undefined ? {} : { applicationRef }),
+      }
+      const inventory = await windows.inventory(control(context.signal), priority)
+      if (input.app === undefined && input.pid === undefined && applicationRef === undefined) return inventory
       const applications = inventory.applications.filter(application =>
         (input.app === undefined || application.name === input.app)
-        && (input.pid === undefined || application.ref.pid === input.pid))
+        && (input.pid === undefined || application.ref.pid === input.pid)
+        && (applicationRef === undefined || application.ref.applicationRef === applicationRef))
       const pids = new Set(applications.map(application => application.ref.pid))
       return { ...inventory, applications, windows: inventory.windows.filter(window => pids.has(window.ownerPid)) }
     },

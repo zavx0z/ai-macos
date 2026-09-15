@@ -292,6 +292,12 @@ export const windowTransitionResultSchema = z.strictObject({
 })
 export type WindowTransitionResult = z.infer<typeof windowTransitionResultSchema>
 
+export type WindowInventoryPriority = {
+  app?: string
+  pid?: number
+  applicationRef?: string
+}
+
 export {
   axInspectionNodeSchema,
   axInspectionRequestSchema,
@@ -315,7 +321,10 @@ export interface WindowAdapter {
     | "desktop.displays"
     | "desktop.ax"
   )[]
-  inventory(control: AdapterControl): Promise<DesktopInventorySnapshot>
+  inventory(
+    control: AdapterControl,
+    priority?: WindowInventoryPriority,
+  ): Promise<DesktopInventorySnapshot>
   transition(
     context: RuntimeOperationContext<NativeExecutionContext>,
     request: WindowTransitionRequest,

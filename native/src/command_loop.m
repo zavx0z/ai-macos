@@ -515,7 +515,9 @@ static NSDictionary *failure(NSString *code, NSString *message) {
         if (self->_requiresRecoveryDomain && mutation && ![self->_backend validateRecoveryRequest:payload]) {
           result = @{@"nativeError": failure(@"request-payload-mismatch", @"RecoveryDomain grant не подтверждает actual primitive plan; dispatch не начат")};
         } else result = axPress ? [self->_backend executeAxPress:payload job:job] : cursorDisplay ? [self->_backend cursorDisplay:payload] : readiness ? [self->_backend executeReadiness:payload job:job] : input ? [self->_backend executeInput:payload job:job] : window ? [self->_backend executeWindow:payload job:job] : capture ? [self->_backend startCapture:payload job:job] : application ? [self->_backend executeApplication:payload job:job] : clipboard ? [self->_backend clipboard:command] :
-            inspection ? [self->_backend inspect:payload] : applicationResolution ? [self->_backend resolveApplication:payload] : hitTest ? [self->_backend hitTest:payload] : [self->_backend inventory];
+            inspection ? [self->_backend inspect:payload] : applicationResolution ? [self->_backend resolveApplication:payload] : hitTest ? [self->_backend hitTest:payload] :
+            [self->_backend respondsToSelector:@selector(inventoryRequest:)] ? [self->_backend inventoryRequest:payload] :
+            payload[@"payload"][@"priority"] == nil ? [self->_backend inventory] : nil;
       }
       dispatch_async(self->_control, ^{
         if (input || readiness || axPress || window || capture || application) {

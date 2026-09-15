@@ -23,10 +23,12 @@ function fixture() {
   let calls = 0
   let inspected = 0
   let presses = 0
+  let inventoryPriority: unknown
   let resources: readonly RuntimeResourceHandle[] = []
   const windows: RuntimeWindowAdapter = {
     host: native.host, services: core.services, capabilities: [],
-    async inventory() {
+    async inventory(_control, priority) {
+      inventoryPriority = priority
       const now = new Date().toISOString()
       return { ...generation, inventoryId: "inventory:1", revision: 1, displayLayoutRevision: 1,
         capturedAt: now, complete: true, errors: [], displays: [],
@@ -46,15 +48,23 @@ function fixture() {
   registerWindowMethods(registry, core, windows)
   const session = core.openClient("principal:fixture").session
   return { core, registry, session, calls: () => calls, inspected: () => inspected,
-    presses: () => presses, resources: () => resources }
+    presses: () => presses, resources: () => resources,
+    inventoryPriority: () => inventoryPriority }
 }
 
 test("фильтр PID различает два одноимённых Chrome без подмены окна", async () => {
-  const { registry, session } = fixture()
+  const { registry, session, inventoryPriority } = fixture()
   const result = await registry.dispatch(session, "list_windows", { app: "Google Chrome", pid: 2 }, new AbortController().signal)
   expect(result.data.applications).toMatchObject([{ ref: { pid: 2 } }])
   expect(result.data.windows).toMatchObject([{ ownerPid: 2 }])
   expect(result.data.complete).toBe(true)
+  expect(inventoryPriority()).toEqual({ app: "Google Chrome", pid: 2 })
+})
+
+test("unscoped inventory не создаёт пустой priority hint", async () => {
+  const { registry, session, inventoryPriority } = fixture()
+  await registry.dispatch(session, "list_windows", {}, new AbortController().signal)
+  expect(inventoryPriority()).toBeUndefined()
 })
 
 test("unknown transition сохраняет operation и не повторяет действие по clientRequestId", async () => {
