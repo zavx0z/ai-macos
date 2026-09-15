@@ -93,6 +93,7 @@ export class BrowserLifetimeCoordinator {
   readonly #slots = new Map<string, Slot>()
   readonly #byId = new Map<string, Slot>()
   readonly #ttlMs: number
+  readonly #shutdownStepMs: number
   readonly #stageRecovered: (operationIds: readonly string[]) => Promise<() => void>
   readonly authority: LifetimeReservationAuthority & {
     resume(session: RuntimeClientSession, reservationId: string): Promise<LifetimeReservationHandle>
@@ -107,6 +108,7 @@ export class BrowserLifetimeCoordinator {
     clock?: RuntimeClock
     ids?: RuntimeIdSource
     ttlMs?: number
+    shutdownStepMs?: number
     stageRecovered: (operationIds: readonly string[]) => Promise<() => void>
   }) {
     this.#generation = options.generation
@@ -116,8 +118,10 @@ export class BrowserLifetimeCoordinator {
     this.#clock = options.clock ?? systemClock
     this.#ids = options.ids ?? randomIdSource
     this.#ttlMs = options.ttlMs ?? 120_000
+    this.#shutdownStepMs = options.shutdownStepMs ?? 5_000
     this.#stageRecovered = options.stageRecovered
     if (!Number.isSafeInteger(this.#ttlMs) || this.#ttlMs < 1 || this.#ttlMs > 86_400_000) throw new Error("Reservation TTL вне допустимого диапазона")
+    if (!Number.isSafeInteger(this.#shutdownStepMs) || this.#shutdownStepMs < 1 || this.#shutdownStepMs > 30_000) throw new Error("Reservation shutdown budget вне допустимого диапазона")
     this.authority = Object.freeze({
       assertChild: (request: ReservationChildRequest) => this.#assertChild(request),
       resume: (session: RuntimeClientSession, id: string) => this.#resume(session, id),
@@ -288,6 +292,57 @@ export class BrowserLifetimeCoordinator {
     }, lifecycle, signal)
   }
 
+  async shutdownLineage(lineageId?: string, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new DOMException("Lifetime shutdown aborted", "AbortError")
+    const slots = [...this.#slots.values()].filter(slot => {
+      return slot.state !== "released" && (lineageId === undefined || slot.lineageId === lineageId)
+    })
+    for (const slot of slots) {
+      if (slot.children.size > 0 || slot.disconnecting !== undefined) {
+        throw new Error("Lifetime shutdown требует drained child operations и отсутствие disconnect in-flight")
+      }
+      if (slot.state === "connecting" || slot.handle === undefined) {
+        this.#quarantine(slot)
+        throw new Error("Lifetime shutdown обнаружил незавершённый connect без reservation handle")
+      }
+      const binding = this.#bindings.get(slot.bindingId)
+      if (binding === undefined) {
+        this.#quarantine(slot)
+        throw new Error("Lifetime shutdown не нашёл immutable configured binding")
+      }
+      slot.disconnecting = `host-shutdown:${this.#ids.next("shutdown")}`
+      try {
+        const commit = await this.#boundedShutdown(async boundedSignal => {
+          await binding.verifier.recoverRemoval(slot.target, boundedSignal)
+          await binding.verifier.verifyRemoved(slot.target, boundedSignal)
+          const commitPrevious = await this.#stageRecovered([...slot.operationIds])
+          const receipt = reservationCleanupReceiptSchema.parse({
+            receiptId: this.#ids.next("reservation-shutdown"),
+            reservationId: slot.handle!.reservationId,
+            reservationGeneration: slot.handle!.reservationGeneration,
+            externalGeneration: slot.handle!.externalGeneration,
+            statusRevision: slot.handle!.statusRevision + 1,
+            cleanupEvidenceRef: slot.disconnecting!,
+            issuedAt: this.#clock.now().toISOString(),
+            state: "released",
+          })
+          return () => {
+            commitPrevious()
+            slot.state = "released"
+            slot.receipt = receipt
+            slot.handle = { ...slot.handle!, state: "released", statusRevision: receipt.statusRevision }
+            delete slot.disconnecting
+          }
+        }, signal)
+        commit()
+      } catch (error) {
+        delete slot.disconnecting
+        this.#quarantine(slot)
+        throw error
+      }
+    }
+  }
+
   async #assertChild(request: ReservationChildRequest): Promise<LifetimeReservationHandle> {
     await this.#clients.assertActive(request.session, this.#clock.now())
     const target = instanceTarget(request.target)
@@ -298,6 +353,27 @@ export class BrowserLifetimeCoordinator {
       || slot.lineageId !== this.#clients.lineage(request.session)
       || !structurallyEqual(slot.target, target)) throw new Error("Child не допущен runtime lifetime coordinator")
     return structuredClone(slot.handle)
+  }
+
+  async #boundedShutdown<T>(work: (signal: AbortSignal) => Promise<T>, external?: AbortSignal): Promise<T> {
+    const controller = new AbortController()
+    const onAbort = () => controller.abort(external?.reason)
+    external?.addEventListener("abort", onAbort, { once: true })
+    if (external?.aborted) onAbort()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let abortListener: (() => void) | undefined
+    try {
+      const stop = new Promise<never>((_, reject) => {
+        abortListener = () => reject(new DOMException("Lifetime shutdown aborted", "AbortError"))
+        controller.signal.addEventListener("abort", abortListener, { once: true })
+        timer = setTimeout(() => controller.abort("lifetime shutdown deadline"), this.#shutdownStepMs)
+      })
+      return await Promise.race([work(controller.signal), stop])
+    } finally {
+      if (timer !== undefined) clearTimeout(timer)
+      if (abortListener !== undefined) controller.signal.removeEventListener("abort", abortListener)
+      external?.removeEventListener("abort", onAbort)
+    }
   }
 
   async recover(

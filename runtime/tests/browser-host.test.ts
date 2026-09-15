@@ -113,6 +113,29 @@ test("configured existing Chrome не запускается до explicit conne
     ...secondActual,
     targetId: "target:second",
   })
+  driver.readDom = async () => ({ content: "<main>bounded</main>", truncated: false })
+  driver.readAccessibility = async () => ({ content: "[{\"role\":\"main\"}]", nodeCount: 1, truncated: false })
+  driver.readConsole = async () => ({ entries: [{ level: "info", text: "bounded", timestamp: new Date().toISOString() }], droppedEvents: 0 })
+  const inventoryId = String(targets.data.inventoryId)
+  const inventoryRevision = Number(targets.data.inventoryRevision)
+  for (const [clientRequestId, observationRequest, expectedKind] of [
+    ["host:dom", { kind: "read-dom" as const, target, maxBytes: 1_024 }, "dom-read"],
+    ["host:ax", { kind: "read-accessibility" as const, target, maxNodes: 10, maxBytes: 1_024 }, "accessibility-read"],
+    ["host:console", { kind: "read-console" as const, target, maxEvents: 10, maxBytes: 1_024 }, "console-read"],
+  ] as const) {
+    const readIntent = runtimeOperationIntentSchema.parse({
+      intent: "read",
+      clientRequestId,
+      precondition: { target: { kind: "browser-target", ref: target }, inventoryId, inventoryRevision },
+      deadlineAt: new Date(Date.now() + 5_000).toISOString(),
+      requestedResources: browserOperationResources(observationRequest),
+    })
+    const observed = await registry.dispatch(session, "browser_chrome_operation", {
+      intent: readIntent,
+      request: observationRequest,
+    }, new AbortController().signal)
+    expect(observed.data.result).toMatchObject({ ok: true, value: { value: { kind: expectedKind } } })
+  }
 
   const png = Uint8Array.from(Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64"))
   driver.captureTarget = async (_id, request) => ({
@@ -133,8 +156,6 @@ test("configured existing Chrome не запускается до explicit conne
     output: { format: "image/png" as const, scale: 1, maxWidthPx: 10, maxHeightPx: 10, maxPixels: 100, maxEncodedBytes: 1024 },
   }
   const request = { kind: "capture-target" as const, target, capture }
-  const inventoryId = String(targets.data.inventoryId)
-  const inventoryRevision = Number(targets.data.inventoryRevision)
   const intent = runtimeOperationIntentSchema.parse({
     intent: "read",
     clientRequestId: "host:capture",
