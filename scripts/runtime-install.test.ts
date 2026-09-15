@@ -691,7 +691,7 @@ test("typed observer retry progress получает единый extended deadl
   const options = { ...fixture.options, requiredCapabilities: ["input.pointer"] as const, doctorTimeoutMs: 100 }
   const plan = await planRuntimeInstall(options)
   const startedAt = Date.now()
-  const deadlineAt = startedAt + 450
+  const deadlineAt = startedAt + 800
   fixture.runner.observerHealthByBuild.set(plan.release.runtimeBuildId, [
     observerPreparing(1, startedAt, deadlineAt, startedAt + 50),
     observerPreparing(2, startedAt, deadlineAt, startedAt + 150),
@@ -756,7 +756,6 @@ test("malformed или mismatched observer preparation немедленно от
       startedAt: new Date(now + 2_000).toISOString(), deadlineAt: new Date(now + 2_100).toISOString() } },
     { state: "ready", viewReady: true, preparation: { attempt: 1, maxAttempts: 3,
       startedAt: new Date(now).toISOString(), deadlineAt: new Date(now + 100).toISOString() } },
-    { state: "ready", viewReady: false },
   ]
   for (const health of cases) {
     const fixture = await createFixture()
@@ -796,6 +795,16 @@ test("legacy nonrequired health без observer сохраняет foundation co
   const fixture = await createFixture()
   const plan = await planRuntimeInstall(fixture.options)
   fixture.runner.omitObserverForBuild.add(plan.release.runtimeBuildId)
+
+  const result = await applyRuntimeInstall(plan, fixture.options)
+
+  expect(result.state).toBe("installed")
+})
+
+test("nonrequired observer coverage ready не требует negotiated view readiness", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  fixture.runner.observerHealthByBuild.set(plan.release.runtimeBuildId, [{ state: "ready", viewReady: false }])
 
   const result = await applyRuntimeInstall(plan, fixture.options)
 
@@ -1179,6 +1188,230 @@ test("failed bootout сохраняет pending journal и не меняет ins
   expect(JSON.parse(await readFile(join(options.paths.installRoot, "pending-update", "record.json"), "utf8"))).toMatchObject({ serviceLoaded: true })
 })
 
+test("bootout ждёт exact label, parent и orphan helper до promotion", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  fixture.runner.commit = "b".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.jobRemovalPolls = 2
+  fixture.runner.parentExitPolls = 2
+  fixture.runner.helperExitPolls = 4
+  const options = {
+    ...fixture.options,
+    shutdownConvergenceTimeoutMs: 500,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:delayed-bootout",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+
+  const result = await applyRuntimeInstall(update, options)
+
+  expect(result.state).toBe("installed")
+  expect(fixture.runner.bootstrapCalls).toBe(2)
+  expect(fixture.runner.helperPresent).toBe(true)
+  expect(fixture.runner.helperOrphaned).toBe(false)
+})
+
+test("exact removing label без PID остаётся pending до not-found", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  fixture.runner.commit = "8".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.removalWithoutPidPolls = 3
+  const options = {
+    ...fixture.options,
+    shutdownConvergenceTimeoutMs: 500,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:removing-label",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+  const began = Date.now()
+
+  const result = await applyRuntimeInstall(update, options)
+
+  expect(result.state).toBe("installed")
+  expect(Date.now() - began).toBeGreaterThanOrEqual(100)
+})
+
+test("orphan helper timeout сохраняет witness и запрещает rollback bootstrap до resumed exit", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  const previousHelper = await readFile(join(fixture.options.paths.installRoot,
+    "computer-use.app/Contents/Helpers/meta-input-helper"))
+  fixture.runner.commit = "c".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.helperExitPolls = 100
+  const options = {
+    ...fixture.options,
+    shutdownConvergenceTimeoutMs: 100,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:orphan-timeout",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+
+  await expect(applyRuntimeInstall(update, options)).rejects.toThrow("rollback incomplete")
+  expect(fixture.runner.bootstrapCalls).toBe(1)
+  expect(fixture.runner.helperOrphaned).toBe(true)
+  expect(await readlink(join(options.paths.installRoot, "current"))).toBe(first.release.releasePath)
+  const record = JSON.parse(await readFile(join(options.paths.installRoot, "pending-update/record.json"), "utf8"))
+  expect(record.shutdownWitness).toMatchObject({ state: "bootout-issued",
+    service: { pid: 4242 }, processes: { parent: { pid: 4242 }, helper: { pid: 4243, parentPid: 4242 } } })
+
+  fixture.runner.helperExitPolls = 0
+  await expect(applyRuntimeInstall(update, {
+    ...options,
+    failpoint(stage) {
+      if (stage === "after-pending-recovery") throw new Error("stop after safe recovery")
+    },
+  })).rejects.toThrow("stop after safe recovery")
+  expect(fixture.runner.bootstrapCalls).toBe(2)
+  expect(await readlink(join(options.paths.installRoot, "current"))).toBe(first.release.releasePath)
+  expect(await readFile(join(options.paths.installRoot,
+    "computer-use.app/Contents/Helpers/meta-input-helper"))).toEqual(previousHelper)
+  await expect(lstat(join(options.paths.installRoot, "pending-update"))).rejects.toThrow()
+})
+
+test("unknown process probe failclosed не выполняет bootstrap", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  fixture.runner.commit = "d".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.processProbeFailure = true
+  const options = {
+    ...fixture.options,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:unknown-process",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+
+  await expect(applyRuntimeInstall(update, options)).rejects.toThrow("rollback incomplete")
+  expect(fixture.runner.bootstrapCalls).toBe(1)
+})
+
+test("runtime с отсутствующим expected helper child не проходит bootout admission", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  fixture.runner.commit = "e".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.helperPresent = false
+  const options = {
+    ...fixture.options,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:missing-helper",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+
+  await expect(applyRuntimeInstall(update, options)).rejects.toThrow("rollback incomplete")
+  expect(fixture.runner.bootstrapCalls).toBe(1)
+})
+
+test("PID reuse считается уходом captured incarnation", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  fixture.runner.commit = "f".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.reuseProcessIdsAfterBootout = true
+  const options = {
+    ...fixture.options,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:pid-reuse",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+
+  const result = await applyRuntimeInstall(update, options)
+  expect(result.state).toBe("installed")
+})
+
+test("foreign replacement exact label блокирует rollback bootstrap", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  fixture.runner.commit = "6".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.replacementLabelPid = 9999
+  const options = {
+    ...fixture.options,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:foreign-label",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+
+  await expect(applyRuntimeInstall(update, options)).rejects.toThrow("rollback incomplete")
+  expect(fixture.runner.bootstrapCalls).toBe(1)
+})
+
+test("неожиданная launchctl print ошибка не считается отсутствующим label", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  fixture.runner.commit = "7".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.unexpectedPrintFailure = true
+  const options = {
+    ...fixture.options,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:launchctl-unknown",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+
+  await expect(applyRuntimeInstall(update, options)).rejects.toThrow("rollback incomplete")
+  expect(fixture.runner.bootstrapCalls).toBe(1)
+})
+
 test("owner lock и late service appearance блокируют concurrent cutover до helper switch", async () => {
   const fixture = await createFixture()
   const plan = await planRuntimeInstall(fixture.options)
@@ -1315,6 +1548,21 @@ class FakeRunner implements CommandRunner {
   foreignStableHelper = false
   implicitRequirement = false
   failBootout = false
+  removing = false
+  jobRemovalPolls = 0
+  removalWithoutPidPolls = 0
+  parentExitPolls = 0
+  helperExitPolls = 0
+  parentPresent = true
+  helperPresent = true
+  helperOrphaned = false
+  processProbeFailure = false
+  replacementLabelPid: number | undefined
+  unexpectedPrintFailure = false
+  reuseProcessIdsAfterBootout = false
+  processIdsReused = false
+  processStartedAt = "Mon Sep 15 21:43:56 2026"
+  bootstrapCalls = 0
   appearAtPrint: number | undefined
   printCalls = 0
   doctorUnavailableCount = 0
@@ -1362,9 +1610,48 @@ class FakeRunner implements CommandRunner {
     if (file === "/bin/launchctl" && args[0] === "print") {
       this.printCalls++
       if (this.appearAtPrint === this.printCalls) this.loaded = true
+      if (this.removing) {
+        if (this.unexpectedPrintFailure) return { stdout: "", stderr: "launchctl transport failed", exitCode: 5 }
+        if (this.replacementLabelPid !== undefined) {
+          return ok(`path = ${this.launchPlist}\nprogram = ${this.launchProgram}\npid = ${this.replacementLabelPid}\n`)
+        }
+        if (this.removalWithoutPidPolls > 0) {
+          this.removalWithoutPidPolls--
+          return ok(`path = ${this.launchPlist}\nprogram = ${this.launchProgram}\n`)
+        }
+        if (this.jobRemovalPolls > 0) {
+          this.jobRemovalPolls--
+          return ok(`path = ${this.launchPlist}\nprogram = ${this.launchProgram}\npid = 4242\n`)
+        }
+        return missingService()
+      }
       return this.loaded
       ? ok(`path = ${this.launchPlist}\nprogram = ${this.launchProgram}\npid = 4242\n`)
-      : fail("not loaded")
+      : missingService()
+    }
+    if (file === "/bin/ps") {
+      if (this.processProbeFailure) return fail("ps unavailable")
+      if (args[0] === "-ww" && args[1] === "-p") {
+        const pid = Number(args[2])
+        if (this.removing && !this.processIdsReused && pid === 4242 && this.parentExitPolls > 0) this.parentExitPolls--
+        else if (this.removing && !this.processIdsReused && pid === 4242) {
+          this.parentPresent = false
+          if (this.helperPresent) this.helperOrphaned = true
+        }
+        if (this.removing && !this.processIdsReused && pid === 4243 && this.helperExitPolls > 0) this.helperExitPolls--
+        else if (this.removing && !this.processIdsReused && pid === 4243) this.helperPresent = false
+        if (pid === 4242 && this.parentPresent) return ok(this.processLine(4242, 1, this.launchProgram))
+        if (pid === 4243 && this.helperPresent) {
+          return ok(this.processLine(4243, this.helperOrphaned ? 1 : 4242, this.helperPath()))
+        }
+        return { stdout: "", stderr: "", exitCode: 1 }
+      }
+      if (args[0] === "-axww") {
+        return ok([
+          ...(this.parentPresent ? [this.processLine(4242, 1, this.launchProgram)] : []),
+          ...(this.helperPresent ? [this.processLine(4243, this.helperOrphaned ? 1 : 4242, this.helperPath())] : []),
+        ].join(""))
+      }
     }
     if (file === process.execPath && args[0] === "build") {
       this.mutations++
@@ -1528,7 +1815,13 @@ class FakeRunner implements CommandRunner {
     }
     if (file === "/bin/launchctl" && args[0] === "bootstrap") {
       this.mutations++
+      this.bootstrapCalls++
       this.loaded = true
+      this.removing = false
+      this.parentPresent = true
+      this.helperPresent = true
+      this.helperOrphaned = false
+      this.processIdsReused = false
       const plist = await readFile(args[2]!, "utf8")
       this.launchProgram = plist.match(/<array><string>([^<]+)<\/string><\/array>/)?.[1] ?? this.launchProgram
       return ok()
@@ -1536,15 +1829,38 @@ class FakeRunner implements CommandRunner {
     if (file === "/bin/launchctl" && args[0] === "bootout") {
       this.mutations++
       if (this.failBootout) return fail("bootout denied")
-      this.loaded = false
+      this.removing = true
+      if (this.reuseProcessIdsAfterBootout) {
+        this.processIdsReused = true
+        this.processStartedAt = "Mon Sep 15 21:43:57 2026"
+      }
+      if (this.jobRemovalPolls === 0) this.loaded = false
+      if (!this.processIdsReused && this.parentExitPolls === 0) {
+        this.parentPresent = false
+        if (this.helperPresent) this.helperOrphaned = true
+      }
+      if (!this.processIdsReused && this.helperExitPolls === 0) this.helperPresent = false
       return ok()
     }
     return fail(`unexpected command ${file} ${args.join(" ")}`)
+  }
+
+  private helperPath(): string {
+    return this.launchProgram.includes("computer-use.app/Contents/MacOS/computer-use")
+      ? this.launchProgram.replace("Contents/MacOS/computer-use", "Contents/Helpers/meta-input-helper")
+      : join(this.repositoryRoot, "input/bin/meta-input-helper")
+  }
+
+  private processLine(pid: number, parentPid: number, command: string): string {
+    return `${pid} ${parentPid} ${this.processStartedAt} ${command}\n`
   }
 }
 
 function ok(stdout = ""): CommandResult { return { stdout, stderr: "", exitCode: 0 } }
 function fail(stderr: string): CommandResult { return { stdout: "", stderr, exitCode: 1 } }
+function missingService(): CommandResult {
+  return { stdout: "", stderr: `Could not find service "${RUNTIME_SERVICE_LABEL}" in domain for user gui: 501`, exitCode: 113 }
+}
 function sha256(value: string | Uint8Array): string { return createHash("sha256").update(value).digest("hex") }
 
 function observerPreparing(attempt: 1 | 2 | 3, startedAt: number, deadlineAt: number, nextRetryAt?: number) {

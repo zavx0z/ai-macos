@@ -127,6 +127,7 @@ export type RuntimeInstallOptions = {
   testOnlyAllowNonCanonicalRoot?: boolean
   doctorTimeoutMs?: number
   permissionWaitMs?: number
+  shutdownConvergenceTimeoutMs?: number
   browserConfig?: string
   readinessProfile?: RuntimeReadinessProfile
   requiredCapabilities?: readonly CapabilityId[]
@@ -136,6 +137,7 @@ export type RuntimeInstallOptions = {
 
 export type InstallFailpoint =
   | "after-installer-lock"
+  | "after-pending-recovery"
   | "after-rollback-prepared"
   | "after-stable-old-writable"
   | "after-stable-old-moved"
@@ -548,7 +550,13 @@ async function applyRuntimeInstallLocked(
   await options.failpoint?.("after-installer-lock")
   await discardIncompleteRollbackPreparations(paths)
   if (await exists(pendingUpdatePath(paths))) {
-    const pendingService = await inspectLaunchService(options.runner, plan)
+    const pendingRecord = parseRollbackRecord(JSON.parse(await readFile(join(pendingUpdatePath(paths), "record.json"), "utf8")))
+    let pendingService: LaunchServiceIdentity | undefined
+    if (pendingRecord.shutdownWitness !== undefined) {
+      await awaitRecordedShutdownWitness(plan, options, pendingRecord)
+    } else {
+      pendingService = await inspectLaunchService(options.runner, plan)
+    }
     if (pendingService !== undefined) {
       if (options.runtimeAdmin === undefined) throw new Error("Pending update recovery требует exact drain authority")
       const pendingRuntime = await options.runtimeAdmin.inspect()
@@ -556,7 +564,8 @@ async function applyRuntimeInstallLocked(
       assertDrainReceipt(pendingRuntime, receipt)
       await assertExactServiceAndRuntime(options, plan, pendingService, pendingRuntime, true)
     }
-    await recoverPendingUpdate(plan, options, pendingService !== undefined)
+    await recoverPendingUpdate(plan, options, pendingService)
+    await options.failpoint?.("after-pending-recovery")
   }
   const release = await ensureRelease(plan, options)
   const { plist } = release
@@ -611,7 +620,7 @@ async function applyRuntimeInstallLocked(
       await assertExactServiceAndRuntime(options, plan, service!, existing, true)
       drainComplete = true
     }
-    if (serviceWasLoaded) await checked(options.runner, "/bin/launchctl", ["bootout", `${plan.service.domain}/${RUNTIME_SERVICE_LABEL}`])
+    if (serviceWasLoaded) await bootoutAndAwaitConvergence(plan, options, service!)
     if (release.manifest.format === RELEASE_FORMAT) {
       await promoteNextStableApplication(paths, options.failpoint)
     } else if (await hashIfPresent(paths.stableHelperPath) !== release.manifest.artifacts.nativeHelper.sha256) {
@@ -643,6 +652,9 @@ async function applyRuntimeInstallLocked(
     if (!drainComplete) {
       await discardPendingUpdate(paths).catch(() => undefined)
       throw new Error("Runtime drain не подтвердил safe cutover; installed files не менялись, admission остаётся sealed", { cause: error })
+    }
+    if (error instanceof BootoutConvergenceError) {
+      throw new AggregateError([error], "Runtime update failed; rollback incomplete")
     }
     const rollbackErrors = await rollback(plan, options, previous)
     if (rollbackErrors.length === 0) await discardPendingUpdate(paths)
@@ -924,12 +936,38 @@ type RollbackRecord = {
   plistPresent: boolean
   serviceLoaded: boolean
   stableApplicationPresent?: boolean
+  shutdownWitness?: {
+    state: "prepared" | "bootout-issued"
+    service: LaunchServiceIdentity
+    processes: OwnedRuntimeProcesses
+  }
 }
 
 type LaunchServiceIdentity = {
   pid: number
   program: string
   plistPath: string
+}
+
+type ProcessIncarnation = {
+  pid: number
+  parentPid: number
+  startedAt: string
+  command: string
+}
+
+type OwnedRuntimeProcesses = {
+  parent: ProcessIncarnation
+  helper: ProcessIncarnation
+}
+
+class BootoutConvergenceError extends Error {
+  constructor(
+    readonly service: LaunchServiceIdentity,
+    readonly processes: OwnedRuntimeProcesses,
+  ) {
+    super("Runtime bootout convergence deadline exceeded: exact label/parent/helper ещё не исчезли")
+  }
 }
 
 async function acquireInstallerLock(paths: RuntimeInstallPaths): Promise<() => Promise<void>> {
@@ -984,14 +1022,15 @@ async function discardIncompleteRollbackPreparations(paths: RuntimeInstallPaths)
 async function recoverPendingUpdate(
   plan: RuntimeInstallPlan,
   options: RuntimeInstallOptions,
-  serviceLoaded: boolean,
+  service: LaunchServiceIdentity | undefined,
 ): Promise<void> {
   const directory = pendingUpdatePath(plan.paths)
   if (!await exists(directory)) return
   const record = parseRollbackRecord(JSON.parse(await readFile(join(directory, "record.json"), "utf8")))
   const helper = record.helperPresent ? await readFile(join(directory, "helper")) : undefined
   const plist = record.plistPresent ? await readFile(join(directory, "launch-agent.plist")) : undefined
-  if (serviceLoaded) await checked(options.runner, "/bin/launchctl", ["bootout", `${plan.service.domain}/${RUNTIME_SERVICE_LABEL}`])
+  if (record.shutdownWitness !== undefined) await awaitRecordedShutdownWitness(plan, options, record)
+  else if (service !== undefined) await bootoutAndAwaitConvergence(plan, options, service)
   if (record.format === "meta-runtime-pending-update-v2") {
     await restoreStableApplication(plan.paths, record, options.failpoint)
   }
@@ -1250,10 +1289,33 @@ function parseRollbackRecord(value: unknown): RollbackRecord {
     || !(record.previousCurrentRelease === null || typeof record.previousCurrentRelease === "string")
     || typeof record.helperPresent !== "boolean" || typeof record.plistPresent !== "boolean"
     || typeof record.serviceLoaded !== "boolean"
-    || record.format === "meta-runtime-pending-update-v2" && typeof record.stableApplicationPresent !== "boolean") {
+    || record.format === "meta-runtime-pending-update-v2" && typeof record.stableApplicationPresent !== "boolean"
+    || record.shutdownWitness !== undefined && !validShutdownWitness(record.shutdownWitness)) {
     throw new Error("Pending update record повреждён")
   }
   return record
+}
+
+function validShutdownWitness(input: unknown): boolean {
+  if (input === null || typeof input !== "object") return false
+  const value = input as NonNullable<RollbackRecord["shutdownWitness"]>
+  if (!["prepared", "bootout-issued"].includes(value.state)
+    || value.service === null || typeof value.service !== "object"
+    || value.processes === null || typeof value.processes !== "object") return false
+  return Number.isSafeInteger(value.service.pid) && value.service.pid > 0
+    && typeof value.service.program === "string" && isAbsolute(value.service.program)
+    && typeof value.service.plistPath === "string" && isAbsolute(value.service.plistPath)
+    && validProcessIncarnation(value.processes.parent)
+    && validProcessIncarnation(value.processes.helper)
+    && value.processes.helper.parentPid === value.processes.parent.pid
+}
+
+function validProcessIncarnation(value: ProcessIncarnation | undefined): boolean {
+  return value !== undefined && value !== null && typeof value === "object"
+    && Number.isSafeInteger(value.pid) && value.pid > 0
+    && Number.isSafeInteger(value.parentPid) && value.parentPid >= 0
+    && typeof value.startedAt === "string" && Number.isFinite(Date.parse(value.startedAt))
+    && typeof value.command === "string" && value.command.length > 0 && value.command.length <= 16_384
 }
 
 function assertPreviousReleasePath(paths: RuntimeInstallPaths, path: string): void {
@@ -1271,14 +1333,16 @@ async function rollback(
     try { await action() }
     catch (error) { errors.push(error instanceof Error ? error : new Error(String(error))) }
   }
+  let record: RollbackRecord
   try {
+    record = parseRollbackRecord(JSON.parse(await readFile(join(pendingUpdatePath(plan.paths), "record.json"), "utf8")))
+    await awaitRecordedShutdownWitness(plan, options, record)
     const service = await inspectLaunchService(options.runner, plan)
-    if (service !== undefined) await checked(options.runner, "/bin/launchctl", ["bootout", `${plan.service.domain}/${RUNTIME_SERVICE_LABEL}`])
+    if (service !== undefined) await bootoutAndAwaitConvergence(plan, options, service)
   } catch (error) {
     return [error instanceof Error ? error : new Error(String(error))]
   }
   await attempt(async () => {
-    const record = parseRollbackRecord(JSON.parse(await readFile(join(pendingUpdatePath(plan.paths), "record.json"), "utf8")))
     if (record.format === "meta-runtime-pending-update-v2") {
       await restoreStableApplication(plan.paths, record, options.failpoint)
     }
@@ -1558,7 +1622,7 @@ function parseObserverHealth(value: unknown, required: boolean): ObserverHealth 
   const observer = value as { state?: unknown, viewReady?: unknown, preparation?: unknown }
   if (!["unavailable", "preparing", "ready"].includes(String(observer.state))
     || typeof observer.viewReady !== "boolean") throw new Error("Observer health повреждён")
-  if ((observer.state === "ready") !== observer.viewReady) {
+  if (observer.viewReady && observer.state !== "ready") {
     throw new Error("Observer state/viewReady не согласованы")
   }
   if (observer.preparation === undefined) {
@@ -2192,20 +2256,228 @@ async function inspectLaunchService(
 ): Promise<LaunchServiceIdentity | undefined> {
   const result = await runner.run("/bin/launchctl", ["print", `${plan.service.domain}/${RUNTIME_SERVICE_LABEL}`], { timeoutMs: 5_000 })
   if (result.exitCode !== 0) {
-    if (!allowAbsent) throw new Error("Expected runtime LaunchAgent отсутствует при exact cutover recheck")
-    return undefined
+    const failureText = `${result.stdout}\n${result.stderr}`
+    const exactMissing = result.exitCode === 113
+      && /could not find service/i.test(failureText)
+      && failureText.includes(RUNTIME_SERVICE_LABEL)
+    if (allowAbsent && exactMissing) return undefined
+    throw new Error(`launchctl print не подтвердил exact service state (${result.exitCode}): ${result.stderr.trim()}`)
   }
   const lines = result.stdout.split("\n").map(line => line.trim())
   const pid = Number(lines.find(line => line.startsWith("pid = "))?.slice("pid = ".length))
   const program = lines.find(line => line.startsWith("program = "))?.slice("program = ".length)
   const plistPath = lines.find(line => line.startsWith("path = "))?.slice("path = ".length)
-  const expectedPrograms = [join(plan.paths.installRoot, "current", "computer-use"),
-    join(plan.paths.installRoot, "current", "runtime"), stableApplicationRuntimePath(plan.paths)]
+  const expectedPrograms = expectedRuntimePrograms(plan)
   if (!Number.isSafeInteger(pid) || pid < 1 || program === undefined || !expectedPrograms.includes(program)
     || plistPath !== plan.paths.launchAgentPath) {
     throw new Error("Loaded LaunchAgent не совпадает с exact canonical pid/program/plist ownership")
   }
   return { pid, program, plistPath }
+}
+
+function expectedRuntimePrograms(plan: RuntimeInstallPlan): string[] {
+  return [join(plan.paths.installRoot, "current", "computer-use"),
+    join(plan.paths.installRoot, "current", "runtime"), stableApplicationRuntimePath(plan.paths)]
+}
+
+async function bootoutAndAwaitConvergence(
+  plan: RuntimeInstallPlan,
+  options: RuntimeInstallOptions,
+  service: LaunchServiceIdentity,
+): Promise<void> {
+  const processes = await captureOwnedRuntimeProcesses(options.runner, plan, service)
+  await persistShutdownWitness(plan.paths, { state: "prepared", service, processes })
+  await checked(options.runner, "/bin/launchctl", ["bootout", `${plan.service.domain}/${RUNTIME_SERVICE_LABEL}`])
+  await persistShutdownWitness(plan.paths, { state: "bootout-issued", service, processes })
+  await awaitBootoutConvergence(plan, options, service, processes)
+  await clearShutdownWitness(plan.paths)
+}
+
+async function persistShutdownWitness(
+  paths: RuntimeInstallPaths,
+  shutdownWitness: NonNullable<RollbackRecord["shutdownWitness"]>,
+): Promise<void> {
+  const path = join(pendingUpdatePath(paths), "record.json")
+  const record = parseRollbackRecord(JSON.parse(await readFile(path, "utf8")))
+  await atomicText(path, `${stableJson({ ...record, shutdownWitness })}\n`, 0o600)
+  await syncDirectory(dirname(path))
+}
+
+async function clearShutdownWitness(paths: RuntimeInstallPaths): Promise<void> {
+  const path = join(pendingUpdatePath(paths), "record.json")
+  const record = parseRollbackRecord(JSON.parse(await readFile(path, "utf8")))
+  const { shutdownWitness: _, ...withoutWitness } = record
+  await atomicText(path, `${stableJson(withoutWitness)}\n`, 0o600)
+  await syncDirectory(dirname(path))
+}
+
+async function awaitRecordedShutdownWitness(
+  plan: RuntimeInstallPlan,
+  options: RuntimeInstallOptions,
+  record: RollbackRecord,
+): Promise<void> {
+  const witness = record.shutdownWitness
+  if (witness === undefined) return
+  assertShutdownWitnessMatchesPlan(plan, witness)
+  if (witness.state === "prepared") {
+    const current = await inspectLaunchServiceConvergence(options.runner, plan, witness.service)
+    if (current === "running") {
+      const result = await options.runner.run("/bin/launchctl", ["bootout", `${plan.service.domain}/${RUNTIME_SERVICE_LABEL}`], {
+        timeoutMs: 30_000,
+      })
+      const alreadyRemoving = result.exitCode === 37
+        && /operation already in progress/i.test(`${result.stdout}\n${result.stderr}`)
+      if (result.exitCode !== 0 && !alreadyRemoving) {
+        throw new Error(`launchctl failed (${result.exitCode}): ${result.stderr.trim()}`)
+      }
+    }
+    witness.state = "bootout-issued"
+    await persistShutdownWitness(plan.paths, witness)
+  }
+  await awaitBootoutConvergence(plan, options, witness.service, witness.processes)
+  await clearShutdownWitness(plan.paths)
+}
+
+function assertShutdownWitnessMatchesPlan(
+  plan: RuntimeInstallPlan,
+  witness: NonNullable<RollbackRecord["shutdownWitness"]>,
+): void {
+  const helperPath = witness.service.program === stableApplicationRuntimePath(plan.paths)
+    ? stableApplicationHelperPath(plan.paths)
+    : plan.paths.stableHelperPath
+  if (!expectedRuntimePrograms(plan).includes(witness.service.program)
+    || witness.service.plistPath !== plan.paths.launchAgentPath
+    || witness.processes.parent.pid !== witness.service.pid
+    || !commandMatchesPath(witness.processes.parent.command, witness.service.program)
+    || witness.processes.helper.parentPid !== witness.processes.parent.pid
+    || !commandMatchesPath(witness.processes.helper.command, helperPath)) {
+    throw new Error("Shutdown witness не соответствует exact runtime/helper ownership")
+  }
+}
+
+async function awaitBootoutConvergence(
+  plan: RuntimeInstallPlan,
+  options: RuntimeInstallOptions,
+  service: LaunchServiceIdentity,
+  processes: OwnedRuntimeProcesses,
+): Promise<void> {
+  const deadlineAt = Date.now() + shutdownConvergenceTimeout(options)
+  while (Date.now() < deadlineAt) {
+    const serviceState = await inspectLaunchServiceConvergence(options.runner, plan, service)
+    const [parentGone, helperGone] = await Promise.all([
+      capturedProcessGone(options.runner, processes.parent),
+      capturedProcessGone(options.runner, processes.helper),
+    ])
+    if (serviceState === "absent" && parentGone && helperGone) return
+    await boundedDelay(Math.min(50, Math.max(1, deadlineAt - Date.now())))
+  }
+  throw new BootoutConvergenceError(service, processes)
+}
+
+async function inspectLaunchServiceConvergence(
+  runner: CommandRunner,
+  plan: RuntimeInstallPlan,
+  expected: LaunchServiceIdentity,
+): Promise<"absent" | "removing" | "running"> {
+  const result = await runner.run("/bin/launchctl", ["print", `${plan.service.domain}/${RUNTIME_SERVICE_LABEL}`], {
+    timeoutMs: 5_000,
+  })
+  if (result.exitCode !== 0) {
+    const failureText = `${result.stdout}\n${result.stderr}`
+    if (result.exitCode === 113 && /could not find service/i.test(failureText)
+      && failureText.includes(RUNTIME_SERVICE_LABEL)) return "absent"
+    throw new Error(`launchctl convergence probe failed (${result.exitCode}): ${result.stderr.trim()}`)
+  }
+  const lines = result.stdout.split("\n").map(line => line.trim())
+  const program = lines.find(line => line.startsWith("program = "))?.slice("program = ".length)
+  const plistPath = lines.find(line => line.startsWith("path = "))?.slice("path = ".length)
+  const pidText = lines.find(line => line.startsWith("pid = "))?.slice("pid = ".length)
+  if (program !== expected.program || plistPath !== expected.plistPath) {
+    throw new Error("После bootout exact label занял foreign replacement runtime")
+  }
+  if (pidText === undefined) return "removing"
+  const pid = Number(pidText)
+  if (!Number.isSafeInteger(pid) || pid < 1 || pid !== expected.pid) {
+    throw new Error("После bootout exact label получил foreign replacement PID")
+  }
+  return "running"
+}
+
+async function captureOwnedRuntimeProcesses(
+  runner: CommandRunner,
+  plan: RuntimeInstallPlan,
+  service: LaunchServiceIdentity,
+): Promise<OwnedRuntimeProcesses> {
+  const parent = await readProcessIncarnation(runner, service.pid)
+  if (parent === undefined || !commandMatchesPath(parent.command, service.program)) {
+    throw new Error("LaunchAgent runtime PID не совпадает с captured process incarnation")
+  }
+  const helperPath = service.program === stableApplicationRuntimePath(plan.paths)
+    ? stableApplicationHelperPath(plan.paths)
+    : plan.paths.stableHelperPath
+  const result = await checked(runner, "/bin/ps", ["-axww", "-o", "pid=,ppid=,lstart=,command="],
+    undefined, 5_000, { LC_ALL: "C", LANG: "C" })
+  const children = result.stdout.split("\n").flatMap(line => {
+    const identity = line.match(/^\s*(\d+)\s+(\d+)\s+/)
+    if (identity === null || Number(identity[2]) !== parent.pid) return []
+    return [parseProcessIncarnation(line)]
+  }).filter(process => commandMatchesPath(process.command, helperPath))
+  if (children.length !== 1) {
+    throw new Error("Loaded runtime не имеет ровно одного captured owned helper child")
+  }
+  return { parent, helper: children[0]! }
+}
+
+async function capturedProcessGone(runner: CommandRunner, captured: ProcessIncarnation): Promise<boolean> {
+  const current = await readProcessIncarnation(runner, captured.pid)
+  if (current === undefined) return true
+  if (current.startedAt !== captured.startedAt) return true
+  if (current.command !== captured.command) {
+    throw new Error(`Process ${captured.pid} изменил command при том же PID/lstart`)
+  }
+  return false
+}
+
+async function readProcessIncarnation(runner: CommandRunner, pid: number): Promise<ProcessIncarnation | undefined> {
+  const result = await runner.run("/bin/ps", ["-ww", "-p", String(pid), "-o", "pid=,ppid=,lstart=,command="], {
+    timeoutMs: 5_000,
+    env: { LC_ALL: "C", LANG: "C" },
+  })
+  if (result.exitCode !== 0) {
+    if (result.stdout.trim() === "" && result.stderr.trim() === "") return undefined
+    throw new Error(`ps process probe failed (${result.exitCode}): ${result.stderr.trim()}`)
+  }
+  const lines = result.stdout.split("\n").filter(line => line.trim().length > 0)
+  if (lines.length !== 1) throw new Error("ps process probe вернул неоднозначный record")
+  const process = parseProcessIncarnation(lines[0]!)
+  if (process.pid !== pid) throw new Error("ps process probe вернул другой PID")
+  return process
+}
+
+function parseProcessIncarnation(line: string): ProcessIncarnation {
+  const match = line.match(/^\s*(\d+)\s+(\d+)\s+(\S+\s+\S+\s+\d{1,2}\s+\d{2}:\d{2}:\d{2}\s+\d{4})\s+(.+)$/)
+  if (match === null) throw new Error("ps process incarnation не распознан")
+  const pid = Number(match[1])
+  const parentPid = Number(match[2])
+  const startedAt = match[3]!
+  const command = match[4]!.trim()
+  if (!Number.isSafeInteger(pid) || pid < 1 || !Number.isSafeInteger(parentPid) || parentPid < 0
+    || command.length < 1 || command.length > 16_384 || !Number.isFinite(Date.parse(startedAt))) {
+    throw new Error("ps process incarnation повреждён")
+  }
+  return { pid, parentPid, startedAt, command }
+}
+
+function commandMatchesPath(command: string, path: string): boolean {
+  return command === path || command.startsWith(`${path} `)
+}
+
+function shutdownConvergenceTimeout(options: RuntimeInstallOptions): number {
+  const timeout = options.shutdownConvergenceTimeoutMs ?? 5_000
+  if (!Number.isSafeInteger(timeout) || timeout < 100 || timeout > 10_000) {
+    throw new Error("Shutdown convergence timeout должен быть 100..10000 ms")
+  }
+  return timeout
 }
 
 async function assertExactServiceAndRuntime(
