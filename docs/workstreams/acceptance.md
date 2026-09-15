@@ -122,3 +122,38 @@ Package export `@meta/shared/contracts` используется из dependency
 непосредственно над SUT для A02/A31 и transport-части A05. Не восстанавливать
 reference Runtime/Ledger/security models. A42 расширять только после публикации
 настоящей retention/persistence поверхности.
+
+## UI fixture checkpoint
+
+Подготовлена минимальная AppKit application для будущей live-приёмки root:
+
+- `tests/computer-use/fixtures/app/main.m`
+- `tests/computer-use/fixtures/app/README.md`
+
+Fixture создаёт одну application с двумя окнами одинакового title и разными
+stable accessibility identifiers, editable NSTextView с RU/EN/emoji/composed
+text, button, bounded scroll area, slider и owned sheet без persistence. Secondary
+window можно закрыть и воссоздать с тем же semantic identifier для проверки
+новой OS instance identity. Обычные AppKit hide/minimize/move/resize/close
+actions остаются доступными.
+
+Опциональный `--test-hook` принимает только read-only JSONL `state` requests по
+stdin и выдаёт bounded structured state/events в stdout. Он не выполняет UI
+mutations, не адресует чужие приложения и не является вторым computer-use
+backend. Payload ограничен 4096 bytes, text — 2048 UTF-16 units, stdout — 1024
+envelopes на process.
+
+Compile check выполнен без запуска binary:
+
+```text
+/usr/bin/clang -fobjc-arc -mmacosx-version-min=13.0 \
+  -Wall -Wextra -Werror -framework AppKit -framework Foundation \
+  tests/computer-use/fixtures/app/main.m -o <temporary>/ComputerUseFixture
+file: Mach-O 64-bit executable x86_64
+```
+
+Временный binary и каталог удалены. NSApplication/окна не запускались; live
+input/capture/clipboard/browser/ADB/permissions не выполнялись. README содержит
+честный mapping A14–A29: какие assertions даёт эта UI fixture, какие требуют
+native/capture fault driver и какие не покрыты. Compile не считается visual,
+AX/CG или input-routing acceptance.
