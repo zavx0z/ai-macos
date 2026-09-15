@@ -22,6 +22,9 @@
 #include "recovery-probe/meta_recovery_probe.h"
 #include "readiness-command/meta_readiness_system.h"
 #include "input-observer/meta_input_observer_binding.h"
+#include "cursor-display/meta_cursor_display.h"
+#include "ax-actions/meta_ax_retained_snapshot.h"
+#include "ax-actions/meta_ax_press.h"
 #include <time.h>
 #include <math.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -46,6 +49,7 @@
 @property(nonatomic, strong) NSDictionary *request;
 @property(nonatomic, strong) NSDictionary *result;
 @property(nonatomic, strong) NSString *snapshotId;
+@property(nonatomic, strong) MetaAXRetainedSnapshotRegistry *registry;
 @end
 @implementation MetaInspectionBorrowContext
 @end
@@ -68,8 +72,36 @@ static bool inspect_borrowed(void *context, const MetaAXTargetBorrow *borrow) {
   MetaInspectionBorrowContext *binding = (__bridge MetaInspectionBorrowContext *)context;
   MetaAXInspectionContext request = {0};
   if (!meta_ax_build_request(borrow, binding.request, binding.snapshotId, &request)) return false;
-  binding.result = meta_ax_inspect_borrowed_element(borrow->element, request);
+  NSMutableDictionary *elements = [NSMutableDictionary dictionary];
+  binding.result = meta_ax_inspect_borrowed_element_and_observer(borrow->element, request,
+    ^BOOL(NSString *elementRef, id element, NSArray<NSString *> *actions) {
+      (void)actions;
+      if (elements.count >= 1500 || elements[elementRef] != nil || element == nil) return NO;
+      elements[elementRef] = element;
+      return YES;
+    });
+  if (binding.result != nil && ![binding.registry publishTarget:binding.request[@"payload"][@"target"]
+      inventoryId:@(borrow->inventory_id) inventoryRevision:borrow->inventory_revision
+      snapshotId:binding.snapshotId nodes:binding.result[@"nodes"] borrowedElements:elements]) {
+    binding.result = nil;
+  }
   return binding.result != nil;
+}
+
+static bool consume_borrow_block(void *context, const MetaAXTargetBorrow *borrow) {
+  return ((__bridge BOOL (^)(const MetaAXTargetBorrow *))context)(borrow);
+}
+
+static uint64_t native_millis(void) {
+  struct timespec now = {0};
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  return (uint64_t)now.tv_sec * 1000 + (uint64_t)now.tv_nsec / 1000000;
+}
+
+static BOOL unsigned_json_number(id value) {
+  return [value isKindOfClass:NSNumber.class] && CFGetTypeID((__bridge CFTypeRef)value) != CFBooleanGetTypeID() &&
+      isfinite([value doubleValue]) && [value doubleValue] >= 0 && [value doubleValue] <= 9007199254740991.0 &&
+      [value doubleValue] == [value unsignedLongLongValue];
 }
 
 static bool verify_window_borrow(void *context, const MetaAXTargetBorrow *borrow) {
@@ -149,6 +181,7 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
   NSMutableDictionary<NSString *, NSString *> *_applicationTaskRefs;
   MetaMacOSInput *_input;
   MetaInputExecutor *_inputExecutor;
+  MetaAXRetainedSnapshotRegistry *_axSnapshots;
   MetaApplicationBundles *_bundles;
   MetaApplicationCommandBinder *_applications;
   MetaApplicationBackend _applicationBackend;
@@ -165,6 +198,8 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
     _applicationTaskRefs = [NSMutableDictionary dictionary];
     _captures = meta_capture_router_create(generation.UTF8String, meta_capture_router_default_backend());
     _input = meta_macos_input_create();
+    _axSnapshots = [[MetaAXRetainedSnapshotRegistry alloc] initWithClock:^uint64_t { return native_millis(); }
+      ttlMillis:120000 maxSnapshots:64 maxNodes:1500];
     _applicationBackend = meta_application_system_backend();
     MetaExecutorBackend sink = {.context = _input, .post_held_event = meta_macos_input_post_held,
       .post_text_cluster = meta_macos_input_post_text, .set_event_flags = meta_macos_input_set_flags,
@@ -209,7 +244,7 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
     _captureCommands = [[MetaCaptureCommandBinder alloc] initWithRouter:_captures inventoryProvider:^const MetaInventorySnapshot * {
       return meta_macos_backend_snapshot(windows);
     } nativeGeneration:generation nativeBuildId:@META_NATIVE_BUILD_ID];
-    if (_windows == NULL || _captures == NULL || _input == NULL || _inputExecutor == nil || _core == NULL || _captureCommands == nil) return nil;
+    if (_windows == NULL || _captures == NULL || _input == NULL || _inputExecutor == nil || _core == NULL || _captureCommands == nil || _axSnapshots == nil) return nil;
   }
   return self;
 }
@@ -574,17 +609,104 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
   if (snapshot == NULL) return nil;
   MetaInspectionBorrowContext *binding = [[MetaInspectionBorrowContext alloc] init];
   binding.request = request;
+  binding.registry = _axSnapshots;
   binding.snapshotId = [@"ax-" stringByAppendingString:NSUUID.UUID.UUIDString];
   MetaAXBorrowStatus status = meta_macos_with_ax_target(_windows, targetRef.UTF8String,
       snapshot->inventory_id, snapshot->revision, [request[@"nativeGeneration"] UTF8String],
       inspect_borrowed, (__bridge void *)binding);
   if (status != META_AX_BORROW_OK) {
+    [_axSnapshots invalidateTarget:target];
     NSString *code = status == META_AX_BORROW_PERMISSION_DENIED ? @"permission-denied" :
                      status == META_AX_BORROW_TARGET_STALE ? @"target-stale" : @"inventory-incomplete";
     return @{@"nativeError": @{@"code": code, @"message": @"AX inspector не получил подтверждённую live target reference",
       @"stage": @"ax-inspect-borrow", @"retryable": @NO, @"replayAllowed": @NO, @"recoveryAction": @"refresh-inventory"}};
   }
   return binding.result;
+}
+
+- (NSDictionary *)cursorDisplay:(NSDictionary *)request {
+  NSDictionary *payload = request[@"payload"];
+  if (![payload isKindOfClass:NSDictionary.class] || ![payload[@"inventoryId"] isKindOfClass:NSString.class] ||
+      !unsigned_json_number(payload[@"inventoryRevision"]) || !unsigned_json_number(payload[@"displayLayoutRevision"])) return nil;
+  NSDictionary *generation = @{@"runtimeEpoch": request[@"runtimeEpoch"], @"loginSessionId": request[@"loginSessionId"], @"nativeGeneration": request[@"nativeGeneration"]};
+  return meta_cursor_display_read(_windows, generation, payload[@"inventoryId"],
+    [payload[@"inventoryRevision"] unsignedLongLongValue], [payload[@"displayLayoutRevision"] unsignedLongLongValue]);
+}
+
+- (NSDictionary *)executeAxPress:(NSDictionary *)request job:(MetaInputJob *)job {
+  NSDictionary *operation = job.operation, *target = operation[@"target"], *ref = target[@"ref"];
+  NSDictionary *element = request[@"payload"][@"element"];
+  const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(_windows);
+  BOOL surface = [target[@"kind"] isEqual:@"surface"];
+  NSString *targetRef = surface ? ref[@"surfaceRef"] : ref[@"windowRef"];
+  if (snapshot == NULL || ![@[@"window", @"surface"] containsObject:target[@"kind"]] ||
+      ![targetRef isKindOfClass:NSString.class] || ![element isKindOfClass:NSDictionary.class] ||
+      ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] || !unsigned_json_number(operation[@"inventoryRevision"]) ||
+      [operation[@"inventoryRevision"] unsignedLongLongValue] != snapshot->revision ||
+      ![element[@"applicationRef"] isEqual:ref[@"applicationRef"]]) return nil;
+  for (NSString *key in @[@"runtimeEpoch", @"loginSessionId", @"nativeGeneration"]) {
+    if (![operation[key] isEqual:element[key]] || ![operation[key] isEqual:ref[key]]) return nil;
+  }
+  NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+  formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+  NSDate *deadlineDate = [formatter dateFromString:request[@"deadlineAt"]];
+  NSTimeInterval remaining = deadlineDate.timeIntervalSinceNow * 1000;
+  if (deadlineDate == nil || remaining <= 0) return nil;
+  uint64_t deadline = native_millis() + (uint64_t)MIN(remaining, 5000);
+  MetaMacOSBackend *windows = _windows;
+  MetaExecutor *executor = [_inputExecutor executorOnActionWorker];
+  __block BOOL accepted = NO;
+  __block NSString *code = @"target-stale";
+  __block NSString *message = @"Retained AX snapshot или exact parent недоступны";
+  BOOL (^identity)(const MetaAXTargetBorrow *) = ^BOOL(const MetaAXTargetBorrow *borrow) {
+    return [ref[@"applicationRef"] isEqual:@(borrow->target.application_ref)] &&
+      (surface ? borrow->target.surface_kind == META_SURFACE_SHEET && [ref[@"ownerWindowRef"] isEqual:@(borrow->target.owner_window_ref)] : borrow->target.surface_kind == META_SURFACE_WINDOW);
+  };
+  NSDictionary *execution = [_inputExecutor executePrimitive:request job:job targetRef:targetRef
+    verify:^BOOL(NSString *value) {
+      return [value isEqual:targetRef] && session_allows_input(operation[@"loginSessionId"]) &&
+        meta_macos_with_ax_target(windows, targetRef.UTF8String, [operation[@"inventoryId"] UTF8String],
+          [operation[@"inventoryRevision"] unsignedLongLongValue], [operation[@"nativeGeneration"] UTF8String],
+          consume_borrow_block, (__bridge void *)identity) == META_AX_BORROW_OK;
+    } action:^NSDictionary * {
+      __block BOOL visited = NO;
+      MetaAXRetainedBorrowStatus retained = [self->_axSnapshots withPressElement:element target:target
+        inventoryId:operation[@"inventoryId"] inventoryRevision:[operation[@"inventoryRevision"] unsignedLongLongValue]
+        consume:^BOOL(id retainedElement) {
+          visited = YES;
+          __block MetaAXPressOutcome outcome = {.status = META_AX_PRESS_INVALID_REQUEST};
+          BOOL (^press)(const MetaAXTargetBorrow *) = ^BOOL(const MetaAXTargetBorrow *borrow) {
+            if (!identity(borrow)) return NO;
+            outcome = meta_ax_press_borrowed_elements((__bridge AXUIElementRef)retainedElement, borrow->element,
+              (MetaAXPressContext){.owner_pid = borrow->target.pid, .max_ancestry_depth = 32,
+                .deadline_millis = deadline, .per_call_timeout_millis = 500},
+              ^BOOL(BOOL (^perform)(void)) {
+                return meta_executor_dispatch_action(executor, dispatch_block, (__bridge void *)perform, "ax-press");
+              });
+            return YES;
+          };
+          MetaAXBorrowStatus borrowed = meta_macos_with_ax_target(windows, targetRef.UTF8String,
+            [operation[@"inventoryId"] UTF8String], [operation[@"inventoryRevision"] unsignedLongLongValue],
+            [operation[@"nativeGeneration"] UTF8String], consume_borrow_block, (__bridge void *)press);
+          accepted = borrowed == META_AX_BORROW_OK && outcome.status == META_AX_PRESS_SUCCEEDED && outcome.dispatch_attempted;
+          if (!accepted) {
+            code = outcome.dispatch_attempted ? @"operation-outcome-unknown" :
+              outcome.status == META_AX_PRESS_ACTION_UNAVAILABLE ? @"unsupported-capability" : @"target-stale";
+            message = [NSString stringWithFormat:@"AXPress не подтверждён: borrow=%ld, status=%ld, AXError=%d",
+              (long)borrowed, (long)outcome.status, outcome.ax_error];
+          }
+          return accepted;
+        }];
+      if (!visited && retained == META_AX_RETAINED_BORROW_ACTION_UNAVAILABLE) code = @"unsupported-capability";
+      if (!accepted) meta_executor_fail(executor, "ax-press-not-confirmed");
+      return accepted ? @{@"element": element, @"action": @"AXPress", @"performed": @YES} : @{};
+    }];
+  if (accepted && [execution[@"finished"] boolValue]) return @{@"value": execution[@"value"], @"status": execution[@"status"]};
+  if (accepted) { code = @"operation-outcome-unknown"; message = @"AXPress вызван, но parent operation не подтвердила finish"; }
+  NSMutableDictionary *failure = [@{@"nativeError": @{@"code": code, @"message": message, @"stage": @"ax-press",
+    @"retryable": @NO, @"replayAllowed": @NO, @"recoveryAction": @"refresh-inventory"}} mutableCopy];
+  if (execution[@"status"] != nil) failure[@"nativeStatus"] = execution[@"status"];
+  return failure;
 }
 
 static NSString *clipboard_error(MetaClipboardStatus status) {

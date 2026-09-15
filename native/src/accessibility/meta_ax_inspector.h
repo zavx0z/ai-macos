@@ -43,13 +43,29 @@ typedef struct {
                                  value:(NSArray **)value;
 @end
 
+typedef BOOL (^MetaAXInspectionNodeObserver)(
+    NSString *elementRef,
+    id borrowedElement,
+    NSArray<NSString *> *advertisedActions);
+
 NSDictionary *meta_ax_inspect_with_backend(
     id borrowedRoot,
     MetaAXInspectionContext context,
     id<MetaAXInspectionBackend> backend);
 
+NSDictionary *meta_ax_inspect_with_backend_and_observer(
+    id borrowedRoot,
+    MetaAXInspectionContext context,
+    id<MetaAXInspectionBackend> backend,
+    MetaAXInspectionNodeObserver observer);
+
 NSDictionary *meta_ax_inspect_borrowed_element(
     AXUIElementRef borrowedRoot,
     MetaAXInspectionContext context);
+
+NSDictionary *meta_ax_inspect_borrowed_element_and_observer(
+    AXUIElementRef borrowedRoot,
+    MetaAXInspectionContext context,
+    MetaAXInspectionNodeObserver observer);
 
 #endif

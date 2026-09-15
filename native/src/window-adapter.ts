@@ -1,6 +1,7 @@
 import {
   NATIVE_PROTOCOL_VERSION,
   authorizeAdapterContext,
+  nativeStatusMatchesOperation,
   desktopInventorySnapshotSchema,
   structurallyEqual,
   windowTransitionResultSchema,
@@ -29,10 +30,15 @@ import {
   type WindowTransitionResult,
   type AxInspectionRequest,
   type AxInspectionResult,
+  type AxPressRequest,
+  type AxPressResult,
 } from "@meta/shared/contracts"
 import {
   nativeAxInspectionRequestSchema,
   nativeAxInspectionResponseSchema,
+  nativeAxPressRequestSchema,
+  nativeAxPressResponseSchema,
+  nativeAxPressResultMatches,
   nativeInventoryRequestSchema,
   nativeInventoryResponseSchema,
   nativeWindowTransitionRequestSchema,
@@ -129,6 +135,53 @@ export class NativeWindowAdapter implements WindowAdapter {
       ok: true,
       value,
       outcome: outcomeFromStatus(response.result.status, context.resources),
+    }
+  }
+
+  async press(
+    context: RuntimeOperationContext<NativeExecutionContext>,
+    request: AxPressRequest,
+  ): Promise<AdapterResult<AxPressResult>> {
+    await authorizeAdapterContext(this.host, this.services, context, new Date())
+    const nativeRequest = nativeAxPressRequestSchema.parse({
+      kind: "request",
+      intent: "mutation",
+      protocolVersion: NATIVE_PROTOCOL_VERSION,
+      requestId: requestId("ax-press"),
+      runtimeEpoch: context.wire.runtimeEpoch,
+      loginSessionId: context.wire.loginSessionId,
+      nativeGeneration: context.wire.nativeGeneration,
+      deadlineAt: context.wire.deadlineAt,
+      method: "ax.press",
+      operation: context.wire,
+      payload: request,
+    })
+    const response = await this.#native.request(
+      nativeAxPressRequestSchema,
+      nativeRequest,
+      nativeAxPressResponseSchema,
+      context.control,
+    )
+    const status = response.ok ? response.result.status : response.nativeStatus
+    if (status !== undefined && (status.requestId !== nativeRequest.requestId || !nativeStatusMatchesOperation(context.wire, status))) {
+      throw new Error("AXPress status не совпадает с exact request, operation или fence")
+    }
+    if (!response.ok) {
+      return {
+        ok: false,
+        error: response.error,
+        outcome: status === undefined ? unknownOutcome(context.resources) : outcomeFromStatus(status, context.resources),
+        ...(status === undefined ? {} : { nativeStatus: status }),
+      }
+    }
+    if (!nativeAxPressResultMatches(nativeRequest, response.result)) {
+      throw new Error("AXPress result содержит другой retained element или accepted fence")
+    }
+    return {
+      ok: true,
+      value: response.result.value,
+      outcome: outcomeFromStatus(response.result.status, context.resources),
+      nativeStatus: response.result.status,
     }
   }
 

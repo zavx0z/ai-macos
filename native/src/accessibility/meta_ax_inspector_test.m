@@ -239,6 +239,43 @@ static void test_owner_mismatch_fails_closed(void) {
   assert([result[@"nodeCount"] unsignedIntegerValue] == 0);
 }
 
+static void test_retention_observer_sees_exact_added_nodes(void) {
+  FixtureNode *root = node(@"AXWindow", @"Документ");
+  FixtureNode *button = node(@"AXButton", @"Кнопка");
+  [root.children addObject:button];
+  FixtureBackend *backend = [[FixtureBackend alloc] init];
+  NSMutableDictionary<NSString *, id> *retained = [NSMutableDictionary dictionary];
+  NSDictionary *result = meta_ax_inspect_with_backend_and_observer(
+      root, context(1000, 10, 1024 * 1024), backend,
+      ^BOOL(NSString *elementRef,
+            id borrowedElement,
+            NSArray<NSString *> *advertisedActions) {
+        assert([advertisedActions isEqual:@[@"AXPress"]]);
+        retained[elementRef] = borrowedElement;
+        return YES;
+      });
+  assert([result[@"complete"] boolValue]);
+  assert(retained.count == 2);
+  assert(retained[@"ax-node:1"] == root);
+  assert(retained[@"ax-node:2"] == button);
+}
+
+static void test_rejected_retention_removes_actionability(void) {
+  FixtureNode *root = node(@"AXButton", @"Кнопка");
+  FixtureBackend *backend = [[FixtureBackend alloc] init];
+  NSDictionary *result = meta_ax_inspect_with_backend_and_observer(
+      root, context(1000, 10, 1024 * 1024), backend,
+      ^BOOL(__unused NSString *elementRef,
+            __unused id borrowedElement,
+            __unused NSArray<NSString *> *advertisedActions) {
+        return NO;
+      });
+  assert(![result[@"complete"] boolValue]);
+  assert([result[@"nodes"][0][@"actions"] count] == 0);
+  assert([result[@"errors"] containsObject:
+                                @"AX node retention observer rejected element"]);
+}
+
 int main(void) {
   @autoreleasepool {
     test_bounded_tree();
@@ -249,6 +286,8 @@ int main(void) {
     test_byte_budget_is_hard();
     test_single_oversized_grapheme_never_crosses_string_limit();
     test_owner_mismatch_fails_closed();
+    test_retention_observer_sees_exact_added_nodes();
+    test_rejected_retention_removes_actionability();
     puts("AX inspector tests passed");
   }
   return 0;

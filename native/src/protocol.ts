@@ -45,6 +45,10 @@ import { nativeHitTestRequestSchema, nativeHitTestResponseSchema } from "./hit-t
 export * from "./hit-test-protocol.ts"
 import { nativeInputReadinessRequestSchema, nativeInputReadinessResponseSchema } from "./readiness-protocol.ts"
 export * from "./readiness-protocol.ts"
+import { nativeAxPressRequestSchema, nativeAxPressResponseSchema } from "./ax-actions/protocol.ts"
+export * from "./ax-actions/protocol.ts"
+import { nativeCursorDisplayRequestSchema, nativeCursorDisplayResponseSchema } from "./cursor-display-protocol.ts"
+export * from "./cursor-display-protocol.ts"
 import {
   nativeApplicationResolveRequestSchema, nativeApplicationResolveResponseSchema,
   nativeApplicationLaunchRequestSchema, nativeApplicationLaunchResponseSchema,
@@ -709,6 +713,8 @@ export const nativeCaptureReleaseRequestSchema = createNativeMutationRequestEnve
 export const nativeCaptureReleaseResponseSchema = createNativeResponseEnvelopeSchema(nativeCaptureReleaseResultSchema)
 
 export const nativeMethodRequestSchema = z.union([
+  nativeCursorDisplayRequestSchema,
+  nativeAxPressRequestSchema,
   nativeInputReadinessRequestSchema,
   nativeHitTestRequestSchema,
   nativeApplicationResolveRequestSchema,
@@ -726,6 +732,8 @@ export const nativeMethodRequestSchema = z.union([
 ])
 
 export const nativeMethodResponseSchema = z.union([
+  nativeCursorDisplayResponseSchema,
+  nativeAxPressResponseSchema,
   nativeInputReadinessResponseSchema,
   nativeHitTestResponseSchema,
   nativeApplicationResolveResponseSchema,

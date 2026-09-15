@@ -155,7 +155,7 @@ static NSDictionary *status_fence(MetaFence fence) {
   NSMutableDictionary *observer = [generation mutableCopy];
   [observer addEntriesFromDictionary:@{@"state": @"unavailable", @"coverageStartCursor": @"observer-0", @"cursor": @"observer-0", @"nextSequence": @1,
     @"startedAt": now, @"coveredFrom": now, @"coveredThrough": now, @"heartbeatAt": now,
-    @"coveredKinds": @[], @"droppedEvents": @0, @"gapDetected": @NO, @"reason": @"Native event observer ещё не подключён"}];
+    @"coveredKinds": @[], @"droppedEvents": @0, @"gapDetected": @NO, @"reason": @"Native observer coverage не подтверждена для текущей operation"}];
   [_condition lock];
   NSDictionary *(^coverageProvider)(void) = _observerCoverageProvider;
   [_condition unlock];

@@ -16,7 +16,7 @@ static BOOL identifier(const char *value, size_t maximum) {
 
 static NSString *bounded_string(NSString *value, NSUInteger maximum) {
   if (![value isKindOfClass:NSString.class]) return @"";
-  if (value.length <= maximum) return value;
+  if (value.length <= maximum) return [value copy];
   __block NSUInteger end = 0;
   [value enumerateSubstringsInRange:NSMakeRange(0, value.length)
                             options:NSStringEnumerationByComposedCharacterSequences
@@ -187,6 +187,15 @@ NSDictionary *meta_ax_inspect_with_backend(
     id borrowedRoot,
     MetaAXInspectionContext context,
     id<MetaAXInspectionBackend> backend) {
+  return meta_ax_inspect_with_backend_and_observer(
+      borrowedRoot, context, backend, nil);
+}
+
+NSDictionary *meta_ax_inspect_with_backend_and_observer(
+    id borrowedRoot,
+    MetaAXInspectionContext context,
+    id<MetaAXInspectionBackend> backend,
+    MetaAXInspectionNodeObserver observer) {
   if (borrowedRoot == nil || backend == nil ||
       !identifier(context.runtime_epoch, 64) ||
       !identifier(context.login_session_id, 64) ||
@@ -285,6 +294,20 @@ NSDictionary *meta_ax_inspect_with_backend(
       complete = NO;
       add_error(errors, @"AX node exceeded remaining byte budget");
       break;
+    }
+    if (observer != nil &&
+        !observer(elementRef, element, [actions copy])) {
+      node[@"actions"] = @[];
+      complete = NO;
+      add_error(errors, @"AX node retention observer rejected element");
+      encodedNode = [NSJSONSerialization dataWithJSONObject:node
+                                                    options:0
+                                                      error:NULL];
+      if (encodedNode == nil ||
+          nodeBytes + encodedNode.length + 512 > context.max_bytes) {
+        add_error(errors, @"AX retained node exceeded remaining byte budget");
+        break;
+      }
     }
     [nodes addObject:node];
     nodeBytes += encodedNode.length + 1;
@@ -540,12 +563,20 @@ NSDictionary *meta_ax_inspect_with_backend(
 NSDictionary *meta_ax_inspect_borrowed_element(
     AXUIElementRef borrowedRoot,
     MetaAXInspectionContext context) {
+  return meta_ax_inspect_borrowed_element_and_observer(
+      borrowedRoot, context, nil);
+}
+
+NSDictionary *meta_ax_inspect_borrowed_element_and_observer(
+    AXUIElementRef borrowedRoot,
+    MetaAXInspectionContext context,
+    MetaAXInspectionNodeObserver observer) {
   if (borrowedRoot == NULL || CFGetTypeID(borrowedRoot) != AXUIElementGetTypeID()) {
     return nil;
   }
   MetaAXSystemBackend *backend = [[MetaAXSystemBackend alloc]
       initWithTimeoutMillis:context.per_call_timeout_millis
              deadlineMillis:context.deadline_millis];
-  return meta_ax_inspect_with_backend((__bridge id)borrowedRoot, context,
-                                      backend);
+  return meta_ax_inspect_with_backend_and_observer(
+      (__bridge id)borrowedRoot, context, backend, observer);
 }
