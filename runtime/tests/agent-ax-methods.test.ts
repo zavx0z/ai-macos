@@ -30,6 +30,9 @@ const nativeGeneration = "native:agent-ax"
 const windowRef = { ...generation, nativeGeneration,
   applicationRef: "application:agent-ax", windowRef: "window:agent-ax" }
 const target = { kind: "window" as const, ref: windowRef }
+const surfaceRef = { ...generation, nativeGeneration, applicationRef: windowRef.applicationRef,
+  surfaceRef: "surface:agent-ax", ownerWindowRef: windowRef.windowRef }
+const surfaceTarget = { kind: "surface" as const, ref: surfaceRef }
 
 test("click выполняет exact AXPress и публикует только короткий operation outcome", async () => {
   const fixture = createFixture()
@@ -113,6 +116,42 @@ test("cancel exact AXPress сохраняет authoritative cancelled cleanup", 
   await fixture.guard.close()
 })
 
+test("modal surface AXPress использует exact surface и replacement не ретаргетится", async () => {
+  const fixture = createFixture()
+  fixture.windows.surface = surfaceRecord()
+  fixture.core.targets.register(surfaceTarget, "inventory:agent-ax", 1,
+    "resolution:surface-agent-ax", "proof:surface-agent-ax", 1, undefined, 120_000)
+  const client = fixture.core.openClient("principal:surface-click")
+  const state = await fixture.registry.dispatch(client.session, "get_state", {
+    kind: "window",
+  }, new AbortController().signal)
+  const surface = (state.data.surfaces as Array<{ targetId: string, ownerTargetId: string }>)[0]!
+  const observed = await fixture.registry.dispatch(client.session, "observe", {
+    targetId: surface.targetId,
+    mode: "ax",
+  }, new AbortController().signal)
+  const elementId = (observed.data.elements as Array<{ elementId: string }>)[0]!.elementId
+  const clicked = await fixture.registry.dispatch(client.session, "click", {
+    targetId: surface.targetId,
+    elementId,
+  }, new AbortController().signal)
+  expect(clicked.data).toMatchObject({ targetId: surface.targetId, outcome: { state: "completed" } })
+  expect(fixture.windows.presses[0]?.target).toEqual(surfaceTarget)
+  expect(surface.ownerTargetId).not.toBe(surface.targetId)
+
+  const next = await fixture.registry.dispatch(client.session, "observe", {
+    targetId: surface.targetId,
+    mode: "ax",
+  }, new AbortController().signal)
+  fixture.windows.surface = surfaceRecord({ ...surfaceRef, surfaceRef: "surface:replacement" })
+  await expect(fixture.registry.dispatch(client.session, "click", {
+    targetId: surface.targetId,
+    elementId: (next.data.elements as Array<{ elementId: string }>)[0]!.elementId,
+  }, new AbortController().signal)).rejects.toThrow("не ретаргетирован")
+  expect(fixture.windows.presses).toHaveLength(1)
+  await fixture.guard.close()
+})
+
 function createFixture() {
   const native = new FixtureNative()
   const core = new RuntimeCore({ generation, runtimeBuildId: "build:agent-ax", nativeGeneration,
@@ -181,6 +220,7 @@ class FixtureWindows implements RuntimeWindowAdapter {
   readonly capabilities = ["desktop.ax"] as const
   readonly presses: Array<{ target: unknown, request: unknown }> = []
   cancelMode = false
+  surface: ReturnType<typeof surfaceRecord> | undefined
   admissions = 0
   #snapshot = 0
   inspections = 0
@@ -197,7 +237,7 @@ class FixtureWindows implements RuntimeWindowAdapter {
   }
 
   async inventory() {
-    return inventory()
+    return inventory(this.surface)
   }
 
   async inspect(request: Parameters<RuntimeWindowAdapter["inspect"]>[0]) {
@@ -332,7 +372,7 @@ class FixtureNative {
   }
 }
 
-function inventory() {
+function inventory(surface?: ReturnType<typeof surfaceRecord>) {
   const now = new Date().toISOString()
   return desktopInventorySnapshotSchema.parse({
     inventoryId: "inventory:agent-ax",
@@ -346,7 +386,7 @@ function inventory() {
     applications: [{ ref: { ...generation, nativeGeneration, applicationRef: windowRef.applicationRef,
       pid: 101, launchedAt: "2026-09-15T10:00:00.000Z", registrationNonce: "registration:agent-ax" },
       name: "Fixture AX", hidden: "false", axStatus: "ready", windowCount: 1 }],
-    windows: [{ kind: "ax-window", ref: windowRef, surfaces: [], ownerPid: 101, cgWindowId: 77,
+    windows: [{ kind: "ax-window", ref: windowRef, surfaces: surface === undefined ? [] : [surface], ownerPid: 101, cgWindowId: 77,
       title: "Fixture AX", role: "AXWindow", subrole: "AXStandardWindow",
       frame: { x: 0, y: 0, width: 640, height: 480 }, applicationHidden: "false",
       minimized: "false", onScreen: "true", spaceVisibility: "current", fullscreen: "false",
@@ -359,6 +399,19 @@ function inventory() {
       actionability: "ax", advertisedActions: ["raise"], permittedActions: ["raise"] }],
     displays: [],
   })
+}
+
+function surfaceRecord(ref = surfaceRef) {
+  return {
+    ref,
+    kind: "sheet" as const,
+    title: "Save changes",
+    role: "AXSheet",
+    frame: { x: 40, y: 50, width: 300, height: 200 },
+    actionability: "ax" as const,
+    advertisedActions: ["close" as const],
+    permittedActions: ["close" as const],
+  }
 }
 
 function outcome(

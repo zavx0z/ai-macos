@@ -11,10 +11,14 @@ import {
   type BrowserOperationResult,
   type BrowserTargetSnapshot,
   type DesktopInventorySnapshot,
+  type DesktopLayoutCaptureTarget,
+  type DisplayCaptureTarget,
+  type DisplayRecord,
   type AxInspectionResult,
   type RuntimeClientSession,
   type ScreenCaptureResult,
   type WindowRecord,
+  type SurfaceRecord,
 } from "@meta/shared/contracts"
 import type { RuntimeCore } from "./core.ts"
 import type { MethodRegistry, RuntimeMethodResponse } from "./method-registry.ts"
@@ -45,6 +49,33 @@ const windowSchema = z.strictObject({
   focused: z.enum(["true", "false", "unknown"]),
   actionExpiresAt: z.string(),
 })
+const surfaceSchema = z.strictObject({
+  targetId,
+  ownerTargetId: targetId,
+  kind: z.enum(["sheet", "popup", "menu", "unknown"]),
+  role: z.string(),
+  title: z.string(),
+  actionability: z.enum(["ax", "unavailable"]),
+  unavailableReason: z.string().optional(),
+  actionExpiresAt: z.string(),
+})
+const displaySchema = z.strictObject({
+  targetId,
+  kind: z.literal("display"),
+  nativeDisplayId: z.number().int(),
+  bounds: z.strictObject({ x: z.number(), y: z.number(), width: z.number(), height: z.number() }),
+  usableBounds: z.strictObject({ x: z.number(), y: z.number(), width: z.number(), height: z.number() }),
+  scale: z.number().positive(),
+  rotationDegrees: z.number().min(0).lt(360),
+  main: z.boolean(),
+  actionExpiresAt: z.string(),
+})
+const desktopLayoutSchema = z.strictObject({
+  targetId,
+  kind: z.literal("desktop-layout"),
+  displayTargetIds: z.array(targetId),
+  actionExpiresAt: z.string(),
+})
 const browserSchema = z.strictObject({
   browserId: targetId,
   kind: z.literal("browser"),
@@ -72,7 +103,10 @@ const stateOutputSchema = z.strictObject({
   errors: z.array(errorSchema),
   applications: z.array(applicationSchema),
   windows: z.array(windowSchema),
+  surfaces: z.array(surfaceSchema),
   unavailableWindows: z.array(unavailableWindowSchema),
+  displays: z.array(displaySchema),
+  desktopLayout: desktopLayoutSchema.optional(),
   browsers: z.array(browserSchema),
 })
 const tabsOutputSchema = z.strictObject({
@@ -106,10 +140,13 @@ type BrowserCapturePublicRequest = {
   target: Extract<BrowserOperationRequest, { kind: "capture-target" }>["target"]
   capture: Omit<Extract<BrowserOperationRequest, { kind: "capture-target" }>["capture"], "publication">
 }
-type FreshWindow = {
+type FreshNative = {
   inventory: DesktopInventorySnapshot
   selected: AgentTargetActionResolution
-  window: WindowRecord
+  window?: WindowRecord
+  surface?: SurfaceRecord
+  display?: DisplayRecord
+  captureTarget?: DisplayCaptureTarget | DesktopLayoutCaptureTarget
 }
 
 export type AgentMethodsOptions = {
@@ -146,9 +183,13 @@ export class RuntimeAgentMethods {
       title: "Доступные цели",
       description: "Возвращает короткие lineage-scoped handles точных окон и настроенных browser instances.",
       input: z.strictObject({
-        kind: z.enum(["window", "browser"]).optional(),
+        kind: z.enum(["window", "display", "browser"]).optional(),
         app: z.string().min(1).max(256).optional(),
         pid: z.number().int().min(1).max(0x7fffffff).optional(),
+      }).superRefine((input, context) => {
+        if (input.kind !== undefined && input.kind !== "window" && (input.app !== undefined || input.pid !== undefined)) {
+          context.addIssue({ code: "custom", message: "app/pid filters применимы только к window discovery" })
+        }
       }),
       output: stateOutputSchema,
       readOnly: true,
@@ -199,7 +240,7 @@ export class RuntimeAgentMethods {
 
   async #getState(
     session: RuntimeClientSession,
-    input: { kind?: "window" | "browser", app?: string, pid?: number },
+    input: { kind?: "window" | "display" | "browser", app?: string, pid?: number },
     signal: AbortSignal,
   ) {
     await this.#health(session, signal)
@@ -207,8 +248,11 @@ export class RuntimeAgentMethods {
     const errors: Array<{ stage: string, message: string }> = []
     let complete = true
     const windows: z.infer<typeof windowSchema>[] = []
+    const surfaces: z.infer<typeof surfaceSchema>[] = []
     const applications: z.infer<typeof applicationSchema>[] = []
     const unavailableWindows: z.infer<typeof unavailableWindowSchema>[] = []
+    const displays: z.infer<typeof displaySchema>[] = []
+    let desktopLayout: z.infer<typeof desktopLayoutSchema> | undefined
     const browsers: z.infer<typeof browserSchema>[] = []
     if (input.kind !== "browser") {
       try {
@@ -219,7 +263,7 @@ export class RuntimeAgentMethods {
         complete &&= inventory.complete
         errors.push(...publicErrors("list_windows", inventory.errors))
         const applicationByRef = new Map(inventory.applications.map(app => [String(app.ref.applicationRef), app]))
-        for (const application of inventory.applications) {
+        if (input.kind !== "display") for (const application of inventory.applications) {
           if (input.app !== undefined && ![application.name, application.bundleId, application.ref.applicationRef].includes(input.app)) continue
           if (input.pid !== undefined && application.ref.pid !== input.pid) continue
           applications.push({
@@ -233,7 +277,7 @@ export class RuntimeAgentMethods {
           })
         }
         const filteredApplicationPids = new Set(applications.map(application => application.pid))
-        for (const window of inventory.windows) {
+        if (input.kind !== "display") for (const window of inventory.windows) {
           if (window.kind !== "ax-window") {
             if (input.pid !== undefined && window.ownerPid !== input.pid) continue
             if (input.app !== undefined && !filteredApplicationPids.has(window.ownerPid)) continue
@@ -265,6 +309,62 @@ export class RuntimeAgentMethods {
             focused: window.focused,
             actionExpiresAt: handle.actionExpiresAt,
           })
+          for (const surface of window.surfaces) {
+            if (!surfaceOwnedByWindow(surface, window)) {
+              throw new Error("Surface owner ref не совпадает с содержащим exact window")
+            }
+            const surfaceHandle = scope.registerTarget({ kind: "surface", ref: surface.ref }, {
+              inventoryId: inventory.inventoryId,
+              inventoryRevision: inventory.revision,
+            })
+            surfaces.push({
+              targetId: surfaceHandle.targetId,
+              ownerTargetId: handle.targetId,
+              kind: surface.kind,
+              role: surface.role,
+              title: surface.title,
+              actionability: surface.actionability,
+              ...(surface.unavailableReason === undefined ? {} : { unavailableReason: surface.unavailableReason }),
+              actionExpiresAt: surfaceHandle.actionExpiresAt,
+            })
+          }
+        }
+        if (input.kind === "display" || input.kind === undefined && input.app === undefined && input.pid === undefined) {
+          const displayHandles = new Map<string, string>()
+          for (const display of inventory.displays) {
+            const handle = scope.registerTarget({ kind: "display", ref: display.ref }, {
+              inventoryId: inventory.inventoryId,
+              inventoryRevision: inventory.revision,
+            })
+            displayHandles.set(display.ref.displayRef, handle.targetId)
+            displays.push({
+              targetId: handle.targetId,
+              kind: "display",
+              nativeDisplayId: display.nativeDisplayId,
+              bounds: display.bounds,
+              usableBounds: display.usableBounds,
+              scale: display.scale,
+              rotationDegrees: display.rotationDegrees,
+              main: display.main,
+              actionExpiresAt: handle.actionExpiresAt,
+            })
+          }
+          if (inventory.desktopLayout !== undefined) {
+            const handle = scope.registerTarget(inventory.desktopLayout.target, {
+              inventoryId: inventory.inventoryId,
+              inventoryRevision: inventory.revision,
+            })
+            desktopLayout = {
+              targetId: handle.targetId,
+              kind: "desktop-layout",
+              displayTargetIds: inventory.desktopLayout.displays.map(display => {
+                const displayTargetId = displayHandles.get(display.target.ref.displayRef)
+                if (displayTargetId === undefined) throw new Error("Desktop layout содержит неизвестный display")
+                return displayTargetId
+              }),
+              actionExpiresAt: handle.actionExpiresAt,
+            }
+          }
         }
       } catch (error) {
         complete = false
@@ -272,7 +372,7 @@ export class RuntimeAgentMethods {
       }
     }
     const chromeAvailable = this.#registry.internal.descriptors().tools.some(tool => tool.name === "browser_chrome_instances")
-    if (chromeAvailable && input.kind !== "window" && input.app === undefined && input.pid === undefined) {
+    if (chromeAvailable && input.kind !== "window" && input.kind !== "display" && input.app === undefined && input.pid === undefined) {
       try {
         const response = await this.#dispatch(session, "browser_chrome_instances", {}, signal)
         const snapshot = response.data as BrowserInstanceSnapshot
@@ -296,7 +396,8 @@ export class RuntimeAgentMethods {
         errors.push(publicError("browser_chrome_instances", error))
       }
     }
-    return stateOutputSchema.parse({ complete, errors, applications, windows, unavailableWindows, browsers })
+    return stateOutputSchema.parse({ complete, errors, applications, windows, surfaces,
+      unavailableWindows, displays, ...(desktopLayout === undefined ? {} : { desktopLayout }), browsers })
   }
 
   async #getTabs(session: RuntimeClientSession, browserId: string, signal: AbortSignal) {
@@ -388,14 +489,14 @@ export class RuntimeAgentMethods {
     return this.#inspectWindow(session, scope, targetIdValue, fresh.selected, signal)
   }
 
-  async refreshWindowAction(
+  async refreshNativeAction(
     session: RuntimeClientSession,
     targetIdValue: string,
     binding: AgentTargetActionResolution,
     signal: AbortSignal,
   ): Promise<AgentTargetActionResolution> {
     await this.#health(session, signal)
-    return (await this.#refreshWindow(session, this.#scope(session), targetIdValue, binding, signal)).selected
+    return (await this.#refreshNative(session, this.#scope(session), targetIdValue, binding, signal)).selected
   }
 
   async getLatestObservation(session: RuntimeClientSession, targetIdValue: string): Promise<{ imageId: string, observation: Observation }> {
@@ -440,16 +541,51 @@ export class RuntimeAgentMethods {
     mode: "ax" | "screenshot" | "both",
     caption: string | undefined,
     signal: AbortSignal,
-  ) {
+  ): Promise<z.infer<typeof observedStateSchema>> {
     await this.#health(session, signal)
     const scope = this.#scope(session)
     const selected = scope.resolveAction(targetIdValue)
-    this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
     if (selected.target.kind === "browser-target") {
+      this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
       return this.#observeBrowser(session, scope, targetIdValue, selected, mode, caption, signal)
     }
-    if (selected.target.kind !== "window") throw new Error("observe поддерживает window или browser target")
-    const fresh = await this.#refreshWindow(session, scope, targetIdValue, selected, signal)
+    if (["display", "desktop-layout"].includes(selected.target.kind)) {
+      if (mode !== "screenshot") throw new Error("Display/layout observe поддерживает только screenshot")
+      this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
+      const fresh = await this.#refreshNative(session, scope, targetIdValue, selected, signal)
+      if (fresh.selected.target.kind !== "display" && fresh.selected.target.kind !== "desktop-layout") {
+        throw new Error("Fresh display/layout target изменил kind")
+      }
+      const capture = async () => observedStateSchema.parse({
+        targetId: targetIdValue,
+        state: "",
+        elements: [],
+        ...await this.#captureDesktop(session, targetIdValue, fresh, caption!, signal),
+      })
+      if (this.#views !== undefined) {
+        try { return await this.#views.observe(session, targetIdValue, fresh.selected.target, capture, result => result.complete) }
+        catch (error) {
+          this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
+          throw error
+        }
+      }
+      return capture()
+    }
+    if (selected.target.kind === "surface") {
+      if (mode !== "ax") throw new Error("Surface observe поддерживает только AX; isolated surface screenshot недоступен")
+      this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
+      const fresh = await this.#refreshNative(session, scope, targetIdValue, selected, signal)
+      if (fresh.selected.target.kind !== "surface") throw new Error("Fresh surface target изменил kind")
+      const inspect = () => this.#inspectWindow(session, scope, targetIdValue, fresh.selected, signal)
+      if (this.#views !== undefined) {
+        try { return await this.#views.observe(session, targetIdValue, fresh.selected.target, inspect, result => result.complete) }
+        catch (error) { scope.invalidateElements(targetIdValue); throw error }
+      }
+      return inspect()
+    }
+    if (selected.target.kind !== "window") throw new Error("observe не поддерживает этот target kind")
+    this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
+    const fresh = await this.#refreshNative(session, scope, targetIdValue, selected, signal)
     const capture = async () => {
     const ax = mode === "screenshot" ? undefined : await this.#inspectWindow(session, scope, targetIdValue, fresh.selected, signal)
     const screenshot = mode === "ax" ? undefined : await this.#captureWindow(session, targetIdValue, fresh, caption!, signal)
@@ -616,11 +752,12 @@ export class RuntimeAgentMethods {
   async #captureWindow(
     session: RuntimeClientSession,
     targetIdValue: string,
-    fresh: FreshWindow,
+    fresh: FreshNative,
     caption: string,
     signal: AbortSignal,
   ) {
     const { inventory, selected, window } = fresh
+    if (selected.target.kind !== "window" || window === undefined) throw new Error("Window capture требует exact window target")
     if (window.mapping !== "corroborated" || window.mappingEvidence === undefined || window.cgWindowId === undefined) {
       throw new Error("Window screenshot требует current corroborated CG/AX mapping")
     }
@@ -643,15 +780,26 @@ export class RuntimeAgentMethods {
     if (!capture.result.ok || capture.frameAvailable !== true || response.frameRefs.length !== 1) {
       throw new Error("Window capture не вернул exact available frame")
     }
-    const observation = capture.result.value.observation
+    return this.#rememberCapture(session, targetIdValue, capture.result.value.observation, response.frameRefs[0]!, "window-capture")
+  }
+
+  #rememberCapture(
+    session: RuntimeClientSession,
+    targetIdValue: string,
+    observationValue: Observation,
+    frameRef: string,
+    stage: "window-capture" | "desktop-capture",
+  ) {
+    const observation = observationSchema.parse(observationValue)
+    if (observation.image.frameRef !== frameRef) throw new Error("Capture frameRef не совпадает с observation")
     const imageId = this.#ids("agent-image")
-    this.#frames.set(imageId, response.frameRefs[0]!)
-    this.#observations.set(canonicalJson([this.#core.clients.lineage(session), targetIdValue]), { imageId, observation: observationSchema.parse(observation) })
+    this.#frames.set(imageId, frameRef)
+    this.#observations.set(canonicalJson([this.#core.clients.lineage(session), targetIdValue]), { imageId, observation })
     this.#pruneFrames()
     this.#pruneObservations()
-    const errors = observation.unavailableReasons.map(message => ({ stage: "window-capture", message }))
+    const errors = observation.unavailableReasons.map(message => ({ stage, message }))
     if (observation.readiness.state !== "ready") {
-      errors.unshift({ stage: "window-capture", message: `Window capture readiness: ${observation.readiness.state}` })
+      errors.unshift({ stage, message: `Capture readiness: ${observation.readiness.state}` })
     }
     return {
       imageId,
@@ -662,28 +810,100 @@ export class RuntimeAgentMethods {
     }
   }
 
+  async #captureDesktop(
+    session: RuntimeClientSession,
+    targetIdValue: string,
+    fresh: FreshNative,
+    caption: string,
+    signal: AbortSignal,
+  ) {
+    const { inventory, selected, captureTarget } = fresh
+    if (!["display", "desktop-layout"].includes(selected.target.kind) || captureTarget === undefined) {
+      throw new Error("Desktop capture требует exact display/layout target")
+    }
+    const response = await this.#dispatch(session, "capture_desktop", {
+      clientRequestId: this.#ids("agent-desktop-capture"),
+      inventoryId: inventory.inventoryId,
+      caption,
+      clip: { kind: "full-target" },
+      cursor: "exclude",
+      readinessPolicy: { policyId: "agent-display-observe",
+        requiredSteps: ["complete-frame", "permission", "target", "ownership"], disabledSteps: [] },
+      output: { format: "image/png", scale: 0.5, maxWidthPx: 16_384, maxHeightPx: 16_384,
+        maxPixels: 8_000_000, maxEncodedBytes: 8 * 1024 * 1024 },
+      target: captureTarget,
+    }, signal)
+    const capture = response.data as { result: AdapterResult<ScreenCaptureResult>, frameAvailable: boolean }
+    if (!capture.result.ok || capture.frameAvailable !== true || response.frameRefs.length !== 1) {
+      throw new Error("Desktop capture не вернул exact available frame")
+    }
+    return this.#rememberCapture(session, targetIdValue, capture.result.value.observation, response.frameRefs[0]!, "desktop-capture")
+  }
+
   async #refreshWindow(
     session: RuntimeClientSession,
     scope: AgentTargetScope,
     targetIdValue: string,
     selected: AgentTargetActionResolution,
     signal: AbortSignal,
-  ): Promise<FreshWindow> {
+  ): Promise<FreshNative> {
     if (selected.target.kind !== "window") throw new Error("Window refresh требует window target")
+    return this.#refreshNative(session, scope, targetIdValue, selected, signal)
+  }
+
+  async #refreshNative(
+    session: RuntimeClientSession,
+    scope: AgentTargetScope,
+    targetIdValue: string,
+    selected: AgentTargetActionResolution,
+    signal: AbortSignal,
+  ): Promise<FreshNative> {
     const inventory = await this.#inventory(session, signal)
-    const targetRef = selected.target.ref
-    const window = inventory.windows.find((candidate): candidate is WindowRecord => {
-      return candidate.kind === "ax-window" && structurallyEqual(candidate.ref, targetRef)
-    })
-    if (window === undefined) {
-      scope.closeTarget(targetIdValue, "Exact window отсутствует в fresh inventory")
-      throw new Error("Exact window closed or stale; handle не ретаргетирован")
+    let result: Omit<FreshNative, "inventory" | "selected"> | undefined
+    switch (selected.target.kind) {
+      case "window": {
+        const window = inventory.windows.find((candidate): candidate is WindowRecord => {
+          return candidate.kind === "ax-window" && structurallyEqual(candidate.ref, selected.target.ref)
+        })
+        if (window !== undefined) result = { window }
+        break
+      }
+      case "surface": {
+        for (const window of inventory.windows) {
+          if (window.kind !== "ax-window") continue
+          const surface = window.surfaces.find(candidate => structurallyEqual(candidate.ref, selected.target.ref))
+          if (surface !== undefined && surfaceOwnedByWindow(surface, window)) { result = { window, surface }; break }
+        }
+        break
+      }
+      case "display": {
+        const display = inventory.displays.find(candidate => structurallyEqual(candidate.ref, selected.target.ref))
+        const captureTarget = inventory.desktopLayout?.displays.find(candidate => {
+          return structurallyEqual(candidate.target, selected.target)
+        })
+        if (display !== undefined) result = { display, ...(captureTarget === undefined ? {} : { captureTarget }) }
+        break
+      }
+      case "desktop-layout": {
+        const captureTarget = inventory.desktopLayout
+        if (captureTarget !== undefined && structurallyEqual(captureTarget.target, selected.target)) result = { captureTarget }
+        break
+      }
+      default:
+        throw new Error("Native refresh не поддерживает browser/device target")
     }
-    scope.registerTarget({ kind: "window", ref: window.ref }, {
+    if (result === undefined) {
+      if (!inventory.complete) {
+        throw new Error("Fresh inventory incomplete; exact native target absence не подтверждено")
+      }
+      scope.closeTarget(targetIdValue, "Exact native target отсутствует в fresh inventory")
+      throw new Error("Exact native target closed or stale; handle не ретаргетирован")
+    }
+    scope.registerTarget(selected.target, {
       inventoryId: inventory.inventoryId,
       inventoryRevision: inventory.revision,
     })
-    return { inventory, window, selected: scope.resolveAction(targetIdValue) }
+    return { inventory, ...result, selected: scope.resolveAction(targetIdValue) }
   }
 
   async #inventory(
@@ -786,4 +1006,12 @@ function publicError(stage: string, error: unknown): { stage: string, message: s
     : typeof error === "object" && error !== null && "message" in error ? String(error.message)
       : String(error)
   return { stage, message: message.slice(0, 1024) }
+}
+
+function surfaceOwnedByWindow(surface: SurfaceRecord, window: WindowRecord): boolean {
+  return surface.ref.runtimeEpoch === window.ref.runtimeEpoch
+    && surface.ref.loginSessionId === window.ref.loginSessionId
+    && surface.ref.nativeGeneration === window.ref.nativeGeneration
+    && surface.ref.applicationRef === window.ref.applicationRef
+    && surface.ref.ownerWindowRef === window.ref.windowRef
 }

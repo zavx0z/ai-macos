@@ -186,12 +186,13 @@ export class RuntimeAgentActionMethods {
       targetId,
       actionName,
       async context => {
-        const binding = await this.methods.refreshWindowAction(
+        const binding = await this.methods.refreshNativeAction(
           session,
           targetId,
           context.binding,
           context.signal,
         )
+        if (binding.target.kind !== "window" && binding.target.kind !== "surface") throw new Error("Keyboard action требует exact window/surface target")
         const response = await this.methods.withViewAction(session, targetId, context.clientRequestId, "keyboard", () => this.#dispatch(session, method, {
           clientRequestId: context.clientRequestId,
           precondition: {

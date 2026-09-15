@@ -72,16 +72,11 @@ export class RuntimeAgentAxMethods {
       timeoutMs: 10_000,
       maxRequestBytes: 4096,
       maxResponseBytes: 4096,
-      requiredCapabilities: [
-        "desktop.applications",
-        "desktop.windows.all",
-        "desktop.window.identity",
-        "desktop.displays",
-        "desktop.ax",
-        "runtime.user-interference",
-        ...(this.pointer === undefined ? [] : ["capture.observation", "input.pointer", "input.readiness"] as const),
-        "runtime.operations",
-      ],
+      requiredCapabilities: this.pointer === undefined
+        ? ["desktop.applications", "desktop.windows.all", "desktop.window.identity", "desktop.displays",
+            "desktop.ax", "runtime.user-interference", "runtime.operations"]
+        : ["desktop.displays", "capture.observation", "input.pointer", "input.readiness",
+            "runtime.user-interference", "runtime.operations"],
       execute: (context, input) => {
         if (input.point !== undefined) {
           return this.pointer!.clickPoint(context.session, input.targetId, input.point, {
@@ -106,13 +101,15 @@ export class RuntimeAgentAxMethods {
       targetId,
       "ax-press",
       async context => {
-        const binding = await this.methods.refreshWindowAction(
+        const binding = await this.methods.refreshNativeAction(
           session,
           targetId,
           context.binding,
           context.signal,
         )
-        if (binding.target.kind !== "window") throw new Error("AXPress требует window target")
+        if (binding.target.kind !== "window" && binding.target.kind !== "surface") {
+          throw new Error("AXPress требует window или surface target")
+        }
         const scope = this.targets.forLineage(this.core.clients.lineage(session))
         const element = scope.resolveElement(targetId, elementId, "AXPress")
         if (

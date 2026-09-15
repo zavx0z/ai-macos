@@ -5,6 +5,7 @@ import {
   freezeAdapterHostContext,
   mapObservationPointGeometry,
   observationSchema,
+  structurallyEqual,
   type AdapterResult,
   type NativeAdapter,
   type NativeCancelRequest,
@@ -33,6 +34,10 @@ const generation = { runtimeEpoch: "runtime:agent-pointer", loginSessionId: "log
 const nativeGeneration = "native:agent-pointer"
 const target = { kind: "window" as const, ref: { ...generation, nativeGeneration,
   applicationRef: "application:agent-pointer", windowRef: "window:agent-pointer" } }
+const displayTarget = { kind: "display" as const, ref: { ...generation, nativeGeneration,
+  displayRef: "display:agent-pointer", displayLayoutRevision: 1 } }
+const layoutTarget = { kind: "desktop-layout" as const, ref: { ...generation, nativeGeneration,
+  layoutRef: "layout:agent-pointer", displayLayoutRevision: 1 } }
 
 test("point click использует исходные image pixels, fresh inventory и тот же observationRef", async () => {
   const fixture = await createFixture()
@@ -202,7 +207,41 @@ test("cancelled и unknown pointer delivery сохраняются в target sta
   await unknown.guard.close()
 })
 
-async function createFixture() {
+test("explicit display pointer сохраняет broad target, а foreign layout не получает window fallback", async () => {
+  const display = await createFixture({ operationTarget: displayTarget,
+    observation: capturedObservation(displayTarget) })
+  await display.registry.dispatch(display.session, "click", {
+    targetId: display.targetId,
+    point: [10, 20],
+  }, new AbortController().signal)
+  expect(display.input.calls[0]?.context.wire.target).toEqual(displayTarget)
+  expect(display.input.destinations[0]).toEqual([{ x: 120, y: 240 }])
+  await display.guard.close()
+
+  const layout = await createFixture({ operationTarget: layoutTarget,
+    observation: capturedObservation(layoutTarget) })
+  await layout.registry.dispatch(layout.session, "hover", {
+    targetId: layout.targetId,
+    point: [4, 5],
+  }, new AbortController().signal)
+  expect(layout.input.calls[0]?.context.wire.target).toEqual(layoutTarget)
+  await layout.guard.close()
+
+  const foreignLayout = await createFixture({ operationTarget: layoutTarget,
+    observation: capturedObservation(displayTarget) })
+  await expect(foreignLayout.registry.dispatch(foreignLayout.session, "click", {
+    targetId: foreignLayout.targetId,
+    point: [10, 20],
+  }, new AbortController().signal)).rejects.toThrow("другому exact target")
+  expect(foreignLayout.input.calls).toHaveLength(0)
+  await foreignLayout.guard.close()
+})
+
+async function createFixture(options: {
+  operationTarget?: typeof target | typeof displayTarget | typeof layoutTarget
+  observation?: Observation
+} = {}) {
+  const operationTarget = options.operationTarget ?? target
   const native = new FixtureNative()
   const core = new RuntimeCore({ generation, runtimeBuildId: "build:agent-pointer", nativeGeneration,
     native: native as unknown as NativeAdapter, cancelGraceMs: 20 })
@@ -212,14 +251,14 @@ async function createFixture() {
     producerRef: "runtime:agent-pointer",
     capabilities: CAPABILITY_IDS.map(id => ({ id, state: "ready" })),
   }))
-  core.targets.register(target, "inventory:fresh:20", 20,
+  core.targets.register(operationTarget, "inventory:fresh:20", 20,
     "resolution:agent-pointer", "proof:agent-pointer", 1, undefined, 120_000)
   const targets = new AgentTargetRegistry({ generation })
   const client = core.openClient("principal:agent-pointer")
   const scope = targets.forLineage(core.clients.lineage(client.session))
-  const handle = scope.registerTarget(target, { inventoryId: "inventory:capture:10", inventoryRevision: 10 })
+  const handle = scope.registerTarget(operationTarget, { inventoryId: "inventory:capture:10", inventoryRevision: 10 })
   const operations = new AgentOperations({ runtime: core, targets })
-  const observation = capturedObservation()
+  const observation = options.observation ?? capturedObservation(operationTarget)
   let observationReads = 0
   let refreshes = 0
   let stale = false
@@ -232,17 +271,20 @@ async function createFixture() {
   })
   const viewBindings = new AgentViewBindings(core, guard)
   const authorizeView = core.bindNativeViewAdmission(viewBindings.authorizeNative)
-  await viewBindings.observe(client.session, handle.targetId, target, async () => observation, () => true)
+  await viewBindings.observe(client.session, handle.targetId, operationTarget, async () => observation, () => true)
   const methods = {
     operations,
-    async refreshWindowAction(_session: unknown, targetId: string) {
+    async refreshNativeAction(_session: unknown, targetId: string) {
       refreshes++
-      scope.registerTarget(target, { inventoryId: "inventory:fresh:20", inventoryRevision: 20 })
+      scope.registerTarget(operationTarget, { inventoryId: "inventory:fresh:20", inventoryRevision: 20 })
       return scope.resolveAction(targetId)
     },
     async getLatestObservation() {
       observationReads++
       if (stale) throw new Error("stale observation")
+      if (!structurallyEqual(observation.captureTarget, operationTarget)) {
+        throw new Error("Latest owned screenshot относится к другому exact target")
+      }
       return { imageId: "image:pointer:10", observation: structuredClone(observation) }
     },
     async withViewAction<T>(_session: unknown, targetId: string, clientRequestId: string,
@@ -406,29 +448,30 @@ class FixtureObserver implements AgentViewObserver {
   }
 }
 
-function capturedObservation(): Observation {
+function capturedObservation(operationTarget: typeof target | typeof displayTarget | typeof layoutTarget = target): Observation {
   const capturedAt = new Date().toISOString()
   const expiresAt = new Date(Date.now() + 120_000).toISOString()
   const display = { ...generation, nativeGeneration, displayRef: "display:pointer", displayLayoutRevision: 1 }
+  const source = operationTarget.kind === "window" ? "window-isolated" as const : "display-composite" as const
   return observationSchema.parse({
     observationId: "observation:pointer:10",
     ...generation,
     nativeGeneration,
-    captureTarget: target,
+    captureTarget: operationTarget,
     caption: "Ожидаю pointer fixture",
     backend: { name: "fixture", buildId: "build:pointer-capture" },
     capturedAt,
     expiresAt,
     inventoryRevision: 10,
     displayLayoutRevision: 1,
-    source: "window-isolated",
+    source,
     image: { frameRef: "frame:pointer:10", widthPx: 100, heightPx: 100,
       mime: "image/png", byteLength: 10, sha256: "a".repeat(64) },
     cursor: "excluded",
     clip: { x: 0, y: 0, width: 100, height: 100 },
     captureEvidence: { state: "confirmed", claim: "frame-freshness", source: "fixture", proof: {
       proofRef: "proof:capture:pointer", authorityRef: "authority:capture:pointer", kind: "frame-freshness",
-      subject: target, ...generation, nativeGeneration, inventoryRevision: 10, displayLayoutRevision: 1,
+      subject: operationTarget, ...generation, nativeGeneration, inventoryRevision: 10, displayLayoutRevision: 1,
       issuedAt: capturedAt, expiresAt,
     } },
     occlusion: { state: "unknown", claim: "occlusion", source: "fixture", reason: "isolated" },

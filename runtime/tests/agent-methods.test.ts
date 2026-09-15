@@ -34,7 +34,7 @@ import {
 } from "@meta/shared/contracts"
 import { AgentTargetRegistry } from "../src/agent-targets.ts"
 import { registerAgentMethods } from "../src/agent-methods.ts"
-import { captureExecutionSchema, captureWindowMethodInputSchema } from "../src/capture-methods.ts"
+import { captureDesktopMethodInputSchema, captureExecutionSchema, captureWindowMethodInputSchema } from "../src/capture-methods.ts"
 import { RuntimeCore } from "../src/core.ts"
 import { MethodRegistry } from "../src/method-registry.ts"
 
@@ -54,6 +54,10 @@ const windowRef = {
   applicationRef: appRef.applicationRef,
   windowRef: "window:chrome:1",
 }
+const displayRef = { ...generation, nativeGeneration, displayRef: "display:agent:1", displayLayoutRevision: 1 }
+const displayTarget = { kind: "display" as const, ref: displayRef }
+const layoutRef = { ...generation, nativeGeneration, layoutRef: "layout:agent:1", displayLayoutRevision: 1 }
+const layoutTarget = { kind: "desktop-layout" as const, ref: layoutRef }
 
 const browserCapturePublicRequestSchema = z.strictObject({
   kind: z.literal("capture-target"),
@@ -136,6 +140,143 @@ test("get_state различает running без AX окон, отсутств�
       axReason: "Accessibility permission denied", axWindowCount: 0 }],
     unavailableWindows: [{ pid: 202, title: "Denied Window", visibility: "true", reason: "AX identity unavailable" }] })
   expect(JSON.stringify(denied.data)).not.toContain("targetId")
+})
+
+test("get_state выдаёт exact surface/display/layout handles с явным owner и честными observe modes", async () => {
+  const fixture = createFixture()
+  const desktop = registerDesktop(fixture)
+  desktop.inventory.windows = [windowRecord(windowRef, [surfaceRecord()])]
+  const mappedDisplay = displayCaptureTarget()
+  desktop.inventory.displays = [{
+    ref: displayRef,
+    nativeDisplayId: 11,
+    bounds: { x: -640, y: 0, width: 640, height: 480 },
+    usableBounds: { x: -640, y: 20, width: 640, height: 460 },
+    scale: 2,
+    rotationDegrees: 0,
+    main: true,
+  }]
+  desktop.inventory.desktopLayout = desktopLayoutTarget(mappedDisplay)
+  fixture.core.targets.register(displayTarget, desktop.inventory.inventoryId, desktop.inventory.revision,
+    "resolution:display-agent", "proof:display-agent", 1)
+  fixture.core.targets.register(layoutTarget, desktop.inventory.inventoryId, desktop.inventory.revision,
+    "resolution:layout-agent", "proof:layout-agent", 1)
+  registerBrowsers(fixture)
+  registerAgentMethods(fixture.registry, fixture.core, fixture.targets, { ids: sequenceIds() })
+  const client = fixture.core.openClient("principal:native-targets")
+  const windows = await fixture.registry.dispatch(client.session, "get_state", {
+    kind: "window",
+  }, new AbortController().signal)
+  const owner = (windows.data.windows as Array<{ targetId: string }>)[0]!
+  const surface = (windows.data.surfaces as Array<{ targetId: string, ownerTargetId: string }>)[0]!
+  expect(surface).toMatchObject({ ownerTargetId: owner.targetId, kind: "sheet", role: "AXSheet", title: "Modal" })
+  const surfaceAx = await fixture.registry.dispatch(client.session, "observe", {
+    targetId: surface.targetId,
+    mode: "ax",
+  }, new AbortController().signal)
+  expect(surfaceAx.data).toMatchObject({ targetId: surface.targetId, complete: true,
+    elements: [{ role: "AXButton", title: "Save" }] })
+  await expect(fixture.registry.dispatch(client.session, "observe", {
+    targetId: surface.targetId,
+    mode: "screenshot",
+    caption: "Ожидаю modal",
+  }, new AbortController().signal)).rejects.toThrow("Surface observe поддерживает только AX")
+
+  const displayState = await fixture.registry.dispatch(client.session, "get_state", {
+    kind: "display",
+  }, new AbortController().signal)
+  const display = (displayState.data.displays as Array<{ targetId: string }>)[0]!
+  const layout = displayState.data.desktopLayout as { targetId: string, displayTargetIds: string[] }
+  expect(displayState.data).toMatchObject({ applications: [], windows: [], surfaces: [], browsers: [],
+    displays: [{ nativeDisplayId: 11, bounds: { x: -640, y: 0 }, scale: 2, main: true }] })
+  expect(layout.displayTargetIds).toEqual([display.targetId])
+  const captured = await fixture.registry.dispatch(client.session, "observe", {
+    targetId: display.targetId,
+    mode: "screenshot",
+    caption: "Ожидаю левый display",
+  }, new AbortController().signal)
+  expect(captured).toMatchObject({ frameRefs: ["frame:display:1"], data: {
+    targetId: display.targetId, state: "", elements: [], width: 320, height: 240, complete: true,
+  } })
+  expect(desktop.desktopCaptureRequests[0]).toMatchObject({
+    caption: "Ожидаю левый display",
+    target: { kind: "display", target: displayTarget, nativeDisplayId: 11 },
+  })
+  const layoutCapture = await fixture.registry.dispatch(client.session, "observe", {
+    targetId: layout.targetId,
+    mode: "screenshot",
+    caption: "Ожидаю полный desktop layout",
+  }, new AbortController().signal)
+  expect(layoutCapture.frameRefs).toEqual(["frame:display:1"])
+  expect(desktop.desktopCaptureRequests[1]).toMatchObject({
+    caption: "Ожидаю полный desktop layout",
+    target: { kind: "desktop-layout", target: layoutTarget,
+      displays: [{ target: displayTarget, nativeDisplayId: 11 }] },
+  })
+  await expect(fixture.registry.dispatch(client.session, "observe", {
+    targetId: layout.targetId,
+    mode: "ax",
+  }, new AbortController().signal)).rejects.toThrow("Display/layout observe поддерживает только screenshot")
+})
+
+test("incomplete inventory и отсутствующий capture mapping не tombstone существующий display handle", async () => {
+  const fixture = createFixture()
+  const mappedDisplay = displayCaptureTarget()
+  const full = {
+    inventoryId: "inventory:display-recovery",
+    ...generation,
+    nativeGeneration,
+    revision: 1,
+    displayLayoutRevision: 1,
+    capturedAt: "2026-09-15T10:00:01.000Z",
+    complete: true,
+    errors: [],
+    applications: [],
+    windows: [],
+    displays: [{ ref: displayRef, nativeDisplayId: 11,
+      bounds: { x: -640, y: 0, width: 640, height: 480 },
+      usableBounds: { x: -640, y: 20, width: 640, height: 460 },
+      scale: 2, rotationDegrees: 0, main: true }],
+    desktopLayout: desktopLayoutTarget(mappedDisplay),
+  }
+  let inventory: any = structuredClone(full)
+  fixture.registry.register("system_health", method(async () => ({
+    machine: { matchesExpected: true }, runtime: { draining: false, admissionSealed: false },
+  })))
+  fixture.registry.register("list_windows", method(async () => structuredClone(inventory)))
+  const methods = registerAgentMethods(fixture.registry, fixture.core, fixture.targets, { ids: sequenceIds() })
+  const client = fixture.core.openClient("principal:display-recovery")
+  const scope = fixture.targets.forLineage(fixture.core.clients.lineage(client.session))
+  const handle = scope.registerTarget(displayTarget, { inventoryId: full.inventoryId, inventoryRevision: full.revision })
+
+  delete inventory.desktopLayout
+  const withoutMapping = await methods.refreshNativeAction(
+    client.session, handle.targetId, scope.resolveAction(handle.targetId), new AbortController().signal,
+  )
+  expect(withoutMapping.target).toEqual(displayTarget)
+  await expect(fixture.registry.dispatch(client.session, "observe", {
+    targetId: handle.targetId,
+    mode: "screenshot",
+    caption: "Ожидаю display без mapping",
+  }, new AbortController().signal)).rejects.toThrow("capture")
+  expect(scope.resolveAction(handle.targetId).target).toEqual(displayTarget)
+
+  const { desktopLayout: _ignoredLayout, ...withoutLayout } = structuredClone(full)
+  inventory = { ...withoutLayout, complete: false,
+    errors: [{ code: "inventory-incomplete", message: "partial fixture", stage: "fixture",
+      retryable: true, replayAllowed: false, recoveryAction: "refresh-inventory" }],
+    displays: [] }
+  await expect(methods.refreshNativeAction(
+    client.session, handle.targetId, scope.resolveAction(handle.targetId), new AbortController().signal,
+  )).rejects.toThrow("absence не подтверждено")
+  expect(scope.resolveAction(handle.targetId).target).toEqual(displayTarget)
+
+  inventory = structuredClone(full)
+  const restored = await methods.refreshNativeAction(
+    client.session, handle.targetId, scope.resolveAction(handle.targetId), new AbortController().signal,
+  )
+  expect(restored.targetId).toBe(handle.targetId)
+  expect(restored.target).toEqual(displayTarget)
 })
 
 test("show_window делает exact show/focus, refresh и возвращает snapshot-bound element IDs", async () => {
@@ -295,6 +436,7 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
   })
   const transitions: Array<{ request: z.infer<typeof windowTransitionRequestSchema> }> = []
   const captureRequests: Array<z.infer<typeof captureWindowMethodInputSchema>> = []
+  const desktopCaptureRequests: Array<z.infer<typeof captureDesktopMethodInputSchema>> = []
   let inventoryCalls = 0
   fixture.core.targets.register(
     { kind: "window", ref: windowRef },
@@ -383,10 +525,24 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     }, captureWindowMethodInputSchema, captureExecutionSchema),
     frames: () => ["frame:agent:1"],
   })
+  fixture.registry.register("capture_desktop", {
+    ...method(async (context, input) => {
+      if (input.target.mappingEvidence.state !== "confirmed") throw new Error("Fixture требует confirmed desktop mapping")
+      desktopCaptureRequests.push(input)
+      return {
+        operation: completedOperation(context.session, input.clientRequestId, input.inventoryId,
+          input.target.mappingEvidence.proof.inventoryRevision, input.target.target, "native"),
+        frameAvailable: true,
+        result: { ok: true as const, value: desktopCaptureResult(input), outcome: successfulOutcome() },
+      }
+    }, captureDesktopMethodInputSchema, captureExecutionSchema),
+    frames: () => ["frame:display:1"],
+  })
   return {
     inventory,
     transitions,
     captureRequests,
+    desktopCaptureRequests,
     inventoryCalls: () => inventoryCalls,
   }
 }
@@ -505,7 +661,7 @@ function method<Input, Output extends Record<string, unknown>>(
   }
 }
 
-function windowRecord(ref = windowRef): WindowRecord {
+function windowRecord(ref = windowRef, surfaces: WindowRecord["surfaces"] = []): WindowRecord {
   return windowRecordSchema.parse({
     kind: "ax-window",
     ref,
@@ -532,10 +688,50 @@ function windowRecord(ref = windowRef): WindowRecord {
         issuedAt: "2026-09-15T10:00:00.000Z", expiresAt: "2099-09-15T10:00:00.000Z" },
     },
     actionability: "ax",
-    surfaces: [],
+    surfaces,
     advertisedActions: ["raise"],
     permittedActions: ["raise"],
   })
+}
+
+function surfaceRecord() {
+  return {
+    ref: { ...generation, nativeGeneration, applicationRef: windowRef.applicationRef,
+      surfaceRef: "surface:agent:modal", ownerWindowRef: windowRef.windowRef },
+    kind: "sheet" as const,
+    title: "Modal",
+    role: "AXSheet",
+    frame: { x: 40, y: 40, width: 300, height: 200 },
+    actionability: "ax" as const,
+    advertisedActions: ["close" as const],
+    permittedActions: ["close" as const],
+  }
+}
+
+function displayCaptureTarget() {
+  return {
+    kind: "display" as const,
+    target: displayTarget,
+    nativeDisplayId: 11,
+    mappingEvidence: { state: "confirmed" as const, claim: "target-resolution", source: "fixture", proof: {
+      proofRef: "proof:display-mapping", authorityRef: "authority:display-mapping", kind: "target-resolution" as const,
+      subject: displayTarget, ...generation, nativeGeneration, inventoryRevision: 1, displayLayoutRevision: 1,
+      issuedAt: "2026-09-15T10:00:00.000Z", expiresAt: "2099-09-15T10:00:00.000Z",
+    } },
+  }
+}
+
+function desktopLayoutTarget(display: ReturnType<typeof displayCaptureTarget>) {
+  return {
+    kind: "desktop-layout" as const,
+    target: layoutTarget,
+    mappingEvidence: { state: "confirmed" as const, claim: "target-resolution", source: "fixture", proof: {
+      proofRef: "proof:layout-mapping", authorityRef: "authority:layout-mapping", kind: "target-resolution" as const,
+      subject: layoutTarget, ...generation, nativeGeneration, inventoryRevision: 1, displayLayoutRevision: 1,
+      issuedAt: "2026-09-15T10:00:00.000Z", expiresAt: "2099-09-15T10:00:00.000Z",
+    } },
+    displays: [display],
+  }
 }
 
 function applicationRef(applicationRef: string, pid: number) {
@@ -755,6 +951,88 @@ function captureResult(input: z.infer<typeof captureWindowMethodInputSchema>) {
       encodedBytes: frame.byteLength,
       readinessPolicy: input.readinessPolicy,
     },
+    cleanup: { scope: "none" as const, state: "complete" as const, resources: [] as [] },
+  }
+}
+
+function desktopCaptureResult(input: z.infer<typeof captureDesktopMethodInputSchema>) {
+  if (input.target.mappingEvidence.state !== "confirmed") throw new Error("Fixture требует confirmed desktop mapping")
+  const capturedAt = "2026-09-15T10:00:02.000Z"
+  const expiresAt = "2099-09-15T10:00:00.000Z"
+  const captureTarget = input.target.target
+  const inventoryRevision = input.target.mappingEvidence.proof.inventoryRevision
+  const displayLayoutRevision = input.target.mappingEvidence.proof.displayLayoutRevision
+  const display = input.target.kind === "display" ? input.target : input.target.displays[0]!
+  const publication = {
+    observationId: "observation:display:1",
+    frameRef: "frame:display:1",
+    source: "display-composite" as const,
+    captureTarget,
+    capturePolicySha256: "5".repeat(64),
+    ...generation,
+    nativeGeneration,
+    expiresAt,
+    inventoryId: input.inventoryId,
+    inventoryRevision,
+    displayLayoutRevision,
+    cacheScopeRef: "cache:display:1",
+  }
+  const frame = {
+    frameRef: publication.frameRef,
+    observationId: publication.observationId,
+    ...generation,
+    nativeGeneration,
+    source: publication.source,
+    target: captureTarget,
+    capturedAt,
+    widthPx: 320,
+    heightPx: 240,
+    byteLength: 10,
+    sha256: "6".repeat(64),
+    mime: "image/png" as const,
+  }
+  const steps = input.readinessPolicy.requiredSteps.map(name => ({ name, state: "reached" as const, durationMs: 1 }))
+  const observation = {
+    observationId: publication.observationId,
+    ...generation,
+    nativeGeneration,
+    captureTarget,
+    caption: input.caption,
+    backend: { name: "fixture", buildId: "build:display-capture" },
+    capturedAt,
+    expiresAt,
+    inventoryRevision,
+    displayLayoutRevision,
+    source: publication.source,
+    image: { frameRef: frame.frameRef, widthPx: frame.widthPx, heightPx: frame.heightPx,
+      mime: frame.mime, byteLength: frame.byteLength, sha256: frame.sha256 },
+    cursor: "excluded" as const,
+    clip: { x: 0, y: 0, width: 320, height: 240 },
+    captureEvidence: { state: "confirmed" as const, claim: "frame-freshness", source: "fixture", proof: {
+      proofRef: "proof:display-frame", authorityRef: "authority:display-frame", kind: "frame-freshness" as const,
+      subject: captureTarget, ...generation, nativeGeneration, inventoryRevision, displayLayoutRevision,
+      issuedAt: capturedAt, expiresAt,
+    } },
+    occlusion: { state: "unknown" as const, claim: "occlusion", source: "fixture", reason: "display composite" },
+    readiness: { state: "ready" as const, policy: input.readinessPolicy, steps, timedOut: false },
+    synchronization: { kind: "single-frame" as const },
+    regions: [{
+      space: { kind: "macos-screen" as const, display: display.target.ref },
+      imageRect: { x: 0, y: 0, width: 320, height: 240 },
+      destinationRect: { x: -640, y: 0, width: 640, height: 480 },
+      imageToDestination: { a: 2, b: 0, c: 0, d: 2, tx: -640, ty: 0 },
+      frameTimestamp: capturedAt,
+      frameStatus: "complete" as const,
+    }],
+    unavailableReasons: [],
+  }
+  return {
+    publication,
+    observation,
+    frame,
+    effective: { clip: input.clip, fullPage: false, cursor: "excluded" as const,
+      scale: input.output.scale, widthPx: 320, heightPx: 240, pixelCount: 320 * 240,
+      encodedBytes: frame.byteLength, readinessPolicy: input.readinessPolicy },
     cleanup: { scope: "none" as const, state: "complete" as const, resources: [] as [] },
   }
 }

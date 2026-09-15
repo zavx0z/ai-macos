@@ -109,3 +109,18 @@ test("AXPress связывает retained element с exact parent и сохра�
   expect(f.presses()).toBe(1)
   expect(f.resources()).toMatchObject([{ kind: "desktop-input", resourceRef: "desktop" }])
 })
+
+test("AXPress принимает exact surface parent, не расширяя target до owner window", async () => {
+  const f = fixture()
+  const surface = { kind: "surface" as const, ref: { ...generation, applicationRef: target.applicationRef,
+    surfaceRef: "surface:save", ownerWindowRef: target.windowRef } }
+  f.core.targets.register(surface, "inventory:1", 1, "resolution:surface", "proof:surface", 1)
+  const input = { clientRequestId: "request:surface-press", precondition: { target: surface, inventoryId: "inventory:1", inventoryRevision: 1 },
+    request: { element: { ...generation, applicationRef: target.applicationRef, snapshotId: "snapshot:surface", elementRef: "element:save" } } }
+  await expect(f.registry.dispatch(f.session, "press_accessibility", {
+    ...input, request: { element: { ...input.request.element, applicationRef: "app:foreign" } },
+  }, new AbortController().signal)).rejects.toThrow("exact parent")
+  const result = await f.registry.dispatch(f.session, "press_accessibility", input, new AbortController().signal)
+  expect(result.data).toMatchObject({ operation: { context: { target: surface }, state: "interrupted-unknown" } })
+  expect(f.presses()).toBe(1)
+})

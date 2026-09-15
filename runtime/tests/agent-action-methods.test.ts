@@ -33,6 +33,23 @@ const windowRef = {
   windowRef: "window:agent-actions",
 }
 const target = { kind: "window" as const, ref: windowRef }
+const surfaceTarget = { kind: "surface" as const, ref: { ...generation, nativeGeneration,
+  applicationRef: windowRef.applicationRef, surfaceRef: "surface:save", ownerWindowRef: windowRef.windowRef } }
+
+test("keyboard action сохраняет exact Save surface target после generic refresh", async () => {
+  const fixture = createFixture({ realView: true })
+  const session = fixture.core.openClient("principal:surface").session
+  try {
+    const state = await fixture.registry.dispatch(session, "get_state", { kind: "window" }, new AbortController().signal)
+    const targetId = (state.data.surfaces as Array<{ targetId: string }>)[0]!.targetId
+    await fixture.views!.observe(session, targetId, surfaceTarget, async () => true, value => value)
+    const result = await fixture.registry.dispatch(session, "type_text", { targetId, text: "Имя файла" }, new AbortController().signal)
+    const operation = await fixture.core.getOperation(session, String(result.data.operationId))
+    expect(operation?.context.target).toEqual(surfaceTarget)
+    expect(operation?.state).toBe("completed")
+    expect(fixture.input.actions).toEqual([{ kind: "text", text: "Имя файла", delayMs: 0 }])
+  } finally { await fixture.guard?.close(); await fixture.core.closeClientLifecycle() }
+})
 
 test("press_shortcut отправляет всю sequence одной tracked Core operation через view binding", async () => {
   const fixture = createFixture({ realView: true })
@@ -167,6 +184,7 @@ function createFixture(options: {
   }))
   core.targets.register(target, "inventory:agent-actions", 1,
     "resolution:agent-actions", "proof:agent-actions", 1)
+  core.targets.register(surfaceTarget, "inventory:agent-actions", 1, "resolution:surface", "proof:surface", 1)
   const registry = new MethodRegistry(core)
   let readinessCalls = 0
   registry.register("system_health", method(async () => ({
@@ -394,7 +412,8 @@ function inventory() {
     windows: [{
       kind: "ax-window",
       ref: windowRef,
-      surfaces: [],
+      surfaces: [{ ref: surfaceTarget.ref, kind: "sheet", title: "Save", role: "AXSheet",
+        frame: { x: 10, y: 10, width: 300, height: 200 }, actionability: "ax", advertisedActions: ["raise", "close"], permittedActions: ["raise", "close"] }],
       ownerPid: 101,
       cgWindowId: 77,
       title: "Fixture",

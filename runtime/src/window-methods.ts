@@ -1,7 +1,7 @@
 import {
-  adapterResultSchema, axInspectionRequestSchema, axInspectionResultSchema, axPressRequestSchema, axPressResultSchema,
+  adapterResultSchema, axInspectionRequestSchema, axInspectionResultSchema, axInspectionTargetSchema, axPressRequestSchema, axPressResultSchema,
   desktopInventorySnapshotSchema, opaqueIdSchema, operationRecordSchema,
-  runtimeOperationIntentSchema, windowRefSchema, windowTransitionRequestSchema, windowTransitionResultSchema, z,
+  runtimeOperationIntentSchema, windowTransitionRequestSchema, windowTransitionResultSchema, z,
   type AdapterResult, type AxPressRequest, type AxPressResult, type NativeExecutionContext,
   type RuntimeOperationContext, type WindowAdapter,
 } from "@meta/shared/contracts"
@@ -20,7 +20,7 @@ const transitionOutput = z.strictObject({
 export const axPressMethodInputSchema = z.strictObject({
   clientRequestId: opaqueIdSchema,
   precondition: z.strictObject({
-    target: z.strictObject({ kind: z.literal("window"), ref: windowRefSchema }),
+    target: axInspectionTargetSchema,
     inventoryId: opaqueIdSchema,
     inventoryRevision: z.number().int().safe().min(0),
   }),
@@ -34,7 +34,7 @@ export const axPressMethodInputSchema = z.strictObject({
     || element.nativeGeneration !== window.nativeGeneration
     || element.applicationRef !== window.applicationRef
   ) {
-    context.addIssue({ code: "custom", path: ["request", "element"], message: "AX element не принадлежит exact parent window" })
+    context.addIssue({ code: "custom", path: ["request", "element"], message: "AX element не принадлежит exact parent window/surface" })
   }
 })
 

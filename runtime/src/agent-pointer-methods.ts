@@ -45,7 +45,7 @@ export interface AgentPointClickHandler {
   ): Promise<AgentPointerResult>
 }
 
-/** Композирует pointer actions только из сохранённого observation и свежей window authority. */
+/** Композирует pointer actions только из сохранённого observation и свежей native target authority. */
 export class RuntimeAgentPointerMethods implements AgentPointClickHandler {
   constructor(
     private readonly registry: MethodRegistry,
@@ -77,7 +77,7 @@ export class RuntimeAgentPointerMethods implements AgentPointClickHandler {
 
     this.registry.register("scroll", {
       title: "Прокрутить от точки снимка",
-      description: "Прокручивает exact window от точки исходного observation в явных line или pixel units.",
+      description: "Прокручивает exact native target от точки исходного observation в явных line или pixel units.",
       input: z.strictObject({
         targetId: agentTargetIdSchema,
         anchor: imagePointSchema,
@@ -176,13 +176,15 @@ export class RuntimeAgentPointerMethods implements AgentPointClickHandler {
       targetId,
       actionName,
       async context => {
-        const binding = await this.methods.refreshWindowAction(
+        const binding = await this.methods.refreshNativeAction(
           session,
           targetId,
           context.binding,
           context.signal,
         )
-        if (binding.target.kind !== "window") throw new Error("Pointer action требует exact window target")
+        if (!["window", "surface", "display", "desktop-layout"].includes(binding.target.kind)) {
+          throw new Error("Pointer action требует exact native target")
+        }
         const { observation } = await this.methods.getLatestObservation(session, targetId)
         const observationRef = reference(observation)
         const response = await this.methods.withViewAction(
@@ -265,9 +267,6 @@ function reference(observation: Observation) {
 
 function pointerCapabilities(kind: "input.pointer" | "input.drag") {
   return [
-    "desktop.applications",
-    "desktop.windows.all",
-    "desktop.window.identity",
     "desktop.displays",
     "capture.observation",
     kind,
