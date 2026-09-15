@@ -106,6 +106,7 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   NSMutableDictionary<NSNumber *, id> *_axApplications;
   NSMutableDictionary<NSNumber *, NSMutableArray<id> *> *_axWindows;
   MetaObserverFocusResolver _focusResolver;
+  MetaObserverEventSink _eventSink;
   CFMachPortRef _tap;
   CFRunLoopSourceRef _source;
   NSTimer *_heartbeatTimer;
@@ -170,6 +171,12 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
 - (void)setFocusResolver:(MetaObserverFocusResolver)resolver {
   [_lock lock];
   _focusResolver = [resolver copy];
+  [_lock unlock];
+}
+
+- (void)setEventSink:(MetaObserverEventSink)sink {
+  [_lock lock];
+  _eventSink = [sink copy];
   [_lock unlock];
 }
 
@@ -599,7 +606,11 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   _lastEvent = time;
   _coveredThrough = time;
   _heartbeat = time;
-  if (_events.count >= 1000 || bytes > 1024 * 1024 - _bytes) {
+  MetaObserverEventSink sink = _eventSink;
+  BOOL accepted = NO;
+  if (sink != nil) {
+    accepted = YES;
+  } else if (_events.count >= 1000 || bytes > 1024 * 1024 - _bytes) {
     _dropped += 1;
     _gap = YES;
     _ready = NO;
@@ -607,8 +618,17 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   } else {
     [_events addObject:event];
     _bytes += bytes;
+    accepted = YES;
   }
+  NSDictionary *published = accepted ? immutable_json_copy(event) : nil;
   [_lock unlock];
+  if (sink != nil && published != nil) {
+    @try {
+      sink(published);
+    } @catch (__unused NSException *exception) {
+      [self markUnavailable:@"Observer event sink failed"];
+    }
+  }
 }
 
 - (void)recordInputFromPid:(pid_t)pid syntheticTag:(uint64_t)tag {

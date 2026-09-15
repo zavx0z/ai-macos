@@ -8,10 +8,12 @@ NS_ASSUME_NONNULL_BEGIN
 
 typedef NSDictionary *_Nullable (^MetaObserverFocusResolver)(
     pid_t pid, AXUIElementRef element, NSString *notification);
+typedef void (^MetaObserverEventSink)(NSDictionary *event);
 
 @interface MetaNativeObserver : NSObject
 - (nullable instancetype)initWithGeneration:(NSDictionary *)generation;
 - (void)setFocusResolver:(MetaObserverFocusResolver)resolver;
+- (void)setEventSink:(nullable MetaObserverEventSink)sink;
 // Resolver читает только immutable native registry snapshot и не синхронизирует
 // main runloop с action worker.
 // start/stop выполняются на main runloop helper и никогда не открывают TCC UI.
