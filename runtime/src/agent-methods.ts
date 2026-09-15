@@ -312,7 +312,8 @@ export class RuntimeAgentMethods {
             hidden: application.hidden,
             axStatus: application.axStatus,
             ...(application.axReason === undefined ? {} : { axReason: application.axReason }),
-            axWindowCount: application.windowCount,
+            axWindowCount: inventory.windows.filter(window => window.kind === "ax-window"
+              && window.ownerPid === application.ref.pid).length,
           })
         }
         const filteredApplicationPids = new Set(applications.map(application => application.pid))

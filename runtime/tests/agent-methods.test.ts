@@ -106,7 +106,7 @@ test("get_state различает running без AX окон, отсутств�
       { ref: noWindowsRef, name: "No Windows", bundleId: "com.meta.no-windows", hidden: "false",
         axStatus: "no-windows", windowCount: 0 },
       { ref: deniedRef, name: "Denied App", bundleId: "com.meta.denied", hidden: "unknown",
-        axStatus: "denied", axReason: "Accessibility permission denied", windowCount: 0 },
+        axStatus: "denied", axReason: "Accessibility permission denied", windowCount: 1 },
     ],
     windows: [{
       kind: "cg-only",
