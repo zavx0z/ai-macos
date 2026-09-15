@@ -1,21 +1,20 @@
 {
   "format": "meta-ai-macos-legacy-source-removal-plan-v1",
-  "generatedFromCommit": "c5e8d71aefa514289ee3e8969d3eac58c4bd5ac8",
-  "state": "awaiting-host-integration-and-verified-installed-cutover",
+  "generatedFromCommit": "258bbc8f0cac4298ec4fe8d20d74e7a5eeac6504",
+  "state": "awaiting-a02-a31-and-fresh-task-a43-recovery",
   "scope": "repository-source-only",
   "preconditions": [
-    "Полный production RuntimeHost catalog и native binding проходят root integration без legacy REST.",
-    "Новый immutable runtime/native release установлен и подтвержден exact doctor receipt.",
     "Актуальные consumers из docs/legacy-callers.md мигрированы либо имеют явный blocker.",
-    "A02 проверен отдельными runtime/MCP subprocesses, A31 проверен на private socket peer/token boundary, A43 проверен из свежей Codex задачи.",
+    "A02 проверен отдельными runtime/MCP subprocesses, A31 проверен на private socket peer/token boundary.",
+    "A43 повторно проверен из свежей Codex задачи после исправления observer recovery: installed catalog 0.4.0 содержит все 36 tools после самостоятельного restart.",
     "LegacyServiceRetirementCoordinator подтвердил exact ownership и завершение собственных listeners 7878-7882.",
     "Chrome CDP LaunchAgent инвентаризирован и остановлен только при подтвержденном ownership.",
-    "Root подтвердил, что удаление source-controlled helper не удаляет installer-managed stable TCC pathname.",
+    "Root подтвердил, что удаление source-controlled input/bin/meta-input-helper не изменяет signed computer-use.app/Contents/Helpers/meta-input-helper.",
     "Принято решение о внешнем API после сравнения вариантов; выбранный интерфейс проверен и не использует legacy REST/CLI как реализацию."
   ],
   "externalApiCompatibility": {
     "goal": "Удобный агентский слой поверх собственного runtime с точной адресацией; полный JavaScript REPL отложен",
-    "contractStatus": "selective-high-level-api-approved-source-implementation-in-progress",
+    "contractStatus": "selective-high-level-api-installed-a43-recovery-pending",
     "researchSources": [
       "/Applications/ChatGPT.app bundled API inspected by root",
       "https://learn.chatgpt.com/docs/computer-use"
@@ -103,7 +102,9 @@
         "scripts/runtime-entry.ts",
         "scripts/runtime-admin.ts",
         "native/scripts/build-broker.sh",
-        "installer-managed input/bin/meta-input-helper stable pathname"
+        "signed computer-use.app/Contents/MacOS/computer-use",
+        "signed computer-use.app/Contents/Helpers/meta-input-helper",
+        "legacy input/bin/meta-input-helper compatibility path"
       ]
     }
   ],
@@ -230,7 +231,7 @@
     },
     {
       "file": "input/bin/meta-input-helper",
-      "action": "Удалить старый source-controlled binary только после successful installer switch. Stable pathname остается управляемым scripts/runtime-install.ts и содержит новый broker для сохранения TCC identity."
+      "action": "Удалить только старый source-controlled binary после A02/A31/fresh-task A43 и final reverse scan. Stable TCC subject находится внутри установленного computer-use.app и не должен изменяться этой source delta."
     },
     {
       "file": "scripts/legacy-services.ts",
@@ -238,7 +239,7 @@
     },
     {
       "file": "mcp/tests/stdio.test.ts",
-      "action": "До удаления добавить новые A02/A43 subprocess tests для scripts/runtime-entry.ts --mcp и одного RuntimeHost. Legacy assertions не переносить как REST expectations."
+      "action": "До удаления закрыть A02 subprocess tests для scripts/runtime-entry.ts --mcp и повторить A43 из новой Codex задачи после observer recovery. Legacy assertions не переносить как REST expectations."
     }
   ],
   "jsonModificationProposals": [
@@ -328,9 +329,9 @@
         "dependencies.@meta/shared"
       ],
       "set": {
-        "scripts.start": "bun src/runtime-mcp.ts"
+        "scripts.start": "bun src/installed-launcher.ts"
       },
-      "note": "Сохранить SDK и @meta/runtime; добавить package exports для test factories только если MCP owner подтверждает public API."
+      "note": "Installed launcher уже является default start; сохранить SDK и @meta/runtime, удалить только отдельные legacy server aliases после A02/A31/A43."
     },
     {
       "file": "native/package.json",
@@ -437,7 +438,7 @@
         "mcp/tests/catalog-server.test.ts",
         "mcp/tests/runtime-mcp.test.ts",
         "tests/computer-use/host-mcp-sut.test.ts",
-        "A02/A43 subprocess test proposed"
+        "A02 subprocess test pending; A43 reached installed runtime but full catalog recovery pending"
       ]
     }
   ],
@@ -453,6 +454,6 @@
     "bun.lock is regenerated once after manifest changes.",
     "New source/full acceptance passes with no skipped or zero-test evidence.",
     "Installed doctor confirms matching runtime/native builds before and after source removal.",
-    "Fresh Codex task receives the dynamic MCP catalog; legacy REST, shell input and direct helper commands are absent from supported workflows."
+    "Fresh Codex task receives installed catalog 0.4.0 with all 36 tools after runtime restart; legacy REST, shell input and direct helper commands are absent from supported workflows."
   ]
 }

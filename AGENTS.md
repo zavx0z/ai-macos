@@ -1,469 +1,140 @@
-# @meta/macos — правила для AI-агентов
-
-## Структура
-
-Bun monorepo. Пять пакетов:
-
-| Пакет           | Порт | Назначение                                                      |
-| --------------- | ---- | --------------------------------------------------------------- |
-| `@meta/shared`  | —    | Общие утилиты                                                   |
-| `@meta/window`  | 7878 | Окна macOS через PID-aware native Accessibility helper          |
-| `@meta/screen`  | 7879 | Скриншоты (`screencapture`)                                     |
-| `@meta/chrome`  | 7880 | Десктопный Chrome (CDP-native agent API + системные окна macOS) |
-| `@meta/android` | 7881 | Chrome на Android (ADB + CDP)                                   |
-| `@meta/input`   | 7882 | Клавиатура, мышь и clipboard (native CoreGraphics + pbpaste/pbcopy) |
-
-## Запуск сервисов
-
-```bash
-cd ~/repozitarium/ai-macos
-bun run dev      # все сервисы параллельно с --hot
-```
-
-## Разрешения macOS
-
-Для установленного runtime согласован автоматический запрос недостающих прав
-при запуске. Сам long-lived helper вызывает официальные AX/CG request API для
-Accessibility, Screen Recording, Post Events и Input Monitoring. Запросы не
-повторяются при каждом health/MCP вызове; runtime ждёт фактической выдачи прав
-перед подготовкой observer и разрешением ввода. `system_health` остаётся
-пассивным и сообщает `startup.permissions`.
-
-Ниже приведены старые REST-команды для диагностики legacy контура. В нём только
-отдельный `POST /permissions/*` запрашивает права или открывает настройки;
-это не замена startup-потоку нового runtime.
-
-```bash
-# Accessibility — один grant meta-input-helper для window и input
-curl http://localhost:7878/permissions/accessibility          # GET: { granted: true|false }
-curl -X POST http://localhost:7878/permissions/accessibility  # POST: { granted, opened: true }
-
-# Screen Recording — нужно для screen: все скриншоты
-curl http://localhost:7879/permissions/screen-recording
-curl -X POST http://localhost:7879/permissions/screen-recording
-```
-
-При `granted: false` ввод и захват остаются недоступны. Вне согласованного
-startup-потока повторный запрос прав или открытие настроек выполняется по явной
-просьбе пользователя.
-
-## @meta/window — порт 7878
-
-Основной selector окна — `{app,pid,windowId}` из `list_windows`/`GET /windows`.
-`windowId` — CGWindowID живого окна; index/title/геометрия не являются identity.
-После закрытия окна старый ID не переиспользовать. При явном ID нельзя делать
-fallback по заголовку, геометрии или индексу. Для sheet сохранять ownerWindowId.
-Подробности — `window/API.md` и `skills/ai-macos/references/incidents.md`.
-
-
-```bash
-# Размер экрана (логические пиксели)
-curl http://localhost:7878/screen
-# → { width: 1920, height: 1200 }
-
-# Список видимых окон
-curl "http://localhost:7878/windows"
-curl "http://localhost:7878/windows?app=Google%20Chrome"
-# → { count: N, windows: [{ app, pid, index, title, x, y, width, height }] }
-
-# pid — часть identity; передавайте его при одноимённых процессах
-
-# Фокус уже видимого окна через exact PID native helper
-curl -X POST http://localhost:7878/focus \
-  -H 'content-type: application/json' -d '{"app":"Google Chrome","pid":85565,"index":1}'
-
-# Переместить / изменить размер
-curl -X POST http://localhost:7878/move   -H 'content-type: application/json' -d '{"app":"iTerm2","x":960,"y":600}'
-curl -X POST http://localhost:7878/resize -H 'content-type: application/json' -d '{"app":"iTerm2","width":960,"height":600}'
-
-# Расположить по пресету → { ok, applied: { x, y, width, height } }
-curl -X POST http://localhost:7878/arrange \
-  -H 'content-type: application/json' \
-  -d '{"app":"Google Chrome","preset":"left"}'
-# Пресеты: left | right | top | bottom | max | center
-
-# Поднять окно поверх без отнятия фокуса (AXRaise, одноразово)
-curl -X POST http://localhost:7878/raise \
-  -H 'content-type: application/json' -d '{"app":"iTerm2","index":1}'
-
-# Soft "always on top" — цикл AXRaise каждые intervalMs мс (min 100)
-curl -X POST http://localhost:7878/pin \
-  -H 'content-type: application/json' -d '{"app":"iTerm2","intervalMs":500}'
-# → { ok, pin: { id, app, index, intervalMs, startedAt, raises, errors } }
-
-curl -X DELETE http://localhost:7878/pin/1   # снять один
-curl -X DELETE http://localhost:7878/pin     # снять все
-curl http://localhost:7878/pin               # список активных
-```
-
-### ⚠️ Ограничения /raise и /pin
-
-- `AXRaise` **не пробивает** поверх активного окна другого приложения при клике.
-- Для настоящего «always on top» нужна **iTerm hotkey floating window** (Settings → Keys → Hotkey → Floating Window ✅).
-- PiP-окна браузеров не пробить AXRaise.
-- Pin-циклы сбрасываются при перезапуске сервера.
-
-## @meta/screen — порт 7879
-
-Health возвращает состояние самого сервиса и доступность window API:
-```json
-{ "ok": true, "windowApi": "http://localhost:7878", "window": { "ok": true } }
-```
-
-```bash
-# Рабочий стол
-curl -s http://localhost:7879/desktop -o desktop.png
-curl -s "http://localhost:7879/desktop?display=2" -o d2.png       # второй дисплей
-curl -s -X POST http://localhost:7879/desktop \
-  -H 'content-type: application/json' \
-  -d '{"display":1,"detail":"medium"}' -o desktop.png
-
-# Список захватываемых окон (прокси к window API)
-curl "http://localhost:7879/windows"
-curl "http://localhost:7879/windows?app=Google%20Chrome"
-
-# Окно приложения
-curl -s "http://localhost:7879/window?app=Google%20Chrome&detail=medium" -o chrome.png
-curl -s "http://localhost:7879/window?app=Google%20Chrome&index=2" -o chrome2.png
-curl -s "http://localhost:7879/window?app=Google%20Chrome&title=GitHub" -o gh.png
-# Параметры: app (обязательно), index (def 1), title (substring, приоритет над index),
-#            restore (def true), delayMs (def 150, max 2000), shadow (def true),
-#            detail (low|medium|high|full), scale (0.0..1.0), format (png|json)
-
-curl -s -X POST http://localhost:7879/window \
-  -H 'content-type: application/json' \
-  -d '{"app":"Google Chrome","detail":"medium","shadow":false}' -o chrome.png
-
-# Область экрана (GET и POST принимают одинаковые параметры)
-curl -s -X POST http://localhost:7879/rect \
-  -H 'content-type: application/json' \
-  -d '{"x":0,"y":0,"width":1920,"height":1200,"detail":"medium"}' -o rect.png
-```
-
-Параметр `detail`:
-| Значение | Масштаб | Размер  |
-| -------- | ------- | ------- |
-| `low`    | 25 %    | ~200 КБ |
-| `medium` | 50 %    | ~400 КБ |
-| `high`   | 75 %    | ~600 КБ |
-| `full`   | 100 %   | ~900 КБ |
-
-Формат `json` вместо `png` → `{ ok, target, mime, base64 }`.
-
-## @meta/chrome — порт 7880
-
-Health: `{ ok, running, cdp }` — `running: false` Chrome не запущен; `cdp.available: true` если Chrome запущен с `--remote-debugging-port=9222`.
-
-**Основной агентский контракт — CDP `targetId`.** Сначала вызвать
-`GET /cdp/targets`, затем передавать выбранный `targetId` в `/navigate`,
-`/reload`, `/wait-ready`, `/viewport`, `/eval`, `/console`, `/source` и `/text`.
-`targetId` сохраняется при navigate/reload. Не связывать CDP-вкладки с
-AppleScript-окнами по URL: отдельный CDP-профиль и обычный Chrome имеют разные
-window identity даже при одинаковом URL и геометрии.
-
-`windowId/tabIndex` относятся к системному AppleScript-контуру и нужны только
-для физического окна/Chrome UI. Без `targetId` часть старых операций может
-использовать AppleScript fallback, но это не основной путь разработки.
-
-Если одновременно запущены обычный Chrome и отдельный CDP Chrome, macOS
-AppleScript не умеет адресовать профиль по PID. Поэтому `/windows`, `/tabs` и
-изменяющие AppleScript-операции отвечают `409`, а не возвращают неполный список
-и не выбирают произвольный профиль. В этом состоянии использовать только
-`GET /cdp/targets` и точный `targetId`; нельзя трактовать прежнее `windows: []`
-как отсутствие уже открытого CDP target и нельзя вызывать `POST /windows`.
-
-Чтобы поднять Chrome с CDP:
-```bash
-cd chrome && bun run cdp          # запускает отдельный Chrome (отдельный профиль)
-cd chrome && bun run cdp:check    # проверка
-# или: curl http://localhost:7880/cdp → { available: true, browser: "Chrome/..." }
-```
-
-Chrome 137+ запрещает `--remote-debugging-port` на дефолтном профиле, поэтому скрипт открывает экземпляр с `--user-data-dir=~/Library/Application Support/Google/Chrome-CDP` — это **отдельный** Chrome рядом с основным.
-
-```bash
-# Stable target inventory без debugger WebSocket URL
-curl http://localhost:7880/cdp/targets
-
-# Создать target сразу в CDP Chrome
-curl -X POST http://localhost:7880/cdp/targets \
-  -H 'content-type: application/json' \
-  -d '{"url":"http://127.0.0.1:4214/"}'
-
-# Прямой viewport screenshot без фокуса и Chrome UI
-curl -s -X POST http://localhost:7880/cdp/screenshot \
-  -H 'content-type: application/json' \
-  -d '{"targetId":"TARGET","format":"png","caption":"Ожидаю увидеть visual scene"}' \
-  -o visual.png
-
-# Диагностика
-curl -X POST http://localhost:7880/cdp/performance -d '{"targetId":"TARGET"}'
-curl -X POST http://localhost:7880/cdp/trace -d '{"targetId":"TARGET","durationMs":1000}' -o trace.json
-curl -X POST http://localhost:7880/cdp/command \
-  -d '{"targetId":"TARGET","method":"Runtime.getHeapUsage","params":{}}'
-```
-
-`GET /windows` возвращает смешанный список Chrome-окон:
-
-- `kind:"browser"` — обычное окно Chrome с массивом `tabs`; только такие окна можно использовать для операций с вкладками (`/tabs`, `/activate`, `/navigate`, `/reload`, `/eval`, `/source`, `/text`, `/viewport`, `/console`, `/wait-ready`).
-- `kind:"appWindow"` — Chrome app-mode окно, найденное по процессу `Google Chrome --app=<url>`; у него есть `id`, `title`, `url`, `pid`, геометрия и `tabs: []`. Не подставлять его в tab-операции и не выдумывать `tabIndex`.
-
-### Чтение консоли через CDP
-
-```bash
-# Прослушать консоль вкладки 1500 мс
-curl -s -X POST http://localhost:7880/console \
-  -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2,"durationMs":1500}'
-# → { entries: [{ type, level: "log|info|warn|error|debug", text, url, line, timestamp }], via: "cdp" }
-```
-Захватываются `console.log/info/warn/error/debug` + `Log.entryAdded` (network errors, browser warnings). Без CDP → 503 с подсказкой `bun run cdp`.
-
-```bash
-# Окна
-curl http://localhost:7880/windows
-# → windows: [{ kind:"browser", tabs:[...] }, { kind:"appWindow", url, pid, tabs:[] }]
-curl -X POST http://localhost:7880/windows \
-  -H 'content-type: application/json' -d '{"url":"https://example.com","incognito":false}'
-curl -X DELETE http://localhost:7880/windows/12345
-
-# Вкладки
-curl http://localhost:7880/tabs
-curl "http://localhost:7880/tabs?windowId=12345"
-curl http://localhost:7880/tabs/active
-curl -X POST http://localhost:7880/tabs \
-  -H 'content-type: application/json' -d '{"windowId":12345,"url":"https://example.com"}'
-curl -X DELETE http://localhost:7880/tabs/12345/2   # /tabs/:windowId/:index
-
-# Навигация — по умолчанию waitReady:true (ждём полной готовности через waitFullyReady)
-curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2,"url":"https://example.com"}'
-# Старое поведение (без wait):
-curl -X POST http://localhost:7880/navigate -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2,"url":"https://example.com","waitReady":false}'
-curl -X POST http://localhost:7880/activate -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2}'   # ← оба поля обязательны
-# → { ok, windowId, tabIndex }   ← сохрани windowId для следующего /screenshot!
-curl -X POST http://localhost:7880/reload -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2}'
-# → { ok, hard, waited, waitMs, via, ready }
-# wait:true (по умолчанию) → после Page.reload запускает waitFullyReady (полная готовность)
-# hard:true → CDP Page.reload({ignoreCache:true}) — без отнятия фокуса
-#             AppleScript-фоллбек: Cmd+Shift+R через System Events — отнимает фокус
-# wait:false → вернуть немедленно
-# waitOpts: пробрасывается в waitFullyReady
-curl -X POST http://localhost:7880/back
-curl -X POST http://localhost:7880/forward
-
-# Контент (требует View → Developer → Allow JavaScript from Apple Events)
-curl -X POST http://localhost:7880/eval \
-  -H 'content-type: application/json' -d '{"js":"return document.title"}'
-# → { ok, result: "...", parsed: ... }
-# result — всегда строка (JSON.stringify результата JS). parsed — JSON.parse(result)
-# для объектов/массивов/чисел/булевых, null для не-JSON строк.
-curl http://localhost:7880/source              # outerHTML (text/html)
-curl http://localhost:7880/text                # innerText (text/plain)
-curl "http://localhost:7880/source?windowId=12345&tabIndex=2"
-
-# Скриншот — всегда передавать windowId (из /windows или из ответа /activate) и caption
-curl -s -X POST http://localhost:7880/screenshot \
-  -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2,"detail":"medium","caption":"Ожидаю увидеть главную страницу с навигацией"}' -o chrome.png
-# Без windowId берётся первое окно Chrome — может быть не то!
-# caption логируется до захвата, возвращается в x-meta-caption заголовке
-```
-
-### /wait-ready и /viewport (CDP only)
-
-```bash
-# Полная готовность страницы: readyState, fonts, networkIdle, eager-load всех <img>,
-# reflowStable, animations, finalCommit. Каждый шаг — отдельный stepMs, общий maxMs.
-curl -X POST http://localhost:7880/wait-ready -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2}'
-# → { via:"cdp", ok, reached:[...], skipped:[...], timedOut, durationMs, steps:[...] }
-# options: { readyState?, fonts?, networkIdle?, images?, reflowStable?, animations?,
-#            finalCommit?, idleMs?(700), stepMs?(8000), maxMs?(15000) }
-# Для страниц с бесконечной rAF-анимацией: { "options": { "reflowStable": false } }
-
-# Resize окна Chrome — физический ресайз через Browser.setWindowBounds (mode:"window", default)
-curl -X POST http://localhost:7880/viewport -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2,"width":1440,"height":900}'
-# → { ok, applied:{...,mode:"window",innerSize:false}, bounds:{before,after}, inner:{...}, reloaded:true, ready:{...} }
-
-# Точный content viewport — innerSize:true. Сервис компенсирует Chrome UI (~80-90px высоты).
-curl -X POST http://localhost:7880/viewport -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2,"width":1024,"height":768,"innerSize":true}'
-# → applied.innerSize:true, inner:{width:1024,height:768}, bounds.after.height ≈ 855
-
-# Mobile-эмуляция — виртуальный viewport (mode:"emulation"; авто при mobile:true)
-curl -X POST http://localhost:7880/viewport -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2,"width":390,"height":844,"deviceScaleFactor":3,"mobile":true}'
-# Физическое окно НЕ меняется — страница видит виртуальный viewport, есть touch + mobile UA.
-
-# По умолчанию reload:true → после resize страница перезагружается + waitFullyReady.
-# reload:false — оставить страницу как есть (для статики с resize-listener).
-
-# DELETE снимает emulation-override (но не возвращает physical resize — для него надо
-# повторно POST /viewport или @meta/window /resize):
-curl -X DELETE http://localhost:7880/viewport -H 'content-type: application/json' \
-  -d '{"windowId":12345,"tabIndex":2}'
-```
-
-`POST /screenshot` теперь по умолчанию дёргает waitFullyReady перед захватом — `waitReady:true`. Отключить: `{"waitReady":false}` в body или `?waitReady=false` в query.
-
-Сервис вызывает `Emulation.setFocusEmulationEnabled` чтобы Chrome не тротлил rAF/setTimeout в фоновых вкладках — wait работает даже когда окно Chrome не в фокусе.
-
-### CDP-ловушки (если работаешь с CDP напрямую, минуя сервис)
-
-Сервис всё это уже учитывает — этот блок для случаев когда агент сам открывает WS к 9222.
-
-- **`Emulation.clearDeviceMetricsOverride` в одиночку ненадёжен.** Chrome может «восстановить» предыдущий override после закрытия CDP-сессии — встречалось при переключении с mobile-emulation на physical resize: одиночный `clear` отвечает `{}` ok, но следующая сессия снова видит `innerWidth=390`. Надёжная последовательность: `clear → setDeviceMetricsOverride({width:0,height:0,deviceScaleFactor:0,mobile:false}) → clear`. В коде сервиса это `forceClearMetrics()` (chrome/src/cdp-mode.ts), вызывается в `mode:"window"` и в `DELETE /viewport`.
-- **`Runtime.evaluate` зависает сразу после `Page.reload`/`Page.navigate`.** Старый Runtime context разрушен, новый ещё не создан — вызов висит в pending бесконечно. Перед evaluate подпишись на `Page.loadEventFired` (или `Page.frameStoppedLoading`) с fallback-таймаутом. В сервисе — `waitForLoadEvent()`.
-- **`window.addEventListener("load", …, {once:true})` после уже-firеd события не сработает.** Не строй ожидание на нём. Polling `document.readyState === "complete"` — надёжнее (`setTimeout` ок, если вкладка не тротлится).
-- **Тротлинг фоновых вкладок:** rAF падает до ~1 Hz, минимальный `setTimeout` — до ~1000 мс в неактивных вкладках. Любой wait-loop на них зависает. В начале сессии: `Emulation.setFocusEmulationEnabled({enabled:true})` — рендерер думает что страница в фокусе, тротлинг выключен, OS-фокус не трогается.
-- **`Browser.setWindowBounds` ругается на width/height при `windowState:"maximized"` или `"minimized"`.** Сначала `setWindowBounds({windowState:"normal"})`, потом размер вторым вызовом.
-- **CDP-override живёт на target, не на сессии.** Закрытие WS не откатывает override автоматически. Что установил — то и сними явно, желательно в той же сессии.
-
-## @meta/android — порт 7881
-
-Chrome на Android-телефоне через ADB + CDP. **`adb` устанавливается автоматически** на старте сервиса (через `brew install --cask android-platform-tools`). От пользователя нужно: USB Debugging на телефоне, кабель, открытый Chrome. `ANDROID_AUTO_INSTALL=false` отключает авто-установку.
-
-> ⚠️ ADB forward использует порт **9223** (не 9222). Порт 9222 зарезервирован под десктопный Chrome CDP. Если сервис возвращает корректный `browser` в `/health`, но скриншоты/вкладки выглядят как с маковского Chrome — порты конфликтуют, нужен `POST /bootstrap`.
-
-```bash
-# Проверка состояния
-curl http://localhost:7881/health
-# → { ok, adb, devices, browser?, hint? }
-
-curl http://localhost:7881/devices
-# → { devices: [{ serial, state }] }
-
-curl -X POST http://localhost:7881/forward      # пересоздать adb forward
-curl -X POST http://localhost:7881/bootstrap    # пере-проверить всё + автоустановка adb
-
-# Список вкладок (CDP target ID — стабильный)
-curl http://localhost:7881/tabs
-# → { tabs: [{ id, title, url, type }] }
-
-curl -X POST http://localhost:7881/navigate -H 'content-type: application/json' \
-  -d '{"url":"https://example.com","tabId":"ABC"}'
-
-curl -X POST http://localhost:7881/reload -H 'content-type: application/json' \
-  -d '{"tabId":"ABC","wait":true}'   # ждёт document.readyState === complete
-
-curl -X POST http://localhost:7881/eval -H 'content-type: application/json' \
-  -d '{"js":"return navigator.userAgent","tabId":"ABC"}'
-
-curl http://localhost:7881/source            # outerHTML
-curl http://localhost:7881/text              # innerText
-
-# Скриншот — caption и detail обязательны как и везде
-curl -s -X POST http://localhost:7881/screenshot \
-  -H 'content-type: application/json' \
-  -d '{"tabId":"ABC","detail":"medium","caption":"Ожидаю мобильную форму логина","fullPage":false}' \
-  -o phone.png
-# fullPage:true → захват всей страницы (не только viewport)
-# CDP снимает только содержимое страницы — без UI Chrome (адресной строки, табов)
-```
-
-## @meta/input — порт 7882
-
-Клавиатура, мышь и низкоуровневый PID-aware window backend. HTTP API и вся логика реализованы на **Bun + TypeScript**. Единственный native backend — собираемый локально `input/bin/meta-input-helper`, который вызывает официальные CoreGraphics/Accessibility/AppKit API. Python, `cliclick` и AppleScript не используются. Нужно один раз выдать **Accessibility** именно `meta-input-helper`; при отсутствии разрешения window/input API закрываются с ошибкой и не возвращают неполную инвентаризацию как успех.
-
-```bash
-curl http://localhost:7882/status
-# → { ok:true, service:"@meta/input", inputReady, clipboardReady, probe:"passive-preflight" }
-# passive: не отправляет CoreGraphics event
-
-curl http://localhost:7882/health
-# → { ok:true, service:"@meta/input", inputReady, clipboardReady, probe:"active-event" }
-# inputReady: true = активное CoreGraphics-событие прошло и курсор восстановлен
-
-curl -X POST http://localhost:7882/permissions/accessibility
-# регистрирует запрос TCC и открывает System Settings
-
-# Мышь
-curl http://localhost:7882/mouse/position                       # { x, y }
-curl -X POST http://localhost:7882/mouse/move    -d '{"x":500,"y":400}'
-curl -X POST http://localhost:7882/mouse/click   -d '{"x":500,"y":400,"button":"left","count":2}'
-curl -X POST http://localhost:7882/mouse/drag    -d '{"from":{"x":100,"y":100},"to":{"x":300,"y":300}}'
-curl -X POST http://localhost:7882/mouse/scroll  -d '{"dy":3}'
-
-# Клавиатура
-curl -X POST http://localhost:7882/keyboard/type     -d '{"text":"Hello","delayMs":30}'
-curl -X POST http://localhost:7882/keyboard/key      -d '{"key":"enter"}'
-curl -X POST http://localhost:7882/keyboard/key      -d '{"key":"a","modifiers":["cmd","shift"]}'
-curl -X POST http://localhost:7882/keyboard/shortcut -d '{"shortcut":"cmd+shift+t"}'
-curl -X POST http://localhost:7882/keyboard/shortcut -d '{"sequence":["cmd+a","cmd+c"],"delayMs":80}'
-```
-
-Имена клавиш: `enter|return`, `tab`, `space`, `escape|esc`, `delete|backspace`, `forwarddelete`, `left|right|up|down`, `home`, `end`, `pageup`, `pagedown`, `f1..f20`, или одиночный символ.
-Модификаторы: `cmd|command|meta|⌘`, `shift|⇧`, `alt|option|opt|⌥`, `ctrl|control|⌃`, `fn`.
-
-### Системный clipboard
-
-Clipboard работает напрямую через системные `/usr/bin/pbpaste` и `/usr/bin/pbcopy`, не требует Accessibility и не использует UI-эмуляцию `Cmd+C`/`Cmd+V`.
-
-```bash
-curl http://localhost:7882/clipboard
-curl -X POST http://localhost:7882/clipboard \
-  -H 'content-type: application/json' -d '{"text":"Hello from ai-macos"}'
-```
-
-`GET /health` возвращает отдельный объект `clipboard` с backend и состоянием доступности обеих системных команд.
-
-## Правила для агентов
-
-1. **Перед каждым скриншотом** — сформулировать одним предложением, что ожидается увидеть, и передать это в поле `caption`. После получения изображения — сравнить ожидание с реальностью и сообщить о расхождении.
-2. Агентский путь — direct MCP server `ai-macos`: перед первой операцией вызвать
-   пассивный `system_health` и продолжать только при
-   `machine.matchesExpected: true`. Перед первым pointer/keyboard input после
-   проверки машины вызвать отдельный `input_readiness`, который активно
-   проверяет post-event delivery с возвратом курсора; pointer/keyboard работа
-   продолжается только при `inputReady: true`. Clipboard использует отдельный
-   `clipboardReady` и активной проверки не требует. Прямые `GET /health`
-   используются только при разработке или диагностике самого MCP/REST контура.
-3. При отсутствии разрешения остановить зависимую desktop-операцию. Запросы
-   согласованного startup-потока нового runtime выполняются автоматически самим
-   helper; health их не повторяет. Вне startup повторный запрос требует явной
-   просьбы пользователя.
-4. Для скриншотов передавать `detail="medium"` если пользователь не указал иное.
-5. Для пользовательских desktop-операций использовать только direct
-   `mcp__ai_macos__*`. REST API является внутренней границей MCP и не служит
-   fallback при отсутствующем или ошибочном MCP tool. Deprecated connector
-   `ai-macos-local`, ожидающий внешнего архивирования, не использовать.
-6. Имя приложения (`app`) — каноническое имя процесса macOS, строго по системному.
-7. Следующие Chrome REST-правила применяются только при разработке или тесте
-   самого `@meta/chrome` либо нового direct Chrome MCP adapter. Они не
-   разрешают обходить отсутствующий MCP tool в обычной пользовательской
-   desktop-операции. В этом контуре сначала вызвать `GET /cdp/targets`, выбрать
-   точный `targetId` и использовать его во всех дальнейших CDP-операциях. Не
-   полагаться на URL как identity. `GET /windows` использовать только для
-   системного окна/Chrome UI.
-8. В том же внутреннем Chrome-контуре для screenshot страницы/canvas
-   использовать `POST /cdp/screenshot {targetId,...}`: он снимает compositor
-   напрямую, не требует фокуса или `@meta/screen`. Обычный `POST /screenshot
-   {windowId,tabIndex,...}` нужен только когда в кадре требуется сам Chrome UI.
-9. Окна `kind:"appWindow"` из `GET /windows` — это Chrome app-mode (`Google Chrome --app=<url>`). Они нужны для видимости/диагностики Chrome app окон, но не имеют вкладок; не использовать их с `/activate`, `/navigate`, `/reload`, `/eval`, `/source`, `/text`, `/viewport`, `/console`, `/wait-ready` и не придумывать `tabIndex`.
-10. После `POST /reload` страница гарантированно загружена (сервис ждёт до 10 с) — можно сразу делать скриншот без `sleep`. `hard: true` переносит фокус на Chrome — использовать только если пользователь явно просит сбросить кеш.
-11. `/activate` требует оба поля `windowId` и `tabIndex` — без них вернёт 400.
-12. При ошибке `osascript failed (-1743)` — нет разрешения Automation.
-13. При недоступном input/Accessibility сообщить точный helper path и не
-    ретраить. Открывать настройки можно только по отдельной явной просьбе.
-14. **Canvas/WebGPU-приложения:** основной proof — `POST /cdp/screenshot` после `/wait-ready`. Если нужен ровно один canvas без остального viewport, использовать `POST /eval {targetId,js:"return document.querySelector('canvas').toDataURL('image/png')"}` и декодировать data URL. При нескольких canvas выбирать точный индекс.
-
-
-## Ветки Git и рабочие каталоги
-
-- Агент работает в том каноническом каталоге и в той ветке Git, где начата
-  задача. Текущая ветка является веткой выполнения задачи.
-- Без прямого указания пользователя нельзя создавать, подключать, переключать,
-  переименовывать или удалять ветки Git, дополнительные рабочие каталоги Git и
-  копии репозитория.
-- Аудит, параллельная работа, изоляция задачи, наличие чужих изменений и
-  временный каталог, созданный средой агента, не являются разрешением на новое
-  ответвление. Если продолжать в текущем состоянии нельзя, агент
-  останавливается и сообщает пользователю точную причину.
-- Слияние, перенос отдельных коммитов, изменение основания, принудительный
-  сброс и отправка изменений на сервер выполняются только по отдельному прямому
-  указанию пользователя.
+# ai-macos — правила для AI-агентов
+
+## Действующая архитектура
+
+Основной агентский интерфейс — direct MCP `ai-macos` поверх одного Runtime
+и одного долгоживущего Native broker. Установленное приложение —
+подписанный `computer-use.app`; transport — private authenticated Unix socket.
+
+| Пакет | Ответственность |
+| --- | --- |
+| `@meta/shared` | Контракты, схемы, capability IDs |
+| `@meta/runtime` | Клиенты, методы, операции, leases, recovery и lifecycle |
+| `@meta/native` | AppKit/AX/CoreGraphics/ScreenCaptureKit, registry и executor |
+| `@meta/input` | Планирование ввода и clipboard adapters |
+| `@meta/screen` | Capture adapter, observations и координаты |
+| `@meta/chrome` | CDP adapter с точной browser/target identity |
+| `@meta/android` | Выбранное ADB-устройство и Chrome CDP adapter |
+| `mcp` | Installed launcher и публикация runtime catalog |
+
+Старые REST/CLI entrypoints, пакет `window` и порты 7878–7882 остаются в
+исходниках до завершения миграции. Не запускать их как второй контур управления.
+Root `bun run dev` ещё относится к legacy сервисам, а не установленному runtime.
+
+Текущее состояние: [журнал запуска](docs/reviews/startup-permissions-and-identity.md),
+[план перехода](docs/reviews/cutover-readiness.md).
+Документы содержат датированные результаты; текущую готовность проверять live.
+
+## Управление компьютером
+
+1. Прочитать [навык ai-macos](skills/ai-macos/SKILL.md). Использовать только
+   объявленные в текущей задаче `mcp__ai_macos__*`.
+2. Первым вызвать пассивный `system_health` и проверить
+   `machine.matchesExpected === true`. Другой диагностический клиент
+   не доказывает обновление каталога этой задачи.
+3. В коротком API выбрать цель через `get_state`/`get_tabs`.
+   `targetId` выдаёт Runtime. PID, заголовок, URL, геометрия и индекс не
+   заменяют identity. Новый процесс/окно не наследует прежний handle.
+4. Native-цикл: `observe` → одно действие → новое `observe`.
+   Вмешательство пользователя, потеря coverage и истечение наблюдения
+   требуют нового observe. Не восстанавливать автоматически старый фокус.
+5. Перед мышью/клавиатурой выполнить отдельный `check_input`, если он объявлен.
+   В старом каталоге — `input_readiness`. Продолжать только при фактической
+   готовности ввода. Health не выполняет активную проверку.
+6. Перед снимком сформулировать ожидание в `caption`; по умолчанию
+   `detail: "medium"`, если поле объявлено схемой. Сравнить изображение с
+   ожиданием. Доставка ввода не доказывает эффект в приложении.
+7. Координаты брать из свежего observation в его системе координат.
+   `elementId` принадлежит AX snapshot. При exact target нельзя подбирать
+   похожее окно по заголовку, URL или геометрии.
+8. После timeout/unknown не повторять действие. Запросить operation status;
+   при потерянном ответе использовать `list_recent_operations`. Запрос cancel
+   не доказывает завершение cleanup.
+9. Clipboard читать только по явному поручению. Text-only восстановление
+   не считать восстановлением всех форматов pasteboard.
+10. При отсутствии инструмента, прав или coverage остановить зависимое действие.
+    REST, AppleScript, shell-ввод, `screencapture`, встроенные Codex Computer Use
+    и AppShot не являются fallback.
+
+Диагностика может читать metadata, подписи и состояние собственных сервисов,
+выполнять MCP initialize/tools/list/passive health. Отдельный диагностический
+клиент не используется для desktop-действий. Fake tests и компиляция Native
+не считаются live-проверкой управления.
+
+## Окна, браузеры и Android
+
+- Неполный inventory не означает закрытие отсутствующих в нём окон.
+  Различать hidden/minimized, отсутствие AX, процесс без окон и CG-only записи.
+- Sheet имеет собственную identity и точного owner. Не подменять его родителем
+  по пересечению координат.
+- `show_window` показывает выбранное существующее окно, не создаёт браузер.
+- Chrome выбирается по объявленной browser instance/profile и CDP target.
+  Одинаковый URL в разных профилях не делает targets взаимозаменяемыми.
+- Storybook использует только собственный специализированный MCP/private browser.
+- Android опционален: нужны объявленная capability, точные serial/transport
+  и подтверждённое USB Debugging. Отсутствующее устройство не заменять другим.
+- Не устанавливать ADB автоматически, не перезапускать общий ADB server и
+  не удалять чужие forwards. Системные зависимости — через MacPorts.
+
+## Права macOS и подпись
+
+По поручению пользователя Runtime при запуске запрашивает отсутствующие
+Accessibility, Screen Recording, Post Events и Input Monitoring. Официальные
+request API вызывает Native helper; повторные health/MCP calls их не вызывают.
+
+`startup.permissions.missing` означает, что текущий helper не подтвердил право.
+Пользователь мог его уже включить. Различать настройки macOS, текущий процесс
+и подпись; не повторять просьбы о выдаче прав при проблеме обновления процесса.
+`requestIssued` не доказывает появления диалога. Вне startup-потока повторный
+запрос требует явного поручения. Все grants не заменяют готовность observer.
+
+Сохранять постоянную certificate identity при обновлениях. Нельзя молча менять
+сертификат или возвращаться к ad-hoc. Создание/импорт приватного ключа требует
+отдельного согласования. Ключи и пароли не записывать в репозиторий или логи.
+Стабильная подпись не гарантирует сохранение всех TCC grants: проверять их.
+
+## Установка и проверки
+
+Владелец установки — `scripts/runtime-install.ts`. Без `--execute` он выдаёт
+план. Нужны clean canonical checkout, `AI_MACOS_EXPECTED_HOSTNAME`, profile
+и browser configuration. Сертификат выбирается через `--signing-identity-sha1`
+и при необходимости `--signing-keychain`; fingerprint брать из локальной identity.
+
+Профиль `--desktop-browser-selected` требует pointer, drag, application lifecycle
+и observer. `input.interaction` (focus session с automatic restore) явно отложен.
+Не уменьшать required set ради успешного doctor. Android — только при config.
+
+Установщик подписывает helper, затем app, проверяет hashes/designated requirements,
+выполняет drain и переход с rollback journal. Не заменять внутренние файлы
+подписанного app вручную. Не редактировать TCC DB.
+Legacy `input/bin/meta-input-helper` не является helper нового bundle.
+
+Installed MCP launcher — `mcp/src/installed-launcher.ts`: проверяет release и
+стабильный app, запускает `--mcp` без source/REST fallback.
+Изменение config не заменяет старое открытое соединение.
+
+Проверять затронутые Bun suites/TypeScript; Native —
+`sh native/scripts/check.sh` и `sh native/scripts/check-observer.sh`.
+Тесты с настоящим вводом не запускать как обычную suite: требуется точная
+тестовая цель и direct MCP preflight. Ведущий координирует live-проверки,
+установку и изменение собственных процессов.
+
+## Завершение миграции
+
+Удаление legacy source — только по актуальному
+[плану](scripts/legacy-source-removal-plan.json) после его проверок.
+Нужны installed doctor, новое рабочее direct MCP подключение, subprocess/security
+tests и сведения о [потребителях](docs/legacy-callers.md).
+Не выдавать успешную установку за полную live-приёмку.
+
+## Git и рабочие каталоги
+
+Работать в исходном canonical checkout внутри `/Users/zavx0z/repozitarium`
+и в той же ветке. Без прямого поручения нельзя создавать/переключать ветки,
+клоны и worktrees. Архивный `/Users/zavx0z/production` и его процессы
+не читать и не изменять. Чужие незакоммиченные изменения сохранять.
+
+Git-операции выполнять в пределах поручения пользователя. Действующее поручение
+о промежуточных commit/push сохраняется между сообщениями.
+Новый и изменяемый TS/JS писать без завершающих точек с запятой.
+Авторские комментарии и документация — на русском.
