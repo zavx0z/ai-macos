@@ -1,9 +1,9 @@
 # Проверка high-level computer use interface на четырёх сценариях
 
-Дата: 15 сентября 2026. Статус: **design candidate принят, implementation не
-начата**. Приняты opaque `targetId` и snapshot-bound `elementId`, полный REPL не
-входит в направление. Точные production schemas ещё требуют owner review.
-Facade и runtime code этим проходом не создаются.
+Дата: 15 сентября 2026. Это **исторический snapshot design evaluation** до
+implementation. Приняты opaque `targetId` и snapshot-bound `elementId`, полный
+REPL не входит в направление. Приведённые traces и JSON bytes фиксируют именно
+тот момент исследования; это не measurement production API.
 Проверяемый candidate: `docs/high-level-agent-api.md`.
 
 Итог четырёх traces: hidden-window, exact browser profile/target и concurrent
@@ -14,6 +14,21 @@ candidate пригоден как направление, но не готов �
 этого owner gap и проверки cancel/handle lifecycle tests.
 Все verdicts ниже относятся к design/schema composition, а не к фактически
 прошедшему high-level behavior или live acceptance.
+
+## Обновление после design evaluation
+
+После этого snapshot приняты source checkpoints:
+
+- `2798c3d` — lineage-local target/element bindings;
+- `34f5394` — exact observation и cancel по target;
+- `cb97922` — короткие input actions, status/cancel и диагностика окон;
+- `c31909a`, `2be38e1` — native AXPress и retained AX snapshot.
+
+Таким образом, зафиксированный ниже AX backend gap закрыт на уровне принятого
+source. High-level methods ещё не подключены к production RuntimeHost/MCP,
+aggregate desktop composition находится под P1 review, установленный MCP 0.3.0
+не переключён, live matrix не выполнена. Исторические traces не переписываются
+задним числом как будто они измеряли новую реализацию.
 
 ## Проверенное текущее основание
 
@@ -322,5 +337,6 @@ durable operation identity; target handle не переносится на од�
 4. `cancel_target` и `get_target_status` работают конкурентно с pending call и
    не допускают blind replay.
 
-До этого facade implementation, production schemas и catalog changes остаются
-на паузе.
+На историческом baseline это были условия начала implementation. Source blocks
+теперь существуют, но их production Host/catalog binding, aggregate validation
+и live acceptance остаются следующими gates.

@@ -4,14 +4,20 @@
 
 Владимир согласовал этот вариант 15 сентября 2026: сохранить runtime и точную
 адресацию окон, добавить удобный внешний слой, отложить полный JavaScript REPL.
-Перед реализацией проверить проект на четырёх сценариях из
+Проект проверен на четырёх сценариях из
 [сравнения вариантов](computer-use-api-comparison.md).
 
 Проект проверен на четырёх fixture-трассах:
 [результаты и ограничения](reviews/high-level-api-scenarios.md).
-Проверка подтверждает форму интерфейса; она не заменяет реализацию или live test.
-Нужны настоящий AXPress и сохранение cancel/status после закрытия цели.
-Начинается реализация привязок. Это ещё не установленный MCP API.
+Проверка подтверждает форму интерфейса; она не заменяет implementation или live
+test. Source blocks приняты в `2798c3d`, `34f5394`, `cb97922`, `c31909a` и
+`2be38e1`: target/element bindings, observation, target-scoped status/cancel,
+короткие actions, AXPress и retained AX snapshot существуют в source.
+
+Текущий статус: **source-only**. Production RuntimeHost/MCP catalog binding,
+aggregate desktop P1 review, installed cutover и live matrix ещё не завершены.
+Подключённый MCP остаётся 0.3.0; наличие source methods не означает, что текущая
+задача Codex уже может их вызвать.
 Внутренние window/browser/input/capture методы остаются исполнительной границей;
 внешний слой не отправляет события в обход RuntimeCore.
 
