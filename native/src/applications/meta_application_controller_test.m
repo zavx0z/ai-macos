@@ -6,11 +6,15 @@
 
 typedef struct {
   uint64_t now;
-  uint64_t launch_step;
   uint64_t lookup_step;
-  MetaApplicationWorkspaceLaunchStatus launch_status;
+  MetaApplicationWorkspaceLaunchStart launch_start;
   MetaApplicationProcess launch_process;
   bool reused;
+  bool complete_immediately;
+  MetaApplicationLaunchCompletion launch_completion;
+  void *launch_completion_context;
+  MetaApplicationActivationStatus activation_status;
+  size_t activation_calls;
   MetaApplicationWorkspaceTerminateStatus terminate_status;
   size_t terminate_calls;
   size_t lookup_calls;
@@ -38,17 +42,32 @@ static uint64_t now(void *context) {
   return ((Fixture *)context)->now;
 }
 
-static MetaApplicationWorkspaceLaunchStatus launch(
+static MetaApplicationWorkspaceLaunchStart start_launch(
     void *context,
     const MetaApplicationLaunchRequest *request,
-    MetaApplicationProcess *value,
-    bool *reused) {
+    MetaApplicationLaunchCompletion completion,
+    void *completion_context) {
   Fixture *fixture = context;
   assert(strcmp(request->application_url, "/Applications/Fixture.app") == 0);
-  fixture->now += fixture->launch_step;
-  *value = fixture->launch_process;
-  *reused = fixture->reused;
-  return fixture->launch_status;
+  fixture->launch_completion = completion;
+  fixture->launch_completion_context = completion_context;
+  if (fixture->complete_immediately &&
+      fixture->launch_start == META_APPLICATION_LAUNCH_ENQUEUED) {
+    completion(completion_context, META_APPLICATION_LAUNCH_CALLBACK_COMPLETED,
+               &fixture->launch_process, fixture->reused, NULL);
+  }
+  return fixture->launch_start;
+}
+
+static MetaApplicationActivationStatus activate(
+    void *context,
+    const MetaApplicationProcess *expected,
+    uint64_t deadline_millis) {
+  Fixture *fixture = context;
+  fixture->activation_calls += 1;
+  assert(fixture->now < deadline_millis);
+  assert(expected->pid == fixture->launch_process.pid);
+  return fixture->activation_status;
 }
 
 static MetaApplicationLookupStatus lookup(
@@ -93,7 +112,8 @@ static MetaApplicationBackend backend(Fixture *fixture) {
   return (MetaApplicationBackend){
       .context = fixture,
       .monotonic_millis = now,
-      .launch = launch,
+      .start_launch = start_launch,
+      .activate = activate,
       .lookup = lookup,
       .terminate = terminate,
       .wait_millis = wait_millis,
@@ -103,8 +123,16 @@ static MetaApplicationBackend backend(Fixture *fixture) {
 static MetaApplicationLaunchRequest launch_request(void) {
   MetaApplicationLaunchRequest request = {
       .activate = true,
+      .fence_counter = 7,
       .deadline_millis = 1000,
   };
+  copy_text(request.launch_task_ref, sizeof(request.launch_task_ref),
+            "launch-task-1");
+  copy_text(request.request_id, sizeof(request.request_id), "launch-request-1");
+  copy_text(request.operation_id, sizeof(request.operation_id), "operation-1");
+  copy_text(request.runtime_epoch, sizeof(request.runtime_epoch), "runtime-1");
+  copy_text(request.login_session_id, sizeof(request.login_session_id), "login-1");
+  copy_text(request.native_generation, sizeof(request.native_generation), "native-1");
   copy_text(request.application_url, sizeof(request.application_url),
             "/Applications/Fixture.app");
   copy_text(request.expected_bundle_id, sizeof(request.expected_bundle_id),
@@ -124,55 +152,130 @@ static MetaApplicationQuitRequest quit_request(void) {
   return request;
 }
 
-static void test_launch_exact_candidate(void) {
+static void test_launch_immediate_completion_and_activation(void) {
   Fixture fixture = {
-      .launch_status = META_APPLICATION_LAUNCH_COMPLETED,
+      .launch_start = META_APPLICATION_LAUNCH_ENQUEUED,
       .launch_process = process(501, 1000000, "com.example.fixture"),
       .reused = true,
+      .complete_immediately = true,
+      .activation_status = META_APPLICATION_ACTIVATION_SUCCEEDED,
   };
-  MetaApplicationLaunchResult result = {0};
   MetaApplicationLaunchRequest request = launch_request();
-  assert(meta_application_launch(backend(&fixture), &request, &result));
-  assert(result.outcome == META_APPLICATION_LAUNCH_READY);
-  assert(result.mutation_attempted && result.process_present);
-  assert(result.reused_existing_process);
-  assert(result.process.pid == 501);
+  MetaApplicationLaunchTask *task =
+      meta_application_launch_task_start(backend(&fixture), &request);
+  assert(task != NULL);
+  MetaApplicationLaunchTaskStatus status =
+      meta_application_launch_task_status(task);
+  assert(status.state == META_APPLICATION_LAUNCH_TASK_COMPLETED);
+  assert(status.drained && status.callback_received && status.process_present);
+  assert(status.reused_existing_process && status.process.pid == 501);
+  assert(status.activation_requested && status.activation_attempted &&
+         status.activation_succeeded && fixture.activation_calls == 1);
+  assert(strcmp(status.operation_id, "operation-1") == 0 &&
+         strcmp(status.launch_task_ref, "launch-task-1") == 0 &&
+         status.fence_counter == 7);
+  assert(meta_application_launch_task_release(task));
 }
 
-static void test_launch_timeout_is_unknown(void) {
-  Fixture fixture = {
-      .launch_status = META_APPLICATION_LAUNCH_TIMED_OUT,
-  };
-  MetaApplicationLaunchResult result = {0};
-  MetaApplicationLaunchRequest request = launch_request();
-  assert(meta_application_launch(backend(&fixture), &request, &result));
-  assert(result.outcome == META_APPLICATION_LAUNCH_OUTCOME_UNKNOWN);
-  assert(result.mutation_attempted && !result.process_present);
+static void complete_launch(Fixture *fixture,
+                            MetaApplicationWorkspaceLaunchCompletionStatus status,
+                            const MetaApplicationProcess *process,
+                            const char *error) {
+  assert(fixture->launch_completion != NULL);
+  MetaApplicationLaunchCompletion completion = fixture->launch_completion;
+  fixture->launch_completion = NULL;
+  completion(fixture->launch_completion_context, status, process,
+             fixture->reused, error);
 }
 
-static void test_late_launch_preserves_candidate_without_false_ready(void) {
+static void test_launch_timeout_retains_task_for_late_callback(void) {
   Fixture fixture = {
-      .launch_status = META_APPLICATION_LAUNCH_COMPLETED,
+      .launch_start = META_APPLICATION_LAUNCH_ENQUEUED,
       .launch_process = process(501, 1000000, "com.example.fixture"),
-      .launch_step = 1000,
+      .activation_status = META_APPLICATION_ACTIVATION_SUCCEEDED,
   };
-  MetaApplicationLaunchResult result = {0};
   MetaApplicationLaunchRequest request = launch_request();
-  assert(meta_application_launch(backend(&fixture), &request, &result));
-  assert(result.outcome == META_APPLICATION_LAUNCH_OUTCOME_UNKNOWN);
-  assert(result.mutation_attempted && result.process_present);
+  MetaApplicationLaunchTask *task =
+      meta_application_launch_task_start(backend(&fixture), &request);
+  assert(task != NULL);
+  fixture.now = request.deadline_millis;
+  MetaApplicationLaunchTaskStatus status =
+      meta_application_launch_task_status(task);
+  assert(status.state ==
+         META_APPLICATION_LAUNCH_TASK_WAITING_LATE_CALLBACK);
+  assert(status.timed_out && !status.drained && !status.callback_received &&
+         status.revision == 2);
+  MetaApplicationLaunchTaskStatus waited =
+      meta_application_launch_task_wait(task, request.deadline_millis + 20);
+  assert(!waited.drained && waited.revision == 2);
+  assert(!meta_application_launch_task_release(task));
+  complete_launch(&fixture, META_APPLICATION_LAUNCH_CALLBACK_COMPLETED,
+                  &fixture.launch_process, NULL);
+  status = meta_application_launch_task_status(task);
+  assert(status.state == META_APPLICATION_LAUNCH_TASK_COMPLETED);
+  assert(status.drained && status.late_completion && status.process_present &&
+         status.revision == 4);
+  assert(!status.activation_attempted && fixture.activation_calls == 0);
+  assert(meta_application_launch_task_release(task));
 }
 
-static void test_launch_foreign_process_is_unknown(void) {
+static void test_cancel_waits_for_callback_and_skips_activation(void) {
   Fixture fixture = {
-      .launch_status = META_APPLICATION_LAUNCH_COMPLETED,
-      .launch_process = process(501, 1000000, "com.example.foreign"),
+      .launch_start = META_APPLICATION_LAUNCH_ENQUEUED,
+      .launch_process = process(501, 1000000, "com.example.fixture"),
+      .activation_status = META_APPLICATION_ACTIVATION_SUCCEEDED,
   };
-  MetaApplicationLaunchResult result = {0};
   MetaApplicationLaunchRequest request = launch_request();
-  assert(meta_application_launch(backend(&fixture), &request, &result));
-  assert(result.outcome == META_APPLICATION_LAUNCH_OUTCOME_UNKNOWN);
-  assert(result.mutation_attempted && !result.process_present);
+  MetaApplicationLaunchTask *task =
+      meta_application_launch_task_start(backend(&fixture), &request);
+  assert(task != NULL && meta_application_launch_task_cancel(task));
+  MetaApplicationLaunchTaskStatus pending =
+      meta_application_launch_task_status(task);
+  assert(pending.cancellation_requested && !pending.drained);
+  complete_launch(&fixture, META_APPLICATION_LAUNCH_CALLBACK_COMPLETED,
+                  &fixture.launch_process, NULL);
+  MetaApplicationLaunchTaskStatus terminal =
+      meta_application_launch_task_status(task);
+  assert(terminal.state == META_APPLICATION_LAUNCH_TASK_COMPLETED);
+  assert(terminal.cancellation_requested && terminal.drained);
+  assert(!terminal.activation_attempted && fixture.activation_calls == 0);
+  assert(meta_application_launch_task_release(task));
+}
+
+static void test_failed_callback_is_terminal_without_candidate(void) {
+  Fixture fixture = {
+      .launch_start = META_APPLICATION_LAUNCH_ENQUEUED,
+  };
+  MetaApplicationLaunchRequest request = launch_request();
+  MetaApplicationLaunchTask *task =
+      meta_application_launch_task_start(backend(&fixture), &request);
+  assert(task != NULL);
+  complete_launch(&fixture, META_APPLICATION_LAUNCH_CALLBACK_FAILED, NULL,
+                  "injected callback failure");
+  MetaApplicationLaunchTaskStatus status =
+      meta_application_launch_task_status(task);
+  assert(status.state ==
+         META_APPLICATION_LAUNCH_TASK_FAILED_AFTER_DISPATCH);
+  assert(status.drained && status.callback_received && !status.process_present);
+  assert(strstr(status.error, "injected") != NULL);
+  assert(meta_application_launch_task_release(task));
+}
+
+static void test_rejected_start_is_terminal_without_mutation(void) {
+  Fixture fixture = {
+      .launch_start = META_APPLICATION_LAUNCH_REJECTED_NO_DISPATCH,
+  };
+  MetaApplicationLaunchRequest request = launch_request();
+  MetaApplicationLaunchTask *task =
+      meta_application_launch_task_start(backend(&fixture), &request);
+  assert(task != NULL);
+  MetaApplicationLaunchTaskStatus status =
+      meta_application_launch_task_status(task);
+  assert(status.state ==
+         META_APPLICATION_LAUNCH_TASK_REJECTED_NO_DISPATCH);
+  assert(status.drained && !status.mutation_attempted &&
+         !status.callback_received);
+  assert(meta_application_launch_task_release(task));
 }
 
 static void test_quit_rejects_stale_without_mutation(void) {
@@ -257,10 +360,11 @@ static void test_still_running_requires_attention_without_force(void) {
 
 int main(void) {
   @autoreleasepool {
-    test_launch_exact_candidate();
-    test_launch_timeout_is_unknown();
-    test_late_launch_preserves_candidate_without_false_ready();
-    test_launch_foreign_process_is_unknown();
+    test_launch_immediate_completion_and_activation();
+    test_launch_timeout_retains_task_for_late_callback();
+    test_cancel_waits_for_callback_and_skips_activation();
+    test_failed_callback_is_terminal_without_candidate();
+    test_rejected_start_is_terminal_without_mutation();
     test_quit_rejects_stale_without_mutation();
     test_quit_observes_exact_termination();
     test_quit_deadline_after_lookup_does_not_dispatch();

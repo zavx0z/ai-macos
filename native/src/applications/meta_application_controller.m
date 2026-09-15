@@ -24,67 +24,10 @@ static bool same_process(const MetaApplicationProcess *left,
          strcmp(left->bundle_id, right->bundle_id) == 0;
 }
 
-static bool valid_backend(MetaApplicationBackend backend) {
-  return backend.monotonic_millis != NULL && backend.launch != NULL &&
-         backend.lookup != NULL && backend.terminate != NULL &&
+static bool valid_quit_backend(MetaApplicationBackend backend) {
+  return backend.monotonic_millis != NULL && backend.lookup != NULL &&
+         backend.terminate != NULL &&
          backend.wait_millis != NULL;
-}
-
-bool meta_application_launch(MetaApplicationBackend backend,
-                             const MetaApplicationLaunchRequest *request,
-                             MetaApplicationLaunchResult *result) {
-  if (result == NULL) return false;
-  *result = (MetaApplicationLaunchResult){0};
-  if (!valid_backend(backend) || request == NULL ||
-      !valid_text(request->application_url, META_APPLICATION_URL_CAPACITY) ||
-      request->application_url[0] != '/' ||
-      !valid_text(request->expected_bundle_id,
-                  META_APPLICATION_BUNDLE_CAPACITY) ||
-      request->deadline_millis <= backend.monotonic_millis(backend.context)) {
-    result->outcome = META_APPLICATION_LAUNCH_REJECTED_NO_DISPATCH;
-    copy_text(result->error, sizeof(result->error),
-              "invalid launch request or expired deadline");
-    return true;
-  }
-  bool reused = false;
-  MetaApplicationProcess process = {0};
-  MetaApplicationWorkspaceLaunchStatus status = backend.launch(
-      backend.context, request, &process, &reused);
-  if (status == META_APPLICATION_LAUNCH_REJECTED) {
-    result->outcome = META_APPLICATION_LAUNCH_REJECTED_NO_DISPATCH;
-    copy_text(result->error, sizeof(result->error),
-              "workspace rejected launch before dispatch");
-    return true;
-  }
-  result->mutation_attempted = true;
-  if (backend.monotonic_millis(backend.context) >= request->deadline_millis) {
-    result->outcome = META_APPLICATION_LAUNCH_OUTCOME_UNKNOWN;
-    if (status == META_APPLICATION_LAUNCH_COMPLETED && process.pid > 0 &&
-        process.launch_time_micros > 0 &&
-        strcmp(process.bundle_id, request->expected_bundle_id) == 0) {
-      result->process_present = true;
-      result->reused_existing_process = reused;
-      result->process = process;
-    }
-    copy_text(result->error, sizeof(result->error),
-              "workspace launch crossed operation deadline");
-    return true;
-  }
-  if (status != META_APPLICATION_LAUNCH_COMPLETED || process.pid <= 0 ||
-      process.launch_time_micros == 0 ||
-      strcmp(process.bundle_id, request->expected_bundle_id) != 0) {
-    result->outcome = META_APPLICATION_LAUNCH_OUTCOME_UNKNOWN;
-    copy_text(result->error, sizeof(result->error),
-              status == META_APPLICATION_LAUNCH_TIMED_OUT
-                  ? "workspace launch timed out after dispatch"
-                  : "workspace launch result lacks exact process identity");
-    return true;
-  }
-  result->outcome = META_APPLICATION_LAUNCH_READY;
-  result->process_present = true;
-  result->reused_existing_process = reused;
-  result->process = process;
-  return true;
 }
 
 bool meta_application_quit(MetaApplicationBackend backend,
@@ -92,7 +35,7 @@ bool meta_application_quit(MetaApplicationBackend backend,
                            MetaApplicationQuitResult *result) {
   if (result == NULL) return false;
   *result = (MetaApplicationQuitResult){0};
-  if (!valid_backend(backend) || request == NULL ||
+  if (!valid_quit_backend(backend) || request == NULL ||
       !valid_text(request->application_ref, META_APPLICATION_REF_CAPACITY) ||
       !valid_text(request->registration_nonce,
                   sizeof(request->registration_nonce)) ||
@@ -249,20 +192,21 @@ static MetaApplicationLookupStatus system_lookup(
   }
 }
 
-static MetaApplicationWorkspaceLaunchStatus system_launch(
+static MetaApplicationWorkspaceLaunchStart system_start_launch(
     void *context,
     const MetaApplicationLaunchRequest *request,
-    MetaApplicationProcess *process,
-    bool *reused_existing_process) {
+    MetaApplicationLaunchCompletion completion,
+    void *completion_context) {
   (void)context;
   @autoreleasepool {
     NSString *path = @(request->application_url);
     NSURL *url = [[NSURL fileURLWithPath:path]
         URLByResolvingSymlinksInPath];
     NSBundle *bundle = [NSBundle bundleWithURL:url];
+    NSString *expectedBundleId = [@(request->expected_bundle_id) copy];
     if (bundle == nil ||
-        ![bundle.bundleIdentifier isEqual:@(request->expected_bundle_id)]) {
-      return META_APPLICATION_LAUNCH_REJECTED;
+        ![bundle.bundleIdentifier isEqual:expectedBundleId]) {
+      return META_APPLICATION_LAUNCH_REJECTED_NO_DISPATCH;
     }
     NSMutableSet<NSString *> *existing = [NSMutableSet set];
     for (NSRunningApplication *candidate in
@@ -277,42 +221,59 @@ static MetaApplicationWorkspaceLaunchStatus system_launch(
     }
     NSWorkspaceOpenConfiguration *configuration =
         [NSWorkspaceOpenConfiguration configuration];
-    configuration.activates = request->activate;
+    configuration.activates = false;
     configuration.createsNewApplicationInstance =
         request->create_new_instance;
     if (system_monotonic_millis(NULL) >= request->deadline_millis) {
-      return META_APPLICATION_LAUNCH_REJECTED;
+      return META_APPLICATION_LAUNCH_REJECTED_NO_DISPATCH;
     }
-    dispatch_semaphore_t completion = dispatch_semaphore_create(0);
-    __block NSRunningApplication *launched = nil;
-    __block NSError *launchError = nil;
     [NSWorkspace.sharedWorkspace openApplicationAtURL:url
                                         configuration:configuration
                                     completionHandler:^(
                                         NSRunningApplication *application,
                                         NSError *error) {
-      launched = application;
-      launchError = error;
-      dispatch_semaphore_signal(completion);
+      MetaApplicationProcess process = {0};
+      if (error != nil || !copy_running_process(application, &process) ||
+          ![@(process.bundle_id) isEqual:expectedBundleId]) {
+        completion(completion_context,
+                   META_APPLICATION_LAUNCH_CALLBACK_FAILED, NULL, false,
+                   error == nil ? "workspace callback lacks exact process identity"
+                                : error.localizedDescription.UTF8String);
+        return;
+      }
+      NSString *identity = [NSString stringWithFormat:@"%d:%llu", process.pid,
+        (unsigned long long)process.launch_time_micros];
+      completion(completion_context,
+                 META_APPLICATION_LAUNCH_CALLBACK_COMPLETED, &process,
+                 [existing containsObject:identity], NULL);
     }];
-    uint64_t now = system_monotonic_millis(NULL);
-    if (now >= request->deadline_millis) {
-      return META_APPLICATION_LAUNCH_TIMED_OUT;
+    return META_APPLICATION_LAUNCH_ENQUEUED;
+  }
+}
+
+static MetaApplicationActivationStatus system_activate(
+    void *context,
+    const MetaApplicationProcess *expected,
+    uint64_t deadline_millis) {
+  (void)context;
+  @autoreleasepool {
+    if (system_monotonic_millis(NULL) >= deadline_millis) {
+      return META_APPLICATION_ACTIVATION_EXPIRED;
     }
-    uint64_t remaining = request->deadline_millis - now;
-    long completed = dispatch_semaphore_wait(
-        completion,
-        dispatch_time(DISPATCH_TIME_NOW, (int64_t)remaining * NSEC_PER_MSEC));
-    if (completed != 0) return META_APPLICATION_LAUNCH_TIMED_OUT;
-    if (launchError != nil ||
-        !copy_running_process(launched, process) ||
-        strcmp(process->bundle_id, request->expected_bundle_id) != 0) {
-      return META_APPLICATION_LAUNCH_FAILED_AFTER_DISPATCH;
+    NSRunningApplication *application =
+        [NSRunningApplication runningApplicationWithProcessIdentifier:
+                                  expected->pid];
+    MetaApplicationProcess current = {0};
+    if (!copy_running_process(application, &current) ||
+        !same_process(expected, &current)) {
+      return META_APPLICATION_ACTIVATION_TARGET_STALE;
     }
-    NSString *identity = [NSString stringWithFormat:@"%d:%llu", process->pid,
-      (unsigned long long)process->launch_time_micros];
-    *reused_existing_process = [existing containsObject:identity];
-    return META_APPLICATION_LAUNCH_COMPLETED;
+    if (system_monotonic_millis(NULL) >= deadline_millis) {
+      return META_APPLICATION_ACTIVATION_EXPIRED;
+    }
+    return [application activateWithOptions:NSApplicationActivateIgnoringOtherApps]
+               ? META_APPLICATION_ACTIVATION_SUCCEEDED
+               : META_APPLICATION_ACTIVATION_FAILED;
   }
 }
 
@@ -360,7 +321,8 @@ static void system_wait_millis(void *context, uint64_t millis) {
 MetaApplicationBackend meta_application_system_backend(void) {
   return (MetaApplicationBackend){
       .monotonic_millis = system_monotonic_millis,
-      .launch = system_launch,
+      .start_launch = system_start_launch,
+      .activate = system_activate,
       .lookup = system_lookup,
       .terminate = system_terminate,
       .wait_millis = system_wait_millis,

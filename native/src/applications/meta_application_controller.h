@@ -22,11 +22,21 @@ typedef enum {
 } MetaApplicationLookupStatus;
 
 typedef enum {
-  META_APPLICATION_LAUNCH_COMPLETED,
-  META_APPLICATION_LAUNCH_TIMED_OUT,
-  META_APPLICATION_LAUNCH_REJECTED,
-  META_APPLICATION_LAUNCH_FAILED_AFTER_DISPATCH,
-} MetaApplicationWorkspaceLaunchStatus;
+  META_APPLICATION_LAUNCH_ENQUEUED,
+  META_APPLICATION_LAUNCH_REJECTED_NO_DISPATCH,
+} MetaApplicationWorkspaceLaunchStart;
+
+typedef enum {
+  META_APPLICATION_LAUNCH_CALLBACK_COMPLETED,
+  META_APPLICATION_LAUNCH_CALLBACK_FAILED,
+} MetaApplicationWorkspaceLaunchCompletionStatus;
+
+typedef enum {
+  META_APPLICATION_ACTIVATION_SUCCEEDED,
+  META_APPLICATION_ACTIVATION_TARGET_STALE,
+  META_APPLICATION_ACTIVATION_EXPIRED,
+  META_APPLICATION_ACTIVATION_FAILED,
+} MetaApplicationActivationStatus;
 
 typedef enum {
   META_APPLICATION_TERMINATE_ACCEPTED,
@@ -37,6 +47,13 @@ typedef enum {
 } MetaApplicationWorkspaceTerminateStatus;
 
 typedef struct {
+  char launch_task_ref[META_APPLICATION_REF_CAPACITY];
+  char request_id[META_APPLICATION_REF_CAPACITY];
+  char operation_id[META_APPLICATION_REF_CAPACITY];
+  char runtime_epoch[65];
+  char login_session_id[65];
+  char native_generation[65];
+  uint64_t fence_counter;
   char application_url[META_APPLICATION_URL_CAPACITY];
   char expected_bundle_id[META_APPLICATION_BUNDLE_CAPACITY];
   bool create_new_instance;
@@ -45,19 +62,44 @@ typedef struct {
 } MetaApplicationLaunchRequest;
 
 typedef enum {
-  META_APPLICATION_LAUNCH_READY,
-  META_APPLICATION_LAUNCH_REJECTED_NO_DISPATCH,
-  META_APPLICATION_LAUNCH_OUTCOME_UNKNOWN,
-} MetaApplicationLaunchOutcome;
+  META_APPLICATION_LAUNCH_TASK_PENDING,
+  META_APPLICATION_LAUNCH_TASK_WAITING_LATE_CALLBACK,
+  META_APPLICATION_LAUNCH_TASK_COMPLETED,
+  META_APPLICATION_LAUNCH_TASK_FAILED_AFTER_DISPATCH,
+  META_APPLICATION_LAUNCH_TASK_REJECTED_NO_DISPATCH,
+} MetaApplicationLaunchTaskState;
 
 typedef struct {
-  MetaApplicationLaunchOutcome outcome;
+  char launch_task_ref[META_APPLICATION_REF_CAPACITY];
+  char request_id[META_APPLICATION_REF_CAPACITY];
+  char operation_id[META_APPLICATION_REF_CAPACITY];
+  char runtime_epoch[65];
+  char login_session_id[65];
+  char native_generation[65];
+  uint64_t fence_counter;
+  uint64_t revision;
+  MetaApplicationLaunchTaskState state;
   bool mutation_attempted;
+  bool cancellation_requested;
+  bool timed_out;
+  bool callback_received;
+  bool drained;
+  bool late_completion;
   bool process_present;
   bool reused_existing_process;
+  bool activation_requested;
+  bool activation_attempted;
+  bool activation_succeeded;
   MetaApplicationProcess process;
   char error[META_APPLICATION_ERROR_CAPACITY];
-} MetaApplicationLaunchResult;
+} MetaApplicationLaunchTaskStatus;
+
+typedef void (*MetaApplicationLaunchCompletion)(
+    void *context,
+    MetaApplicationWorkspaceLaunchCompletionStatus status,
+    const MetaApplicationProcess *process,
+    bool reused_existing_process,
+    const char *error);
 
 typedef struct {
   char application_ref[META_APPLICATION_REF_CAPACITY];
@@ -87,11 +129,15 @@ typedef struct {
 typedef struct {
   void *context;
   uint64_t (*monotonic_millis)(void *context);
-  MetaApplicationWorkspaceLaunchStatus (*launch)(
+  MetaApplicationWorkspaceLaunchStart (*start_launch)(
       void *context,
       const MetaApplicationLaunchRequest *request,
-      MetaApplicationProcess *process,
-      bool *reused_existing_process);
+      MetaApplicationLaunchCompletion completion,
+      void *completion_context);
+  MetaApplicationActivationStatus (*activate)(
+      void *context,
+      const MetaApplicationProcess *expected,
+      uint64_t deadline_millis);
   MetaApplicationLookupStatus (*lookup)(
       void *context,
       int32_t pid,
@@ -103,9 +149,22 @@ typedef struct {
   void (*wait_millis)(void *context, uint64_t millis);
 } MetaApplicationBackend;
 
-bool meta_application_launch(MetaApplicationBackend backend,
-                             const MetaApplicationLaunchRequest *request,
-                             MetaApplicationLaunchResult *result);
+typedef struct MetaApplicationLaunchTask MetaApplicationLaunchTask;
+
+MetaApplicationLaunchTask *meta_application_launch_task_start(
+    MetaApplicationBackend backend,
+    const MetaApplicationLaunchRequest *request);
+
+MetaApplicationLaunchTaskStatus meta_application_launch_task_status(
+    MetaApplicationLaunchTask *task);
+
+MetaApplicationLaunchTaskStatus meta_application_launch_task_wait(
+    MetaApplicationLaunchTask *task,
+    uint64_t wait_deadline_millis);
+
+bool meta_application_launch_task_cancel(MetaApplicationLaunchTask *task);
+
+bool meta_application_launch_task_release(MetaApplicationLaunchTask *task);
 
 bool meta_application_quit(MetaApplicationBackend backend,
                            const MetaApplicationQuitRequest *request,
