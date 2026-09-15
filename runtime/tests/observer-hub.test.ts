@@ -92,6 +92,10 @@ function fixture(options: {
   maxEventsPerSubscriber?: number
   closeMs?: number
   hangEvents?: boolean
+  hangCoverage?: boolean
+  controlTimeoutMs?: number
+  maxHistoryEvents?: number
+  maxHistoryBytes?: number
   initialSnapshot?: NativeObserverSnapshot
 } = {}) {
   const queue = new EventQueue()
@@ -112,6 +116,7 @@ function fixture(options: {
       return queue.events(signal)
     },
     async observer(request: NativeObserverRequest) {
+      if (options.hangCoverage) await new Promise<never>(() => undefined)
       return {
         kind: "observer-response",
         protocolVersion: "1",
@@ -133,6 +138,9 @@ function fixture(options: {
     onGap: error => gaps.push(error),
     maxEventsPerSubscriber: options.maxEventsPerSubscriber,
     closeMs: options.closeMs,
+    controlTimeoutMs: options.controlTimeoutMs,
+    maxHistoryEvents: options.maxHistoryEvents,
+    maxHistoryBytes: options.maxHistoryBytes,
   })
   return {
     diagnostics,
@@ -167,6 +175,54 @@ async function next(iterable: AsyncIterable<ObservedEvent>): Promise<IteratorRes
 }
 
 describe("C3 runtime native observer hub", () => {
+  test("длительный PUSH сохраняет continuity после вытеснения старой истории", async () => {
+    const value = fixture({ maxHistoryEvents: 3 })
+    value.hub.start()
+    const live = value.hub.subscribe()[Symbol.asyncIterator]()
+    let last = 0
+    for (let sequence = 1; sequence <= 2_001; sequence++) {
+      value.queue.push(event(sequence))
+      last = (await live.next()).value!.sequence
+    }
+    value.setSnapshot({
+      ...snapshot(),
+      coverage: { ...snapshot().coverage, cursor: "cursor:start:s2001", nextSequence: 2002 },
+    })
+    expect(last).toBe(2001)
+    expect(value.gaps).toEqual([])
+    await expect(value.hub.coverage()).resolves.toMatchObject({ state: "ready", nextSequence: 2002 })
+    expect(() => value.hub.subscribe({ afterCursor: "cursor:start" })).toThrow("bounded hub history")
+    expect(() => value.hub.subscribe({ afterCursor: "cursor:start:s1997" })).toThrow("bounded hub history")
+    const replay = value.hub.subscribe({ afterCursor: "cursor:start:s1998" })[Symbol.asyncIterator]()
+    const replayed = []
+    for (let count = 0; count < 3; count++) replayed.push((await replay.next()).value!.sequence)
+    expect(replayed).toEqual([1999, 2000, 2001])
+    await live.return?.()
+    await replay.return?.()
+    await value.hub.close()
+  })
+
+  test("byte budget вытесняет историю без потери живой доставки", async () => {
+    const value = fixture({ maxHistoryBytes: 700 })
+    value.hub.start()
+    const live = value.hub.subscribe()[Symbol.asyncIterator]()
+    for (let sequence = 1; sequence <= 10; sequence++) {
+      value.queue.push(event(sequence))
+      await live.next()
+    }
+    expect(value.gaps).toEqual([])
+    expect(() => value.hub.subscribe({ afterCursor: "cursor:start:s1" })).toThrow("bounded hub history")
+    await live.return?.()
+    await value.hub.close()
+  })
+
+  test("coverage завершается по deadline даже когда backend игнорирует abort", async () => {
+    const value = fixture({ hangCoverage: true, controlTimeoutMs: 5 })
+    value.hub.start()
+    await expect(value.hub.coverage()).resolves.toMatchObject({ state: "unavailable", reason: "Observer coverage timeout" })
+    await value.hub.close()
+  })
+
   test("один native consumer валидирует event и fanout двум subscribers", async () => {
     const value = fixture()
     value.hub.start()

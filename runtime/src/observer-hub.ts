@@ -62,6 +62,7 @@ export class RuntimeNativeObserverHub {
   readonly #subscribers = new Set<Subscriber>()
   readonly #history: EventEntry[] = []
   #historyBytes = 0
+  #historyBeforeCursor: string
   #nextSequence: number
   #cursor: string
   #coverage: ObserverCoverage
@@ -98,6 +99,7 @@ export class RuntimeNativeObserverHub {
     this.#coverage = structuredClone(options.snapshot.coverage)
     this.#nextSequence = options.snapshot.coverage.nextSequence
     this.#cursor = options.snapshot.coverage.cursor
+    this.#historyBeforeCursor = options.snapshot.coverage.cursor
     this.#clock = options.now ?? systemClock
     this.#ids = options.ids ?? randomIdSource
     this.#diagnostic = options.diagnostic ?? (() => undefined)
@@ -186,10 +188,10 @@ export class RuntimeNativeObserverHub {
         deadlineAt,
         observerInstanceRef: this.#snapshot.observerInstanceRef,
       })
-      const response = await this.#native.observer(request, {
+      const response = await withTimeout(this.#native.observer(request, {
         signal: controller.signal,
         checkpoint: () => { controller.signal.throwIfAborted() },
-      })
+      }), this.#controlTimeoutMs, "Observer coverage timeout")
       if (!response.ok) return this.#unavailableCoverage(response.error.message, false)
       if (response.snapshot.observerInstanceRef !== this.#snapshot.observerInstanceRef) {
         return this.#markGap("Observer coverage response содержит foreign instance")
@@ -259,12 +261,19 @@ export class RuntimeNativeObserverHub {
         }
         const immutable = deepFreeze(structuredClone(event))
         const entry = { event: immutable, bytes: new TextEncoder().encode(JSON.stringify(immutable)).byteLength }
-        if (
+        if (entry.bytes > this.#maxHistoryBytes) {
+          this.#markGap("Observer event превышает bounded history budget")
+          return
+        }
+        // История нужна для повторного чтения. Уже доставленные события можно
+        // вытеснить; непрерывность защищают sequence и отдельные очереди подписчиков.
+        while (
           this.#history.length >= this.#maxHistoryEvents
           || this.#historyBytes + entry.bytes > this.#maxHistoryBytes
         ) {
-          this.#markGap("Observer hub history overflow")
-          return
+          const evicted = this.#history.shift()!
+          this.#historyBytes -= evicted.bytes
+          this.#historyBeforeCursor = evicted.event.cursor
         }
         this.#history.push(entry)
         this.#historyBytes += entry.bytes
@@ -310,7 +319,7 @@ export class RuntimeNativeObserverHub {
 
   #historyAfter(afterCursor: string | undefined): EventEntry[] {
     if (afterCursor === undefined || afterCursor === this.#cursor) return []
-    if (afterCursor === this.#snapshot.coverage.coverageStartCursor) return [...this.#history]
+    if (afterCursor === this.#historyBeforeCursor) return [...this.#history]
     const index = this.#history.findIndex(entry => entry.event.cursor === afterCursor)
     if (index < 0) throw new Error("Observer afterCursor отсутствует в bounded hub history")
     return this.#history.slice(index + 1)
@@ -359,13 +368,13 @@ function limit(value: number | undefined, fallback: number, minimum: number, max
   return selected
 }
 
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message = "Observer hub close timeout"): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
-        timer = setTimeout(() => reject(new Error("Observer hub close timeout")), timeoutMs)
+        timer = setTimeout(() => reject(new Error(message)), timeoutMs)
       }),
     ])
   } finally {
