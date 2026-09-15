@@ -237,6 +237,44 @@ sh native/scripts/build.sh /tmp/meta-native-build.*/libmeta-native.dylib
 
 ## Следующий шаг
 
+### Async command loop и keyboard checkpoint
+
+`command_loop.m` теперь использует `MetaBrokerTransport`: control queue отдельно
+от последовательной action queue, main NSRunLoop продолжает работать. Slow AX
+inventory не удерживает heartbeat/drain. При занятой action queue новый action
+отклоняется; requests не копятся в скрытом scheduler.
+
+`MetaInputExecutor` владеет постоянным C executor только на action thread.
+`MetaInputJob` передаёт atomic cancel и immutable status snapshots через
+`NSCondition`; durable ledger ACK ждёт отдельная bounded condition. TS adapter
+продолжает читать control responses, пока ledger sink сохраняет snapshot.
+Дополнительный checkpoint после down ledger ACK предотвращает post после
+полученной отмены; неопределённая pending entry сохраняет quarantine.
+
+Production handlers `input.execute` для key/text подключены к CoreGraphics sink,
+exact focused AX target и текущему inventory ID/revision; status/cancel читают
+job snapshot и меняют только cancel signal. Pointer/shortcut, capture и window
+transitions ещё остаются последующими handler slices.
+
+Проверки: 8 C/Objective-C fixtures pass; adapter + command-loop suites —
+12 tests / 36 assertions pass. Настоящий command loop с injected sink проверяет
+cancel между Unicode clusters и heartbeat/cancel во время ledger ACK wait.
+Production executable собирается с build ID `native-concurrent-input-check`,
+но не запускался. Targeted tsc и diff check проходят.
+
+Scoped async review исправил три случая: input focus использует exact
+`CFEqual(focused, target)` и больше не принимает родительское окно вместо
+focused sheet; rejected ledger sink переводит adapter в `poisoned`, закрывает
+transport и немедленно отклоняет status/cancel; native failures отображаются
+из C status как target-stale/failed, resource-quarantined, cleanup-incomplete
+или cancelled. Если C executor уже принял operation, коррелированный status
+сохраняется и при begin-time verification failure.
+
+После исправлений adapter+command-loop: 15 tests / 49 assertions pass.
+Cancel ACK с `stopped:false` подтверждает лишь запрос. После последующего
+`stopped:true, cleanup:complete` дополнительная status-проверка подтверждает
+неизменность dispatch counter. Production candidate пересобран, но не запущен.
+
 ### Первый executable checkpoint
 
 `native/scripts/build-broker.sh <temporary-candidate-output> <build-id>` теперь

@@ -379,6 +379,7 @@ typedef struct {
                             const MetaScrollEvent *event,
                             uint64_t synthetic_tag);
   bool (*set_event_flags)(void *context, uint64_t flags);
+  bool (*should_cancel)(void *context);
 } MetaExecutorBackend;
 
 typedef struct MetaExecutor MetaExecutor;

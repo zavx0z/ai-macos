@@ -3,6 +3,8 @@
 #include "meta_macos.h"
 #include "meta_ledger.h"
 #include "meta_serialization.h"
+#include "meta_input_executor.h"
+#include "meta_macos_input.h"
 #include "clipboard/meta_clipboard.h"
 #include <ApplicationServices/ApplicationServices.h>
 #include <CoreGraphics/CoreGraphics.h>
@@ -22,6 +24,8 @@
 @implementation MetaSystemCommandBackend {
   MetaMacOSBackend *_windows;
   MetaCaptureRouter *_captures;
+  MetaMacOSInput *_input;
+  MetaInputExecutor *_inputExecutor;
   BOOL _sealed;
 }
 
@@ -30,12 +34,21 @@
   if (self) {
     _windows = meta_macos_backend_create(generation.UTF8String);
     _captures = meta_capture_router_create(generation.UTF8String, meta_capture_router_default_backend());
+    _input = meta_macos_input_create();
+    MetaExecutorBackend sink = {.context = _input, .post_held_event = meta_macos_input_post_held,
+      .post_text_cluster = meta_macos_input_post_text, .set_event_flags = meta_macos_input_set_flags};
+    MetaMacOSBackend *windows = _windows;
+    _inputExecutor = [[MetaInputExecutor alloc] initWithGeneration:generation sink:sink verify:^BOOL(NSString *target) {
+      return meta_macos_input_preflight() && meta_macos_target_is_focused(windows, target.UTF8String);
+    }];
     if (_windows == NULL || _captures == NULL) return nil;
   }
   return self;
 }
 
 - (void)dealloc {
+  _inputExecutor = nil;
+  meta_macos_input_destroy(_input);
   meta_macos_backend_destroy(_windows);
   meta_capture_router_destroy(_captures);
 }
@@ -137,9 +150,19 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
   return nil;
 }
 
+- (NSDictionary *)executeInput:(NSDictionary *)request job:(MetaInputJob *)job {
+  const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(_windows);
+  NSDictionary *operation = job.operation;
+  if (snapshot == NULL || ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
+      [operation[@"inventoryRevision"] unsignedLongLongValue] != snapshot->revision) return nil;
+  return [_inputExecutor execute:request job:job];
+}
+
 - (BOOL)beginRotation {
   _sealed = YES;
-  return meta_capture_router_seal_for_rotation(_captures);
+  BOOL inputReady = [_inputExecutor sealForRotation];
+  BOOL captureReady = meta_capture_router_seal_for_rotation(_captures);
+  return inputReady && captureReady;
 }
 @end
 

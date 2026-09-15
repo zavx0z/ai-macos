@@ -745,6 +745,27 @@ static void read_transition_state(AXHandle *handle,
   CFRelease(application);
 }
 
+bool meta_macos_target_is_focused(MetaMacOSBackend *backend, const char *target_ref) {
+  if (backend == NULL || target_ref == NULL || !AXIsProcessTrusted()) return false;
+  const MetaWindowRecord *record = meta_registry_resolve_target(backend->registry, target_ref);
+  if (record == NULL) return false;
+  AXHandle *handle = find_handle(backend, record->ax_token);
+  if (!process_matches(record, handle)) return false;
+  NSRunningApplication *running = [NSRunningApplication runningApplicationWithProcessIdentifier:handle->pid];
+  if (running == nil || running.hidden || NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != handle->pid ||
+      copy_bool_attribute(handle->element, kAXMinimizedAttribute) == META_TRUE) return false;
+  AXUIElementRef application = AXUIElementCreateApplication(handle->pid);
+  if (application == NULL) return false;
+  AXUIElementSetMessagingTimeout(application, 0.5f);
+  CFTypeRef focused = NULL;
+  AXError error = AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute, &focused);
+  const bool exact = error == kAXErrorSuccess && focused != NULL &&
+                     CFGetTypeID(focused) == AXUIElementGetTypeID() && CFEqual(focused, handle->element);
+  if (focused != NULL) CFRelease(focused);
+  CFRelease(application);
+  return exact;
+}
+
 static bool perform_focus(MetaMacOSBackend *backend, const char *window_ref,
                           bool show, MetaWindowTransition *result) {
   if (backend == NULL || window_ref == NULL || result == NULL) return false;

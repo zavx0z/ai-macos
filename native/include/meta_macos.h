@@ -41,6 +41,7 @@ typedef struct {
 typedef struct MetaMacOSBackend MetaMacOSBackend;
 
 MetaMacOSBackend *meta_macos_backend_create(const char *native_generation);
+bool meta_macos_target_is_focused(MetaMacOSBackend *backend, const char *target_ref);
 void meta_macos_backend_destroy(MetaMacOSBackend *backend);
 const MetaInventorySnapshot *meta_macos_backend_snapshot(
     const MetaMacOSBackend *backend);

@@ -105,6 +105,8 @@ export class NativeBrokerAdapter implements NativeAdapter {
   readonly #binaryWaiters = new Map<string, BinaryWaiter>()
   readonly #reader: Promise<void>
   #closed = false
+  #poisoned: Error | undefined
+  #transportClosing: Promise<void> | undefined
   #rotationSealed = false
   #ledgerWrites = 0
   readonly #startedAt = Date.now()
@@ -112,7 +114,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
   get sessionState() {
     const rotationRequired = this.#seenRequestIds.size >= 9_000 || Date.now() - this.#startedAt >= 24 * 60 * 60 * 1000
     return {
-      state: this.#closed ? "closed" as const : this.#rotationSealed ? "draining" as const : rotationRequired ? "rotation-required" as const : "ready" as const,
+      state: this.#poisoned !== undefined ? "poisoned" as const : this.#closed ? "closed" as const : this.#rotationSealed ? "draining" as const : rotationRequired ? "rotation-required" as const : "ready" as const,
       requestsUsed: this.#seenRequestIds.size,
       pendingRequests: this.#pending.size,
       pendingBinaries: this.#binary.size + this.#binaryWaiters.size,
@@ -373,7 +375,10 @@ export class NativeBrokerAdapter implements NativeAdapter {
   }
 
   async close(): Promise<void> {
-    if (this.#closed) return
+    if (this.#closed) {
+      await this.#transportClosing
+      return
+    }
     this.#closed = true
     this.#readerAbort.abort(new Error("Native adapter закрыт"))
     await this.#transport.close()
@@ -455,7 +460,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
       }
       if (!this.#closed) throw new Error("Native transport завершился до close")
     } catch (error) {
-      if (!this.#closed) this.#rejectPending(error instanceof Error ? error : new Error(String(error)))
+      if (!this.#closed) this.#poison(error instanceof Error ? error : new Error(String(error)))
     }
   }
 
@@ -484,19 +489,21 @@ export class NativeBrokerAdapter implements NativeAdapter {
       return
     }
     if (frame.channel === "ledger-persist") {
+      if (this.#ledgerWrites >= 8) throw new Error("Native ledger ACK queue overflow")
       this.#ledgerWrites += 1
-      try {
-      const ack = await this.ledgerSink.persist(frame.payload.requestId, frame.payload.snapshot)
-      if (!heldInputLedgerAckMatches(frame.payload.requestId, frame.payload.snapshot, ack)) {
-        throw new Error("Ledger sink вернул некоррелированный durable ACK")
-      }
-      await this.#transport.send(nativeTransportRequestFrameSchema.parse({
-        channel: "ledger-ack",
-        payload: ack,
-      }))
-      } finally {
-        this.#ledgerWrites -= 1
-      }
+      void (async () => {
+        try {
+          const ack = await this.ledgerSink.persist(frame.payload.requestId, frame.payload.snapshot)
+          if (!heldInputLedgerAckMatches(frame.payload.requestId, frame.payload.snapshot, ack)) {
+            throw new Error("Ledger sink вернул некоррелированный durable ACK")
+          }
+          await this.#transport.send(nativeTransportRequestFrameSchema.parse({ channel: "ledger-ack", payload: ack }))
+        } catch (cause) {
+          this.#poison(cause instanceof Error ? cause : new Error(String(cause)))
+        } finally {
+          this.#ledgerWrites -= 1
+        }
+      })()
       return
     }
     if (frame.channel === "binary") {
@@ -552,6 +559,15 @@ export class NativeBrokerAdapter implements NativeAdapter {
       waiter.reject(error)
     }
     this.#eventWaiters.length = 0
+  }
+
+  #poison(error: Error): void {
+    if (this.#closed) return
+    this.#poisoned = error
+    this.#closed = true
+    this.#readerAbort.abort(error)
+    this.#rejectPending(error)
+    this.#transportClosing = this.#transport.close().catch(() => undefined)
   }
 
   #pruneRequestTombstones(): void {
