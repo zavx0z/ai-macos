@@ -1,4 +1,8 @@
-# ai-macos MCP tool map
+# Справка подключения MCP 0.3.x
+
+Эта справка относится только к ещё подключённому старому процессу. Для runtime
+использовать [новый workflow](runtime.md) и текущие объявленные tool schemas.
+Обновление исходников не означает переключение установленного сервера.
 
 The repository at `~/repozitarium/ai-macos` on the current Mac is authoritative for
 implementation details. This reference describes the direct MCP surface exposed
