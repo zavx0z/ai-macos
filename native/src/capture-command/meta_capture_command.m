@@ -36,6 +36,7 @@ NSErrorDomain const MetaCaptureCommandErrorDomain = @"@meta/macos.capture-comman
 @property(nonatomic) uint64_t maxPixels;
 @property(nonatomic) uint64_t maxEncodedBytes;
 @property(nonatomic, copy, nullable) NSDictionary *frameMetadata;
+@property(nonatomic, copy, nullable) NSArray<NSDictionary *> *readinessFacts;
 @property(nonatomic) BOOL terminalEvidenceEmitted;
 @property(nonatomic) uint64_t terminalStatusRevision;
 @property(nonatomic, copy, nullable) NSString *terminalDrainedEvidenceRef;
@@ -917,6 +918,7 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
     @synchronized(record) {
     if (record.frameMetadata != nil) {
       value[@"frame"] = record.frameMetadata;
+      value[@"readinessFacts"] = record.readinessFacts ?: @[];
       return value;
     }
     uint64_t pixels = (uint64_t)result->imageWidthPixels *
@@ -924,6 +926,7 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
     if (result->pngData == NULL || result->encodedBytes == 0 ||
         result->encodedBytes != (uint64_t)CFDataGetLength(result->pngData) ||
         result->imageWidthPixels == 0 || result->imageHeightPixels == 0 ||
+        result->frameStatus != 0 ||
         result->imageWidthPixels > record.maxWidthPixels ||
         result->imageHeightPixels > record.maxHeightPixels ||
         pixels > record.maxPixels ||
@@ -1009,6 +1012,20 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
            @"Frame region set не совпадает с accepted display mapping");
       return nil;
     }
+    BOOL window_target = [record.nativeMapping[@"kind"] isEqual:@"window"];
+    BOOL target_ready = result->shareableTargetMatched &&
+        (!window_target || (result->beforeTargetMatched &&
+                            result->afterTargetMatched &&
+                            result->boundsUnchanged &&
+                            result->auxiliarySurfacesExcluded));
+    value[@"readinessFacts"] = @[
+      @{ @"name" : @"permission", @"state" : @"reached", @"durationMs" : @0 },
+      target_ready
+          ? @{ @"name" : @"target", @"state" : @"reached", @"durationMs" : @0 }
+          : @{ @"name" : @"target", @"state" : @"unavailable", @"durationMs" : @0,
+               @"reason" : @"Native capture не подтвердил стабильность exact target" },
+      @{ @"name" : @"complete-frame", @"state" : @"reached", @"durationMs" : @0 },
+    ];
     NSMutableDictionary *geometry = [@{
       @"frameRef" : record.frameRef,
       @"observationId" : record.observationId,
@@ -1043,6 +1060,7 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
     }
     value[@"frame"] = frame;
     record.frameMetadata = [frame copy];
+    record.readinessFacts = [value[@"readinessFacts"] copy];
     [self.lock lock];
     self.frameGeometries[record.frameRef] = [geometry copy];
     [self.lock unlock];

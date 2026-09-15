@@ -769,6 +769,12 @@ test("ProtocolNativeCaptureDriver проходит start/pending/result/binary/e
   expect(result.ok).toBe(true)
   if (!result.ok) throw new Error(result.message)
   expect(result.bytes).toEqual(bytes)
+  expect(result.readinessFacts).toEqual({
+    permission: { state: "reached", durationMs: 0 },
+    target: { state: "reached", durationMs: 1 },
+    "complete-frame": { state: "reached", durationMs: 2 },
+  })
+  expect(result.readinessFacts).not.toHaveProperty("ownership")
   expect(transport.resultPolls).toBe(2)
   expect(evidenceReports.map(report => report.factKind)).toEqual([
     "capture-task-start",

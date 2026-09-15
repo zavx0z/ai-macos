@@ -554,6 +554,35 @@ describe("RuntimeScreenAdapter", () => {
     expect(result.value.observation.captureTarget).toEqual(captureTarget)
   })
 
+  test("read-only capture явно skips ownership без объявления point proof", async () => {
+    const { publication: _publication, ...base } = request()
+    const readOnlyRequest = bindRequest({
+      ...base,
+      readinessPolicy: {
+        policyId: "readiness:read-only-frame",
+        requiredSteps: ["permission", "target", "complete-frame"],
+        disabledSteps: ["ownership"],
+      },
+    })
+    const result = await new RuntimeScreenAdapter(
+      host,
+      services(),
+      new FakeNativeDriver(),
+      () => new Date(nowMs),
+    ).capture(context(), readOnlyRequest)
+    expect(result.ok).toBe(true)
+    if (!result.ok) throw new Error(result.error.message)
+    expect(result.value.observation.readiness.state).toBe("ready")
+    expect(result.value.observation.readiness.steps).toContainEqual({
+      name: "ownership",
+      state: "skipped",
+      durationMs: 0,
+      reason: "disabled-by-policy",
+    })
+    expect(result.value.observation.captureEvidence.state).toBe("confirmed")
+    expect(result.value.observation.occlusion.state).toBe("unknown")
+  })
+
   test("не запускает native при несовпавшей authoritative mapping", async () => {
     const native = new FakeNativeDriver()
     const runtime = services(target => ({

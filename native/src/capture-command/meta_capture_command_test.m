@@ -95,6 +95,7 @@ static void fake_release_task(void *context, MetaCaptureTaskRef task) {
 static void fake_release_result(void *context, MetaCaptureResult *result) {
   FakeCaptureBackend *fake = context;
   if (result->caption != NULL) CFRelease(result->caption);
+  if (result->errorMessage != NULL) CFRelease(result->errorMessage);
   if (result->pngData != NULL) CFRelease(result->pngData);
   free(result->regions);
   free(result);
@@ -339,6 +340,21 @@ static MetaCaptureResult *successful_window_result(void) {
   result->requestedDisplayID = 0;
   result->requestedWindowID = 77;
   result->requestedOwnerPID = 42;
+  result->auxiliarySurfacesExcluded = true;
+  return result;
+}
+
+static MetaCaptureResult *successful_complete_window_result(void) {
+  MetaCaptureResult *result = successful_window_result();
+  MetaCaptureDisplayRegion *regions = realloc(
+      result->regions, 2 * sizeof(*result->regions));
+  assert(regions != NULL);
+  result->regions = regions;
+  result->regions[1] = result->regions[0];
+  result->regions[1].displayID = 20;
+  result->regions[1].displayBoundsPoints = CGRectMake(0, 0, 2, 2);
+  result->regions[1].destinationRectPoints = CGRectMake(0, 0, 2, 2);
+  result->regionCount = 2;
   return result;
 }
 
@@ -351,6 +367,20 @@ static MetaCaptureResult *successful_layout_child(
   result->regions[0].destinationRectPoints = bounds;
   result->regions[0].backingScaleX = backing_scale;
   result->regions[0].backingScaleY = backing_scale;
+  return result;
+}
+
+static MetaCaptureResult *failed_display_result(void) {
+  MetaCaptureResult *result = calloc(1, sizeof(*result));
+  result->outcome = MetaCaptureOutcomeFailed;
+  result->cleanup = MetaCaptureCleanupComplete;
+  result->errorCode = MetaCaptureErrorStreamFailed;
+  result->source = MetaCaptureSourceDisplayComposite;
+  result->caption = CFStringCreateCopy(
+      NULL, CFSTR("Ожидаю основной дисплей"));
+  result->errorMessage = CFStringCreateCopy(
+      NULL, CFSTR("Fixture stream failure"));
+  result->requestedDisplayID = 10;
   return result;
 }
 
@@ -534,6 +564,10 @@ int main(void) {
     assert(![execution[@"observedAt"] isEqual:started[@"observedAt"]]);
     assert([execution[@"observedAt"]
         isEqual:execution[@"frame"][@"capturedAt"]]);
+    assert([execution[@"readinessFacts"] count] == 3);
+    assert([execution[@"readinessFacts"][0][@"name"] isEqual:@"permission"]);
+    assert([execution[@"readinessFacts"][1][@"name"] isEqual:@"target"]);
+    assert([execution[@"readinessFacts"][2][@"name"] isEqual:@"complete-frame"]);
     assert([execution[@"backend"][@"buildId"] isEqual:@"native-build-1"]);
     assert([execution[@"frame"][@"frameRef"] isEqual:@"frame-1"]);
     assert([execution[@"frame"][@"encodedBytes"] unsignedLongLongValue] == 4);
@@ -560,6 +594,8 @@ int main(void) {
         error:&error];
     assert(repeated != nil);
     assert(repeated_emissions == 0);
+    assert([repeated[@"poll"][@"result"][@"readinessFacts"]
+        isEqual:execution[@"readinessFacts"]]);
     assert([repeated[@"poll"][@"result"][@"frame"][@"binaryToken"]
         isEqual:execution[@"frame"][@"binaryToken"]]);
     assert(![repeated[@"poll"][@"result"][@"sourceResponseRef"]
@@ -720,6 +756,50 @@ int main(void) {
     assert(fake.release_task_count == 3);
     assert(fake.release_result_count == 3);
 
+    error = nil;
+    NSDictionary *ready_window_started = [binder startRequest:
+        start_request(@"inventory-1", 4, @"window",
+                      @"2099-09-15T10:02:00.000Z") error:&error];
+    assert(ready_window_started != nil && error == nil);
+    last_child(&fake)->status = (MetaCaptureTaskStatus){
+        .revision = 5,
+        .completionDelivered = true,
+        .streamStopped = true,
+        .cleanup = MetaCaptureCleanupComplete,
+        .drained = true,
+    };
+    last_child(&fake)->completion(successful_complete_window_result());
+    NSDictionary *ready_window = [binder cleanupRequest:
+        cleanup_request(@"result", ready_window_started[@"captureTaskRef"], 1,
+                        ready_window_started[@"statusEvidenceRef"],
+                        @"cleanup-ready-window")
+        emitBinary:^BOOL(NSDictionary *header, NSData *bytes) {
+          (void)header;
+          (void)bytes;
+          return YES;
+        }
+        error:&error];
+    assert(ready_window != nil && error == nil);
+    NSArray *window_readiness = ready_window[@"poll"][@"result"][@"readinessFacts"];
+    assert(window_readiness.count == 3);
+    assert([window_readiness[0][@"state"] isEqual:@"reached"]);
+    assert([window_readiness[1][@"state"] isEqual:@"reached"]);
+    assert([window_readiness[2][@"state"] isEqual:@"reached"]);
+    NSString *ready_window_drained =
+        ready_window[@"poll"][@"result"][@"drainedEvidenceRef"];
+    NSDictionary *ready_window_release = [binder cleanupRequest:
+        cleanup_request(@"release", ready_window_started[@"captureTaskRef"], 5,
+                        ready_window_drained, @"cleanup-ready-window-release")
+        emitBinary:^BOOL(NSDictionary *header, NSData *bytes) {
+          (void)header;
+          (void)bytes;
+          return YES;
+        }
+        error:&error];
+    assert(ready_window_release != nil && error == nil);
+    assert(fake.release_task_count == 4);
+    assert(fake.release_result_count == 4);
+
     topologyCurrent = YES;
     error = nil;
     NSDictionary *layout_started = [binder startRequest:
@@ -727,9 +807,9 @@ int main(void) {
                       @"2099-09-15T10:02:00.000Z") error:&error];
     assert(layout_started != nil && error == nil);
     assert([layout_started[@"status"][@"startPending"] boolValue]);
-    assert(fake.start_count == 5);
-    FakeCaptureChild *first_layout = &fake.children[3];
-    FakeCaptureChild *second_layout = &fake.children[4];
+    assert(fake.start_count == 6);
+    FakeCaptureChild *first_layout = &fake.children[4];
+    FakeCaptureChild *second_layout = &fake.children[5];
     assert(first_layout->accepted_request.displayID == 10);
     assert(second_layout->accepted_request.displayID == 20);
     assert(first_layout->accepted_request.maxEncodedBytes == 500000);
@@ -814,6 +894,8 @@ int main(void) {
     assert([layout_result[@"nativeMapping"][@"kind"]
         isEqual:@"desktop-layout"]);
     assert([layout_result[@"frame"][@"regions"] count] == 2);
+    assert([layout_result[@"readinessFacts"] count] == 3);
+    assert([layout_result[@"readinessFacts"][1][@"state"] isEqual:@"reached"]);
     assert([layout_result[@"frame"][@"regions"][0]
         [@"destinationRect"][@"x"] doubleValue] == -2);
     NSString *layout_drained = layout_result[@"drainedEvidenceRef"];
@@ -829,8 +911,48 @@ int main(void) {
         }
         error:&error];
     assert(layout_release != nil && error == nil);
-    assert(fake.release_task_count == 5);
-    assert(fake.release_result_count == 6);
+    assert(fake.release_task_count == 6);
+    assert(fake.release_result_count == 7);
+
+    error = nil;
+    NSDictionary *failed_started = [binder startRequest:
+        start_request(@"inventory-1", 4, @"display",
+                      @"2099-09-15T10:02:00.000Z") error:&error];
+    assert(failed_started != nil && error == nil);
+    last_child(&fake)->status = (MetaCaptureTaskStatus){
+        .revision = 6,
+        .completionDelivered = true,
+        .streamStopped = true,
+        .cleanup = MetaCaptureCleanupComplete,
+        .drained = true,
+    };
+    last_child(&fake)->completion(failed_display_result());
+    NSDictionary *failed_capture = [binder cleanupRequest:
+        cleanup_request(@"result", failed_started[@"captureTaskRef"], 1,
+                        failed_started[@"statusEvidenceRef"],
+                        @"cleanup-failed-display")
+        emitBinary:^BOOL(NSDictionary *header, NSData *bytes) {
+          (void)header;
+          (void)bytes;
+          return YES;
+        }
+        error:&error];
+    assert(failed_capture != nil && error == nil);
+    assert([failed_capture[@"poll"][@"result"][@"readinessFacts"] count] == 0);
+    NSString *failed_drained =
+        failed_capture[@"poll"][@"result"][@"drainedEvidenceRef"];
+    NSDictionary *failed_release = [binder cleanupRequest:
+        cleanup_request(@"release", failed_started[@"captureTaskRef"], 6,
+                        failed_drained, @"cleanup-failed-display-release")
+        emitBinary:^BOOL(NSDictionary *header, NSData *bytes) {
+          (void)header;
+          (void)bytes;
+          return YES;
+        }
+        error:&error];
+    assert(failed_release != nil && error == nil);
+    assert(fake.release_task_count == 7);
+    assert(fake.release_result_count == 8);
     meta_capture_router_destroy(router);
   }
   puts("meta_capture_command_test: ok");

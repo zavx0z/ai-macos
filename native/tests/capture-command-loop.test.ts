@@ -561,6 +561,11 @@ test("production command loop проводит observer ACK перед PUSH и c
     expect(completed.poll.result.frame?.widthPx).toBe(1)
     expect(completed.poll.result.frame?.heightPx).toBe(1)
     expect(completed.poll.result.nativeMapping).toEqual(request.payload.nativeMapping)
+    expect(completed.poll.result.readinessFacts).toEqual([
+      { name: "permission", state: "reached", durationMs: 0 },
+      { name: "target", state: "reached", durationMs: 0 },
+      { name: "complete-frame", state: "reached", durationMs: 0 },
+    ])
 
     const frame = completed.poll.result.frame
     if (frame === undefined) throw new Error("Capture frame отсутствует")
@@ -744,6 +749,11 @@ test("production command loop проводит observer ACK перед PUSH и c
     expect(layoutCompleted.poll.status.drained).toBe(true)
     expect(layoutCompleted.poll.result.sourceResponseRef).not.toBe(layoutStarted.result.sourceResponseRef)
     expect(layoutCompleted.poll.result.nativeMapping).toEqual(layoutRequest.payload.nativeMapping)
+    expect(layoutCompleted.poll.result.readinessFacts).toEqual([
+      { name: "permission", state: "reached", durationMs: 0 },
+      { name: "target", state: "reached", durationMs: 0 },
+      { name: "complete-frame", state: "reached", durationMs: 0 },
+    ])
     const layoutFrame = layoutCompleted.poll.result.frame
     if (layoutFrame === undefined) throw new Error("Layout frame отсутствует")
     expect(layoutFrame.widthPx).toBe(4)
