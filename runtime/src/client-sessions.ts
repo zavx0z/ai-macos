@@ -18,6 +18,7 @@ export const storedClientSessionSchema = z.strictObject({
   lineageId: z.string().min(1).max(127),
   bearerDigest: z.string().regex(/^[a-f0-9]{64}$/),
   resumptionDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  resumptionExpiresAt: z.iso.datetime({ offset: true }).optional(),
   disconnected: z.boolean(), revoked: z.boolean(),
 })
 export type StoredClientSession = z.infer<typeof storedClientSessionSchema>
@@ -63,6 +64,7 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
       lineageId,
       bearerDigest: sha256(bearerToken),
       resumptionDigest: sha256(resumptionToken),
+      resumptionExpiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
       disconnected: false,
       revoked: false,
     }
@@ -80,14 +82,21 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
   }
 
   resume(resumptionToken: string, ttlMs = 5 * 60 * 1_000): RuntimeClientCredential {
-    const previous = this.#byDigest(this.#resumptionIndex, sha256(resumptionToken))
-    if (previous.revoked || previous.session.loginSessionId !== this.#generation.loginSessionId
-      || this.#clock.now().getTime() >= Date.parse(previous.session.expiresAt)) throw new Error("Resumption credential отозван, истёк или принадлежит другой login session")
+    const previous = this.#resumable(resumptionToken)
     const credential = this.#open(previous.session.principalId, previous.lineageId, ttlMs, resumptionToken)
     previous.disconnected = true
     previous.revoked = true
     this.#bearerIndex.delete(previous.bearerDigest)
     return credential
+  }
+
+  resumptionLineage(resumptionToken: string): string { return this.#resumable(resumptionToken).lineageId }
+
+  #resumable(resumptionToken: string): StoredSession {
+    const previous = this.#byDigest(this.#resumptionIndex, sha256(resumptionToken))
+    if (previous.revoked || previous.session.loginSessionId !== this.#generation.loginSessionId
+      || this.#clock.now().getTime() >= Date.parse(previous.resumptionExpiresAt ?? previous.session.expiresAt)) throw new Error("Resumption credential отозван, истёк или принадлежит другой login session")
+    return previous
   }
 
   snapshot(): StoredClientSession[] { return structuredClone([...this.#sessions.values()]) }

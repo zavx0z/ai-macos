@@ -162,6 +162,8 @@ export class ProofRegistry implements ProofAuthority {
     displayLayoutRevision: number
     ttlMs: number
   }): ProofRef {
+    for (const [id, proof] of this.#proofs) if (this.#clock.now().getTime() >= Date.parse(proof.expiresAt)) this.#proofs.delete(id)
+    if (this.#proofs.size >= 10_000) throw new Error("Runtime proof capacity exceeded")
     const issuedAt = this.#clock.now()
     const proof = proofRefSchema.parse({
       proofRef: this.#ids.next("proof"),
@@ -169,7 +171,7 @@ export class ProofRegistry implements ProofAuthority {
       kind: input.kind,
       subject: input.subject,
       ...this.#runtime,
-      ...(this.#nativeGeneration === undefined ? {} : { nativeGeneration: this.#nativeGeneration }),
+      ...(this.#nativeGeneration === undefined || !("nativeGeneration" in input.subject.ref) ? {} : { nativeGeneration: this.#nativeGeneration }),
       inventoryRevision: input.inventoryRevision,
       displayLayoutRevision: input.displayLayoutRevision,
       issuedAt: issuedAt.toISOString(),
@@ -328,9 +330,12 @@ export class NativeEvidenceAuthority implements EvidenceIssuer {
       throw new Error("Window CG/AX mapping требует issueWindowCorrelation")
     }
     const published = this.#assertReceipt(request.receipt,
-      request.nativeMapping === undefined ? "native-target-identity" : "target-resolution")
+      request.nativeMapping === undefined
+        ? request.target.kind === "application-bundle" ? "application-bundle-identity" : "native-target-identity"
+        : "target-resolution")
     if (
-      (published.report.factKind !== "target-resolution" && published.report.factKind !== "native-target-identity")
+      (published.report.factKind !== "target-resolution" && published.report.factKind !== "native-target-identity"
+        && published.report.factKind !== "application-bundle-identity")
       || canonicalJson(published.report.target) !== canonicalJson(request.target)
       || (published.report.factKind === "target-resolution"
         && canonicalJson(published.report.mapping) !== canonicalJson(request.nativeMapping))
@@ -525,19 +530,31 @@ export class FrameStore implements BinaryFramePublisher {
   readonly #publicationsByFrame = new Map<string, ObservationPublication>()
   readonly #frames = new Map<string, StoredFrame>()
   readonly #maxFramesPerScope: number
+  readonly #maxFrames: number
+  readonly #maxBytes: number
+  readonly #issuedFrames = new Map<string, boolean>()
+  readonly #issuedObservations = new Set<string>()
+  #byteLength = 0
   readonly #ttlMs: number
 
   constructor(
     generation: RuntimeGeneration,
-    options: { clock?: RuntimeClock, maxFramesPerScope?: number, ttlMs?: number } = {},
+    options: { clock?: RuntimeClock, maxFramesPerScope?: number, maxFrames?: number, maxBytes?: number, ttlMs?: number } = {},
   ) {
     this.#generation = generation
     this.#clock = options.clock ?? systemClock
     this.#maxFramesPerScope = options.maxFramesPerScope ?? 4
+    this.#maxFrames = options.maxFrames ?? 64
+    this.#maxBytes = options.maxBytes ?? 128 * 1024 * 1024
     this.#ttlMs = options.ttlMs ?? 120_000
+    for (const value of [this.#maxFramesPerScope, this.#maxFrames, this.#maxBytes, this.#ttlMs]) {
+      if (!Number.isSafeInteger(value) || value < 1) throw new Error("Frame retention bounds должны быть положительными")
+    }
+    if (this.#maxFrames > 10_000 || this.#maxFramesPerScope > this.#maxFrames || this.#maxBytes > 256 * 1024 * 1024 || this.#ttlMs > 120_000) throw new Error("Frame retention bounds превышены")
   }
 
   registerPublication(value: unknown): ObservationPublication {
+    this.#prune()
     const publication = observationPublicationSchema.parse(value)
     if (
       publication.runtimeEpoch !== this.#generation.runtimeEpoch
@@ -545,15 +562,19 @@ export class FrameStore implements BinaryFramePublisher {
     ) {
       throw new Error("Observation publication принадлежит другой runtime generation")
     }
-    if (this.#publications.has(publication.observationId) || this.#publicationsByFrame.has(publication.frameRef)) {
+    if (this.#issuedObservations.has(publication.observationId) || this.#issuedFrames.has(publication.frameRef)) {
       throw new Error("Observation/frame reservation уже существует")
     }
+    if (this.#issuedFrames.size >= 10_000 || this.#publications.size >= 1024) throw new Error("Capture publication capacity требует runtime rotation")
+    this.#issuedObservations.add(publication.observationId)
+    this.#issuedFrames.set(publication.frameRef, false)
     this.#publications.set(publication.observationId, publication)
     this.#publicationsByFrame.set(publication.frameRef, publication)
     return publication
   }
 
   async publish(request: Parameters<BinaryFramePublisher["publish"]>[0]): Promise<void> {
+    this.#prune()
     const publication = this.#publications.get(request.observationId)
     if (publication === undefined) throw new Error("Observation publication не зарегистрирована")
     if (
@@ -570,10 +591,13 @@ export class FrameStore implements BinaryFramePublisher {
     if (this.#publicationsByFrame.get(request.frameRef)?.observationId !== request.observationId) {
       throw new Error("FrameRef не зарезервирован для observation")
     }
-    if (this.#frames.has(request.frameRef)) throw new Error("FrameRef уже опубликован и не может быть перезаписан")
+    if (this.#issuedFrames.get(request.frameRef)) throw new Error("FrameRef уже опубликован и не может быть перезаписан")
+    if (request.bytes.byteLength > Math.min(this.#maxBytes, 64 * 1024 * 1024)) throw new Error("Frame bytes превышают global retention budget")
     const digest = new Bun.CryptoHasher("sha256").update(request.bytes).digest("hex")
     if (digest !== request.expectedSha256) throw new Error("Binary frame digest не совпадает")
-    this.#evict(publication.cacheScopeRef)
+    this.#evict(publication.cacheScopeRef, request.bytes.byteLength)
+    this.#issuedFrames.set(request.frameRef, true)
+    this.#byteLength += request.bytes.byteLength
     this.#frames.set(request.frameRef, {
       publication,
       bytes: request.bytes.slice(),
@@ -583,6 +607,7 @@ export class FrameStore implements BinaryFramePublisher {
   }
 
   get(frameRef: string, cacheScopeRef: string): Uint8Array | undefined {
+    this.#prune()
     const stored = this.#frames.get(frameRef)
     if (
       stored === undefined
@@ -595,24 +620,49 @@ export class FrameStore implements BinaryFramePublisher {
   }
 
   hasVerified(frameRef: string, sha256Value: string): boolean {
+    this.#prune()
     const frame = this.#frames.get(frameRef)
     return frame !== undefined
       && frame.sha256 === sha256Value
       && this.#clock.now().getTime() - frame.createdAt < this.#ttlMs
   }
 
-  #evict(cacheScopeRef: string): void {
+  stats(): { frames: number, bytes: number, publications: number, issuedRefs: number } {
+    this.#prune()
+    return { frames: this.#frames.size, bytes: this.#byteLength, publications: this.#publications.size, issuedRefs: this.#issuedFrames.size }
+  }
+
+  #drop(frameRef: string): void {
+    const stored = this.#frames.get(frameRef)
+    if (stored === undefined) return
+    this.#byteLength -= stored.bytes.byteLength
+    this.#frames.delete(frameRef)
+  }
+
+  #prune(): void {
     const now = this.#clock.now().getTime()
+    for (const [id, frame] of this.#frames) {
+      if (now - frame.createdAt >= this.#ttlMs || now >= Date.parse(frame.publication.expiresAt)) this.#drop(id)
+    }
+    for (const [id, publication] of this.#publications) {
+      if (now < Date.parse(publication.expiresAt)) continue
+      this.#publications.delete(id)
+      this.#publicationsByFrame.delete(publication.frameRef)
+    }
+  }
+
+  #evict(cacheScopeRef: string, incomingBytes: number): void {
     const scoped = [...this.#frames.entries()]
       .filter(([, frame]) => frame.publication.cacheScopeRef === cacheScopeRef)
       .sort(([, left], [, right]) => left.createdAt - right.createdAt)
-    for (const [frameRef, frame] of scoped) {
-      if (now - frame.createdAt >= this.#ttlMs) this.#frames.delete(frameRef)
+    while (scoped.length >= this.#maxFramesPerScope) {
+      const oldest = scoped.shift()
+      if (oldest !== undefined) this.#drop(oldest[0])
     }
-    const remaining = scoped.filter(([frameRef]) => this.#frames.has(frameRef))
-    while (remaining.length >= this.#maxFramesPerScope) {
-      const oldest = remaining.shift()
-      if (oldest !== undefined) this.#frames.delete(oldest[0])
+    while (this.#frames.size >= this.#maxFrames || this.#byteLength + incomingBytes > this.#maxBytes) {
+      const oldest = this.#frames.keys().next().value
+      if (oldest === undefined) throw new Error("Frame eviction не может выполнить budget")
+      this.#drop(oldest)
     }
   }
 }
@@ -634,16 +684,29 @@ export class ObservationRegistry implements ObservationResolver {
   }
 
   register(value: unknown): Observation {
+    this.#prune()
     const observation = observationSchema.parse(value)
+    const existing = this.#observations.get(observation.observationId)
+    if (existing !== undefined && canonicalJson(existing) !== canonicalJson(observation)) throw new Error("Observation immutable conflict")
+    if (existing === undefined && this.#observations.size >= 10_000) throw new Error("Observation retention capacity exceeded")
     this.#observations.set(observation.observationId, observation)
-    return observation
+    return structuredClone(observation)
   }
 
   get(observationId: string): Observation | undefined {
-    return this.#observations.get(observationId)
+    this.#prune()
+    return structuredClone(this.#observations.get(observationId))
+  }
+
+  #prune(): void {
+    const now = this.#clock.now().getTime()
+    for (const [id, observation] of this.#observations) {
+      if (now >= Date.parse(observation.expiresAt)) this.#observations.delete(id)
+    }
   }
 
   async resolvePoint(request: ResolveStoredObservationPointRequest): Promise<AuthorizedObservationPoint> {
+    this.#prune()
     const stored = this.#observations.get(request.observationRef.observationId)
     if (
       stored === undefined
@@ -688,6 +751,8 @@ function targetKey(target: OperationTarget): string {
 
 function targetAuthorityScope(target: OperationTarget): string {
   switch (target.kind) {
+    case "application-bundle":
+      return `bundle:${target.ref.nativeGeneration}:${target.ref.bundleRef}`
     case "application":
     case "window":
     case "surface":

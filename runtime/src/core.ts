@@ -245,7 +245,19 @@ export class RuntimeCore implements RuntimeAdapter {
   }
 
   async resumeClientDurable(resumptionToken: string, ttlMs?: number): Promise<RuntimeClientCredential> {
-    return this.#persistCredential(() => this.clients.resume(resumptionToken, ttlMs))
+    return this.#persistCredential(() => {
+      const lineage = this.clients.resumptionLineage(resumptionToken)
+      if ([...this.#journal.values()].some(entry => !entry.settled && entry.lineageId === lineage)) throw new RuntimeContractError("operation-in-progress", "Client renewal ждёт завершения active operations", "runtime-client")
+      return this.clients.resume(resumptionToken, ttlMs)
+    })
+  }
+
+  async closeClientDurable(session: RuntimeClientSession): Promise<void> {
+    await this.clients.assertActive(session, this.#clock.now())
+    this.disconnectClient(session.clientSessionId)
+    const pending = [...this.#journal.values()].filter(entry => entry.record.clientSessionId === session.clientSessionId && !entry.settled)
+    await Promise.all(pending.map(entry => entry.promise?.catch(() => undefined)))
+    if (this.#clientPersistence !== undefined) await this.#awaitDurable(this.#clientPersistence.persist(this.clients.snapshot()))
   }
 
   async #persistCredential(create: () => RuntimeClientCredential): Promise<RuntimeClientCredential> {
@@ -1047,6 +1059,7 @@ export class RuntimeCore implements RuntimeAdapter {
       target: intent.precondition.target,
     }
     switch (intent.precondition.target.kind) {
+      case "application-bundle":
       case "application":
       case "window":
       case "surface":

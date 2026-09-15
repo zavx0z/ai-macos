@@ -37,6 +37,12 @@ import { nativeClipboardRequestSchema, nativeClipboardResponseSchema, NATIVE_CLI
 export * from "./clipboard-protocol.ts"
 import { nativePermissionsRequestSchema, nativePermissionsResponseSchema } from "./permissions-protocol.ts"
 export * from "./permissions-protocol.ts"
+import {
+  nativeApplicationResolveRequestSchema, nativeApplicationResolveResponseSchema,
+  nativeApplicationLaunchRequestSchema, nativeApplicationLaunchResponseSchema,
+  nativeApplicationQuitRequestSchema, nativeApplicationQuitResponseSchema,
+} from "./applications-protocol.ts"
+export * from "./applications-protocol.ts"
 
 export const NATIVE_FRAME_HEADER_BYTES = 4
 export const NATIVE_CLIPBOARD_FRAME_FLAG = 0x80000000
@@ -695,6 +701,9 @@ export const nativeCaptureReleaseRequestSchema = createNativeMutationRequestEnve
 export const nativeCaptureReleaseResponseSchema = createNativeResponseEnvelopeSchema(nativeCaptureReleaseResultSchema)
 
 export const nativeMethodRequestSchema = z.union([
+  nativeApplicationResolveRequestSchema,
+  nativeApplicationLaunchRequestSchema,
+  nativeApplicationQuitRequestSchema,
   nativeInventoryRequestSchema,
   nativeWindowTransitionRequestSchema,
   nativeAxInspectionRequestSchema,
@@ -707,6 +716,9 @@ export const nativeMethodRequestSchema = z.union([
 ])
 
 export const nativeMethodResponseSchema = z.union([
+  nativeApplicationResolveResponseSchema,
+  nativeApplicationLaunchResponseSchema,
+  nativeApplicationQuitResponseSchema,
   nativeInventoryResponseSchema,
   nativeWindowTransitionResponseSchema,
   nativeAxInspectionResponseSchema,

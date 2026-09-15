@@ -10,6 +10,38 @@ production cutover ещё впереди. Recovery и Android composition при
 
 ## Checkpoint durable core и host integration
 
+Проверенный lifecycle checkpoint:
+
+- Host использует kernel lease и проверенную очистку stale socket/credential до
+  запуска metadata/helper. Новый integration test принудительно завершает
+  RuntimeHost через SIGKILL, проверяет оставшиеся артефакты и подтверждает
+  успешный новый host с прежней lineage после resume.
+- ClientRenewalCoordinator обновляет credential между calls, до expiry или до
+  длинного метода. Concurrent renew coalesces; active call не теряет bearer.
+  Runtime запрещает resume при ещё active operation этой lineage. Resumption
+  inactivity TTL отделён от пятиминутного bearer и ограничен 24 часами.
+- Explicit UDS close останавливает renewal/catalog polling, сообщает disconnect
+  runtime и ждёт остановки active calls. Thin MCP закрывает свой runtime client;
+  doctor также освобождает временную session. Browser lifetime grace cleanup
+  ещё требует отдельной интеграции.
+- Host heartbeat: один in-flight request, interval 250 ms, deadline 500 ms;
+  failure закрывает admission, drain/close останавливают цикл. Heartbeat IDs
+  имеют отдельное bounded окно 128 IDs/5 секунд и не исчерпывают 24h action IDs.
+- FrameStore ограничен глобально 64 кадрами/128 MiB, по 4 на lineage; expiry
+  удаляет байты и publication metadata. Bounded issued-reference tombstones
+  запрещают повторную публикацию после eviction. Proof/observation metadata
+  имеют capacity и очистку expired записей; browser proof не связывается с
+  native generation смешанного host.
+- Host подключает owner registrars Input/Capture/Browser, но pointer/drag
+  остаются unavailable до настоящего readonly point-hit evidence provider.
+  Browser endpoints задаются только явным host config; Chrome не запускается,
+  Android остаётся explicit opt-in. Window и capture readiness берутся из
+  реальных declared Native capabilities.
+- Последний полный runtime + thin MCP run: **129 pass / 618 assertions**;
+  root typecheck **exit 0**, diff-check **pass**. После него pointer/drag были
+  оставлены fail-closed до production point-hit цепочки; изменение только
+  capability allowlist.
+
 Restart credentials и пассивная идентичность helper:
 
 - Private client state хранит HMAC key generation, ключ, hashes bearer/resumption

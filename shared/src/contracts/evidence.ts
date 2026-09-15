@@ -2,6 +2,7 @@ import { z } from "zod"
 import {
   displayRefSchema,
   applicationRefSchema,
+  applicationBundleRefSchema,
   surfaceRefSchema,
   fenceTokenSchema,
   generationIdSchema,
@@ -50,6 +51,11 @@ const nativeEvidenceCommonShape = {
 }
 
 export const nativeEvidenceReportSchema = z.discriminatedUnion("factKind", [
+  z.strictObject({
+    factKind: z.literal("application-bundle-identity"),
+    ...nativeEvidenceCommonShape,
+    target: z.strictObject({ kind: z.literal("application-bundle"), ref: applicationBundleRefSchema }),
+  }),
   z.strictObject({
     factKind: z.literal("native-target-identity"),
     ...nativeEvidenceCommonShape,
@@ -169,6 +175,7 @@ export const verifiedNativeEvidenceReceiptSchema = z.strictObject({
   displayLayoutRevision: z.number().int().safe().min(0),
   observedAt: isoTimestampSchema,
   factKind: z.enum([
+    "application-bundle-identity",
     "native-target-identity",
     "target-resolution",
     "window-cg-ax-correlation",

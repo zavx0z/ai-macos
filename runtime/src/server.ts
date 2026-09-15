@@ -13,9 +13,11 @@ export async function main(): Promise<void> {
   if (process.argv.includes("--doctor")) {
     const client = await RuntimeUdsClient.fromCredentialFile(required("META_RUNTIME_SOCKET"), required("META_RUNTIME_CREDENTIAL"))
     await client.open("runtime-doctor")
-    const result = await client.callTool("system_health", {}, AbortSignal.timeout(5000))
-    process.stdout.write(`${JSON.stringify(result)}\n`)
-    if (result.isError) process.exitCode = 1
+    try {
+      const result = await client.callTool("system_health", {}, AbortSignal.timeout(5000))
+      process.stdout.write(`${JSON.stringify(result)}\n`)
+      if (result.isError) process.exitCode = 1
+    } finally { await client.close() }
     return
   }
   const host = await createRuntimeHost({

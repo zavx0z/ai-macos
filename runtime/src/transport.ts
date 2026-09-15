@@ -4,6 +4,7 @@ import {
   parseWireJson,
   operationRecordSchema,
   runtimeOperationIntentSchema,
+  runtimeClientSessionSchema,
   z,
   type AdapterResult,
   type OperationRecord,
@@ -15,6 +16,7 @@ import { RuntimeCore } from "./core.ts"
 import { RuntimeContractError, contractErrorFrom } from "./errors.ts"
 import { randomIdSource, type RuntimeIdSource } from "./primitives.ts"
 import { MethodRegistry, type RuntimeMethodResponse, type RuntimeToolDescriptor } from "./method-registry.ts"
+import { ClientRenewalCoordinator } from "./client-renewal.ts"
 
 const MAX_RUNTIME_REQUEST_BYTES = 1024 * 1024
 const MAX_RUNTIME_RESPONSE_BYTES = 8 * 1024 * 1024
@@ -206,6 +208,11 @@ export class RuntimeUdsServer {
       }
 
       const session = this.#authenticate(request)
+      if (request.method === "POST" && url.pathname === "/v1/session/close") {
+        await readJson(request, z.strictObject({}))
+        await this.#core.closeClientDurable(session)
+        return json({ closed: true })
+      }
       if (request.method === "GET" && url.pathname === "/v1/catalog") {
         if (this.#catalog === undefined) return json({ error: "catalog-unavailable" }, 503)
         return json(this.#catalog.descriptors())
@@ -303,24 +310,28 @@ export class RuntimeUdsClient {
   #bearerToken: string | undefined
   #resumptionToken: string | undefined
   readonly #timeoutMs: number
+  readonly #renewal: ClientRenewalCoordinator
+  readonly #catalogSubscriptions = new Set<() => void>()
+  #closing?: Promise<void>
 
-  private constructor(socketPath: string, credentialPath: string, bootstrapToken: string, timeoutMs: number, adminToken?: string) {
+  private constructor(socketPath: string, credentialPath: string, bootstrapToken: string, timeoutMs: number, adminToken?: string, now?: () => number) {
     this.#socketPath = socketPath
     this.#credentialPath = credentialPath
     this.#bootstrapToken = bootstrapToken
     this.#adminToken = adminToken
     this.#timeoutMs = timeoutMs
+    this.#renewal = new ClientRenewalCoordinator({ now, renew: signal => this.#renewCredential(signal) })
   }
 
   static async fromCredentialFile(
     socketPath: string,
     credentialPath: string,
-    options: { timeoutMs?: number } = {},
+    options: { timeoutMs?: number, now?: () => number } = {},
   ): Promise<RuntimeUdsClient> {
     const credential = parseWireJson(bootstrapCredentialSchema, await readFile(credentialPath, "utf8"))
     const timeoutMs = options.timeoutMs ?? RUNTIME_TRANSPORT_TIMEOUT_MS
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error("Runtime client timeout должен быть 1..30000 ms")
-    return new RuntimeUdsClient(socketPath, credentialPath, credential.bootstrapToken, timeoutMs, credential.adminToken)
+    return new RuntimeUdsClient(socketPath, credentialPath, credential.bootstrapToken, timeoutMs, credential.adminToken, options.now)
   }
 
   async open(clientName: string): Promise<void> {
@@ -332,9 +343,14 @@ export class RuntimeUdsClient {
     const credential = sessionCredentialSchema.parse(response)
     this.#bearerToken = credential.bearerToken
     this.#resumptionToken = credential.resumptionToken
+    this.#renewal.setCredential(credential.session)
   }
 
   async resume(): Promise<void> {
+    await this.#renewal.renewNow()
+  }
+
+  async #renewCredential(signal: AbortSignal) {
     if (this.#resumptionToken === undefined) throw new Error("Нет resumption credential")
     const bootstrap = parseWireJson(bootstrapCredentialSchema, await readFile(this.#credentialPath, "utf8"))
     this.#bootstrapToken = bootstrap.bootstrapToken
@@ -343,10 +359,22 @@ export class RuntimeUdsClient {
       method: "POST",
       bootstrap: true,
       body: { resumptionToken: this.#resumptionToken },
+      signal,
     })
     const credential = sessionCredentialSchema.parse(response)
     this.#bearerToken = credential.bearerToken
     this.#resumptionToken = credential.resumptionToken
+    return credential.session
+  }
+
+  close(): Promise<void> {
+    return this.#closing ??= (async () => {
+      this.#renewal.close()
+      for (const unsubscribe of [...this.#catalogSubscriptions]) unsubscribe()
+      if (this.#bearerToken === undefined) return
+      try { await this.#request("/v1/session/close", { method: "POST", body: {}, skipRenewal: true }) }
+      finally { this.#bearerToken = undefined }
+    })()
   }
 
   async health(): Promise<unknown> {
@@ -398,11 +426,14 @@ export class RuntimeUdsClient {
   }
 
   async readFrame(frameRef: string, signal?: AbortSignal): Promise<Uint8Array> {
-    const response = await this.#raw(`/v1/frames/${encodeURIComponent(frameRef)}`, { signal })
+    const lease = await this.#renewal.enter(this.#timeoutMs * 2, signal)
+    try {
+    const response = await this.#raw(`/v1/frames/${encodeURIComponent(frameRef)}`, { signal: lease.signal })
     if (!response.ok) throw new RuntimeUdsHttpError(response.status, await readResponseJson(response, this.#timeoutMs))
     if (response.headers.get("content-type") !== "image/png") throw new Error("Runtime frame response имеет другой MIME")
     const bytes = await readBoundedBinary(response, 64 * 1024 * 1024, this.#timeoutMs)
     return bytes
+    } finally { lease.release() }
   }
 
   subscribeCatalogChanged(listener: () => void): () => void {
@@ -418,7 +449,9 @@ export class RuntimeUdsClient {
       if (!controller.signal.aborted) timer = setTimeout(() => void poll(), 1000)
     }
     void poll()
-    return () => { controller.abort(); if (timer !== undefined) clearTimeout(timer) }
+    const unsubscribe = () => { controller.abort(); if (timer !== undefined) clearTimeout(timer); this.#catalogSubscriptions.delete(unsubscribe) }
+    this.#catalogSubscriptions.add(unsubscribe)
+    return unsubscribe
   }
 
   async invoke<Result>(method: string, intent: RuntimeOperationIntent, payload: unknown): Promise<RuntimeExecution<Result>> {
@@ -441,19 +474,25 @@ export class RuntimeUdsClient {
   }
 
   async getOperation(operationId: string): Promise<OperationRecord | undefined> {
-    const response = await this.#raw(`/v1/operations/${encodeURIComponent(operationId)}`)
+    const lease = await this.#renewal.enter(this.#timeoutMs * 2)
+    try {
+    const response = await this.#raw(`/v1/operations/${encodeURIComponent(operationId)}`, { signal: lease.signal })
     const body = await readResponseJson(response, this.#timeoutMs)
     if (response.status === 404) return undefined
     if (!response.ok) throw new RuntimeUdsHttpError(response.status, body)
     return operationRecordSchema.parse(body)
+    } finally { lease.release() }
   }
 
   async getOperationByRequest(clientRequestId: string): Promise<OperationRecord | undefined> {
-    const response = await this.#raw(`/v1/operations/by-request/${encodeURIComponent(clientRequestId)}`)
+    const lease = await this.#renewal.enter(this.#timeoutMs * 2)
+    try {
+    const response = await this.#raw(`/v1/operations/by-request/${encodeURIComponent(clientRequestId)}`, { signal: lease.signal })
     const body = await readResponseJson(response, this.#timeoutMs)
     if (response.status === 404) return undefined
     if (!response.ok) throw new RuntimeUdsHttpError(response.status, body)
     return operationRecordSchema.parse(body)
+    } finally { lease.release() }
   }
 
   async cancelOperation(operationId: string, reason: string): Promise<OperationRecord> {
@@ -465,8 +504,13 @@ export class RuntimeUdsClient {
 
   async #request(
     path: string,
-    options: { method?: string, body?: unknown, bootstrap?: boolean, admin?: boolean, signal?: AbortSignal, timeoutMs?: number } = {},
+    options: { method?: string, body?: unknown, bootstrap?: boolean, admin?: boolean, signal?: AbortSignal, timeoutMs?: number, skipRenewal?: boolean } = {},
   ): Promise<unknown> {
+    if (!options.bootstrap && !options.admin && !options.skipRenewal) {
+      const lease = await this.#renewal.enter((options.timeoutMs ?? this.#timeoutMs) + this.#timeoutMs, options.signal)
+      try { return await this.#request(path, { ...options, skipRenewal: true, signal: lease.signal }) }
+      finally { lease.release() }
+    }
     const response = await this.#raw(path, options)
     const body = await readResponseJson(response, this.#timeoutMs)
     if (!response.ok) throw new RuntimeUdsHttpError(response.status, body)
@@ -517,7 +561,7 @@ const bootstrapCredentialSchema = z.strictObject({
   adminToken: z.string().min(1).max(256).optional(),
 })
 const sessionCredentialSchema = z.strictObject({
-  session: z.unknown(),
+  session: runtimeClientSessionSchema,
   bearerToken: z.string().min(1).max(256),
   resumptionToken: z.string().min(1).max(256),
   clientName: z.string().optional(),

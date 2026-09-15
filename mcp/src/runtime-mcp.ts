@@ -5,13 +5,21 @@ import { RuntimeUdsClient } from "@meta/runtime"
 import { createCatalogServer } from "./catalog-server.ts"
 
 export function createRuntimeMcpServer(client: RuntimeUdsClient) {
-  return createCatalogServer({
+  const server = createCatalogServer({
     async listTools() {
       return (await client.listTools()).map(tool => ToolSchema.parse(tool))
     },
     callTool: (name, args, signal) => client.callTool(name, args, signal),
     subscribeCatalogChanged: listener => client.subscribeCatalogChanged(listener),
   })
+  const catalogClosed = server.onclose
+  server.onclose = () => {
+    catalogClosed?.()
+    void client.close().catch(() => { console.error("Runtime client disconnect не подтверждён") })
+  }
+  const closeServer = server.close.bind(server)
+  server.close = async () => { await closeServer(); await client.close() }
+  return server
 }
 
 export function createUnavailableRuntimeMcpServer(
@@ -61,12 +69,14 @@ export async function main(): Promise<void> {
     if (socketPath === undefined || credentialPath === undefined) {
       server = createUnavailableRuntimeMcpServer("configuration-missing", expectedHostname)
     } else {
+      let client: RuntimeUdsClient | undefined
       try {
-        const client = await RuntimeUdsClient.fromCredentialFile(socketPath, credentialPath)
+        client = await RuntimeUdsClient.fromCredentialFile(socketPath, credentialPath)
         await client.open(`mcp:${process.pid}`)
         await client.listTools()
         server = createRuntimeMcpServer(client)
       } catch {
+        await client?.close().catch(() => undefined)
         // Содержимое повреждённого credential не попадает в MCP или stderr.
         server = createUnavailableRuntimeMcpServer("runtime-unavailable", expectedHostname)
       }

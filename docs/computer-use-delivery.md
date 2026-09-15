@@ -36,6 +36,7 @@ inventory другого репозитория. Их должен реализ�
 | `runtime.operations` | Нет | runtime/native | Request dedup, status, cancellation, drain, crash recovery | F03, F05 |
 | `runtime.user-interference` | Нет | native/runtime | User takeover отзывает lease; unavailable observer обозначен | F04, F09 |
 | `desktop.applications` | Нет | window/native | Приложения с окнами/без окон, hidden, AX errors | F07 |
+| `desktop.application.lifecycle` | Нет | runtime/native | Resolve installed bundle, exact launch/quit, late completion и unsaved outcome | F07, F11 |
 | `desktop.windows.all` | Нет | window/native | Все обнаруженные окна; incomplete/ambiguous не теряются | F07 |
 | `desktop.window.identity` | Частично | native/window | Live ref, native generation, CG correlation evidence | F01, F07 |
 | `desktop.window.show` | Нет | window/native | Exact unhide/unminimize/focus или честный unsupported | F07 |

@@ -17,11 +17,21 @@ import { clipboardReadRequestSchema, clipboardWriteRequestSchema, clipboardReadR
 import { adapterResultSchema } from "@meta/shared/contracts"
 import { RuntimeUdsServer, readBoundedResponseText } from "./transport.ts"
 import { acquireHostLock } from "./host-lock.ts"
+import { reclaimStaleHostArtifacts } from "./host-artifacts.ts"
 import { composeHostCapabilities } from "./host-capabilities.ts"
 import { FileHeldInputLedger, FileOperationJournal } from "./storage/index.ts"
 import { registerWindowMethods } from "./window-methods.ts"
 import { FileClientState } from "./client-state.ts"
 import { sha256 } from "./primitives.ts"
+import { startRuntimeHeartbeat } from "./heartbeat.ts"
+import { createBrowserHostComposition, type BrowserHostConfig } from "./browser-host.ts"
+import { registerBrowserMethods } from "./browser-methods.ts"
+import { registerInputMethods } from "./input-methods.ts"
+import { registerCaptureMethods } from "./capture-methods.ts"
+import { DesktopInputAdapter } from "@meta/input/adapter"
+import { RuntimeScreenAdapter } from "@meta/screen/adapter"
+import { ProtocolNativeCaptureDriver } from "@meta/screen/native-driver"
+import { NativeCaptureClient } from "@meta/native/capture-client"
 
 export type RuntimeHostOptions = {
   socketPath: string
@@ -35,12 +45,16 @@ export type RuntimeHostOptions = {
   metadata?: unknown
   transportFactory?: () => NativeTransport
   stateDirectory?: string
+  browser?: BrowserHostConfig
 }
 
 export async function createRuntimeHost(options: RuntimeHostOptions) {
   if (hostname() !== options.expectedHostname) throw new Error("Runtime host machine identity mismatch")
   const releaseLock = await acquireHostLock(options.socketPath)
-  try { return await createLockedHost(options, releaseLock) }
+  try {
+    await reclaimStaleHostArtifacts(releaseLock.lease, { socketPath: options.socketPath, credentialPath: options.credentialPath })
+    return await createLockedHost(options, releaseLock)
+  }
   catch (error) { await releaseLock(); throw error }
 }
 
@@ -64,9 +78,11 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   let nativeError: string | undefined
   let clipboard: RuntimeClipboardHandler | undefined
   let draining = false
+  let heartbeat: ReturnType<typeof startRuntimeHeartbeat> | undefined
+  let browserHost: ReturnType<typeof createBrowserHostComposition> | undefined
   const revokeNative = (reason: string) => {
     nativeError = reason
-    runtime?.updateCapabilities(composeHostCapabilities("host:runtime", undefined, reason))
+    runtime?.updateCapabilities(composeHostCapabilities("host:runtime", undefined, reason, browserHost?.capabilitySet))
   }
   if (options.transport !== undefined || options.transportFactory !== undefined || options.helperPath !== undefined) {
     const delegate = options.transport ?? options.transportFactory?.() ?? new NativeProcessTransport(options.helperPath!)
@@ -142,8 +158,16 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     clipboard = new RuntimeClipboardHandler(runtime, native)
   }
   const core = runtime
-  core.updateCapabilities(composeHostCapabilities("host:runtime", native === undefined ? undefined : handshake?.capabilities))
+  browserHost = createBrowserHostComposition(core, options.browser ?? {})
+  core.updateCapabilities(composeHostCapabilities("host:runtime", native === undefined ? undefined : handshake?.capabilities, undefined, browserHost.capabilitySet))
   const catalog = new MethodRegistry(core)
+  registerBrowserMethods(catalog, core, browserHost.bindings)
+  if (native !== undefined && handshake !== undefined) {
+    const adapterHost = freezeAdapterHostContext({ generation, runtimeBuildId: options.runtimeBuildId, capabilities: handshake.capabilities })
+    registerInputMethods(catalog, core, new DesktopInputAdapter(adapterHost, core.services, native))
+    registerCaptureMethods(catalog, core, new RuntimeScreenAdapter(adapterHost, core.services,
+      new ProtocolNativeCaptureDriver(new NativeCaptureClient(native, core.continuations))))
+  }
   const doctor = () => ({
     machine: { hostname: hostname(), matchesExpected: hostname() === options.expectedHostname },
     runtime: { buildId: options.runtimeBuildId, ...generation, draining,
@@ -240,6 +264,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   const drain = async (signal?: AbortSignal) => {
     draining = true
     core.sealAdmission()
+    await heartbeat?.stop()
     await core.drainOperations()
     if (core.recoveryEvidence().length > 0 || core.startupRecoveryReasons().length > 0) throw new Error("Startup recovery не завершена")
     if (native === undefined || handshake === undefined) return { cleanup: "complete" as const }
@@ -265,11 +290,17 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   return {
     core, catalog, doctor,
     async start() {
-      try { await uds.start() }
-      catch (error) { core.sealAdmission(); await native?.close(); await releaseLock(); throw error }
+      try {
+        if (native !== undefined && handshake !== undefined) heartbeat = startRuntimeHeartbeat({ native,
+          generation: { ...generation, nativeGeneration: handshake.nativeGeneration },
+          onFailure(error) { core.quarantineStartup(`Native heartbeat unavailable: ${error.message}`); revokeNative("Native heartbeat unavailable") },
+        })
+        await uds.start()
+      }
+      catch (error) { core.sealAdmission(); await heartbeat?.stop(); await native?.close(); await releaseLock(); throw error }
     },
     drain,
-    async close() { core.sealAdmission(); await uds.stop(); await native?.close(); await releaseLock() },
+    async close() { core.sealAdmission(); await heartbeat?.stop(); await uds.stop(); await native?.close(); await releaseLock() },
   }
   } catch (error) { await native?.close(); throw error }
 }

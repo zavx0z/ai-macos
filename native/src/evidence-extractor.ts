@@ -1,5 +1,7 @@
 import {
   nativeEvidenceReportSchema,
+  applicationBundleResolutionSchema,
+  sameNativeGeneration,
   parseWireJson,
   type NativeEvidenceReport,
   type NativeTargetMapping,
@@ -55,6 +57,15 @@ export function extractNativeEvidenceReports(bytes: Uint8Array): readonly Native
   const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
   const frame = parseWireJson(nativeTransportResponseFrameSchema, text)
   if (frame.channel === "response" && frame.payload.ok) {
+    const bundle = applicationBundleResolutionSchema.safeParse(frame.payload.result)
+    if (bundle.success) {
+      if (!sameNativeGeneration(bundle.data.target.ref, frame.payload)) throw new Error("Bundle resolution содержит другую native generation")
+      return [nativeEvidenceReportSchema.parse({
+        factKind: "application-bundle-identity", sourceResponseRef: bundle.data.sourceResponseRef,
+        inventoryId: bundle.data.inventoryId, inventoryRevision: bundle.data.inventoryRevision,
+        displayLayoutRevision: 0, observedAt: bundle.data.observedAt, target: bundle.data.target,
+      })]
+    }
     const inventory = nativeInventoryResultSchema.safeParse(frame.payload.result)
     if (inventory.success) return inventoryReports(frame.payload, inventory.data)
     const transition = nativeWindowTransitionResultSchema.safeParse(frame.payload.result)

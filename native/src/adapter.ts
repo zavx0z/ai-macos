@@ -100,6 +100,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
   readonly #pending = new Map<string, PendingResponse>()
   readonly #expired = new Map<string, number>()
   readonly #seenRequestIds = new Map<string, number>()
+  readonly #heartbeatRequestIds = new Map<string, number>()
   readonly #events: Array<{ event: ObservedEvent, bytes: number }> = []
   #eventBytes = 0
   #eventGap: Error | undefined
@@ -418,12 +419,15 @@ export class NativeBrokerAdapter implements NativeAdapter {
     }
     const key = `${expectedChannel}:${requestId}`
     this.#pruneRequestTombstones()
-    if (this.#seenRequestIds.has(requestId)) throw new Error(`Native requestId уже использован: ${requestId}`)
+    if (this.#seenRequestIds.has(requestId) || this.#heartbeatRequestIds.has(requestId)) throw new Error(`Native requestId уже использован: ${requestId}`)
     if (this.#seenRequestIds.size >= 10_000 && frame.channel !== "drain") throw new Error("Native session exhausted: разрешён только runtime drain")
     if (this.#seenRequestIds.size >= 10_128) throw new Error("Native session exhausted: reserve drain requests исчерпан, требуется runtime quarantine")
     if (this.#pending.size >= 128) throw new Error("Native concurrent request limit исчерпан")
     if (this.#pending.has(key)) throw new Error(`Native request уже ожидается: ${requestId}`)
-    this.#seenRequestIds.set(requestId, Date.now() + 24 * 60 * 60 * 1000)
+    if (frame.channel === "heartbeat") {
+      if (this.#heartbeatRequestIds.size >= 128) throw new Error("Native heartbeat recent correlation capacity exceeded")
+      this.#heartbeatRequestIds.set(requestId, Date.now() + 5000)
+    } else this.#seenRequestIds.set(requestId, Date.now() + 24 * 60 * 60 * 1000)
     return await new Promise<NativeTransportResponseFrame>((resolve, reject) => {
       const remainingMs = deadlineAt === undefined ? undefined : Date.parse(deadlineAt) - Date.now()
       if (remainingMs !== undefined && remainingMs <= 0) {
@@ -433,7 +437,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
       let timer: ReturnType<typeof setTimeout> | undefined
       const expire = (error: Error) => {
         this.#pending.delete(key)
-        this.#expired.set(key, Date.now() + 24 * 60 * 60 * 1000)
+        this.#expired.set(key, Date.now() + (frame.channel === "heartbeat" ? 5000 : 24 * 60 * 60 * 1000))
         reject(error)
       }
       const onAbort = () => {
@@ -588,6 +592,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
 
   #pruneRequestTombstones(): void {
     const now = Date.now()
+    for (const [id, expiresAt] of this.#heartbeatRequestIds) if (expiresAt <= now) this.#heartbeatRequestIds.delete(id)
     for (const [key, expiresAt] of this.#expired) {
       if (expiresAt <= now) this.#expired.delete(key)
     }

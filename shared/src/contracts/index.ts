@@ -1,4 +1,5 @@
 export * from "./adapters.ts"
+export * from "./applications.ts"
 export * from "./browser.ts"
 export * from "./capabilities.ts"
 export * from "./capture.ts"

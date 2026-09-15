@@ -84,6 +84,35 @@ test("UDS callTool использует advertised method budget вместо к
   } finally { await server.stop(); await rm(directory, { recursive: true, force: true }) }
 })
 
+test("UDS автоматически renews после fake idle/outage дольше bearer TTL и close прекращает calls", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "runtime-renewal-"))
+  const socketPath = join(directory, "runtime.sock")
+  const credentialPath = join(directory, "credential.json")
+  let now = Date.now()
+  const core = new RuntimeCore({ generation, runtimeBuildId: "build:renewal", clock: { now: () => new Date(now) } })
+  const catalog = new MethodRegistry(core)
+  catalog.register("identity", { title: "Session", description: "Проверка renewal", readOnly: true,
+    input: z.strictObject({}), output: z.strictObject({ session: z.string(), lineage: z.string() }),
+    async execute(context) { return { session: context.session.clientSessionId, lineage: core.clients.lineage(context.session) } } })
+  const server = new RuntimeUdsServer({ socketPath, credentialPath, core, catalog })
+  try {
+    await server.start()
+    const client = await RuntimeUdsClient.fromCredentialFile(socketPath, credentialPath, { now: () => now })
+    await client.open("renewal")
+    const first = (await client.callTool("identity", {}, new AbortController().signal)).structuredContent!
+    now += 240_000
+    const renewed = (await client.callTool("identity", {}, new AbortController().signal)).structuredContent!
+    expect(renewed.session).not.toBe(first.session)
+    expect(renewed.lineage).toBe(first.lineage)
+    now += 400_000
+    const resumed = (await client.callTool("identity", {}, new AbortController().signal)).structuredContent!
+    expect(resumed.session).not.toBe(renewed.session)
+    expect(resumed.lineage).toBe(first.lineage)
+    await client.close()
+    await expect(client.listTools()).rejects.toThrow("закрыт")
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }) }
+})
+
 test("private UDS authenticates clients before executor and preserves exact operation", async () => {
   const directory = await mkdtemp(join(tmpdir(), "meta-runtime-uds-"))
   const socketPath = join(directory, "runtime.sock")
