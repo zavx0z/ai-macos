@@ -3,10 +3,12 @@ import { createHash, randomUUID } from "node:crypto"
 import {
   chmod,
   copyFile,
+  cp,
   lstat,
   mkdir,
   open,
   readFile,
+  readdir,
   readlink,
   realpath,
   rename,
@@ -27,10 +29,16 @@ const execFileAsync = promisify(execFile)
 export const RUNTIME_SERVICE_LABEL = "com.meta.ai-macos.runtime"
 export const RUNTIME_SIGNING_IDENTIFIER = "com.meta.ai-macos.runtime"
 export const HELPER_SIGNING_IDENTIFIER = "com.meta.input.helper"
-const RELEASE_FORMAT = "meta-ai-macos-runtime-release-v1"
-const RUNTIME_ARTIFACT_NAMES = ["computer-use", "runtime"] as const
+const LEGACY_RELEASE_FORMAT = "meta-ai-macos-runtime-release-v1"
+const RELEASE_FORMAT = "meta-ai-macos-runtime-release-v2"
+const APPLICATION_NAME = "computer-use.app"
+const APPLICATION_INFO_PATH = `${APPLICATION_NAME}/Contents/Info.plist` as const
+const APPLICATION_RUNTIME_PATH = `${APPLICATION_NAME}/Contents/MacOS/computer-use` as const
+const APPLICATION_HELPER_PATH = `${APPLICATION_NAME}/Contents/Helpers/meta-input-helper` as const
+const RUNTIME_ARTIFACT_NAMES = ["computer-use", "runtime", APPLICATION_RUNTIME_PATH] as const
+const HELPER_ARTIFACT_NAMES = ["native-helper", APPLICATION_HELPER_PATH] as const
 type RuntimeArtifactName = typeof RUNTIME_ARTIFACT_NAMES[number]
-const CURRENT_RUNTIME_ARTIFACT_NAME: RuntimeArtifactName = "computer-use"
+type HelperArtifactName = typeof HELPER_ARTIFACT_NAMES[number]
 const MAX_COMMAND_OUTPUT = 8 * 1024 * 1024
 const MAX_BROWSER_CONFIG_BYTES = 64 * 1024
 const STARTUP_PERMISSION_NAMES = ["accessibility", "screenRecording", "postEvents", "inputMonitoring"] as const
@@ -125,6 +133,16 @@ export type RuntimeInstallOptions = {
 export type InstallFailpoint =
   | "after-installer-lock"
   | "after-rollback-prepared"
+  | "after-stable-old-writable"
+  | "after-stable-old-moved"
+  | "after-stable-next-writable"
+  | "after-stable-next-moved"
+  | "after-stable-mode-sealed"
+  | "after-stable-restore-current-writable"
+  | "after-stable-restore-current-moved"
+  | "after-stable-restore-backup-writable"
+  | "after-stable-restore-backup-moved"
+  | "after-stable-restore-mode-sealed"
   | "after-helper-switch"
   | "after-release-switch"
   | "after-plist-switch"
@@ -191,12 +209,19 @@ export type RuntimeInstallPlan = {
 }
 
 export type ReleaseManifest = {
-  format: typeof RELEASE_FORMAT
+  format: typeof LEGACY_RELEASE_FORMAT | typeof RELEASE_FORMAT
   releaseId: string
   createdAt: string
   source: { repositoryRoot: string, commit: string, clean: true }
   builds: { runtimeBuildId: string, nativeBuildId: string }
   artifacts: {
+    application?: {
+      path: typeof APPLICATION_NAME
+      infoPlist: { path: typeof APPLICATION_INFO_PATH, sha256: string, bytes: number }
+      signingIdentifier: typeof RUNTIME_SIGNING_IDENTIFIER
+      designatedRequirement: string
+      cdhash: string
+    }
     runtime: {
       path: RuntimeArtifactName
       sha256: string
@@ -206,7 +231,7 @@ export type ReleaseManifest = {
       cdhash?: string
     }
     nativeHelper: {
-      path: "native-helper"
+      path: HelperArtifactName
       sha256: string
       bytes: number
       signingIdentifier: typeof HELPER_SIGNING_IDENTIFIER
@@ -215,6 +240,7 @@ export type ReleaseManifest = {
       auditSession: NativeAuditIdentity
     }
   }
+  stableApplication?: { path: typeof APPLICATION_NAME }
   signing?:
     | { mode: "adhoc" }
     | { mode: "identity", certificateSha1: string }
@@ -223,6 +249,7 @@ export type ReleaseManifest = {
     source: "scripts/runtime-entry.ts"
     modes: readonly ["runtime", "doctor", "mcp"]
     mcpTransport: "stdio"
+    path?: typeof APPLICATION_RUNTIME_PATH
   }
   configuration: RuntimeInstallPlan["configuration"]
   tcc: {
@@ -292,7 +319,7 @@ export async function planRuntimeInstall(options: RuntimeInstallOptions): Promis
   const clean = status.stdout.length === 0
   const configuration = installConfiguration(options)
   const signing = await planSigning(options)
-  const sourceKey = sha256(`${commit}\n${RELEASE_FORMAT}`).slice(0, 24)
+  const sourceKey = sha256(`${commit}\n${LEGACY_RELEASE_FORMAT}`).slice(0, 24)
   const signingReleaseSuffix = signing.mode === "adhoc" ? "" : `\n${stableJson(signingReleaseIdentity(signing))}`
   const releaseKey = sha256(`${commit}\n${RELEASE_FORMAT}\n${stableJson(configuration)}${signingReleaseSuffix}`).slice(0, 24)
   const releaseId = `release-${releaseKey}`
@@ -332,7 +359,7 @@ export async function planRuntimeInstall(options: RuntimeInstallOptions): Promis
     steps: installSteps(paths, releaseId, runtimeBuildId, nativeBuildId, domain),
     legacyRetirement: legacyCandidates(paths.repositoryRoot),
   }
-  plan.release.alreadyInstalled = loaded && await installedReleaseMatches(plan)
+  plan.release.alreadyInstalled = loaded && await installedReleaseMatches(plan, options.runner)
   plan.gates.existingRuntimeRequiresDrain = loaded && !plan.release.alreadyInstalled
   if (!clean) plan.steps.unshift({
     id: "source-dirty-block",
@@ -514,11 +541,7 @@ async function applyRuntimeInstallLocked(
   paths: RuntimeInstallPaths,
 ): Promise<RuntimeInstallResult> {
   await options.failpoint?.("after-installer-lock")
-  const release = await ensureRelease(plan, options)
-  const { plist } = release
-  await assertSignerContinuity(plan, release.manifest)
-  await assertNativeBuildStableAcrossConfiguration(plan, release.manifest)
-  await assertSourceUnchanged(plan, options)
+  await discardIncompleteRollbackPreparations(paths)
   if (await exists(pendingUpdatePath(paths))) {
     const pendingService = await inspectLaunchService(options.runner, plan)
     if (pendingService !== undefined) {
@@ -530,13 +553,21 @@ async function applyRuntimeInstallLocked(
     }
     await recoverPendingUpdate(plan, options, pendingService !== undefined)
   }
+  const release = await ensureRelease(plan, options)
+  const { plist } = release
+  await assertSignerContinuity(plan, release.manifest, options.runner)
+  await assertNativeBuildStableAcrossConfiguration(plan, release.manifest)
+  await assertSourceUnchanged(plan, options)
   const service = await inspectLaunchService(options.runner, plan)
   if (plan.service.loaded && service === undefined) throw new Error("Runtime service исчез после reviewable plan; ownership требует нового plan")
   const serviceWasLoaded = service !== undefined
   const previous = { ...await snapshotInstalledState(paths), serviceLoaded: serviceWasLoaded }
+  const stablePayloadMatches = release.manifest.format === RELEASE_FORMAT
+    ? await stableApplicationMatches(plan, release.manifest, options.runner)
+    : previous.helperSha256 === release.manifest.artifacts.nativeHelper.sha256
   const sameRelease = serviceWasLoaded
     && previous.currentRelease === plan.release.releasePath
-    && previous.helperSha256 === release.manifest.artifacts.nativeHelper.sha256
+    && stablePayloadMatches
     && previous.plistBytes !== undefined
     && new TextDecoder().decode(previous.plistBytes) === plist
   if (sameRelease) {
@@ -558,6 +589,9 @@ async function applyRuntimeInstallLocked(
     throw new Error("Loaded runtime требует injected exact drain authority")
   }
   await prepareRollback(plan, previous)
+  if (release.manifest.format === RELEASE_FORMAT) {
+    await prepareNextStableApplication(plan, release.manifest, options.runner)
+  }
   await options.failpoint?.("after-rollback-prepared")
   if (!serviceWasLoaded && await inspectLaunchService(options.runner, plan) !== undefined) {
     await discardPendingUpdate(paths)
@@ -573,7 +607,9 @@ async function applyRuntimeInstallLocked(
       drainComplete = true
     }
     if (serviceWasLoaded) await checked(options.runner, "/bin/launchctl", ["bootout", `${plan.service.domain}/${RUNTIME_SERVICE_LABEL}`])
-    if (await hashIfPresent(paths.stableHelperPath) !== release.manifest.artifacts.nativeHelper.sha256) {
+    if (release.manifest.format === RELEASE_FORMAT) {
+      await promoteNextStableApplication(paths, options.failpoint)
+    } else if (await hashIfPresent(paths.stableHelperPath) !== release.manifest.artifacts.nativeHelper.sha256) {
       await atomicCopy(release.nativeHelperPath, paths.stableHelperPath, 0o755)
     }
     await options.failpoint?.("after-helper-switch")
@@ -588,10 +624,7 @@ async function applyRuntimeInstallLocked(
       doctorTimeout(options), permissionWait(options))
     await discardPendingUpdate(paths)
     return {
-      state: previous.currentRelease === plan.release.releasePath
-        && previous.helperSha256 === release.manifest.artifacts.nativeHelper.sha256
-        ? "already-installed"
-        : "installed",
+      state: "installed",
       releaseId: plan.release.releaseId,
       manifestSha256: release.manifestSha256,
       rollbackUsed,
@@ -634,9 +667,9 @@ function installSteps(
   return [
     { id: "verify-source", description: "Проверить canonical checkout, HEAD и отсутствие uncommitted source", mutates: false },
     { id: "build-runtime", description: `Собрать runtime ${runtimeBuildId} во временный release`, mutates: true,
-      command: { file: process.execPath, args: ["build", "scripts/runtime-entry.ts", "--compile", "--outfile", `${releasePath}.staging/${CURRENT_RUNTIME_ARTIFACT_NAME}`] } },
+      command: { file: process.execPath, args: ["build", "scripts/runtime-entry.ts", "--compile", "--outfile", `${releasePath}.staging/${APPLICATION_RUNTIME_PATH}`] } },
     { id: "build-native", description: `Собрать native helper ${nativeBuildId} во временный release`, mutates: true,
-      command: { file: "/bin/sh", args: [join(paths.repositoryRoot, "native/scripts/build-broker.sh"), `${releasePath}.staging/native-helper`, nativeBuildId] } },
+      command: { file: "/bin/sh", args: [join(paths.repositoryRoot, "native/scripts/build-broker.sh"), `${releasePath}.staging/${APPLICATION_HELPER_PATH}`, nativeBuildId] } },
     { id: "verify-candidate", description: "Подписать runtime и helper configured identity, проверить signer continuity, metadata, build IDs и digests", mutates: true },
     { id: "publish-release", description: "Опубликовать immutable manifest и release атомарным rename", mutates: true },
     { id: "drain", description: "Для loaded runtime получить exact complete drain receipt до bootout", mutates: false },
@@ -654,7 +687,7 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
   const manifestPath = join(releasePath, "manifest.json")
   if (await exists(manifestPath)) {
     const manifest = parseManifest(JSON.parse(await readFile(manifestPath, "utf8")))
-    const plist = launchAgentPlist(plan, manifest.artifacts.runtime.path, manifestNativeCdhash(manifest))
+    const plist = launchAgentPlist(plan, manifest, manifestNativeCdhash(manifest))
     assertManifestMatchesPlan(manifest, plan, sha256(plist))
     await verifyReleaseArtifacts(releasePath, manifest, options.runner, plan)
     return {
@@ -670,8 +703,14 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
   const staging = join(stagingRoot, `${plan.release.releaseId}.${randomUUID()}`)
   await mkdir(staging, { recursive: false, mode: 0o700 })
   try {
-    const runtimePath = join(staging, CURRENT_RUNTIME_ARTIFACT_NAME)
-    const nativeHelperPath = join(staging, "native-helper")
+    const applicationPath = join(staging, APPLICATION_NAME)
+    const infoPlistPath = join(staging, APPLICATION_INFO_PATH)
+    const runtimePath = join(staging, APPLICATION_RUNTIME_PATH)
+    const nativeHelperPath = join(staging, APPLICATION_HELPER_PATH)
+    await mkdir(dirname(runtimePath), { recursive: true, mode: 0o700 })
+    await mkdir(dirname(nativeHelperPath), { recursive: true, mode: 0o700 })
+    await writeFile(infoPlistPath, applicationInfoPlist(), { flag: "wx", mode: 0o600 })
+    await checked(options.runner, "/usr/bin/plutil", ["-lint", infoPlistPath])
     await checked(options.runner, process.execPath, [
       "build",
       "scripts/runtime-entry.ts",
@@ -686,8 +725,6 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
       nativeHelperPath,
       plan.release.nativeBuildId,
     ], plan.paths.repositoryRoot, 120_000)
-    const runtimeSignature = await signArtifact(options.runner, runtimePath,
-      RUNTIME_SIGNING_IDENTIFIER, plan.signing)
     const signature = await signArtifact(options.runner, nativeHelperPath,
       HELPER_SIGNING_IDENTIFIER, plan.signing)
     const architectures = await checked(options.runner, "/usr/bin/lipo", ["-archs", nativeHelperPath])
@@ -697,34 +734,42 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
     if (metadata.nativeBuildId !== plan.release.nativeBuildId) throw new Error("Native metadata содержит другой build ID")
     if (metadata.installRoot !== plan.paths.repositoryRoot) throw new Error("Native metadata содержит другой canonical install root")
     assertCurrentAuditUser(metadata.session)
-    await chmod(runtimePath, 0o555)
-    await chmod(nativeHelperPath, 0o555)
-    const [runtimeArtifact, nativeArtifact] = await Promise.all([
+    const applicationSignature = await signArtifact(options.runner, applicationPath,
+      RUNTIME_SIGNING_IDENTIFIER, plan.signing)
+    await sealApplicationModes(applicationPath)
+    await assertExactApplicationTopology(applicationPath)
+    const [infoPlistArtifact, runtimeArtifact, nativeArtifact] = await Promise.all([
+      artifact(infoPlistPath),
       artifact(runtimePath),
       artifact(nativeHelperPath),
     ])
-    const plist = launchAgentPlist(plan, CURRENT_RUNTIME_ARTIFACT_NAME, signature.cdhash)
-    const manifest: ReleaseManifest = {
+    const manifestShape = {
       format: RELEASE_FORMAT,
+      artifacts: {
+        application: { path: APPLICATION_NAME, infoPlist: { path: APPLICATION_INFO_PATH, ...infoPlistArtifact },
+          signingIdentifier: RUNTIME_SIGNING_IDENTIFIER,
+          designatedRequirement: applicationSignature.designatedRequirement, cdhash: applicationSignature.cdhash },
+        runtime: { path: APPLICATION_RUNTIME_PATH, ...runtimeArtifact },
+        nativeHelper: { path: APPLICATION_HELPER_PATH, ...nativeArtifact, signingIdentifier: HELPER_SIGNING_IDENTIFIER,
+          designatedRequirement: signature.designatedRequirement, cdhash: signature.cdhash,
+          auditSession: metadata.session },
+      },
+      stableApplication: { path: APPLICATION_NAME },
+    } as const
+    const plist = launchAgentPlist(plan, manifestShape, signature.cdhash)
+    const manifest: ReleaseManifest = {
+      ...manifestShape,
       releaseId: plan.release.releaseId,
       createdAt: plan.createdAt,
       source: { repositoryRoot: plan.source.repositoryRoot, commit: plan.source.commit, clean: true },
       builds: { runtimeBuildId: plan.release.runtimeBuildId, nativeBuildId: plan.release.nativeBuildId },
-      artifacts: {
-        runtime: { path: CURRENT_RUNTIME_ARTIFACT_NAME, ...runtimeArtifact,
-          signingIdentifier: RUNTIME_SIGNING_IDENTIFIER,
-          designatedRequirement: runtimeSignature.designatedRequirement,
-          cdhash: runtimeSignature.cdhash },
-        nativeHelper: { path: "native-helper", ...nativeArtifact, signingIdentifier: HELPER_SIGNING_IDENTIFIER,
-          designatedRequirement: signature.designatedRequirement, cdhash: signature.cdhash,
-          auditSession: metadata.session },
-      },
       signing: signingReleaseIdentity(plan.signing),
       launchAgent: { label: RUNTIME_SERVICE_LABEL, sha256: sha256(plist) },
-      entrypoint: { source: "scripts/runtime-entry.ts", modes: ["runtime", "doctor", "mcp"], mcpTransport: "stdio" },
+      entrypoint: { source: "scripts/runtime-entry.ts", modes: ["runtime", "doctor", "mcp"],
+        mcpTransport: "stdio", path: APPLICATION_RUNTIME_PATH },
       configuration: plan.configuration,
       tcc: {
-        subjectPath: plan.paths.stableHelperPath,
+        subjectPath: stableApplicationHelperPath(plan.paths),
         candidateCdhash: signature.cdhash,
         automaticGrantPreservation: false,
         requiredPassiveChecks: ["accessibility", "screen-recording", "post-events", "input-monitoring"],
@@ -737,7 +782,7 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
     await syncDirectory(dirname(releasePath))
     await chmod(releasePath, 0o555)
     return { manifest, manifestSha256: sha256(stableJson(manifest)),
-      nativeHelperPath: join(releasePath, "native-helper"), plist }
+      nativeHelperPath: join(releasePath, APPLICATION_HELPER_PATH), plist }
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => undefined)
     throw error
@@ -752,6 +797,13 @@ async function verifyReleaseArtifacts(
 ): Promise<void> {
   await assertOwnedNode(releasePath, "directory", 0o555)
   await assertOwnedNode(join(releasePath, "manifest.json"), "file", 0o444)
+  if (manifest.format === RELEASE_FORMAT) {
+    const entries = (await readdir(releasePath)).sort()
+    if (stableJson(entries) !== stableJson([APPLICATION_NAME, "manifest.json"])) {
+      throw new Error("V2 release topology не соответствует exact contract")
+    }
+    await assertExactApplicationTopology(join(releasePath, APPLICATION_NAME))
+  }
   const runtimePath = safeChild(releasePath, manifest.artifacts.runtime.path)
   const helperPath = safeChild(releasePath, manifest.artifacts.nativeHelper.path)
   await assertOwnedNode(runtimePath, "file", 0o555)
@@ -761,7 +813,17 @@ async function verifyReleaseArtifacts(
     || stableJson(helperArtifact) !== stableJson({ sha256: manifest.artifacts.nativeHelper.sha256, bytes: manifest.artifacts.nativeHelper.bytes })) {
     throw new Error("Immutable release artifact digest mismatch")
   }
-  if (manifest.signing !== undefined) {
+  if (manifest.format === RELEASE_FORMAT) {
+    const application = manifest.artifacts.application!
+    const infoPlistPath = join(releasePath, application.infoPlist.path)
+    const infoPlistArtifact = await artifact(infoPlistPath)
+    if (stableJson(infoPlistArtifact) !== stableJson({ sha256: application.infoPlist.sha256,
+      bytes: application.infoPlist.bytes })) throw new Error("Immutable application Info.plist digest mismatch")
+    if (await readFile(infoPlistPath, "utf8") !== applicationInfoPlist()) {
+      throw new Error("Application Info.plist не соответствует exact identity contract")
+    }
+    await verifyApplicationSignature(runner, join(releasePath, application.path), application, manifest.signing!)
+  } else if (manifest.signing !== undefined) {
     await verifyManifestArtifactSignature(runner, runtimePath, manifest.artifacts.runtime,
       RUNTIME_SIGNING_IDENTIFIER, manifest.signing)
   }
@@ -786,6 +848,28 @@ async function verifyReleaseArtifacts(
   }
 }
 
+async function verifyApplicationSignature(
+  runner: CommandRunner,
+  path: string,
+  application: NonNullable<ReleaseManifest["artifacts"]["application"]>,
+  signing: NonNullable<ReleaseManifest["signing"]>,
+): Promise<void> {
+  await checked(runner, "/usr/bin/codesign", ["--verify", "--strict", path])
+  const signature = await inspectCodeSignature(runner, path)
+  if (application.signingIdentifier !== RUNTIME_SIGNING_IDENTIFIER
+    || signature.identifier !== RUNTIME_SIGNING_IDENTIFIER
+    || application.cdhash !== signature.cdhash
+    || application.designatedRequirement !== signature.designatedRequirement
+    || signature.adhoc !== (signing.mode === "adhoc")) {
+    throw new Error("Application bundle codesign identity не совпадает с manifest")
+  }
+  if (signing.mode === "identity") {
+    await verifyCertificateRequirement(runner, path, RUNTIME_SIGNING_IDENTIFIER, signing.certificateSha1)
+    assertEmbeddedCertificateRequirement(signature.designatedRequirement,
+      RUNTIME_SIGNING_IDENTIFIER, signing.certificateSha1)
+  }
+}
+
 async function assertOwnedNode(path: string, kind: "file" | "directory", mode: number): Promise<void> {
   const info = await lstat(path)
   const correctKind = kind === "file" ? info.isFile() : info.isDirectory()
@@ -798,23 +882,31 @@ async function snapshotInstalledState(paths: RuntimeInstallPaths) {
   const currentPath = join(paths.installRoot, "current")
   const currentRelease = await readLinkIfPresent(currentPath)
   if (currentRelease !== undefined) assertPreviousReleasePath(paths, currentRelease)
+  const stableApplicationPresent = await exists(stableApplicationPath(paths))
+  if (stableApplicationPresent) {
+    if (currentRelease === undefined) throw new Error("Stable application не имеет current release owner")
+    const manifest = parseManifest(JSON.parse(await readFile(join(currentRelease, "manifest.json"), "utf8")))
+    if (manifest.format !== RELEASE_FORMAT) throw new Error("Legacy current release не владеет stable application")
+  }
   return {
     currentRelease,
     helperBytes: await readRegularFileIfPresent(paths.stableHelperPath),
     helperSha256: await hashIfPresent(paths.stableHelperPath),
     plistBytes: await readRegularFileIfPresent(paths.launchAgentPath),
+    stableApplicationPresent,
   }
 }
 
 type InstalledState = Awaited<ReturnType<typeof snapshotInstalledState>> & { serviceLoaded: boolean }
 
 type RollbackRecord = {
-  format: "meta-runtime-pending-update-v1"
+  format: "meta-runtime-pending-update-v1" | "meta-runtime-pending-update-v2"
   releaseId: string
   previousCurrentRelease: string | null
   helperPresent: boolean
   plistPresent: boolean
   serviceLoaded: boolean
+  stableApplicationPresent?: boolean
 }
 
 type LaunchServiceIdentity = {
@@ -838,25 +930,38 @@ async function prepareRollback(
 ): Promise<void> {
   const directory = pendingUpdatePath(plan.paths)
   if (await exists(directory)) throw new Error("Незавершённый pending-update должен быть восстановлен до нового cutover")
-  await mkdir(directory, { mode: 0o700 })
+  const preparing = `${directory}.preparing.${randomUUID()}`
+  await mkdir(preparing, { mode: 0o700 })
   try {
-    if (previous.helperBytes !== undefined) await durableBytes(join(directory, "helper"), previous.helperBytes, 0o600)
-    if (previous.plistBytes !== undefined) await durableBytes(join(directory, "launch-agent.plist"), previous.plistBytes, 0o600)
+    if (previous.plistBytes !== undefined) await durableBytes(join(preparing, "launch-agent.plist"), previous.plistBytes, 0o600)
+    if (previous.stableApplicationPresent) {
+      await copyApplication(stableApplicationPath(plan.paths), join(preparing, "stable-application"))
+    }
     const record: RollbackRecord = {
-      format: "meta-runtime-pending-update-v1",
+      format: "meta-runtime-pending-update-v2",
       releaseId: plan.release.releaseId,
       previousCurrentRelease: previous.currentRelease ?? null,
-      helperPresent: previous.helperBytes !== undefined,
+      helperPresent: false,
       plistPresent: previous.plistBytes !== undefined,
       serviceLoaded: previous.serviceLoaded,
+      stableApplicationPresent: previous.stableApplicationPresent,
     }
-    await durableText(join(directory, "record.json"), `${stableJson(record)}\n`, 0o600)
-    await syncDirectory(directory)
+    await durableText(join(preparing, "record.json"), `${stableJson(record)}\n`, 0o600)
+    await syncTree(preparing)
+    await rename(preparing, directory)
     await syncDirectory(dirname(directory))
   } catch (error) {
-    await rm(directory, { recursive: true, force: true }).catch(() => undefined)
+    await removeOwnedTree(preparing).catch(() => undefined)
     throw error
   }
+}
+
+async function discardIncompleteRollbackPreparations(paths: RuntimeInstallPaths): Promise<void> {
+  for (const entry of await readdir(paths.installRoot)) {
+    if (!entry.startsWith("pending-update.preparing.")) continue
+    await removeOwnedTree(join(paths.installRoot, entry))
+  }
+  await syncDirectory(paths.installRoot)
 }
 
 async function recoverPendingUpdate(
@@ -870,8 +975,13 @@ async function recoverPendingUpdate(
   const helper = record.helperPresent ? await readFile(join(directory, "helper")) : undefined
   const plist = record.plistPresent ? await readFile(join(directory, "launch-agent.plist")) : undefined
   if (serviceLoaded) await checked(options.runner, "/bin/launchctl", ["bootout", `${plan.service.domain}/${RUNTIME_SERVICE_LABEL}`])
-  if (helper === undefined) await rm(plan.paths.stableHelperPath, { force: true })
-  else await atomicBytes(plan.paths.stableHelperPath, helper, 0o755)
+  if (record.format === "meta-runtime-pending-update-v2") {
+    await restoreStableApplication(plan.paths, record, options.failpoint)
+  }
+  if (record.format === "meta-runtime-pending-update-v1") {
+    if (helper === undefined) await rm(plan.paths.stableHelperPath, { force: true })
+    else await atomicBytes(plan.paths.stableHelperPath, helper, 0o755)
+  }
   const current = join(plan.paths.installRoot, "current")
   if (record.previousCurrentRelease === null) await rm(current, { force: true })
   else {
@@ -905,8 +1015,201 @@ async function recoverPendingUpdate(
 }
 
 async function discardPendingUpdate(paths: RuntimeInstallPaths): Promise<void> {
-  await rm(pendingUpdatePath(paths), { recursive: true, force: true })
+  await removeOwnedTree(pendingUpdatePath(paths))
   await syncDirectory(paths.installRoot)
+}
+
+async function prepareNextStableApplication(
+  plan: RuntimeInstallPlan,
+  manifest: ReleaseManifest,
+  runner: CommandRunner,
+): Promise<void> {
+  const source = join(plan.release.releasePath, APPLICATION_NAME)
+  const target = join(pendingUpdatePath(plan.paths), "next-application")
+  await copyApplication(source, target)
+  await verifyApplicationCopy(target, manifest, runner, plan)
+  await syncTree(target)
+  await syncDirectory(dirname(target))
+}
+
+async function promoteNextStableApplication(
+  paths: RuntimeInstallPaths,
+  failpoint?: RuntimeInstallOptions["failpoint"],
+): Promise<void> {
+  const directory = pendingUpdatePath(paths)
+  const next = join(directory, "next-application")
+  const displaced = join(directory, "displaced-application")
+  const stable = stableApplicationPath(paths)
+  if (!await exists(next)) throw new Error("Prepared stable application отсутствует")
+  if (await exists(displaced)) throw new Error("Stable application displacement уже начат")
+  await chmod(directory, 0o700)
+  await chmod(paths.installRoot, 0o700)
+  if (await exists(stable)) {
+    await chmod(stable, 0o700)
+    await failpoint?.("after-stable-old-writable")
+    await rename(stable, displaced)
+    await syncRenameParents(stable, displaced)
+    await failpoint?.("after-stable-old-moved")
+  }
+  await chmod(next, 0o700)
+  await failpoint?.("after-stable-next-writable")
+  await rename(next, stable)
+  await syncRenameParents(next, stable)
+  await failpoint?.("after-stable-next-moved")
+  await chmod(stable, 0o555)
+  await syncDirectory(stable)
+  await failpoint?.("after-stable-mode-sealed")
+}
+
+async function restoreStableApplication(
+  paths: RuntimeInstallPaths,
+  record: RollbackRecord,
+  failpoint?: RuntimeInstallOptions["failpoint"],
+): Promise<void> {
+  const directory = pendingUpdatePath(paths)
+  const backup = join(directory, "stable-application")
+  const stable = stableApplicationPath(paths)
+  const discarded = join(directory, "failed-application")
+  const discardedPresent = await exists(discarded)
+  if (await exists(backup)) {
+    const backupInfo = await lstat(backup)
+    if (!backupInfo.isDirectory() || backupInfo.isSymbolicLink() || backupInfo.uid !== process.getuid?.()) {
+      throw new Error("Rollback stable application backup имеет foreign identity")
+    }
+    await chmod(backup, 0o555)
+    await assertExactApplicationTopology(backup)
+    if (discardedPresent) await removeOwnedTree(discarded)
+    if (await exists(stable)) {
+      await chmod(stable, 0o700)
+      await failpoint?.("after-stable-restore-current-writable")
+      await rename(stable, discarded)
+      await syncRenameParents(stable, discarded)
+      await failpoint?.("after-stable-restore-current-moved")
+    }
+    await chmod(backup, 0o700)
+    await failpoint?.("after-stable-restore-backup-writable")
+    await rename(backup, stable)
+    await syncRenameParents(backup, stable)
+    await failpoint?.("after-stable-restore-backup-moved")
+    await chmod(stable, 0o555)
+    await syncDirectory(stable)
+    await failpoint?.("after-stable-restore-mode-sealed")
+  } else if (record.stableApplicationPresent) {
+    if (!await exists(stable) || !discardedPresent) {
+      throw new Error("Rollback потерял previous stable application или displacement evidence")
+    }
+    await chmod(stable, 0o555)
+    await assertExactApplicationTopology(stable)
+    await syncDirectory(stable)
+    await removeOwnedTree(discarded)
+    await syncDirectory(directory)
+  } else if (await exists(stable)) {
+    if (discardedPresent) await removeOwnedTree(discarded)
+    await chmod(stable, 0o700)
+    await failpoint?.("after-stable-restore-current-writable")
+    await rename(stable, discarded)
+    await syncRenameParents(stable, discarded)
+    await failpoint?.("after-stable-restore-current-moved")
+    await removeOwnedTree(discarded)
+    await syncDirectory(directory)
+  } else if (discardedPresent) {
+    await removeOwnedTree(discarded)
+    await syncDirectory(directory)
+  }
+}
+
+async function syncRenameParents(source: string, destination: string): Promise<void> {
+  const parents = new Set([dirname(source), dirname(destination)])
+  for (const parent of parents) await syncDirectory(parent)
+}
+
+async function removeOwnedTree(path: string): Promise<void> {
+  if (!await exists(path)) return
+  const info = await lstat(path)
+  if (info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error(`Удаление foreign/symlink tree запрещено: ${path}`)
+  if (info.isDirectory()) {
+    await chmod(path, 0o700)
+    for (const entry of await readdir(path)) await removeOwnedTree(join(path, entry))
+    await rm(path, { recursive: true })
+    return
+  }
+  if (!info.isFile()) throw new Error(`Удаление unsupported node запрещено: ${path}`)
+  await rm(path)
+}
+
+async function copyApplication(source: string, target: string): Promise<void> {
+  await assertExactApplicationTopology(source)
+  if (await exists(target)) throw new Error(`Application copy target уже существует: ${target}`)
+  await cp(source, target, { recursive: true, force: false, errorOnExist: true, preserveTimestamps: true })
+  await assertExactApplicationTopology(target)
+}
+
+async function syncTree(path: string): Promise<void> {
+  const info = await lstat(path)
+  if (info.isSymbolicLink()) throw new Error(`Symlink запрещён в durable application tree: ${path}`)
+  if (info.isFile()) {
+    await syncFile(path)
+    return
+  }
+  if (!info.isDirectory()) throw new Error(`Unsupported durable application node: ${path}`)
+  for (const entry of await readdir(path)) await syncTree(join(path, entry))
+  await syncDirectory(path)
+}
+
+async function verifyApplicationCopy(
+  applicationPath: string,
+  manifest: ReleaseManifest,
+  runner: CommandRunner,
+  plan: RuntimeInstallPlan,
+): Promise<void> {
+  if (manifest.format !== RELEASE_FORMAT || manifest.artifacts.application === undefined || manifest.signing === undefined) {
+    throw new Error("Stable application требует v2 manifest")
+  }
+  await assertExactApplicationTopology(applicationPath)
+  const infoPath = join(applicationPath, "Contents/Info.plist")
+  const runtimePath = join(applicationPath, "Contents/MacOS/computer-use")
+  const helperPath = join(applicationPath, "Contents/Helpers/meta-input-helper")
+  const [infoArtifact, runtimeArtifact, helperArtifact] = await Promise.all([
+    artifact(infoPath), artifact(runtimePath), artifact(helperPath),
+  ])
+  if (stableJson(infoArtifact) !== stableJson({ sha256: manifest.artifacts.application.infoPlist.sha256,
+    bytes: manifest.artifacts.application.infoPlist.bytes })
+    || stableJson(runtimeArtifact) !== stableJson({ sha256: manifest.artifacts.runtime.sha256,
+      bytes: manifest.artifacts.runtime.bytes })
+    || stableJson(helperArtifact) !== stableJson({ sha256: manifest.artifacts.nativeHelper.sha256,
+      bytes: manifest.artifacts.nativeHelper.bytes })) {
+    throw new Error("Stable application artifact digest mismatch")
+  }
+  if (await readFile(infoPath, "utf8") !== applicationInfoPlist()) {
+    throw new Error("Stable application Info.plist identity mismatch")
+  }
+  await verifyApplicationSignature(runner, applicationPath, manifest.artifacts.application, manifest.signing)
+  await checked(runner, "/usr/bin/codesign", ["--verify", "--strict", helperPath])
+  const helperSignature = await inspectCodeSignature(runner, helperPath)
+  if (helperSignature.identifier !== HELPER_SIGNING_IDENTIFIER
+    || helperSignature.cdhash !== manifest.artifacts.nativeHelper.cdhash
+    || helperSignature.designatedRequirement !== manifest.artifacts.nativeHelper.designatedRequirement) {
+    throw new Error("Stable helper codesign identity mismatch")
+  }
+  if (manifest.signing.mode === "identity") {
+    await verifyCertificateRequirement(runner, helperPath, HELPER_SIGNING_IDENTIFIER, manifest.signing.certificateSha1)
+    assertEmbeddedCertificateRequirement(helperSignature.designatedRequirement,
+      HELPER_SIGNING_IDENTIFIER, manifest.signing.certificateSha1)
+  }
+  const metadata = parseNativeMetadata((await checked(runner, helperPath, ["--metadata"], undefined, 5_000)).stdout)
+  if (metadata.nativeBuildId !== manifest.builds.nativeBuildId || metadata.installRoot !== plan.paths.repositoryRoot
+    || !freshAuditUser(metadata.session)) throw new Error("Stable helper metadata identity mismatch")
+}
+
+async function stableApplicationMatches(
+  plan: RuntimeInstallPlan,
+  manifest: ReleaseManifest,
+  runner: CommandRunner,
+): Promise<boolean> {
+  try {
+    await verifyApplicationCopy(stableApplicationPath(plan.paths), manifest, runner, plan)
+    return true
+  } catch { return false }
 }
 
 function pendingUpdatePath(paths: RuntimeInstallPaths): string {
@@ -916,10 +1219,14 @@ function pendingUpdatePath(paths: RuntimeInstallPaths): string {
 function parseRollbackRecord(value: unknown): RollbackRecord {
   if (value === null || typeof value !== "object") throw new Error("Pending update record повреждён")
   const record = value as RollbackRecord
-  if (record.format !== "meta-runtime-pending-update-v1" || typeof record.releaseId !== "string"
+  if (!["meta-runtime-pending-update-v1", "meta-runtime-pending-update-v2"].includes(record.format)
+    || typeof record.releaseId !== "string"
     || !(record.previousCurrentRelease === null || typeof record.previousCurrentRelease === "string")
     || typeof record.helperPresent !== "boolean" || typeof record.plistPresent !== "boolean"
-    || typeof record.serviceLoaded !== "boolean") throw new Error("Pending update record повреждён")
+    || typeof record.serviceLoaded !== "boolean"
+    || record.format === "meta-runtime-pending-update-v2" && typeof record.stableApplicationPresent !== "boolean") {
+    throw new Error("Pending update record повреждён")
+  }
   return record
 }
 
@@ -945,8 +1252,10 @@ async function rollback(
     return [error instanceof Error ? error : new Error(String(error))]
   }
   await attempt(async () => {
-    if (previous.helperBytes === undefined) await rm(plan.paths.stableHelperPath, { force: true })
-    else await atomicBytes(plan.paths.stableHelperPath, previous.helperBytes, 0o755)
+    const record = parseRollbackRecord(JSON.parse(await readFile(join(pendingUpdatePath(plan.paths), "record.json"), "utf8")))
+    if (record.format === "meta-runtime-pending-update-v2") {
+      await restoreStableApplication(plan.paths, record, options.failpoint)
+    }
   })
   await attempt(async () => {
     const current = join(plan.paths.installRoot, "current")
@@ -981,17 +1290,18 @@ async function rollback(
   return errors
 }
 
-async function installedReleaseMatches(plan: RuntimeInstallPlan): Promise<boolean> {
+async function installedReleaseMatches(plan: RuntimeInstallPlan, runner: CommandRunner): Promise<boolean> {
   try {
     const current = await readLinkIfPresent(join(plan.paths.installRoot, "current"))
     if (current !== plan.release.releasePath) return false
     const manifest = parseManifest(JSON.parse(await readFile(join(current, "manifest.json"), "utf8")))
-    const expectedPlist = launchAgentPlist(plan, manifest.artifacts.runtime.path, manifestNativeCdhash(manifest))
+    const expectedPlist = launchAgentPlist(plan, manifest, manifestNativeCdhash(manifest))
     assertManifestMatchesPlan(manifest, plan, sha256(expectedPlist))
-    const helperSha256 = await hashIfPresent(plan.paths.stableHelperPath)
     const plist = await readRegularFileIfPresent(plan.paths.launchAgentPath)
-    return helperSha256 === manifest.artifacts.nativeHelper.sha256
-      && plist !== undefined
+    const payloadMatches = manifest.format === RELEASE_FORMAT
+      ? await stableApplicationMatches(plan, manifest, runner)
+      : await hashIfPresent(plan.paths.stableHelperPath) === manifest.artifacts.nativeHelper.sha256
+    return payloadMatches && plist !== undefined
       && new TextDecoder().decode(plist) === expectedPlist
   } catch { return false }
 }
@@ -1011,7 +1321,11 @@ async function assertNativeBuildStableAcrossConfiguration(plan: RuntimeInstallPl
   }
 }
 
-async function assertSignerContinuity(plan: RuntimeInstallPlan, candidate: ReleaseManifest): Promise<void> {
+async function assertSignerContinuity(
+  plan: RuntimeInstallPlan,
+  candidate: ReleaseManifest,
+  runner: CommandRunner,
+): Promise<void> {
   if (!manifestSigningMatchesPlan(candidate, plan.signing)) {
     throw new Error("Candidate release имеет другую signing identity")
   }
@@ -1019,6 +1333,9 @@ async function assertSignerContinuity(plan: RuntimeInstallPlan, candidate: Relea
   if (current === undefined || current === plan.release.releasePath) return
   assertPreviousReleasePath(plan.paths, current)
   const manifest = parseManifest(JSON.parse(await readFile(join(current, "manifest.json"), "utf8")))
+  if (manifest.format === RELEASE_FORMAT) {
+    await verifyApplicationCopy(stableApplicationPath(plan.paths), manifest, runner, plan)
+  }
   if (manifest.signing?.mode === "identity") {
     if (plan.signing.mode !== "identity") {
       throw new Error("Certificate-signed runtime нельзя молча заменить ad-hoc release")
@@ -1036,7 +1353,9 @@ async function runDoctor(
   timeoutMs: number,
   permissionWaitMs: number,
 ): Promise<unknown> {
-  const executable = join(plan.paths.installRoot, "current", manifest.artifacts.runtime.path)
+  const executable = manifest.format === RELEASE_FORMAT
+    ? stableApplicationRuntimePath(plan.paths)
+    : join(plan.paths.installRoot, "current", manifest.artifacts.runtime.path)
   let readinessDeadlineAt = Date.now() + timeoutMs
   let permissionDeadlineAt: number | undefined
   let previousPermissionStatePending = false
@@ -1099,14 +1418,17 @@ async function runDoctor(
     const screenRecording = doctor.structuredContent?.permissions?.screenRecording
     const postEvents = doctor.structuredContent?.permissions?.postEvents
     const inputMonitoring = doctor.structuredContent?.permissions?.inputMonitoring
+    const expectedHelperPath = manifest.format === RELEASE_FORMAT
+      ? stableApplicationHelperPath(plan.paths)
+      : plan.paths.stableHelperPath
     const requiresExtendedPermissions = (manifest.tcc.requiredPassiveChecks as readonly string[]).includes("post-events")
-    if (accessibility?.helperPath !== plan.paths.stableHelperPath
+    if (accessibility?.helperPath !== expectedHelperPath
       || accessibility.cdhash !== manifest.artifacts.nativeHelper.cdhash
-      || screenRecording?.ownerPath !== plan.paths.stableHelperPath
+      || screenRecording?.ownerPath !== expectedHelperPath
       || screenRecording.cdhash !== manifest.artifacts.nativeHelper.cdhash
-      || (requiresExtendedPermissions && (postEvents?.helperPath !== plan.paths.stableHelperPath
+      || (requiresExtendedPermissions && (postEvents?.helperPath !== expectedHelperPath
         || postEvents.cdhash !== manifest.artifacts.nativeHelper.cdhash
-        || inputMonitoring?.helperPath !== plan.paths.stableHelperPath
+        || inputMonitoring?.helperPath !== expectedHelperPath
         || inputMonitoring.cdhash !== manifest.artifacts.nativeHelper.cdhash))) {
       throw new Error("Installed runtime doctor обнаружил другой permission owner path/cdhash; polling запрещён")
     }
@@ -1221,14 +1543,18 @@ async function boundedDelay(ms: number): Promise<void> {
 
 function launchAgentPlist(
   plan: RuntimeInstallPlan,
-  runtimeArtifactName: RuntimeArtifactName,
+  manifest: Pick<ReleaseManifest, "format" | "artifacts">,
   nativeCdhash?: string,
 ): string {
-  const runtime = join(plan.paths.installRoot, "current", runtimeArtifactName)
+  const bundle = manifest.format === RELEASE_FORMAT
+  const runtime = bundle
+    ? stableApplicationRuntimePath(plan.paths)
+    : join(plan.paths.installRoot, "current", manifest.artifacts.runtime.path)
+  const helper = bundle ? stableApplicationHelperPath(plan.paths) : plan.paths.stableHelperPath
   const environment: Record<string, string> = {
     META_RUNTIME_SOCKET: join(plan.paths.runRoot, "runtime.sock"),
     META_RUNTIME_CREDENTIAL: join(plan.paths.runRoot, "credential.json"),
-    META_NATIVE_HELPER: plan.paths.stableHelperPath,
+    META_NATIVE_HELPER: helper,
     META_NATIVE_BUILD_ID: plan.release.nativeBuildId,
     ...(nativeCdhash === undefined ? {} : { META_NATIVE_CDHASH: nativeCdhash }),
     META_RUNTIME_BUILD_ID: plan.release.runtimeBuildId,
@@ -1250,7 +1576,7 @@ function launchAgentPlist(
 ${environmentXml}
   </dict>
   <key>WorkingDirectory</key>
-  <string>${xml(join(plan.paths.installRoot, "current"))}</string>
+  <string>${xml(bundle ? stableApplicationPath(plan.paths) : join(plan.paths.installRoot, "current"))}</string>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
   <key>ProcessType</key><string>Interactive</string>
@@ -1260,6 +1586,77 @@ ${environmentXml}
 </dict>
 </plist>
 `
+}
+
+function applicationInfoPlist(): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleIdentifier</key><string>${RUNTIME_SIGNING_IDENTIFIER}</string>
+  <key>CFBundleName</key><string>computer-use</string>
+  <key>CFBundleDisplayName</key><string>computer-use</string>
+  <key>CFBundleExecutable</key><string>computer-use</string>
+  <key>CFBundlePackageType</key><string>APPL</string>
+  <key>CFBundleVersion</key><string>1</string>
+  <key>LSBackgroundOnly</key><true/>
+</dict>
+</plist>
+`
+}
+
+function stableApplicationPath(paths: RuntimeInstallPaths): string {
+  return join(paths.installRoot, APPLICATION_NAME)
+}
+
+function stableApplicationRuntimePath(paths: RuntimeInstallPaths): string {
+  return join(paths.installRoot, APPLICATION_RUNTIME_PATH)
+}
+
+function stableApplicationHelperPath(paths: RuntimeInstallPaths): string {
+  return join(paths.installRoot, APPLICATION_HELPER_PATH)
+}
+
+async function sealApplicationModes(applicationPath: string): Promise<void> {
+  const directories = [applicationPath, join(applicationPath, "Contents"),
+    join(applicationPath, "Contents/MacOS"), join(applicationPath, "Contents/Helpers"),
+    join(applicationPath, "Contents/_CodeSignature")]
+  const files = [join(applicationPath, "Contents/Info.plist"),
+    join(applicationPath, "Contents/_CodeSignature/CodeResources")]
+  const executables = [join(applicationPath, "Contents/MacOS/computer-use"),
+    join(applicationPath, "Contents/Helpers/meta-input-helper")]
+  await Promise.all([
+    ...directories.map(path => chmod(path, 0o555)),
+    ...files.map(path => chmod(path, 0o444)),
+    ...executables.map(path => chmod(path, 0o555)),
+  ])
+}
+
+async function assertExactApplicationTopology(applicationPath: string): Promise<void> {
+  const expectedDirectories = new Set(["", "Contents", "Contents/MacOS", "Contents/Helpers", "Contents/_CodeSignature"])
+  const expectedFiles = new Set(["Contents/Info.plist", "Contents/MacOS/computer-use",
+    "Contents/Helpers/meta-input-helper", "Contents/_CodeSignature/CodeResources"])
+  const foundDirectories = new Set<string>()
+  const foundFiles = new Set<string>()
+  async function visit(path: string, relativePath: string): Promise<void> {
+    const info = await lstat(path)
+    if (info.isSymbolicLink() || info.uid !== process.getuid?.()) throw new Error(`Application bundle содержит foreign/symlink node: ${path}`)
+    if (info.isDirectory()) {
+      foundDirectories.add(relativePath)
+      for (const entry of await readdir(path)) await visit(join(path, entry), relativePath === "" ? entry : join(relativePath, entry))
+      return
+    }
+    if (!info.isFile()) throw new Error(`Application bundle содержит unsupported node: ${path}`)
+    foundFiles.add(relativePath)
+  }
+  await visit(applicationPath, "")
+  if (stableJson([...foundDirectories].sort()) !== stableJson([...expectedDirectories].sort())
+    || stableJson([...foundFiles].sort()) !== stableJson([...expectedFiles].sort())) {
+    throw new Error("Application bundle topology не соответствует exact contract")
+  }
+  for (const path of expectedDirectories) await assertOwnedNode(join(applicationPath, path), "directory", 0o555)
+  for (const path of expectedFiles) await assertOwnedNode(join(applicationPath, path), "file",
+    path.endsWith("computer-use") || path.endsWith("meta-input-helper") ? 0o555 : 0o444)
 }
 
 function manifestNativeCdhash(manifest: ReleaseManifest): string | undefined {
@@ -1501,9 +1898,12 @@ function assertDrainReceipt(expected: RuntimeInspection, receipt: RuntimeDrainRe
 }
 
 function assertManifestMatchesPlan(manifest: ReleaseManifest, plan: RuntimeInstallPlan, plistSha256: string): void {
+  const expectedSubjectPath = manifest.format === RELEASE_FORMAT
+    ? stableApplicationHelperPath(plan.paths)
+    : plan.paths.stableHelperPath
   if (manifest.releaseId !== plan.release.releaseId || manifest.source.commit !== plan.source.commit
     || manifest.builds.runtimeBuildId !== plan.release.runtimeBuildId || manifest.builds.nativeBuildId !== plan.release.nativeBuildId
-    || manifest.launchAgent.sha256 !== plistSha256 || manifest.tcc.subjectPath !== plan.paths.stableHelperPath
+    || manifest.launchAgent.sha256 !== plistSha256 || manifest.tcc.subjectPath !== expectedSubjectPath
     || stableJson(manifest.configuration) !== stableJson(plan.configuration)
     || !manifestSigningMatchesPlan(manifest, plan.signing)) {
     throw new Error("Existing immutable release конфликтует с install plan")
@@ -1513,9 +1913,21 @@ function assertManifestMatchesPlan(manifest: ReleaseManifest, plan: RuntimeInsta
 function parseManifest(value: unknown): ReleaseManifest {
   if (value === null || typeof value !== "object") throw new Error("Release manifest должен быть object")
   const manifest = value as ReleaseManifest
-  if (manifest.format !== RELEASE_FORMAT
+  const legacy = manifest.format === LEGACY_RELEASE_FORMAT
+  const current = manifest.format === RELEASE_FORMAT
+  if ((!legacy && !current)
+    || typeof manifest.releaseId !== "string" || manifest.releaseId.length < 1
+    || typeof manifest.source?.repositoryRoot !== "string" || !isAbsolute(manifest.source.repositoryRoot)
+    || typeof manifest.source.commit !== "string" || !/^[a-f0-9]{40,64}$/.test(manifest.source.commit)
+    || manifest.source.clean !== true
+    || typeof manifest.builds?.runtimeBuildId !== "string" || typeof manifest.builds.nativeBuildId !== "string"
+    || current && (typeof manifest.createdAt !== "string" || !Number.isFinite(Date.parse(manifest.createdAt)))
     || !RUNTIME_ARTIFACT_NAMES.some(name => name === manifest.artifacts?.runtime?.path)
-    || manifest.artifacts?.nativeHelper?.path !== "native-helper"
+    || !HELPER_ARTIFACT_NAMES.some(name => name === manifest.artifacts?.nativeHelper?.path)
+    || current && (manifest.artifacts.runtime.path !== APPLICATION_RUNTIME_PATH
+      || manifest.artifacts.nativeHelper.path !== APPLICATION_HELPER_PATH)
+    || legacy && (!(["computer-use", "runtime"] as const).some(name => name === manifest.artifacts.runtime.path)
+      || manifest.artifacts.nativeHelper.path !== "native-helper")
     || manifest.artifacts.nativeHelper.signingIdentifier !== HELPER_SIGNING_IDENTIFIER
     || !/^[a-f0-9]{64}$/.test(manifest.artifacts.runtime.sha256)
     || !/^[a-f0-9]{64}$/.test(manifest.artifacts.nativeHelper.sha256)
@@ -1535,8 +1947,12 @@ function parseManifest(value: unknown): ReleaseManifest {
     || manifest.entrypoint?.source !== "scripts/runtime-entry.ts"
     || stableJson(manifest.entrypoint.modes) !== stableJson(["runtime", "doctor", "mcp"])
     || manifest.entrypoint.mcpTransport !== "stdio"
+    || current && manifest.entrypoint.path !== APPLICATION_RUNTIME_PATH
+    || legacy && manifest.entrypoint.path !== undefined
     || !validManifestConfiguration(manifest.configuration)
-    || !validManifestSigning(manifest)) {
+    || !validManifestSigning(manifest)
+    || !validApplicationManifest(manifest)
+    || current && !validV2ExactShape(manifest)) {
     throw new Error("Release manifest не соответствует strict format")
   }
   return manifest
@@ -1549,17 +1965,65 @@ function manifestSigningMatchesPlan(manifest: ReleaseManifest, signing: RuntimeS
 }
 
 function validManifestSigning(manifest: ReleaseManifest): boolean {
+  if (manifest.signing !== undefined && manifest.signing.mode !== "adhoc" && manifest.signing.mode !== "identity") return false
+  if (manifest.signing?.mode === "identity" && !/^[a-f0-9]{40}$/.test(manifest.signing.certificateSha1)) return false
+  if (manifest.format === RELEASE_FORMAT) {
+    if (manifest.signing === undefined) return false
+    return manifest.artifacts.runtime.signingIdentifier === undefined
+      && manifest.artifacts.runtime.designatedRequirement === undefined
+      && manifest.artifacts.runtime.cdhash === undefined
+  }
   if (manifest.signing === undefined) return manifest.artifacts.runtime.signingIdentifier === undefined
     && manifest.artifacts.runtime.designatedRequirement === undefined
     && manifest.artifacts.runtime.cdhash === undefined
-  if (manifest.signing.mode !== "adhoc" && manifest.signing.mode !== "identity") return false
-  if (manifest.signing.mode === "identity" && !/^[a-f0-9]{40}$/.test(manifest.signing.certificateSha1)) return false
   const runtime = manifest.artifacts.runtime
   return runtime.signingIdentifier === RUNTIME_SIGNING_IDENTIFIER
     && typeof runtime.designatedRequirement === "string"
     && runtime.designatedRequirement.startsWith("designated =>")
     && typeof runtime.cdhash === "string"
     && /^[a-f0-9]{40,64}$/.test(runtime.cdhash)
+}
+
+function validApplicationManifest(manifest: ReleaseManifest): boolean {
+  if (manifest.format === LEGACY_RELEASE_FORMAT) {
+    return manifest.artifacts.application === undefined && manifest.stableApplication === undefined
+  }
+  const application = manifest.artifacts.application
+  return application?.path === APPLICATION_NAME
+    && application.infoPlist.path === APPLICATION_INFO_PATH
+    && /^[a-f0-9]{64}$/.test(application.infoPlist.sha256)
+    && Number.isSafeInteger(application.infoPlist.bytes) && application.infoPlist.bytes > 0
+    && application.signingIdentifier === RUNTIME_SIGNING_IDENTIFIER
+    && application.designatedRequirement.startsWith("designated =>")
+    && /^[a-f0-9]{40,64}$/.test(application.cdhash)
+    && manifest.stableApplication?.path === APPLICATION_NAME
+}
+
+function validV2ExactShape(manifest: ReleaseManifest): boolean {
+  const application = manifest.artifacts.application
+  if (application === undefined || manifest.stableApplication === undefined || manifest.signing === undefined) return false
+  return exactKeys(manifest, ["artifacts", "builds", "configuration", "createdAt", "entrypoint", "format",
+    "launchAgent", "releaseId", "signing", "source", "stableApplication", "tcc"])
+    && exactKeys(manifest.source, ["clean", "commit", "repositoryRoot"])
+    && exactKeys(manifest.builds, ["nativeBuildId", "runtimeBuildId"])
+    && exactKeys(manifest.artifacts, ["application", "nativeHelper", "runtime"])
+    && exactKeys(application, ["cdhash", "designatedRequirement", "infoPlist", "path", "signingIdentifier"])
+    && exactKeys(application.infoPlist, ["bytes", "path", "sha256"])
+    && exactKeys(manifest.artifacts.runtime, ["bytes", "path", "sha256"])
+    && exactKeys(manifest.artifacts.nativeHelper, ["auditSession", "bytes", "cdhash", "designatedRequirement",
+      "path", "sha256", "signingIdentifier"])
+    && exactKeys(manifest.artifacts.nativeHelper.auditSession,
+      ["auditSessionId", "auditUserId", "effectiveUid", "source", "uid", "verified"])
+    && exactKeys(manifest.stableApplication, ["path"])
+    && exactKeys(manifest.launchAgent, ["label", "sha256"])
+    && exactKeys(manifest.entrypoint, ["mcpTransport", "modes", "path", "source"])
+    && exactKeys(manifest.signing, manifest.signing.mode === "identity"
+      ? ["certificateSha1", "mode"] : ["mode"])
+    && exactKeys(manifest.tcc, ["automaticGrantPreservation", "candidateCdhash", "requiredPassiveChecks", "subjectPath"])
+}
+
+function exactKeys(value: object, expected: readonly string[]): boolean {
+  return stableJson(Object.keys(value).sort()) === stableJson([...expected].sort())
 }
 
 async function assertSourceUnchanged(plan: RuntimeInstallPlan, options: RuntimeInstallOptions): Promise<void> {
@@ -1584,7 +2048,8 @@ async function inspectLaunchService(
   const pid = Number(lines.find(line => line.startsWith("pid = "))?.slice("pid = ".length))
   const program = lines.find(line => line.startsWith("program = "))?.slice("program = ".length)
   const plistPath = lines.find(line => line.startsWith("path = "))?.slice("path = ".length)
-  const expectedPrograms = RUNTIME_ARTIFACT_NAMES.map(name => join(plan.paths.installRoot, "current", name))
+  const expectedPrograms = [join(plan.paths.installRoot, "current", "computer-use"),
+    join(plan.paths.installRoot, "current", "runtime"), stableApplicationRuntimePath(plan.paths)]
   if (!Number.isSafeInteger(pid) || pid < 1 || program === undefined || !expectedPrograms.includes(program)
     || plistPath !== plan.paths.launchAgentPath) {
     throw new Error("Loaded LaunchAgent не совпадает с exact canonical pid/program/plist ownership")

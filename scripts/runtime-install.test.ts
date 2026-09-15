@@ -1,9 +1,10 @@
 import { afterEach, expect, test } from "bun:test"
 import { createHash } from "node:crypto"
-import { chmod, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { chmod, copyFile, lstat, mkdir, mkdtemp, readFile, readdir, readlink, realpath, rm, symlink, writeFile } from "node:fs/promises"
 import { hostname } from "node:os"
 import { join } from "node:path"
 import { CAPABILITY_IDS } from "../shared/src/contracts/index.ts"
+import { runInstalledLauncher, type InstalledRunner } from "../mcp/src/installed-launcher.ts"
 import {
   HELPER_SIGNING_IDENTIFIER,
   RUNTIME_SERVICE_LABEL,
@@ -24,11 +25,76 @@ type FakeStartupPermissionState = "not-required" | "checking" | "requesting" | "
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map(async path => {
-    const releases = join(path, "home", "Library", "Application Support", "ai-macos", "runtime", "releases")
-    for (const name of await readdir(releases).catch(() => [])) await chmod(join(releases, name), 0o700).catch(() => undefined)
+    await makeRemovable(path)
     await rm(path, { recursive: true, force: true })
   }))
 })
+
+async function makeRemovable(path: string): Promise<void> {
+  const info = await lstat(path).catch(() => undefined)
+  if (info === undefined || info.isSymbolicLink()) return
+  if (info.isDirectory()) {
+    await chmod(path, 0o700)
+    for (const entry of await readdir(path)) await makeRemovable(join(path, entry))
+  } else if (info.isFile()) await chmod(path, 0o600)
+}
+
+async function makeLegacyV1Release(
+  fixture: Awaited<ReturnType<typeof createFixture>>,
+  plan: Awaited<ReturnType<typeof planRuntimeInstall>>,
+  withoutNativeCdhash = false,
+): Promise<string> {
+  const releasePath = plan.release.releasePath
+  const manifestPath = join(releasePath, "manifest.json")
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
+  const applicationPath = join(releasePath, "computer-use.app")
+  const legacyRuntimePath = join(releasePath, "runtime")
+  const legacyHelperPath = join(releasePath, "native-helper")
+  await chmod(releasePath, 0o700)
+  await copyFile(join(applicationPath, "Contents/MacOS/computer-use"), legacyRuntimePath)
+  await copyFile(join(applicationPath, "Contents/Helpers/meta-input-helper"), legacyHelperPath)
+  await chmod(legacyRuntimePath, 0o555)
+  await chmod(legacyHelperPath, 0o555)
+  await copyFile(legacyHelperPath, fixture.options.paths.stableHelperPath)
+  await chmod(fixture.options.paths.stableHelperPath, 0o755)
+  const stableApplication = join(fixture.options.paths.installRoot, "computer-use.app")
+  await makeRemovable(stableApplication)
+  await rm(stableApplication, { recursive: true })
+  await makeRemovable(applicationPath)
+  await rm(applicationPath, { recursive: true })
+
+  let legacyPlist = (await readFile(fixture.options.paths.launchAgentPath, "utf8"))
+    .replace(join(fixture.options.paths.installRoot, "computer-use.app/Contents/MacOS/computer-use"),
+      join(fixture.options.paths.installRoot, "current/runtime"))
+    .replace(join(fixture.options.paths.installRoot, "computer-use.app/Contents/Helpers/meta-input-helper"),
+      fixture.options.paths.stableHelperPath)
+  if (withoutNativeCdhash) {
+    legacyPlist = legacyPlist.replace(
+      `    <key>META_NATIVE_CDHASH</key>\n    <string>${manifest.artifacts.nativeHelper.cdhash}</string>\n`,
+      "",
+    )
+  }
+  manifest.format = "meta-ai-macos-runtime-release-v1"
+  manifest.artifacts.runtime.path = "runtime"
+  manifest.artifacts.nativeHelper.path = "native-helper"
+  delete manifest.artifacts.application
+  delete manifest.stableApplication
+  delete manifest.entrypoint.path
+  delete manifest.signing
+  delete manifest.artifacts.runtime.signingIdentifier
+  delete manifest.artifacts.runtime.designatedRequirement
+  delete manifest.artifacts.runtime.cdhash
+  manifest.tcc.subjectPath = fixture.options.paths.stableHelperPath
+  if (withoutNativeCdhash) manifest.tcc.requiredPassiveChecks = ["accessibility", "screen-recording"]
+  manifest.launchAgent.sha256 = sha256(legacyPlist)
+  await chmod(manifestPath, 0o600)
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
+  await chmod(manifestPath, 0o444)
+  await chmod(releasePath, 0o555)
+  await writeFile(fixture.options.paths.launchAgentPath, legacyPlist)
+  fixture.runner.launchProgram = join(fixture.options.paths.installRoot, "current/runtime")
+  return legacyPlist
+}
 
 test("dry-run строит reviewable plan без login identity и execute публикует immutable release", async () => {
   const fixture = await createFixture()
@@ -36,7 +102,7 @@ test("dry-run строит reviewable plan без login identity и execute пу
   const plan = await planRuntimeInstall(fixture.options)
   expect(plan.gates).toMatchObject({ sourceClean: true, exactHostname: true, permissionsRequested: false, liveDesktopProbe: false })
   expect(plan.steps.some(step => step.id === "build-runtime"
-    && step.command?.args.at(-1)?.endsWith(".staging/computer-use"))).toBe(true)
+    && step.command?.args.at(-1)?.endsWith(".staging/computer-use.app/Contents/MacOS/computer-use"))).toBe(true)
   expect(plan.steps.some(step => step.id === "build-native" && step.command?.args[2] === plan.release.nativeBuildId)).toBe(true)
   expect(plan.legacyRetirement.every(candidate => candidate.disposition === "inspect-only")).toBe(true)
   expect(fixture.runner.mutations).toBe(0)
@@ -46,18 +112,25 @@ test("dry-run строит reviewable plan без login identity и execute пу
   expect(await readlink(join(fixture.options.paths.installRoot, "current"))).toBe(plan.release.releasePath)
   const manifest = JSON.parse(await readFile(join(plan.release.releasePath, "manifest.json"), "utf8"))
   expect(manifest).toMatchObject({
-    format: "meta-ai-macos-runtime-release-v1",
+    format: "meta-ai-macos-runtime-release-v2",
     builds: { runtimeBuildId: plan.release.runtimeBuildId, nativeBuildId: plan.release.nativeBuildId },
     signing: { mode: "adhoc" },
-    artifacts: { runtime: { path: "computer-use", signingIdentifier: RUNTIME_SIGNING_IDENTIFIER },
-      nativeHelper: { signingIdentifier: HELPER_SIGNING_IDENTIFIER,
+    stableApplication: { path: "computer-use.app" },
+    artifacts: {
+      application: { path: "computer-use.app", signingIdentifier: RUNTIME_SIGNING_IDENTIFIER,
+        infoPlist: { path: "computer-use.app/Contents/Info.plist" } },
+      runtime: { path: "computer-use.app/Contents/MacOS/computer-use" },
+      nativeHelper: { path: "computer-use.app/Contents/Helpers/meta-input-helper",
+        signingIdentifier: HELPER_SIGNING_IDENTIFIER,
         designatedRequirement: expect.stringContaining("designated => cdhash") } },
-    entrypoint: { source: "scripts/runtime-entry.ts", modes: ["runtime", "doctor", "mcp"], mcpTransport: "stdio" },
+    entrypoint: { source: "scripts/runtime-entry.ts", modes: ["runtime", "doctor", "mcp"],
+      mcpTransport: "stdio", path: "computer-use.app/Contents/MacOS/computer-use" },
   })
   expect((await lstat(plan.release.releasePath)).mode & 0o777).toBe(0o555)
   const plist = await readFile(fixture.options.paths.launchAgentPath, "utf8")
   expect(plist).toContain(`<string>${RUNTIME_SERVICE_LABEL}</string>`)
-  expect(plist).toContain(`${join(fixture.options.paths.installRoot, "current", "computer-use")}</string>`)
+  expect(plist).toContain(`${join(fixture.options.paths.installRoot,
+    "computer-use.app", "Contents/MacOS/computer-use")}</string>`)
   expect(plist).toContain("META_NATIVE_HELPER")
   expect(plist).toContain("META_NATIVE_CDHASH")
   expect(plist).toContain(`<string>${manifest.artifacts.nativeHelper.cdhash}</string>`)
@@ -65,7 +138,39 @@ test("dry-run строит reviewable plan без login identity и execute пу
   expect(plist).toContain("META_RUNTIME_BROWSER_CONFIG")
   expect(plist).toContain("META_RUNTIME_MANAGED")
   expect(plist).not.toContain("META_LOGIN_SESSION_ID")
-  expect(await readFile(fixture.options.paths.stableHelperPath, "utf8")).toContain(plan.release.nativeBuildId)
+  expect(await readFile(join(fixture.options.paths.installRoot,
+    "computer-use.app", "Contents/Helpers/meta-input-helper"), "utf8")).toContain(plan.release.nativeBuildId)
+  await expect(lstat(fixture.options.paths.stableHelperPath)).rejects.toThrow()
+})
+
+test("generated v2 release и stable app запускаются реальным installed launcher contract", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(plan, fixture.options)
+  const spawned: Array<{ file: string, args: readonly string[], cwd: string }> = []
+  const runner: InstalledRunner = {
+    run: (file, args) => fixture.runner.run(file, args),
+    spawn(file, args, options) {
+      spawned.push({ file, args, cwd: options.cwd })
+      return { exited: Promise.resolve(0), kill() {} }
+    },
+  }
+
+  const result = await runInstalledLauncher({
+    expectedHostname: hostname(),
+    actualHostname: hostname(),
+    homeDirectory: join(fixture.root, "home"),
+    uid: process.getuid?.() ?? 501,
+    runner,
+    testOnlyAllowNonCanonicalSourceRoot: true,
+    serveUnavailable: async reason => { throw new Error(`unexpected launcher fallback: ${reason}`) },
+  })
+
+  const stableApplication = join(fixture.options.paths.installRoot, "computer-use.app")
+  expect(result).toEqual({ state: "launched", releaseId: plan.release.releaseId,
+    runtimePath: join(stableApplication, "Contents/MacOS/computer-use"), exitCode: 0 })
+  expect(spawned).toEqual([{ file: join(stableApplication, "Contents/MacOS/computer-use"),
+    args: ["--mcp"], cwd: stableApplication }])
 })
 
 test("explicit identity мигрирует ad-hoc и сохраняет certificate DR между source updates", async () => {
@@ -98,11 +203,11 @@ test("explicit identity мигрирует ad-hoc и сохраняет certific
   expect(migrated.state).toBe("installed")
   expect(migrationPlan.signing).toEqual({ mode: "identity", certificateSha1, identityAvailable: true })
   expect(migratedManifest.signing).toEqual({ mode: "identity", certificateSha1 })
-  expect(migratedManifest.artifacts.runtime.signingIdentifier).toBe(RUNTIME_SIGNING_IDENTIFIER)
+  expect(migratedManifest.artifacts.application.signingIdentifier).toBe(RUNTIME_SIGNING_IDENTIFIER)
   expect(migratedManifest.artifacts.nativeHelper.signingIdentifier).toBe(HELPER_SIGNING_IDENTIFIER)
-  expect(migratedManifest.artifacts.runtime.designatedRequirement).toContain(certificateSha1)
+  expect(migratedManifest.artifacts.application.designatedRequirement).toContain(certificateSha1)
   expect(migratedManifest.artifacts.nativeHelper.designatedRequirement).toContain(certificateSha1)
-  expect(migratedManifest.artifacts.runtime.designatedRequirement)
+  expect(migratedManifest.artifacts.application.designatedRequirement)
     .not.toBe(migratedManifest.artifacts.nativeHelper.designatedRequirement)
 
   fixture.runner.commit = "b".repeat(40)
@@ -126,8 +231,8 @@ test("explicit identity мигрирует ad-hoc и сохраняет certific
     .not.toBe(migratedManifest.artifacts.nativeHelper.cdhash)
   expect(updateManifest.artifacts.nativeHelper.designatedRequirement)
     .toBe(migratedManifest.artifacts.nativeHelper.designatedRequirement)
-  expect(updateManifest.artifacts.runtime.designatedRequirement)
-    .toBe(migratedManifest.artifacts.runtime.designatedRequirement)
+  expect(updateManifest.artifacts.application.designatedRequirement)
+    .toBe(migratedManifest.artifacts.application.designatedRequirement)
   expect(fixture.runner.testRequirementCalls).toBeGreaterThanOrEqual(4)
 })
 
@@ -158,7 +263,10 @@ test("certificate signer нельзя молча ротировать или п�
   const signedPlan = await planRuntimeInstall(signedOptions)
   await applyRuntimeInstall(signedPlan, signedOptions)
   fixture.runner.loaded = true
-  const mutations = fixture.runner.mutations
+  const current = await readlink(join(fixture.options.paths.installRoot, "current"))
+  const stableHelperPath = join(fixture.options.paths.installRoot,
+    "computer-use.app/Contents/Helpers/meta-input-helper")
+  const stableHelper = await readFile(stableHelperPath)
 
   const rotationOptions = {
     ...fixture.options,
@@ -166,13 +274,15 @@ test("certificate signer нельзя молча ротировать или п�
   }
   const rotationPlan = await planRuntimeInstall(rotationOptions)
   await expect(applyRuntimeInstall(rotationPlan, rotationOptions))
-    .rejects.toThrow("signer continuity не подтверждена")
-  expect(fixture.runner.mutations).toBe(mutations)
+    .rejects.toThrow("rotation требует отдельного explicit migration")
+  expect(await readlink(join(fixture.options.paths.installRoot, "current"))).toBe(current)
+  expect(await readFile(stableHelperPath)).toEqual(stableHelper)
 
   const adhocPlan = await planRuntimeInstall(fixture.options)
   await expect(applyRuntimeInstall(adhocPlan, fixture.options))
     .rejects.toThrow("нельзя молча заменить ad-hoc")
-  expect(fixture.runner.mutations).toBe(mutations)
+  expect(await readlink(join(fixture.options.paths.installRoot, "current"))).toBe(current)
+  expect(await readFile(stableHelperPath)).toEqual(stableHelper)
 })
 
 test("identity signing отклоняет weak и wrong embedded DR при успешном external requirement", async () => {
@@ -245,9 +355,14 @@ test("immutable release отклоняет plist cdhash, не совпадающ
   manifest.tcc.candidateCdhash = tamperedCdhash
   manifest.launchAgent.sha256 = sha256(tamperedPlist)
   await chmod(plan.release.releasePath, 0o700)
+  const writableDirectories = [join(plan.release.releasePath, "computer-use.app"),
+    join(plan.release.releasePath, "computer-use.app/Contents"),
+    join(plan.release.releasePath, "computer-use.app/Contents/Helpers")]
+  for (const directory of writableDirectories) await chmod(directory, 0o700)
   await chmod(manifestPath, 0o600)
   await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
   await chmod(manifestPath, 0o444)
+  for (const directory of writableDirectories.reverse()) await chmod(directory, 0o555)
   await chmod(plan.release.releasePath, 0o555)
   const repeated = await planRuntimeInstall(fixture.options)
 
@@ -325,7 +440,9 @@ test("failed doctor атомарно возвращает previous helper, relea
   const fixture = await createFixture()
   const firstPlan = await planRuntimeInstall(fixture.options)
   await applyRuntimeInstall(firstPlan, fixture.options)
-  const firstHelper = await readFile(fixture.options.paths.stableHelperPath)
+  const stableHelperPath = join(fixture.options.paths.installRoot,
+    "computer-use.app/Contents/Helpers/meta-input-helper")
+  const firstHelper = await readFile(stableHelperPath)
   const firstPlist = await readFile(fixture.options.paths.launchAgentPath)
 
   fixture.runner.commit = "b".repeat(40)
@@ -343,7 +460,7 @@ test("failed doctor атомарно возвращает previous helper, relea
   fixture.runner.failDoctorForBuild = secondPlan.release.runtimeBuildId
   await expect(applyRuntimeInstall(secondPlan, options)).rejects.toThrow("doctor")
   expect(await readlink(join(options.paths.installRoot, "current"))).toBe(firstPlan.release.releasePath)
-  expect(await readFile(options.paths.stableHelperPath)).toEqual(firstHelper)
+  expect(await readFile(stableHelperPath)).toEqual(firstHelper)
   expect(await readFile(options.paths.launchAgentPath)).toEqual(firstPlist)
 })
 
@@ -351,22 +468,8 @@ test("loaded LaunchAgent со старым runtime program мигрирует н
   const fixture = await createFixture()
   const firstPlan = await planRuntimeInstall(fixture.options)
   await applyRuntimeInstall(firstPlan, fixture.options)
-  const manifestPath = join(firstPlan.release.releasePath, "manifest.json")
-  const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
-  const computerUsePath = join(firstPlan.release.releasePath, "computer-use")
-  const legacyRuntimePath = join(firstPlan.release.releasePath, "runtime")
-  const currentPlist = await readFile(fixture.options.paths.launchAgentPath, "utf8")
-  const legacyPlist = currentPlist.replace("/current/computer-use", "/current/runtime")
-  await chmod(firstPlan.release.releasePath, 0o700)
-  await rename(computerUsePath, legacyRuntimePath)
-  manifest.artifacts.runtime.path = "runtime"
-  manifest.launchAgent.sha256 = sha256(legacyPlist)
-  await chmod(manifestPath, 0o600)
-  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
-  await chmod(manifestPath, 0o444)
-  await chmod(firstPlan.release.releasePath, 0o555)
-  await writeFile(fixture.options.paths.launchAgentPath, legacyPlist)
-  fixture.runner.launchProgram = join(fixture.options.paths.installRoot, "current", "runtime")
+  await makeLegacyV1Release(fixture, firstPlan)
+  const legacyHelper = await readFile(fixture.options.paths.stableHelperPath)
   fixture.runner.loaded = true
 
   fixture.runner.commit = "8".repeat(40)
@@ -383,39 +486,18 @@ test("loaded LaunchAgent со старым runtime program мигрирует н
   const result = await applyRuntimeInstall(update, options)
 
   expect(result.state).toBe("installed")
-  expect(fixture.runner.launchProgram).toBe(join(fixture.options.paths.installRoot, "current", "computer-use"))
+  expect(fixture.runner.launchProgram).toBe(join(fixture.options.paths.installRoot,
+    "computer-use.app/Contents/MacOS/computer-use"))
   expect(JSON.parse(await readFile(join(update.release.releasePath, "manifest.json"), "utf8"))
-    .artifacts.runtime.path).toBe("computer-use")
+    .artifacts.runtime.path).toBe("computer-use.app/Contents/MacOS/computer-use")
+  expect(await readFile(fixture.options.paths.stableHelperPath)).toEqual(legacyHelper)
 })
 
 test("rollback принимает старый manifest и plist без META_NATIVE_CDHASH", async () => {
   const fixture = await createFixture()
   const firstPlan = await planRuntimeInstall(fixture.options)
   await applyRuntimeInstall(firstPlan, fixture.options)
-  const manifestPath = join(firstPlan.release.releasePath, "manifest.json")
-  const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
-  const computerUsePath = join(firstPlan.release.releasePath, "computer-use")
-  const legacyRuntimePath = join(firstPlan.release.releasePath, "runtime")
-  const currentPlist = await readFile(fixture.options.paths.launchAgentPath, "utf8")
-  const legacyPlist = currentPlist.replace("/current/computer-use", "/current/runtime").replace(
-    `    <key>META_NATIVE_CDHASH</key>\n    <string>${manifest.artifacts.nativeHelper.cdhash}</string>\n`,
-    "",
-  )
-  await chmod(firstPlan.release.releasePath, 0o700)
-  await rename(computerUsePath, legacyRuntimePath)
-  manifest.artifacts.runtime.path = "runtime"
-  manifest.tcc.requiredPassiveChecks = ["accessibility", "screen-recording"]
-  delete manifest.signing
-  delete manifest.artifacts.runtime.signingIdentifier
-  delete manifest.artifacts.runtime.designatedRequirement
-  delete manifest.artifacts.runtime.cdhash
-  manifest.launchAgent.sha256 = sha256(legacyPlist)
-  await chmod(manifestPath, 0o600)
-  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
-  await chmod(manifestPath, 0o444)
-  await chmod(firstPlan.release.releasePath, 0o555)
-  await writeFile(fixture.options.paths.launchAgentPath, legacyPlist)
-  fixture.runner.launchProgram = join(fixture.options.paths.installRoot, "current", "runtime")
+  const legacyPlist = await makeLegacyV1Release(fixture, firstPlan, true)
 
   fixture.runner.commit = "9".repeat(40)
   fixture.runner.loaded = true
@@ -500,7 +582,9 @@ test("исчерпанный startup permission budget откатывает пр
   const fixture = await createFixture()
   const firstPlan = await planRuntimeInstall(fixture.options)
   await applyRuntimeInstall(firstPlan, fixture.options)
-  const firstHelper = await readFile(fixture.options.paths.stableHelperPath)
+  const stableHelperPath = join(fixture.options.paths.installRoot,
+    "computer-use.app/Contents/Helpers/meta-input-helper")
+  const firstHelper = await readFile(stableHelperPath)
 
   fixture.runner.commit = "f".repeat(40)
   fixture.runner.loaded = true
@@ -518,7 +602,7 @@ test("исчерпанный startup permission budget откатывает пр
 
   await expect(applyRuntimeInstall(update, options)).rejects.toThrow("startup permission wait deadline exceeded")
   expect(await readlink(join(options.paths.installRoot, "current"))).toBe(firstPlan.release.releasePath)
-  expect(await readFile(options.paths.stableHelperPath)).toEqual(firstHelper)
+  expect(await readFile(stableHelperPath)).toEqual(firstHelper)
   expect(fixture.runner.permissionUiRequests).toBe(0)
 })
 
@@ -581,18 +665,104 @@ test("durable pending-update восстанавливается при след�
   })).rejects.toThrow("simulated process loss")
   const pending = join(fixture.options.paths.installRoot, "pending-update", "record.json")
   expect(JSON.parse(await readFile(pending, "utf8"))).toMatchObject({
-    format: "meta-runtime-pending-update-v1",
+    format: "meta-runtime-pending-update-v2",
     previousCurrentRelease: null,
     helperPresent: false,
     plistPresent: false,
+    stableApplicationPresent: false,
   })
-  await writeFile(fixture.options.paths.stableHelperPath, "partial-new-helper")
+  const partialApplication = join(fixture.options.paths.installRoot, "computer-use.app")
+  await mkdir(partialApplication)
+  await writeFile(join(partialApplication, "partial"), "partial-new-application")
   await symlink(plan.release.releasePath, join(fixture.options.paths.installRoot, "current"))
   await writeFile(fixture.options.paths.launchAgentPath, "partial plist")
   const recovered = await applyRuntimeInstall(plan, fixture.options)
   expect(recovered.state).toBe("installed")
   await expect(lstat(join(fixture.options.paths.installRoot, "pending-update"))).rejects.toThrow()
   expect(await readlink(join(fixture.options.paths.installRoot, "current"))).toBe(plan.release.releasePath)
+  expect(await readFile(join(partialApplication, "Contents/Info.plist"), "utf8")).toContain("CFBundleIdentifier")
+})
+
+test("whole-app promotion failpoints возвращают previous signed bundle", async () => {
+  const stages = ["after-stable-old-writable", "after-stable-old-moved", "after-stable-next-writable",
+    "after-stable-next-moved", "after-stable-mode-sealed"] as const
+  const commits = ["6", "7", "8", "9", "b"] as const
+  for (const [index, failStage] of stages.entries()) {
+    const fixture = await createFixture()
+    const firstPlan = await planRuntimeInstall(fixture.options)
+    await applyRuntimeInstall(firstPlan, fixture.options)
+    const stableHelperPath = join(fixture.options.paths.installRoot,
+      "computer-use.app/Contents/Helpers/meta-input-helper")
+    const previousHelper = await readFile(stableHelperPath)
+    fixture.runner.commit = commits[index]!.repeat(40)
+    fixture.runner.loaded = true
+    const inspection: RuntimeInspection = {
+      running: true,
+      runtimeEpoch: `runtime:promotion:${index}`,
+      runtimeBuildId: firstPlan.release.runtimeBuildId,
+      nativeBuildId: firstPlan.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }
+    const options = {
+      ...fixture.options,
+      runtimeAdmin: successfulAdmin(inspection),
+      failpoint(stage: Parameters<NonNullable<RuntimeInstallOptions["failpoint"]>>[0]) {
+        if (stage === failStage) throw new Error(`promotion crash: ${stage}`)
+      },
+    }
+    const update = await planRuntimeInstall(options)
+
+    await expect(applyRuntimeInstall(update, options)).rejects.toThrow(`promotion crash: ${failStage}`)
+    expect(await readlink(join(options.paths.installRoot, "current"))).toBe(firstPlan.release.releasePath)
+    expect(await readFile(stableHelperPath)).toEqual(previousHelper)
+    await expect(lstat(join(options.paths.installRoot, "pending-update"))).rejects.toThrow()
+  }
+})
+
+test("whole-app restore failpoints продолжаются идемпотентно из durable journal", async () => {
+  const stages = ["after-stable-restore-current-writable", "after-stable-restore-current-moved",
+    "after-stable-restore-backup-writable", "after-stable-restore-backup-moved",
+    "after-stable-restore-mode-sealed"] as const
+  for (const [index, failStage] of stages.entries()) {
+    const fixture = await createFixture()
+    const firstPlan = await planRuntimeInstall(fixture.options)
+    await applyRuntimeInstall(firstPlan, fixture.options)
+    const stableHelperPath = join(fixture.options.paths.installRoot,
+      "computer-use.app/Contents/Helpers/meta-input-helper")
+    const previousHelper = await readFile(stableHelperPath)
+    fixture.runner.commit = String(index + 4).repeat(40)
+    fixture.runner.loaded = true
+    const inspection: RuntimeInspection = {
+      running: true,
+      runtimeEpoch: `runtime:restore:${index}`,
+      runtimeBuildId: firstPlan.release.runtimeBuildId,
+      nativeBuildId: firstPlan.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }
+    const baseOptions = { ...fixture.options, runtimeAdmin: successfulAdmin(inspection) }
+    const update = await planRuntimeInstall(baseOptions)
+    fixture.runner.failDoctorForBuild = update.release.runtimeBuildId
+    const crashingOptions = {
+      ...baseOptions,
+      failpoint(stage: Parameters<NonNullable<RuntimeInstallOptions["failpoint"]>>[0]) {
+        if (stage === failStage) throw new Error(`restore crash: ${stage}`)
+      },
+    }
+
+    await expect(applyRuntimeInstall(update, crashingOptions)).rejects.toThrow("rollback incomplete")
+    expect(await lstat(join(baseOptions.paths.installRoot, "pending-update", "record.json"))).toBeTruthy()
+    fixture.runner.failDoctorForBuild = undefined
+    await expect(applyRuntimeInstall(update, {
+      ...baseOptions,
+      failpoint(stage) {
+        if (stage === "after-rollback-prepared") throw new Error("stop after recovered state")
+      },
+    })).rejects.toThrow("stop after recovered state")
+    expect(await readlink(join(baseOptions.paths.installRoot, "current"))).toBe(firstPlan.release.releasePath)
+    expect(await readFile(stableHelperPath)).toEqual(previousHelper)
+  }
 })
 
 test("слишком длинный macOS UDS path отклоняется до git и filesystem mutations", async () => {
@@ -742,7 +912,9 @@ test("failed bootout сохраняет pending journal и не меняет ins
   const fixture = await createFixture()
   const first = await planRuntimeInstall(fixture.options)
   await applyRuntimeInstall(first, fixture.options)
-  const helper = await readFile(fixture.options.paths.stableHelperPath)
+  const stableHelperPath = join(fixture.options.paths.installRoot,
+    "computer-use.app/Contents/Helpers/meta-input-helper")
+  const helper = await readFile(stableHelperPath)
   const current = await readlink(join(fixture.options.paths.installRoot, "current"))
   fixture.runner.commit = "e".repeat(40)
   fixture.runner.failBootout = true
@@ -753,7 +925,7 @@ test("failed bootout сохраняет pending journal и не меняет ins
   const options = { ...fixture.options, runtimeAdmin: successfulAdmin(running) }
   const update = await planRuntimeInstall(options)
   await expect(applyRuntimeInstall(update, options)).rejects.toThrow("rollback incomplete")
-  expect(await readFile(options.paths.stableHelperPath)).toEqual(helper)
+  expect(await readFile(stableHelperPath)).toEqual(helper)
   expect(await readlink(join(options.paths.installRoot, "current"))).toBe(current)
   expect(JSON.parse(await readFile(join(options.paths.installRoot, "pending-update", "record.json"), "utf8"))).toMatchObject({ serviceLoaded: true })
 })
@@ -786,18 +958,52 @@ test("existing release требует owned non-symlink tree, exact signature/me
   await applyRuntimeInstall(plan, fixture.options)
   expect(fixture.runner.doctorCalls).toBe(3)
   await chmod(plan.release.releasePath, 0o700)
-  const helperPath = join(plan.release.releasePath, "native-helper")
-  const moved = join(plan.release.releasePath, "native-helper.real")
+  const writableDirectories = [join(plan.release.releasePath, "computer-use.app"),
+    join(plan.release.releasePath, "computer-use.app/Contents"),
+    join(plan.release.releasePath, "computer-use.app/Contents/Helpers")]
+  for (const directory of writableDirectories) await chmod(directory, 0o700)
+  const helperPath = join(plan.release.releasePath,
+    "computer-use.app/Contents/Helpers/meta-input-helper")
+  const moved = join(plan.release.releasePath,
+    "computer-use.app/Contents/Helpers/meta-input-helper.real")
   await Bun.write(moved, await readFile(helperPath))
   await chmod(moved, 0o555)
   await rm(helperPath)
   await symlink(moved, helperPath)
+  for (const directory of writableDirectories.reverse()) await chmod(directory, 0o555)
   await chmod(plan.release.releasePath, 0o555)
   const repeated = await planRuntimeInstall({ ...fixture.options, runtimeAdmin: successfulAdmin({
     running: true, runtimeEpoch: "runtime:existing", runtimeBuildId: plan.release.runtimeBuildId,
     nativeBuildId: plan.release.nativeBuildId, activeOperations: 0, quarantinedResources: 0,
   }) })
-  await expect(applyRuntimeInstall(repeated, fixture.options)).rejects.toThrow("symlink/mode mismatch")
+  await expect(applyRuntimeInstall(repeated, fixture.options)).rejects.toThrow("foreign/symlink")
+})
+
+test("installer не перезаписывает stable app с unexpected leaf без exact rollback source", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(plan, fixture.options)
+  const stableContents = join(fixture.options.paths.installRoot, "computer-use.app/Contents")
+  await chmod(stableContents, 0o700)
+  await writeFile(join(stableContents, "unexpected"), "foreign")
+  await chmod(join(stableContents, "unexpected"), 0o444)
+  await chmod(stableContents, 0o555)
+  fixture.runner.loaded = true
+  const repeatedOptions = {
+    ...fixture.options,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:stable-tamper",
+      runtimeBuildId: plan.release.runtimeBuildId,
+      nativeBuildId: plan.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const repeated = await planRuntimeInstall(repeatedOptions)
+
+  await expect(applyRuntimeInstall(repeated, repeatedOptions)).rejects.toThrow("topology")
+  expect(await readlink(join(fixture.options.paths.installRoot, "current"))).toBe(plan.release.releasePath)
 })
 
 function successfulAdmin(inspection: RuntimeInspection): RuntimeAdmin {
@@ -926,10 +1132,19 @@ class FakeRunner implements CommandRunner {
       const target = args.at(-1)!
       const identity = args[args.indexOf("--sign") + 1]!
       const identifier = args[args.indexOf("--identifier") + 1]!
-      const content = await readFile(target)
+      if ((await lstat(target)).isDirectory()) {
+        const signatureDirectory = join(target, "Contents/_CodeSignature")
+        await mkdir(signatureDirectory, { recursive: true })
+        await writeFile(join(signatureDirectory, "CodeResources"),
+          `sealed:${identity}:${identifier}:${await signatureContentKey(join(target, "Contents"))}`)
+      } else {
+        const unsigned = (await readFile(target, "utf8")).split("\ncode-signature:")[0]!
+        await writeFile(target, `${unsigned}\ncode-signature:${identity}:${identifier}`)
+      }
+      const content = await signatureContentKey(target)
       const cdhash = createHash("sha1").update(content).digest("hex")
       const certificateSha1 = identity === "-" ? undefined : identity.toLowerCase()
-      this.signaturesByContent.set(sha256(content), {
+      this.signaturesByContent.set(content, {
         identifier,
         cdhash,
         designatedRequirement: this.embeddedRequirementOverrides.get(identifier) ?? (certificateSha1 === undefined
@@ -942,7 +1157,7 @@ class FakeRunner implements CommandRunner {
     }
     if (file === "/usr/bin/codesign" && args.includes("--display")) {
       const target = args.at(-1)!
-      const recorded = this.signaturesByContent.get(sha256(await readFile(target)))
+      const recorded = this.signaturesByContent.get(await signatureContentKey(target))
       const identifier = this.foreignStableHelper && target.endsWith("input/bin/meta-input-helper")
         ? "foreign.helper"
         : recorded?.identifier ?? HELPER_SIGNING_IDENTIFIER
@@ -956,7 +1171,7 @@ class FakeRunner implements CommandRunner {
     if (file === "/usr/bin/codesign" && args.includes("--test-requirement")) {
       this.testRequirementCalls++
       const target = args.at(-1)!
-      const recorded = this.signaturesByContent.get(sha256(await readFile(target)))
+      const recorded = this.signaturesByContent.get(await signatureContentKey(target))
       const requirement = args[args.indexOf("--test-requirement") + 1]!
       return recorded?.adhoc === false
         && requirement.includes(recorded.certificateSha1!)
@@ -970,7 +1185,7 @@ class FakeRunner implements CommandRunner {
     }
     if (file === "/usr/bin/lipo") return ok("x86_64\n")
     if (args.length === 1 && args[0] === "--metadata") {
-      const nativeBuildId = (await readFile(file, "utf8")).slice("native:".length)
+      const nativeBuildId = (await readFile(file, "utf8")).split("\ncode-signature:")[0]!.slice("native:".length)
       return ok(JSON.stringify({
         nativeBuildId,
         installRoot: this.repositoryRoot,
@@ -978,14 +1193,19 @@ class FakeRunner implements CommandRunner {
           effectiveUid: process.geteuid?.() ?? 501, auditUserId: process.getuid?.() ?? 501, auditSessionId: this.auditSessionId },
       }))
     }
-    if ((file.endsWith("/current/computer-use") || file.endsWith("/current/runtime")) && args[0] === "--doctor") {
+    if ((file.endsWith("/current/computer-use") || file.endsWith("/current/runtime")
+      || file.endsWith("/computer-use.app/Contents/MacOS/computer-use")) && args[0] === "--doctor") {
       this.doctorCalls++
       if (this.doctorUnavailableCount > 0) {
         this.doctorUnavailableCount--
         return fail("credential not ready")
       }
+      const stableSuffix = "/computer-use.app/Contents/MacOS/computer-use"
+      const stableBundle = file.endsWith(stableSuffix) && !file.includes("/current/")
       const artifactName = file.endsWith("/computer-use") ? "computer-use" : "runtime"
-      const releasePath = await readlink(file.slice(0, -`/${artifactName}`.length))
+      const releasePath = stableBundle
+        ? await readlink(join(file.slice(0, -stableSuffix.length), "current"))
+        : await readlink(file.slice(0, -`/${artifactName}`.length))
       const manifest = JSON.parse(await readFile(join(releasePath, "manifest.json"), "utf8"))
       if (manifest.builds.runtimeBuildId === this.failDoctorForBuild) return fail("doctor failed")
       const runtimeBuildId = manifest.builds.runtimeBuildId as string
@@ -1003,7 +1223,7 @@ class FakeRunner implements CommandRunner {
         && permissionState !== "failed" && permissionState !== "timed-out"
       const permissionOwnerPath = this.wrongPermissionIdentityForBuild.has(runtimeBuildId)
         ? join(this.repositoryRoot, "input/bin/foreign-helper")
-        : join(this.repositoryRoot, "input/bin/meta-input-helper")
+        : manifest.tcc.subjectPath
       const startup = this.legacyDeniedBuilds.has(runtimeBuildId) ? {} : { startup: { permissions: {
         state: permissionState,
         required: ["accessibility", "screenRecording", "postEvents", "inputMonitoring"],
@@ -1053,3 +1273,22 @@ class FakeRunner implements CommandRunner {
 function ok(stdout = ""): CommandResult { return { stdout, stderr: "", exitCode: 0 } }
 function fail(stderr: string): CommandResult { return { stdout: "", stderr, exitCode: 1 } }
 function sha256(value: string | Uint8Array): string { return createHash("sha256").update(value).digest("hex") }
+
+async function signatureContentKey(path: string): Promise<string> {
+  const info = await lstat(path)
+  if (info.isFile()) return sha256(await readFile(path))
+  if (!info.isDirectory() || info.isSymbolicLink()) throw new Error(`unsupported signature fixture path ${path}`)
+  const values: string[] = []
+  async function visit(directory: string, prefix: string): Promise<void> {
+    for (const entry of (await readdir(directory)).sort()) {
+      const child = join(directory, entry)
+      const relativePath = prefix === "" ? entry : join(prefix, entry)
+      const childInfo = await lstat(child)
+      if (childInfo.isDirectory()) await visit(child, relativePath)
+      else if (childInfo.isFile()) values.push(`${relativePath}:${sha256(await readFile(child))}`)
+      else throw new Error(`unsupported signature fixture node ${child}`)
+    }
+  }
+  await visit(path, "")
+  return sha256(values.join("\n"))
+}
