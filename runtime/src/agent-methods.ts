@@ -4,6 +4,7 @@ import {
   observationSchema,
   contractErrorSchema,
   opaqueIdSchema,
+  windowTransitionResultSchema,
   type Observation,
   z,
   type AdapterResult,
@@ -20,6 +21,7 @@ import {
   type RuntimeClientSession,
   type ScreenCaptureResult,
   type WindowRecord,
+  type WindowTransitionResult,
   type SurfaceRecord,
 } from "@meta/shared/contracts"
 import type { RuntimeCore } from "./core.ts"
@@ -511,12 +513,8 @@ export class RuntimeAgentMethods {
   async #showWindow(session: RuntimeClientSession, targetIdValue: string, signal: AbortSignal) {
     await this.#health(session, signal)
     this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
-    const show = this.operations.runTrackedMutation(session, targetIdValue, "show-window-show",
-      context => this.#transitionWindow(session, targetIdValue, "show", context), signal)
-    await Promise.resolve()
-    const focus = this.operations.runTrackedMutation(session, targetIdValue, "show-window-focus",
-      context => this.#transitionWindow(session, targetIdValue, "focus", context), signal)
-    await Promise.all([show, focus])
+    await this.operations.runTrackedMutation(session, targetIdValue, "show-window-show",
+      context => this.#transitionWindow(session, targetIdValue, context), signal)
     const scope = this.#scope(session)
     const fresh = await this.#refreshWindow(session, scope, targetIdValue, scope.resolveAction(targetIdValue), signal)
     if (this.#views !== undefined && fresh.selected.target.kind === "window") {
@@ -542,9 +540,14 @@ export class RuntimeAgentMethods {
     const target = this.#scope(session).resolveAction(targetIdValue)
     const stored = this.#observations.get(canonicalJson([lineage, targetIdValue]))
     if (stored === undefined || !structurallyEqual(stored.observation.captureTarget, target.target)
-      || this.#now().getTime() >= Date.parse(stored.observation.expiresAt)
-      || !this.#core.frames.hasVerified(stored.observation.image.frameRef, stored.observation.image.sha256)) {
+      || this.#now().getTime() >= Date.parse(stored.observation.expiresAt)) {
       throw new Error("Latest owned screenshot отсутствует, истёк или относится к другому target")
+    }
+    if (stored.observation.readiness.state !== "ready" || stored.observation.unavailableReasons.length > 0) {
+      throw new Error("Latest owned screenshot не имеет image-ready readiness для point action")
+    }
+    if (!this.#core.frames.hasVerified(stored.observation.image.frameRef, stored.observation.image.sha256)) {
+      throw new Error("Latest owned screenshot frame bytes отсутствуют или не подтверждены")
     }
     return structuredClone(stored)
   }
@@ -558,17 +561,22 @@ export class RuntimeAgentMethods {
   async #transitionWindow(
     session: RuntimeClientSession,
     targetIdValue: string,
-    kind: "show" | "focus",
     context: AgentMutationContext,
   ): Promise<void> {
     const scope = this.#scope(session)
     const fresh = await this.#refreshWindow(session, scope, targetIdValue, context.binding, context.signal)
-    await this.#dispatch(session, "window_transition", {
+    const response = await this.#registry.internal.dispatch(session, "window_transition", {
       inventoryId: fresh.selected.inventoryId,
       inventoryRevision: fresh.selected.inventoryRevision,
       clientRequestId: context.clientRequestId,
-      request: { kind, target: fresh.selected.target.ref },
+      request: { kind: "show", target: fresh.selected.target.ref },
     }, context.signal)
+    if (response.isError) {
+      const result = objectRecord(response.data.result)
+      const transition = result?.ok === true ? windowTransitionResultSchema.safeParse(result.value) : undefined
+      if (transition?.success && transition.data.partial) throw partialWindowTransitionError(response, transition.data)
+      throw internalMethodError(response, "window_transition")
+    }
     await this.#refreshWindow(session, scope, targetIdValue, fresh.selected, context.signal)
   }
 
@@ -623,21 +631,27 @@ export class RuntimeAgentMethods {
     if (selected.target.kind !== "window") throw new Error("observe не поддерживает этот target kind")
     this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
     const fresh = await this.#refreshNative(session, scope, targetIdValue, selected, signal)
+    let viewEligible = false
     const capture = async () => {
-    const ax = mode === "screenshot" ? undefined : await this.#inspectWindow(session, scope, targetIdValue, fresh.selected, signal)
-    const screenshot = mode === "ax" ? undefined : await this.#captureWindow(session, targetIdValue, fresh, caption!, signal)
-    if (mode === "screenshot") scope.invalidateElements(targetIdValue)
-    return observedStateSchema.parse({
-      targetId: targetIdValue,
-      state: ax?.state ?? "",
-      complete: (ax?.complete ?? true) && (screenshot?.complete ?? true),
-      errors: [...(ax?.errors ?? []), ...(screenshot?.errors ?? [])],
-      elements: ax?.elements ?? [],
-      ...(screenshot === undefined ? {} : screenshot),
-    })
+      const ax = mode === "screenshot" ? undefined : await this.#inspectWindow(session, scope, targetIdValue, fresh.selected, signal)
+      const screenshot = mode === "ax" ? undefined : await this.#captureWindow(session, targetIdValue, fresh, caption!, signal)
+      if (mode === "screenshot") scope.invalidateElements(targetIdValue)
+      viewEligible = ax?.complete === true || screenshot?.complete === true
+      return observedStateSchema.parse({
+        targetId: targetIdValue,
+        state: ax?.state ?? "",
+        complete: (ax?.complete ?? true) && (screenshot?.complete ?? true),
+        errors: [...(ax?.errors ?? []), ...(screenshot?.errors ?? [])],
+        elements: ax?.elements ?? [],
+        ...(screenshot === undefined ? {} : {
+          imageId: screenshot.imageId,
+          width: screenshot.width,
+          height: screenshot.height,
+        }),
+      })
     }
     if (this.#views !== undefined && fresh.selected.target.kind === "window") {
-      try { return await this.#views.observe(session, targetIdValue, fresh.selected.target, capture, result => result.complete) }
+      try { return await this.#views.observe(session, targetIdValue, fresh.selected.target, capture, () => viewEligible) }
       catch (error) {
         scope.invalidateElements(targetIdValue)
         this.#observations.delete(canonicalJson([this.#core.clients.lineage(session), targetIdValue]))
@@ -969,28 +983,7 @@ export class RuntimeAgentMethods {
   ): Promise<RuntimeMethodResponse> {
     signal.throwIfAborted()
     const response = await this.#registry.internal.dispatch(session, name, input, signal)
-    if (response.isError) {
-      const result = objectRecord(response.data.result)
-      const parsed = contractErrorSchema.safeParse(objectRecord(result?.error))
-      if (parsed.success) {
-        const operation = objectRecord(response.data.operation)
-        const operationContext = objectRecord(operation?.context)
-        const operationId = opaqueIdSchema.safeParse(operationContext?.operationId)
-        const context = {
-          ...(parsed.data.context ?? {}),
-          ...(operationId.success ? { operationId: operationId.data } : {}),
-        }
-        throw new RuntimeContractError(parsed.data.code, parsed.data.message, parsed.data.stage, {
-          retryable: parsed.data.retryable,
-          replayAllowed: parsed.data.replayAllowed,
-          recoveryAction: parsed.data.recoveryAction,
-          ...(Object.keys(context).length === 0 ? {} : { context }),
-        })
-      }
-      throw new RuntimeContractError("internal-error", `Internal runtime method ${name} вернул malformed error`, "agent-method-dispatch", {
-        recoveryAction: "get-operation",
-      })
-    }
+    if (response.isError) throw internalMethodError(response, name)
     return response
   }
 
@@ -1013,6 +1006,59 @@ function objectRecord(value: unknown): Record<string, unknown> | undefined {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? value as Record<string, unknown>
     : undefined
+}
+
+function responseOperationId(response: RuntimeMethodResponse): string | undefined {
+  const operation = objectRecord(response.data.operation)
+  const context = objectRecord(operation?.context)
+  const parsed = opaqueIdSchema.safeParse(context?.operationId)
+  return parsed.success ? parsed.data : undefined
+}
+
+function internalMethodError(response: RuntimeMethodResponse, name: string): RuntimeContractError {
+  const result = objectRecord(response.data.result)
+  const parsed = contractErrorSchema.safeParse(objectRecord(result?.error))
+  if (parsed.success) {
+    const operationId = responseOperationId(response)
+    const context = {
+      ...(parsed.data.context ?? {}),
+      ...(operationId === undefined ? {} : { operationId }),
+    }
+    return new RuntimeContractError(parsed.data.code, parsed.data.message, parsed.data.stage, {
+      retryable: parsed.data.retryable,
+      replayAllowed: parsed.data.replayAllowed,
+      recoveryAction: parsed.data.recoveryAction,
+      ...(Object.keys(context).length === 0 ? {} : { context }),
+    })
+  }
+  return new RuntimeContractError("internal-error", `Internal runtime method ${name} вернул malformed error`, "agent-method-dispatch", {
+    recoveryAction: "get-operation",
+  })
+}
+
+function partialWindowTransitionError(
+  response: RuntimeMethodResponse,
+  transition: WindowTransitionResult,
+): RuntimeContractError {
+  const primary = transition.errors[0]!
+  const actual = transition.actual.kind === "ax-window"
+    ? `ax-window hidden=${transition.actual.applicationHidden} minimized=${transition.actual.minimized} focused=${transition.actual.focused} onScreen=${transition.actual.onScreen} visibility=${transition.actual.spaceVisibility}`
+    : transition.actual.kind === "unknown"
+      ? `unknown reason=${transition.actual.reason}`
+      : "closed"
+  const errors = transition.errors.map(error => `${error.code}@${error.stage}: ${error.message}`).join("; ")
+  const message = `Window transition partial; actual=${actual}; errors=${errors}`.slice(0, 2_048)
+  const operationId = responseOperationId(response)
+  const context = {
+    ...(primary.context ?? {}),
+    ...(operationId === undefined ? {} : { operationId }),
+  }
+  return new RuntimeContractError(primary.code, message, primary.stage, {
+    retryable: primary.retryable,
+    replayAllowed: primary.replayAllowed,
+    recoveryAction: primary.recoveryAction,
+    ...(Object.keys(context).length === 0 ? {} : { context }),
+  })
 }
 
 export function registerAgentMethods(

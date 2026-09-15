@@ -36,7 +36,7 @@ import {
   type WindowRecord,
 } from "@meta/shared/contracts"
 import { AgentTargetRegistry } from "../src/agent-targets.ts"
-import { agentObservedStateSchema, registerAgentMethods } from "../src/agent-methods.ts"
+import { agentObservedStateSchema, registerAgentMethods, type AgentMethodsOptions } from "../src/agent-methods.ts"
 import { captureDesktopMethodInputSchema, captureExecutionSchema, captureWindowMethodInputSchema } from "../src/capture-methods.ts"
 import { RuntimeCore } from "../src/core.ts"
 import { MethodRegistry } from "../src/method-registry.ts"
@@ -297,7 +297,7 @@ test("incomplete inventory и отсутствующий capture mapping не to
   expect(restored.target).toEqual(displayTarget)
 })
 
-test("show_window делает exact show/focus, refresh и возвращает snapshot-bound element IDs", async () => {
+test("show_window делает один exact show, refresh и возвращает snapshot-bound element IDs", async () => {
   const fixture = createFixture()
   const desktop = registerDesktop(fixture)
   registerBrowsers(fixture)
@@ -306,13 +306,55 @@ test("show_window делает exact show/focus, refresh и возвращает
   const state = await fixture.registry.dispatch(client.session, "get_state", { kind: "window" }, new AbortController().signal)
   const id = (state.data.windows as Array<{ targetId: string }>)[0]!.targetId
   const shown = await fixture.registry.dispatch(client.session, "show_window", { targetId: id }, new AbortController().signal)
-  expect(desktop.transitions.map(call => call.request.kind)).toEqual(["show", "focus"])
+  expect(desktop.transitions.map(call => call.request.kind)).toEqual(["show"])
   expect(shown.data).toMatchObject({ targetId: id, complete: true, elements: [{ role: "AXButton", title: "Save", actions: ["AXPress"] }] })
   expect(String(shown.data.state)).toContain("role=AXButton")
   expect(JSON.stringify(shown.data)).not.toContain("elementRef")
   const status = await methods.operations.getTargetStatus(client.session, id)
-  expect(status.recent.map(operation => operation.action).sort()).toEqual(["show-window-focus", "show-window-show"])
-  expect(new Set(status.recent.map(operation => operation.operationId)).size).toBe(2)
+  expect(status.recent.map(operation => operation.action)).toEqual(["show-window-show"])
+  expect(new Set(status.recent.map(operation => operation.operationId)).size).toBe(1)
+})
+
+test("partial show_window возвращает actual/error/operationId и не запускает orphan focus", async () => {
+  const fixture = createFixture()
+  const desktop = registerDesktop(fixture)
+  desktop.setTransitionFailure({
+    code: "operation-outcome-unknown",
+    message: "Immediate focus readback не подтвердил focused window",
+    stage: "window-show-readback",
+    retryable: false,
+    replayAllowed: false,
+    recoveryAction: "get-operation",
+    context: { checkpoint: "focus-readback" },
+  })
+  registerBrowsers(fixture)
+  const methods = registerAgentMethods(fixture.registry, fixture.core, fixture.targets, { ids: sequenceIds() })
+  const client = fixture.core.openClient("principal:show-partial")
+  const state = await fixture.registry.dispatch(client.session, "get_state", { kind: "window" }, new AbortController().signal)
+  const targetId = (state.data.windows as Array<{ targetId: string }>)[0]!.targetId
+  let failure: unknown
+  try {
+    await fixture.registry.dispatch(client.session, "show_window", { targetId }, new AbortController().signal)
+  } catch (error) { failure = error }
+  expect(failure).toBeInstanceOf(RuntimeContractError)
+  const contract = (failure as RuntimeContractError).contract
+  expect(contract).toMatchObject({
+    code: "operation-outcome-unknown",
+    stage: "window-show-readback",
+    retryable: false,
+    replayAllowed: false,
+    recoveryAction: "get-operation",
+    context: { checkpoint: "focus-readback" },
+  })
+  expect(contract.message).toContain("actual=ax-window hidden=true minimized=false focused=false onScreen=false visibility=not-current")
+  expect(contract.message).toContain("Immediate focus readback не подтвердил focused window")
+  expect(contract.context?.operationId).toStartWith("operation:")
+  expect(desktop.transitions.map(call => call.request.kind)).toEqual(["show"])
+  const operation = await fixture.core.getOperation(client.session, contract.context!.operationId!)
+  expect(operation).toMatchObject({ state: "completed", outcome: { cleanup: { state: "complete" } } })
+  const status = await methods.operations.getTargetStatus(client.session, targetId)
+  expect(status.recent).toHaveLength(1)
+  expect(status.recent[0]).toMatchObject({ action: "show-window-show" })
 })
 
 test("AX facade сохраняет static text value, zero frame, redaction и opaque parent lineage", async () => {
@@ -412,6 +454,64 @@ test("observe both регистрирует elements, скрывает observati
   expect(() => scope.resolveElement(id, elementId)).toThrow("latest target snapshot")
 })
 
+test("both с partial AX и image-ready сохраняет public partial, но mint view по свежему image", async () => {
+  const fixture = createFixture()
+  const desktop = registerDesktop(fixture)
+  desktop.setInspectionFailure(axFixtureError("Optional AXDescription read failed"))
+  registerBrowsers(fixture)
+  const probe = viewEligibilityProbe()
+  registerAgentMethods(fixture.registry, fixture.core, fixture.targets, { ids: sequenceIds(), views: probe.views })
+  const client = fixture.core.openClient("principal:both-ax-partial")
+  const state = await fixture.registry.dispatch(client.session, "get_state", { kind: "window" }, new AbortController().signal)
+  const targetId = (state.data.windows as Array<{ targetId: string }>)[0]!.targetId
+  const observed = await fixture.registry.dispatch(client.session, "observe", {
+    targetId, mode: "both", caption: "Ожидаю свежий кадр при partial AX metadata",
+  }, new AbortController().signal)
+  expect(observed.data).toMatchObject({ complete: false, imageId: expect.any(String),
+    errors: [{ message: "Optional AXDescription read failed" }], elements: [{ role: "AXButton" }] })
+  expect(probe.eligibility).toEqual([true])
+  expect(desktop.windowCaptureResults[0]?.observation.readiness.state).toBe("ready")
+})
+
+test("AX-ready не заменяет image-ready для pointer, both-failed не mint view и старый image не переиспользуется", async () => {
+  const fixture = createFixture()
+  const desktop = registerDesktop(fixture)
+  desktop.setWindowCaptureReady(false)
+  registerBrowsers(fixture)
+  const probe = viewEligibilityProbe()
+  const methods = registerAgentMethods(fixture.registry, fixture.core, fixture.targets, { ids: sequenceIds(), views: probe.views })
+  const client = fixture.core.openClient("principal:both-image-partial")
+  const state = await fixture.registry.dispatch(client.session, "get_state", { kind: "window" }, new AbortController().signal)
+  const targetId = (state.data.windows as Array<{ targetId: string }>)[0]!.targetId
+  const imagePartial = await fixture.registry.dispatch(client.session, "observe", {
+    targetId, mode: "both", caption: "Ожидаю AX-ready и image-unavailable",
+  }, new AbortController().signal)
+  expect(imagePartial.data).toMatchObject({ complete: false, elements: [{ role: "AXButton" }] })
+  expect((imagePartial.data.errors as Array<{ message: string }>).map(error => error.message)).toEqual([
+    "Capture readiness: unavailable",
+    "Fixture capture target unavailable",
+  ])
+  expect(probe.eligibility).toEqual([true])
+  await expect(methods.getLatestObservation(client.session, targetId)).rejects.toThrow("image-ready readiness")
+
+  desktop.setInspectionFailure(axFixtureError("AX metadata unavailable"))
+  const bothFailed = await fixture.registry.dispatch(client.session, "observe", {
+    targetId, mode: "both", caption: "Ожидаю обе partial modalities",
+  }, new AbortController().signal)
+  expect(bothFailed.data).toMatchObject({ complete: false })
+  expect((bothFailed.data.errors as Array<{ message: string }>).map(error => error.message)).toEqual([
+    "AX metadata unavailable",
+    "Capture readiness: unavailable",
+    "Fixture capture target unavailable",
+  ])
+  expect(probe.eligibility).toEqual([true, false])
+
+  const axOnly = await fixture.registry.dispatch(client.session, "observe", { targetId, mode: "ax" }, new AbortController().signal)
+  expect(axOnly.data).not.toHaveProperty("imageId")
+  expect(probe.eligibility).toEqual([true, false, false])
+  await expect(methods.getLatestObservation(client.session, targetId)).rejects.toThrow("отсутствует")
+})
+
 test("failed capture сохраняет typed contract error и реальный operationId без user payload", async () => {
   const fixture = createFixture()
   const desktop = registerDesktop(fixture)
@@ -500,6 +600,30 @@ test("observe browser выполняет exact AX и capture через выбр
   expect(JSON.stringify(observed.data)).not.toContain("backend-node:save")
 })
 
+function axFixtureError(message: string): ContractError {
+  return {
+    code: "inventory-incomplete",
+    message,
+    stage: "ax-inspect-attribute",
+    retryable: true,
+    replayAllowed: false,
+    recoveryAction: "retry-read-only",
+  }
+}
+
+function viewEligibilityProbe() {
+  const eligibility: boolean[] = []
+  const views: NonNullable<AgentMethodsOptions["views"]> = {
+    async observe(_session, _targetId, _target, capture, complete) {
+      const value = await capture()
+      eligibility.push(complete(value))
+      return value
+    },
+    async run(_session, _targetId, _clientRequestId, _mode, action) { return action() },
+  }
+  return { eligibility, views }
+}
+
 function createFixture() {
   const native = {
     lastStatus: undefined as ReturnType<typeof nativeStatus> | undefined,
@@ -550,6 +674,9 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
   const desktopCaptureResults: ScreenCaptureResult[] = []
   const inspectionRequests: Array<z.infer<typeof axInspectionRequestSchema>> = []
   let captureFailure: ContractError | undefined
+  let transitionFailure: ContractError | undefined
+  let inspectionFailure: ContractError | undefined
+  let windowCaptureReady = true
   let inspectionNodes: AxInspectionResult["nodes"] = [{
     elementRef: { ...generation, nativeGeneration, applicationRef: appRef.applicationRef,
       snapshotId: "snapshot:agent:1", elementRef: "element:save" },
@@ -575,9 +702,11 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     app: z.string().min(1).max(1024).optional(),
     pid: z.number().int().min(1).max(0x7fffffff).optional(),
   }), desktopInventorySnapshotSchema))
-  fixture.registry.register("window_transition", method(async (context, input) => {
+  fixture.registry.register("window_transition", { ...method(async (context, input) => {
     transitions.push(input)
-    const actual = windowRecord(input.request.target)
+    const actual = transitionFailure === undefined
+      ? windowRecord(input.request.target)
+      : { ...windowRecord(input.request.target), focused: "false" as const }
     const target = { kind: "window" as const, ref: input.request.target }
     const intent = runtimeOperationIntentSchema.parse({
       intent: "mutation",
@@ -597,8 +726,8 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
         requested: input.request,
         actual,
         changed: true,
-        partial: false,
-        errors: [],
+        partial: transitionFailure !== undefined,
+        errors: transitionFailure === undefined ? [] : [transitionFailure],
         }),
         outcome: successfulOutcome(operation.resources),
         nativeStatus: status,
@@ -612,17 +741,17 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
   }), z.strictObject({
     operation: operationRecordSchema,
     result: adapterResultSchema(windowTransitionResultSchema),
-  })))
+  })), isError: output => !output.result.ok || output.result.value.partial })
   fixture.registry.register("inspect_accessibility", method(async (_context, input) => {
     inspectionRequests.push(structuredClone(input.request))
     return {
       snapshotId: "snapshot:agent:1",
       target: input.request.target,
-      complete: true,
+      complete: inspectionFailure === undefined,
       nodeCount: inspectionNodes.length,
       encodedBytes: 100,
       nodes: structuredClone(inspectionNodes),
-      errors: [],
+      errors: inspectionFailure === undefined ? [] : [inspectionFailure],
     }
   }, z.strictObject({
     inventoryId: z.string(),
@@ -639,7 +768,7 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
         return { operation, frameAvailable: false,
           result: { ok: false as const, error: structuredClone(captureFailure), outcome: successfulOutcome() } }
       }
-      const value = captureResult(input)
+      const value = captureResult(input, windowCaptureReady)
       windowCaptureResults.push(structuredClone(value))
       return {
         operation,
@@ -676,6 +805,9 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     inventoryCalls: () => inventoryCalls,
     setInspectionNodes(nodes: AxInspectionResult["nodes"]) { inspectionNodes = structuredClone(nodes) },
     setCaptureFailure(error: ContractError | undefined) { captureFailure = error === undefined ? undefined : structuredClone(error) },
+    setTransitionFailure(error: ContractError | undefined) { transitionFailure = error === undefined ? undefined : structuredClone(error) },
+    setInspectionFailure(error: ContractError | undefined) { inspectionFailure = error === undefined ? undefined : structuredClone(error) },
+    setWindowCaptureReady(ready: boolean) { windowCaptureReady = ready },
   }
 }
 
@@ -997,7 +1129,7 @@ function browserExecution(
   }
 }
 
-function captureResult(input: z.infer<typeof captureWindowMethodInputSchema>) {
+function captureResult(input: z.infer<typeof captureWindowMethodInputSchema>, ready = true) {
   if (input.target.mappingEvidence.state !== "confirmed") throw new Error("Fixture требует confirmed mapping")
   const capturedAt = "2026-09-15T10:00:02.000Z"
   const expiresAt = "2099-09-15T10:00:00.000Z"
@@ -1034,7 +1166,9 @@ function captureResult(input: z.infer<typeof captureWindowMethodInputSchema>) {
     mime: "image/png" as const,
   }
   const steps = [
-    ...input.readinessPolicy.requiredSteps.map(name => ({ name, state: "reached" as const, durationMs: 1 })),
+    ...input.readinessPolicy.requiredSteps.map(name => !ready && name === "target"
+      ? { name, state: "unavailable" as const, durationMs: 1, reason: "Fixture capture target unavailable" }
+      : { name, state: "reached" as const, durationMs: 1 }),
     ...input.readinessPolicy.disabledSteps.map(name => ({ name, state: "skipped" as const, durationMs: 0, reason: "disabled-by-policy" as const })),
   ]
   const observation = {
@@ -1059,7 +1193,7 @@ function captureResult(input: z.infer<typeof captureWindowMethodInputSchema>) {
       issuedAt: capturedAt, expiresAt,
     } },
     occlusion: { state: "unknown" as const, claim: "occlusion", source: "fixture", reason: "isolated window" },
-    readiness: { state: "ready" as const, policy: input.readinessPolicy, steps, timedOut: false },
+    readiness: { state: ready ? "ready" as const : "unavailable" as const, policy: input.readinessPolicy, steps, timedOut: false },
     synchronization: { kind: "single-frame" as const },
     regions: [{
       space: { kind: "macos-screen" as const, display },
@@ -1069,7 +1203,7 @@ function captureResult(input: z.infer<typeof captureWindowMethodInputSchema>) {
       frameTimestamp: capturedAt,
       frameStatus: "complete" as const,
     }],
-    unavailableReasons: [],
+    unavailableReasons: ready ? [] : ["Fixture capture target unavailable"],
   }
   return {
     publication,
