@@ -3,6 +3,7 @@ import {
   authorizeAdapterContext,
   clipboardVersionSchema,
   contractErrorSchema,
+  operationOutcomeSchema,
   requireAuthorizedResourceHandles,
   z,
   type AdapterHostContext,
@@ -15,7 +16,13 @@ import {
   type OperationOutcome,
   type RuntimeOperationContext,
 } from "@meta/shared/contracts"
-import { MAX_CLIPBOARD_TEXT_BYTES } from "./clipboard.ts"
+import { NATIVE_CLIPBOARD_MAX_UTF8_BYTES } from "@meta/native/protocol"
+import {
+  ClipboardBackendError,
+  clipboardBackendReportSchema,
+  type ClipboardBackendReport,
+  type VersionedClipboardBackend,
+} from "./native-clipboard-backend.ts"
 
 export const clipboardReadRequestSchema = z.strictObject({
   kind: z.literal("read"),
@@ -25,9 +32,9 @@ export const clipboardWriteRequestSchema = z.strictObject({
   kind: z.literal("write"),
   text: z.string(),
   expectedVersion: clipboardVersionSchema.optional(),
-}).refine(request => new TextEncoder().encode(request.text).byteLength <= MAX_CLIPBOARD_TEXT_BYTES, {
+}).refine(request => new TextEncoder().encode(request.text).byteLength <= NATIVE_CLIPBOARD_MAX_UTF8_BYTES, {
   path: ["text"],
-  message: `clipboard text превышает ${MAX_CLIPBOARD_TEXT_BYTES} UTF-8 байт`,
+  message: `clipboard text превышает ${NATIVE_CLIPBOARD_MAX_UTF8_BYTES} UTF-8 байт`,
 })
 
 export const clipboardRequestSchema = z.discriminatedUnion("kind", [
@@ -36,31 +43,55 @@ export const clipboardRequestSchema = z.discriminatedUnion("kind", [
 ])
 export type ClipboardRequest = z.infer<typeof clipboardRequestSchema>
 
-const clipboardMetadataShape = {
+const clipboardTextMetadataShape = {
   version: clipboardVersionSchema,
   length: z.number().int().safe().min(0),
-  bytes: z.number().int().safe().min(0).max(MAX_CLIPBOARD_TEXT_BYTES),
+  bytes: z.number().int().safe().min(0).max(NATIVE_CLIPBOARD_MAX_UTF8_BYTES),
 }
 
-export const clipboardResultSchema = z.discriminatedUnion("kind", [
-  z.strictObject({ kind: z.literal("read"), text: z.string(), ...clipboardMetadataShape }),
-  z.strictObject({ kind: z.literal("write"), ...clipboardMetadataShape }),
+export const clipboardResultSchema = z.union([
+  z.strictObject({
+    kind: z.literal("read"),
+    status: z.literal("ok"),
+    text: z.string(),
+    beforeChangeCount: z.number().int().safe().min(0),
+    afterChangeCount: z.number().int().safe().min(0),
+    ...clipboardTextMetadataShape,
+  }),
+  z.strictObject({
+    kind: z.literal("read"),
+    status: z.literal("text-unavailable"),
+    beforeChangeCount: z.number().int().safe().min(0),
+    afterChangeCount: z.number().int().safe().min(0),
+    version: clipboardVersionSchema,
+  }),
+  z.strictObject({
+    kind: z.literal("write"),
+    status: z.literal("written"),
+    beforeChangeCount: z.number().int().safe().min(0),
+    declaredChangeCount: z.number().int().safe().min(0),
+    afterChangeCount: z.number().int().safe().min(0),
+    atomicPrecondition: z.literal(false),
+    ...clipboardTextMetadataShape,
+  }),
 ])
 export type ClipboardResult = z.infer<typeof clipboardResultSchema>
 
-export interface VersionedClipboardBackend {
-  readonly buildId: string
-  currentVersion(control: RuntimeOperationContext<ClipboardExecutionContext>["control"]): Promise<number>
-  readText(control: RuntimeOperationContext<ClipboardExecutionContext>["control"]): Promise<{
-    text: string
-    changeCount: number
-  }>
-  writeText(
-    text: string,
-    expectedChangeCount: number | undefined,
-    control: RuntimeOperationContext<ClipboardExecutionContext>["control"],
-  ): Promise<{ changeCount: number }>
-}
+export const clipboardAdapterResultSchema = z.discriminatedUnion("ok", [
+  z.strictObject({
+    ok: z.literal(true),
+    value: clipboardResultSchema,
+    outcome: operationOutcomeSchema,
+    clipboard: clipboardBackendReportSchema,
+  }),
+  z.strictObject({
+    ok: z.literal(false),
+    error: contractErrorSchema,
+    outcome: operationOutcomeSchema,
+    clipboard: clipboardBackendReportSchema,
+  }),
+])
+export type ClipboardAdapterResult = z.infer<typeof clipboardAdapterResultSchema>
 
 export class SystemClipboardAdapter implements SharedClipboardAdapter<ClipboardRequest, ClipboardResult> {
   readonly capabilities = ["input.clipboard"] as const
@@ -75,93 +106,209 @@ export class SystemClipboardAdapter implements SharedClipboardAdapter<ClipboardR
   async currentVersion(context: RuntimeOperationContext<ClipboardExecutionContext>): Promise<ClipboardVersion> {
     await this.#authorize(context)
     await context.control.checkpoint("clipboard.version")
+    const call = await this.backend.currentVersion(context)
+    if (call.value.status !== "ok") {
+      throw new ClipboardBackendError(
+        `Clipboard version недоступна: ${call.value.status}`,
+        undefined,
+        call.report,
+      )
+    }
     return clipboardVersionSchema.parse({
       backendBuildId: this.backend.buildId,
-      changeCount: await this.backend.currentVersion(context.control),
+      changeCount: call.value.changeCount,
     })
   }
 
   async execute(
     context: RuntimeOperationContext<ClipboardExecutionContext>,
     input: ClipboardRequest,
-  ): Promise<AdapterResult<ClipboardResult>> {
+  ): Promise<ClipboardAdapterResult> {
     let request: ClipboardRequest
     try {
       request = clipboardRequestSchema.parse(input)
       await this.#authorize(context)
     } catch (error) {
-      return failure(context, errorFrom(error, "clipboard-precondition"), "none", "complete")
+      const command = isWriteLike(input) ? "clipboard.write" : "clipboard.read"
+      return failed(
+        context,
+        errorFrom(error, "clipboard-precondition"),
+        notDispatchedReport(command),
+        "none",
+        "unknown",
+      )
     }
 
-    if (request.kind === "read") {
-      try {
-        await context.control.checkpoint("clipboard.read")
-        const read = await this.backend.readText(context.control)
-        const bytes = new TextEncoder().encode(read.text).byteLength
-        if (bytes > MAX_CLIPBOARD_TEXT_BYTES) throw new Error("clipboard read превышает byte budget")
-        const value = clipboardResultSchema.parse({
-          kind: "read",
-          text: read.text,
-          length: read.text.length,
-          bytes,
-          version: { backendBuildId: this.backend.buildId, changeCount: read.changeCount },
-        })
-        return {
+    if (request.kind === "read") return await this.#read(context)
+    return await this.#write(context, request)
+  }
+
+  async #read(
+    context: RuntimeOperationContext<ClipboardExecutionContext>,
+  ): Promise<ClipboardAdapterResult> {
+    try {
+      await context.control.checkpoint("clipboard.read")
+      const call = await this.backend.readText(context, NATIVE_CLIPBOARD_MAX_UTF8_BYTES)
+      const value = call.value
+      if (value.status === "ok") {
+        const bytes = new TextEncoder().encode(value.text).byteLength
+        return clipboardAdapterResultSchema.parse({
           ok: true,
-          value,
-          outcome: outcome(context, "none", "verified", "complete"),
-        }
-      } catch (error) {
-        return failure(context, errorFrom(error, "clipboard-read"), "none", "complete")
+          value: {
+            kind: "read",
+            status: "ok",
+            text: value.text,
+            length: value.text.length,
+            bytes,
+            version: { backendBuildId: this.backend.buildId, changeCount: value.afterChangeCount },
+            beforeChangeCount: value.beforeChangeCount,
+            afterChangeCount: value.afterChangeCount,
+          },
+          outcome: pendingOutcome(context, "none", "verified"),
+          clipboard: call.report,
+        })
       }
+      if (value.status === "text-unavailable") {
+        return clipboardAdapterResultSchema.parse({
+          ok: true,
+          value: {
+            kind: "read",
+            status: "text-unavailable",
+            version: { backendBuildId: this.backend.buildId, changeCount: value.afterChangeCount },
+            beforeChangeCount: value.beforeChangeCount,
+            afterChangeCount: value.afterChangeCount,
+          },
+          outcome: pendingOutcome(context, "none", "verified"),
+          clipboard: call.report,
+        })
+      }
+      if (value.status === "changed-during-read") {
+        return failed(
+          context,
+          contractError("target-stale", "Clipboard изменился во время чтения", "clipboard-read", true, true, "retry-read-only"),
+          call.report,
+          "none",
+          "unknown",
+        )
+      }
+      return failed(
+        context,
+        contractError(
+          value.status === "payload-too-large" ? "payload-too-large" : "capability-unavailable",
+          `Clipboard read завершился: ${value.status}`,
+          "clipboard-read",
+          false,
+          false,
+          "none",
+        ),
+        call.report,
+        "none",
+        "unknown",
+      )
+    } catch (error) {
+      return backendFailure(context, error, "clipboard.read")
+    }
+  }
+
+  async #write(
+    context: RuntimeOperationContext<ClipboardExecutionContext>,
+    request: z.infer<typeof clipboardWriteRequestSchema>,
+  ): Promise<ClipboardAdapterResult> {
+    if (
+      request.expectedVersion !== undefined
+      && request.expectedVersion.backendBuildId !== this.backend.buildId
+    ) {
+      return failed(
+        context,
+        contractError(
+          "backend-version-mismatch",
+          "Clipboard expectedVersion принадлежит другому backend build",
+          "clipboard-write-precondition",
+          false,
+          false,
+          "inspect-health",
+        ),
+        notDispatchedReport("clipboard.write"),
+        "none",
+        "unknown",
+      )
     }
 
     try {
-      if (
-        request.expectedVersion !== undefined
-        && request.expectedVersion.backendBuildId !== this.backend.buildId
-      ) {
-        return failure(context, contractErrorSchema.parse({
-          code: "backend-version-mismatch",
-          message: "Clipboard expectedVersion принадлежит другому backend build",
-          stage: "clipboard-write-precondition",
-          retryable: false,
-          replayAllowed: false,
-          recoveryAction: "inspect-health",
-        }), "none", "complete")
-      }
       await context.control.checkpoint("clipboard.write")
-      const written = await this.backend.writeText(
+      const call = await this.backend.conditionalWrite(
+        context,
         request.text,
         request.expectedVersion?.changeCount,
-        context.control,
       )
-      const bytes = new TextEncoder().encode(request.text).byteLength
-      const value = clipboardResultSchema.parse({
-        kind: "write",
-        length: request.text.length,
-        bytes,
-        version: { backendBuildId: this.backend.buildId, changeCount: written.changeCount },
-      })
-      return {
-        ok: true,
-        value,
-        outcome: outcome(context, "finished", "verified", "complete"),
+      const value = call.value
+      if (value.status === "written") {
+        const bytes = new TextEncoder().encode(request.text).byteLength
+        return clipboardAdapterResultSchema.parse({
+          ok: true,
+          value: {
+            kind: "write",
+            status: "written",
+            length: request.text.length,
+            bytes,
+            version: { backendBuildId: this.backend.buildId, changeCount: value.afterChangeCount },
+            beforeChangeCount: value.beforeChangeCount,
+            declaredChangeCount: value.declaredChangeCount,
+            afterChangeCount: value.afterChangeCount,
+            atomicPrecondition: false,
+          },
+          outcome: pendingOutcome(context, "finished", "verified"),
+          clipboard: call.report,
+        })
       }
-    } catch {
-      return failure(
+      if (value.status === "precondition-mismatch-no-dispatch") {
+        return failed(
+          context,
+          contractError(
+            "target-stale",
+            "Clipboard expectedChangeCount больше не актуален",
+            "clipboard-write-precondition",
+            true,
+            false,
+            "none",
+          ),
+          call.report,
+          "none",
+          "unknown",
+        )
+      }
+      if (value.status === "partial-or-unknown") {
+        return failed(
+          context,
+          contractError(
+            "operation-outcome-unknown",
+            "Clipboard write начат, но итог ownership не подтверждён",
+            "clipboard-write",
+            false,
+            false,
+            "get-operation",
+          ),
+          call.report,
+          "unknown",
+          "unknown",
+        )
+      }
+      return failed(
         context,
-        contractErrorSchema.parse({
-          code: "operation-outcome-unknown",
-          message: "Clipboard write outcome не подтверждён; payload исключён из результата",
-          stage: "clipboard-write",
-          retryable: false,
-          replayAllowed: false,
-          recoveryAction: "get-operation",
-        }),
-        "unknown",
+        contractError(
+          value.status === "payload-too-large" ? "payload-too-large" : "capability-unavailable",
+          `Clipboard write отклонён: ${value.status}; payload исключён`,
+          "clipboard-write",
+          false,
+          false,
+          "none",
+        ),
+        call.report,
+        "none",
         "unknown",
       )
+    } catch (error) {
+      return backendFailure(context, error, "clipboard.write")
     }
   }
 
@@ -190,66 +337,134 @@ export class SystemClipboardAdapter implements SharedClipboardAdapter<ClipboardR
   }
 }
 
-function errorFrom(
+function backendFailure(
+  context: RuntimeOperationContext<ClipboardExecutionContext>,
   error: unknown,
-  stage: string,
-  fallbackCode: ContractError["code"] = "invalid-request",
-): ContractError {
-  if (typeof error === "object" && error !== null && "contract" in error) {
-    const parsed = contractErrorSchema.safeParse((error as { contract: unknown }).contract)
-    if (parsed.success) return parsed.data
+  command: ClipboardBackendReport["command"],
+): ClipboardAdapterResult {
+  if (error instanceof ClipboardBackendError) {
+    const unknownWrite = command === "clipboard.write"
+      && error.report.mutationAttempted === "unknown"
+    return failed(
+      context,
+      unknownWrite
+        ? contractError(
+            "operation-outcome-unknown",
+            "Native clipboard write response недоступен; payload исключён",
+            "clipboard-write",
+            false,
+            false,
+            "get-operation",
+          )
+        : errorFrom(error, command),
+      error.report,
+      unknownWrite ? "unknown" : "none",
+      "unknown",
+    )
   }
-  return contractErrorSchema.parse({
-    code: fallbackCode,
-    message: (error instanceof Error ? error.message : "Неизвестная clipboard ошибка").slice(0, 2_048),
-    stage,
-    retryable: false,
-    replayAllowed: false,
-    recoveryAction: fallbackCode === "operation-outcome-unknown" ? "get-operation" : "none",
+  return failed(
+    context,
+    errorFrom(error, command),
+    notDispatchedReport(command),
+    "none",
+    "unknown",
+  )
+}
+
+function failed(
+  context: RuntimeOperationContext<ClipboardExecutionContext>,
+  error: ContractError,
+  clipboard: ClipboardBackendReport,
+  dispatch: OperationOutcome["dispatch"],
+  targetVerified: OperationOutcome["targetVerified"],
+): ClipboardAdapterResult {
+  return clipboardAdapterResultSchema.parse({
+    ok: false,
+    error,
+    outcome: pendingOutcome(context, dispatch, targetVerified),
+    clipboard,
   })
 }
 
-function failure(
-  context: RuntimeOperationContext<ClipboardExecutionContext>,
-  error: ContractError,
-  dispatch: OperationOutcome["dispatch"],
-  cleanup: "complete" | "unknown",
-): AdapterResult<ClipboardResult> {
-  return {
-    ok: false,
-    error,
-    outcome: outcome(context, dispatch, "unknown", cleanup),
-  }
-}
-
-function outcome(
+function pendingOutcome(
   context: RuntimeOperationContext<ClipboardExecutionContext>,
   dispatch: OperationOutcome["dispatch"],
   targetVerified: OperationOutcome["targetVerified"],
-  cleanupState: "complete" | "unknown",
 ): OperationOutcome {
-  const cleanup = context.resources.length === 0
-    ? { scope: "none" as const, state: "complete" as const, resources: [] as [] }
-    : cleanupState === "complete"
-      ? {
-          scope: "owned" as const,
-          state: "complete" as const,
-          resources: context.resources.map(handle => ({ handle, outcome: "released" as const })),
-        }
-      : {
-          scope: "owned" as const,
-          state: "unknown" as const,
-          reason: "Clipboard write outcome не подтверждён",
-          resources: context.resources.map(handle => ({ handle, outcome: "quarantined" as const })),
-        }
-  return {
+  return operationOutcomeSchema.parse({
     dispatch,
     targetVerified,
     userInterference: "unknown",
     observation: "unavailable",
     effect: { state: "unverified", proofRefs: [] },
-    cleanup,
+    cleanup: context.resources.length === 0
+      ? { scope: "none", state: "complete", resources: [] }
+      : {
+          scope: "owned",
+          state: "pending",
+          resources: context.resources.map(handle => ({ handle, outcome: "held" })),
+        },
     restoration: "not-applicable",
     dispatchAttempts: dispatch === "none" ? 0 : 1,
-  }
+  })
 }
+
+function notDispatchedReport(command: ClipboardBackendReport["command"]): ClipboardBackendReport {
+  return clipboardBackendReportSchema.parse({
+    authority: "adapter-precondition",
+    command,
+    status: "not-dispatched",
+    mutationAttempted: "false",
+    atomicPrecondition: false,
+  })
+}
+
+function errorFrom(error: unknown, stage: string): ContractError {
+  if (error instanceof ClipboardBackendError && error.contract !== undefined) {
+    const parsed = contractErrorSchema.safeParse(error.contract)
+    if (parsed.success) {
+      return {
+        ...parsed.data,
+        message: stage === "clipboard.write"
+          ? "Native clipboard write завершился ошибкой; payload исключён"
+          : parsed.data.message,
+      }
+    }
+  }
+  if (typeof error === "object" && error !== null && "contract" in error) {
+    const parsed = contractErrorSchema.safeParse((error as { contract: unknown }).contract)
+    if (parsed.success) return parsed.data
+  }
+  return contractError(
+    "invalid-request",
+    (error instanceof Error ? error.message : "Неизвестная clipboard ошибка").slice(0, 2_048),
+    stage,
+    false,
+    false,
+    "none",
+  )
+}
+
+function contractError(
+  code: ContractError["code"],
+  message: string,
+  stage: string,
+  retryable: boolean,
+  replayAllowed: boolean,
+  recoveryAction: ContractError["recoveryAction"],
+): ContractError {
+  return contractErrorSchema.parse({
+    code,
+    message,
+    stage,
+    retryable,
+    replayAllowed,
+    recoveryAction,
+  })
+}
+
+function isWriteLike(value: unknown): boolean {
+  return typeof value === "object" && value !== null && (value as { kind?: unknown }).kind === "write"
+}
+
+export type GenericClipboardAdapterResult = AdapterResult<ClipboardResult>

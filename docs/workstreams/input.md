@@ -117,9 +117,10 @@ clipboard module tests passed
 - `input/src/clipboard-adapter.ts`:
   - отдельные explicit read/write/version операции;
   - exact `clipboard:system` resource и generation/session checks;
-  - write expected-version передаётся backend атомарно;
+  - write expected-version передаётся как optimistic precondition без CAS claim;
   - UTF-8 byte budget; write payload отсутствует в result/error;
-  - неизвестный write outcome запрещает replay и quarantines resource.
+  - неизвестный write outcome запрещает replay и удерживает resource до
+    Runtime-owned quarantine/finalization.
 - `input/tests/clipboard.test.ts` теперь live opt-in только при
   `AI_MACOS_LIVE_CLIPBOARD=true`; по умолчанию системный clipboard не читается и
   не изменяется. Gate проверяется на fake environment.
@@ -132,6 +133,8 @@ clipboard module tests passed
 - `@meta/input/authorization` → `input/src/authorization.ts`
 - `@meta/input/native-action` → `input/src/native-action.ts`
 - `@meta/input/clipboard-adapter` → `input/src/clipboard-adapter.ts`
+- `@meta/input/native-clipboard-backend` →
+  `input/src/native-clipboard-backend.ts`
 
 `input/package.json` добавляет dependency `@meta/native: workspace:*`; ведущий
 добавил native в root workspaces и обновил lock. Других root manifest изменений
@@ -224,8 +227,9 @@ gate, дальнейшие прогоны используют только яв
    `input.execute` для остальных pointer/key/shortcut действий целиком. Text
    cluster path уже подтверждён fake end-to-end integration; input не реализует
    transport или ledger.
-3. Реального versioned clipboard backend с системным `changeCount` пока нет.
-   Legacy `pbpaste/pbcopy` нельзя выдать за этот контракт.
+3. Native versioned clipboard client реализован поверх broker protocol; Runtime
+   typed mapper и финальная real-backend acceptance ещё не завершены. Legacy
+   `pbpaste/pbcopy` нельзя выдать за этот контракт.
 4. `input.readiness` не объявляется реализованной данным adapter: passive/active
    probe и permission state принадлежат native/runtime.
 5. Legacy wildcard HTTP routes, mutating GET и raw global input удаляются только
@@ -239,3 +243,56 @@ native-owner завершает остальные `input.execute` действ�
 После этого ведущий выполняет runtime/MCP cutover и C3 acceptance. Live
 input/capture/clipboard и service restart выполняет только ведущий после
 отдельной проверки условий.
+
+## Clipboard protocol integration checkpoint
+
+После публикации `@meta/native/protocol` реализован production-facing, но
+полностью injected `NativeVersionedClipboardBackend`:
+
+- вызывает только `NativeBrokerAdapter.clipboard` с существующим
+  `ClipboardExecutionContext`, без native fence и второго lease owner;
+- связывает request/response identity через native protocol;
+- создаёт bounded metadata-only receipt после коррелированного native response;
+- хранит до 1 024 metadata reports без текста и предоставляет registered
+  `verifyReport`; caller report сам по себе authority не является;
+- correlated native error получает verified receipt, потерянный ответ остаётся
+  `unverified-request` с `mutationAttempted: unknown` для write;
+- write payload удаляется из error/report независимо от lower-layer message.
+
+`SystemClipboardAdapter` теперь возвращает input-owned strict
+`clipboardAdapterResultSchema`: общий `AdapterResult` плюс обязательный верхний
+`clipboard` report. Shared generic schema не ослаблялся. Cleanup остаётся
+`pending/held` до Runtime-owned trusted mapper, который обязан проверить report,
+затем сформировать обычный terminal `AdapterResult` для core.
+
+Typed outcomes:
+
+- coherent read → explicit text value + одинаковые before/after counts;
+- text unavailable → отдельный success без поля `text`;
+- changed during read → retryable read-only error;
+- written → measured before/declared/after и `atomicPrecondition: false`;
+- expected mismatch → no dispatch, retryable как новое осознанное действие,
+  `replayAllowed: false`;
+- partial/lost reply → unknown, `replayAllowed: false`, lease остаётся held до
+  Runtime quarantine/finalization.
+
+Focused checks:
+
+```text
+bun test input/tests/clipboard-adapter.test.ts \
+  input/tests/native-clipboard-backend.test.ts
+11 pass, 0 fail, 24 assertions
+
+bunx --no-install tsc --noEmit --strict --target ESNext \
+  --module Preserve --moduleResolution bundler \
+  --allowImportingTsExtensions --types bun \
+  input/src/clipboard-adapter.ts input/src/native-clipboard-backend.ts \
+  input/tests/clipboard-adapter.test.ts \
+  input/tests/native-clipboard-backend.test.ts
+exit 0
+```
+
+Системный clipboard не вызывался. Следующий обязательный owner checkpoint:
+Runtime handler валидирует/верифицирует extended result и проверяет через core
+success/mismatch/partial/lost reply; Native завершает build/command-loop mapping
+к уже принятому Objective-C ABI.

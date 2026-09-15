@@ -7,12 +7,17 @@ import {
 } from "@meta/shared/contracts"
 import {
   SystemClipboardAdapter,
-  type VersionedClipboardBackend,
 } from "../src/clipboard-adapter.ts"
-import { MAX_CLIPBOARD_TEXT_BYTES } from "../src/clipboard.ts"
+import {
+  ClipboardBackendError,
+  clipboardBackendReportSchema,
+  type ClipboardBackendReport,
+  type VersionedClipboardBackend,
+} from "../src/native-clipboard-backend.ts"
 
 const runtimeEpoch = "runtime:1"
 const loginSessionId = "login:1"
+const nativeGeneration = "native:1"
 const deadlineAt = "2026-09-15T10:01:00.000Z"
 const host = freezeAdapterHostContext({
   generation: { runtimeEpoch, loginSessionId },
@@ -63,21 +68,84 @@ const resource = {
   state: "active",
 } as const
 
+function report(
+  command: ClipboardBackendReport["command"],
+  status: ClipboardBackendReport["status"],
+  metadata: Partial<ClipboardBackendReport> = {},
+): ClipboardBackendReport {
+  return clipboardBackendReportSchema.parse({
+    authority: "verified-response",
+    command,
+    status,
+    receipt: {
+      receiptId: `receipt:${command}:${status}`,
+      adapterInstanceRef: "native-adapter:1",
+      backendBuildId: "native-build:1",
+      requestId: `native-request:${command}:${status}`,
+      operationId: wire.operationId,
+      runtimeEpoch,
+      loginSessionId,
+      nativeGeneration,
+    },
+    mutationAttempted: command === "clipboard.write" ? "true" : "false",
+    atomicPrecondition: false,
+    ...metadata,
+  })
+}
+
 function fixture(overrides: Partial<VersionedClipboardBackend> = {}) {
   const calls: Array<{ kind: string, text?: string, expected?: number }> = []
   const backend: VersionedClipboardBackend = {
-    buildId: "clipboard-build:1",
+    buildId: "native-build:1",
     async currentVersion() {
-      return 7
+      return {
+        value: { status: "ok", changeCount: 7 },
+        report: report("clipboard.version", "ok", { changeCount: 7 }),
+      }
     },
     async readText() {
       calls.push({ kind: "read" })
-      return { text: "секрет из clipboard", changeCount: 7 }
+      return {
+        value: {
+          status: "ok",
+          text: "секрет из clipboard",
+          utf8Bytes: 27,
+          beforeChangeCount: 7,
+          afterChangeCount: 7,
+        },
+        report: report("clipboard.read", "ok", {
+          beforeChangeCount: 7,
+          afterChangeCount: 7,
+          utf8Bytes: 27,
+        }),
+      }
     },
-    async writeText(text, expected) {
+    async conditionalWrite(_context, text, expected) {
       calls.push({ kind: "write", text, expected })
-      return { changeCount: 8 }
+      return {
+        value: {
+          status: "written",
+          beforeChangeCount: 7,
+          declaredChangeCount: 8,
+          afterChangeCount: 8,
+          mutationAttempted: true,
+          setStringSucceeded: true,
+          ownershipStableAfterWrite: true,
+          atomicPrecondition: false,
+          utf8Bytes: new TextEncoder().encode(text).byteLength,
+        },
+        report: report("clipboard.write", "written", {
+          beforeChangeCount: 7,
+          declaredChangeCount: 8,
+          afterChangeCount: 8,
+          mutationAttempted: "true",
+          setStringSucceeded: true,
+          ownershipStableAfterWrite: true,
+          utf8Bytes: new TextEncoder().encode(text).byteLength,
+        }),
+      }
     },
+    async verifyReport() {},
     ...overrides,
   }
   const checkpoints: string[] = []
@@ -134,8 +202,8 @@ function fixture(overrides: Partial<VersionedClipboardBackend> = {}) {
   }
 }
 
-describe("C2 clipboard adapter", () => {
-  test("read возвращает текст только явному caller вместе с version", async () => {
+describe("C3 clipboard adapter", () => {
+  test("explicit read возвращает coherent text и metadata-only report", async () => {
     const value = fixture()
     const result = await value.adapter.execute(value.context, { kind: "read" })
 
@@ -143,20 +211,22 @@ describe("C2 clipboard adapter", () => {
       ok: true,
       value: {
         kind: "read",
+        status: "ok",
         text: "секрет из clipboard",
-        length: 19,
-        version: { backendBuildId: "clipboard-build:1", changeCount: 7 },
+        version: { backendBuildId: "native-build:1", changeCount: 7 },
       },
+      outcome: { cleanup: { state: "pending" } },
+      clipboard: { authority: "verified-response", status: "ok" },
     })
-    expect(value.checkpoints).toEqual(["clipboard.authorize-context", "clipboard.read"])
+    expect(JSON.stringify(result.clipboard)).not.toContain("секрет из clipboard")
   })
 
-  test("write передаёт expected changeCount атомарному backend и не возвращает payload", async () => {
+  test("written сохраняет measured counts и не обещает CAS", async () => {
     const value = fixture()
     const result = await value.adapter.execute(value.context, {
       kind: "write",
       text: "секрет для записи",
-      expectedVersion: { backendBuildId: "clipboard-build:1", changeCount: 7 },
+      expectedVersion: { backendBuildId: "native-build:1", changeCount: 7 },
     })
 
     expect(value.calls).toEqual([{ kind: "write", text: "секрет для записи", expected: 7 }])
@@ -164,28 +234,72 @@ describe("C2 clipboard adapter", () => {
       ok: true,
       value: {
         kind: "write",
-        version: { backendBuildId: "clipboard-build:1", changeCount: 8 },
+        status: "written",
+        beforeChangeCount: 7,
+        declaredChangeCount: 8,
+        afterChangeCount: 8,
+        atomicPrecondition: false,
       },
-      outcome: { dispatch: "finished", cleanup: { state: "complete" } },
+      outcome: { dispatch: "finished", cleanup: { state: "pending" } },
+      clipboard: { status: "written", atomicPrecondition: false },
     })
     expect(JSON.stringify(result)).not.toContain("секрет для записи")
   })
 
-  test("отклоняет oversized payload до backend", async () => {
-    const value = fixture()
+  test("precondition mismatch не исполняется и запрещает automatic replay", async () => {
+    const mismatch = report("clipboard.write", "precondition-mismatch-no-dispatch", {
+      beforeChangeCount: 8,
+      mutationAttempted: "false",
+    })
+    const value = fixture({
+      async conditionalWrite() {
+        return {
+          value: {
+            status: "precondition-mismatch-no-dispatch",
+            beforeChangeCount: 8,
+            mutationAttempted: false,
+            atomicPrecondition: false,
+          },
+          report: mismatch,
+        }
+      },
+    })
     const result = await value.adapter.execute(value.context, {
       kind: "write",
-      text: "x".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1),
+      text: "new",
+      expectedVersion: { backendBuildId: "native-build:1", changeCount: 7 },
     })
 
-    expect(result).toMatchObject({ ok: false, outcome: { dispatch: "none", cleanup: { state: "complete" } } })
-    expect(value.calls).toEqual([])
+    expect(result).toMatchObject({
+      ok: false,
+      error: { code: "target-stale", retryable: true, replayAllowed: false },
+      outcome: { dispatch: "none", cleanup: { state: "pending" } },
+      clipboard: { mutationAttempted: "false" },
+    })
   })
 
-  test("неизвестный write outcome quarantines lease без утечки текста", async () => {
+  test("partial write остаётся unknown и не раскрывает payload", async () => {
+    const partial = report("clipboard.write", "partial-or-unknown", {
+      beforeChangeCount: 7,
+      mutationAttempted: "true",
+      setStringSucceeded: false,
+      ownershipStableAfterWrite: false,
+      utf8Bytes: 27,
+    })
     const value = fixture({
-      async writeText(text) {
-        throw new Error(`backend disconnected while writing ${text}`)
+      async conditionalWrite() {
+        return {
+          value: {
+            status: "partial-or-unknown",
+            beforeChangeCount: 7,
+            mutationAttempted: true,
+            setStringSucceeded: false,
+            ownershipStableAfterWrite: false,
+            atomicPrecondition: false,
+            utf8Bytes: 27,
+          },
+          report: partial,
+        }
       },
     })
     const result = await value.adapter.execute(value.context, { kind: "write", text: "не логировать это" })
@@ -193,15 +307,62 @@ describe("C2 clipboard adapter", () => {
     expect(result).toMatchObject({
       ok: false,
       error: { code: "operation-outcome-unknown", replayAllowed: false },
-      outcome: { dispatch: "unknown", cleanup: { state: "unknown" } },
+      outcome: { dispatch: "unknown", cleanup: { state: "pending" } },
+      clipboard: { status: "partial-or-unknown" },
     })
     expect(JSON.stringify(result)).not.toContain("не логировать это")
   })
 
-  test("currentVersion использует отдельный explicit API", async () => {
+  test("lost reply остаётся unverified и удерживает lease", async () => {
+    const unavailable = clipboardBackendReportSchema.parse({
+      authority: "unverified-request",
+      command: "clipboard.write",
+      status: "response-unavailable",
+      requestId: "native-request:lost",
+      mutationAttempted: "unknown",
+      atomicPrecondition: false,
+    })
+    const value = fixture({
+      async conditionalWrite() {
+        throw new ClipboardBackendError("lost", undefined, unavailable)
+      },
+    })
+    const result = await value.adapter.execute(value.context, { kind: "write", text: "секрет lost reply" })
+
+    expect(result).toMatchObject({
+      ok: false,
+      error: { code: "operation-outcome-unknown", replayAllowed: false },
+      outcome: { cleanup: { state: "pending" } },
+      clipboard: { authority: "unverified-request", mutationAttempted: "unknown" },
+    })
+    expect(JSON.stringify(result)).not.toContain("секрет lost reply")
+  })
+
+  test("text unavailable отличается от пустой строки", async () => {
+    const value = fixture({
+      async readText() {
+        return {
+          value: { status: "text-unavailable", beforeChangeCount: 9, afterChangeCount: 9 },
+          report: report("clipboard.read", "text-unavailable", {
+            beforeChangeCount: 9,
+            afterChangeCount: 9,
+          }),
+        }
+      },
+    })
+    const result = await value.adapter.execute(value.context, { kind: "read" })
+
+    expect(result).toMatchObject({
+      ok: true,
+      value: { kind: "read", status: "text-unavailable", version: { changeCount: 9 } },
+    })
+    expect(result.ok && "text" in result.value).toBe(false)
+  })
+
+  test("currentVersion использует тот же ClipboardExecutionContext", async () => {
     const value = fixture()
     await expect(value.adapter.currentVersion(value.context)).resolves.toEqual({
-      backendBuildId: "clipboard-build:1",
+      backendBuildId: "native-build:1",
       changeCount: 7,
     })
   })

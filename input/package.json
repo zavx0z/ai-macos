@@ -11,7 +11,8 @@
     "./actions": "./src/actions.ts",
     "./authorization": "./src/authorization.ts",
     "./clipboard-adapter": "./src/clipboard-adapter.ts",
-    "./native-action": "./src/native-action.ts"
+    "./native-action": "./src/native-action.ts",
+    "./native-clipboard-backend": "./src/native-clipboard-backend.ts"
   },
   "scripts": {
     "dev": "bun --hot src/index.ts",
