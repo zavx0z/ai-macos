@@ -61,6 +61,7 @@ export interface PersistentOperationJournal {
     options?: OperationJournalPersistOptions,
   ): Promise<StoredOperationEvidence>
   read(key: OperationJournalKey): Promise<StoredOperationEvidence | undefined>
+  loadAll?(): Promise<StoredOperationEvidence[]>
   loadRecoveryEvidence(): Promise<StoredOperationEvidence[]>
 }
 
@@ -139,19 +140,27 @@ export class FileOperationJournal implements PersistentOperationJournal {
 
   async loadRecoveryEvidence(): Promise<StoredOperationEvidence[]> {
     return await this.#exclusive(async () => {
-      const evidence: StoredOperationEvidence[] = []
-      for (const path of await storageFiles(this.#directory)) {
-        const envelope = await this.#readEnvelope(path)
-        if (envelope === undefined) throw new Error(`Operation journal record исчез: ${path}`)
-        if (requiresRecovery(envelope.record)) {
-          evidence.push({
-            revision: envelope.revision,
-            record: structuredClone(envelope.record),
-          })
-        }
-      }
-      return evidence
+      return (await this.#loadAllEvidence()).filter(evidence => {
+        return requiresRecovery(evidence.record)
+      })
     })
+  }
+
+  async loadAll(): Promise<StoredOperationEvidence[]> {
+    return await this.#exclusive(async () => await this.#loadAllEvidence())
+  }
+
+  async #loadAllEvidence(): Promise<StoredOperationEvidence[]> {
+    const evidence: StoredOperationEvidence[] = []
+    for (const path of await storageFiles(this.#directory)) {
+      const envelope = await this.#readEnvelope(path)
+      if (envelope === undefined) throw new Error(`Operation journal record исчез: ${path}`)
+      evidence.push({
+        revision: envelope.revision,
+        record: structuredClone(envelope.record),
+      })
+    }
+    return evidence
   }
 
   async #readEnvelope(path: string): Promise<OperationEnvelope | undefined> {
