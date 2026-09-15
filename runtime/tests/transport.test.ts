@@ -93,6 +93,62 @@ test("UDS callTool использует advertised method budget вместо к
   } finally { await server.stop(); await rm(directory, { recursive: true, force: true }) }
 })
 
+test("catalog subscription сравнивает parsed descriptors при совпавшем revision и не шумит без изменений", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "runtime-catalog-fingerprint-"))
+  const socketPath = join(directory, "runtime.sock")
+  const credentialPath = join(directory, "credential.json")
+  const core = new RuntimeCore({ generation, runtimeBuildId: "build:catalog-fingerprint" })
+  const credential = core.openClient("catalog-fingerprint")
+  await writeFile(credentialPath, JSON.stringify({ protocolVersion: "1", ...generation,
+    principalId: "catalog-fingerprint", bootstrapToken: "bootstrap:catalog-fingerprint" }), { mode: 0o600 })
+  const descriptor = (coordinateSchema: Record<string, unknown>) => ({
+    name: "click", title: "Click", description: "Click exact point",
+    inputSchema: { type: "object", properties: { coordinates: coordinateSchema } },
+    outputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: false, destructiveHint: true, openWorldHint: false },
+    _meta: { maxRequestBytes: 1024, maxResponseBytes: 1024, timeoutMs: 5000 },
+  })
+  const original = { revision: 7, tools: [descriptor({ type: "string" })] }
+  const rebuilt = { revision: 7, tools: [descriptor({ type: "array", items: { type: "number" }, minItems: 2, maxItems: 2 })] }
+  const advanced = { revision: 8, tools: rebuilt.tools }
+  const catalogs = [original, rebuilt, rebuilt, advanced, advanced]
+  let catalogRequests = 0
+  const server = Bun.serve({ unix: socketPath, fetch(request) {
+    const path = new URL(request.url).pathname
+    if (path === "/v1/session/open") return fixtureJson(credential)
+    if (path === "/v1/session/close") return fixtureJson({ closed: true })
+    if (path === "/v1/catalog") {
+      const value = catalogs[Math.min(catalogRequests, catalogs.length - 1)]!
+      catalogRequests++
+      return fixtureJson(value)
+    }
+    return fixtureJson({ error: "not-found" }, 404)
+  } })
+  let client: RuntimeUdsClient | undefined
+  let unsubscribe: (() => void) | undefined
+  try {
+    client = await RuntimeUdsClient.fromCredentialFile(socketPath, credentialPath)
+    await client.open("catalog-fingerprint")
+    let notifications = 0
+    unsubscribe = client.subscribeCatalogChanged(() => { notifications++ })
+    await waitUntil(() => catalogRequests >= 1)
+    expect(notifications).toBe(0)
+    await waitUntil(() => catalogRequests >= 2)
+    expect(notifications).toBe(1)
+    await waitUntil(() => catalogRequests >= 3)
+    expect(notifications).toBe(1)
+    await waitUntil(() => catalogRequests >= 4)
+    expect(notifications).toBe(2)
+    await waitUntil(() => catalogRequests >= 5)
+    expect(notifications).toBe(2)
+  } finally {
+    unsubscribe?.()
+    await client?.close().catch(() => undefined)
+    server.stop(true)
+    await rm(directory, { recursive: true, force: true })
+  }
+}, 8_000)
+
 test("UDS автоматически renews после fake idle/outage дольше bearer TTL и close прекращает calls", async () => {
   const directory = await mkdtemp(join(tmpdir(), "runtime-renewal-"))
   const socketPath = join(directory, "runtime.sock")
@@ -346,3 +402,16 @@ test("reader timeout does not wait for never-resolving cancel and reports incomp
   expect(performance.now() - requestStarted).toBeLessThan(100)
   expect(requestStream.locked).toBe(false)
 })
+
+function fixtureJson(value: unknown, status = 200): Response {
+  return new Response(JSON.stringify(value), { status, headers: { "content-type": "application/json" } })
+}
+
+async function waitUntil(predicate: () => boolean, timeoutMs = 6_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!predicate()) {
+    if (Date.now() >= deadline) throw new Error("Fixture catalogue poll timeout")
+    await Bun.sleep(10)
+  }
+  await Bun.sleep(10)
+}

@@ -14,7 +14,7 @@ import {
 } from "@meta/shared/contracts"
 import { RuntimeCore } from "./core.ts"
 import { RuntimeContractError, contractErrorFrom } from "./errors.ts"
-import { randomIdSource, type RuntimeIdSource } from "./primitives.ts"
+import { canonicalJson, randomIdSource, type RuntimeIdSource } from "./primitives.ts"
 import { MethodRegistry, type RuntimeMethodResponse, type RuntimeToolDescriptor } from "./method-registry.ts"
 import { ClientRenewalCoordinator } from "./client-renewal.ts"
 
@@ -456,13 +456,15 @@ export class RuntimeUdsClient {
 
   subscribeCatalogChanged(listener: () => void): () => void {
     const controller = new AbortController()
-    let revision: number | undefined
+    let fingerprint: string | undefined
     let timer: ReturnType<typeof setTimeout> | undefined
     const poll = async () => {
       try {
         const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog", { signal: controller.signal }))
-        if (revision !== undefined && catalog.revision !== revision) listener()
-        revision = catalog.revision
+        const nextFingerprint = canonicalJson(catalog)
+        const changed = fingerprint !== undefined && nextFingerprint !== fingerprint
+        fingerprint = nextFingerprint
+        if (changed) listener()
       } catch { /* Переподключение каталога повторится на следующем ограниченном запросе. */ }
       if (!controller.signal.aborted) timer = setTimeout(() => void poll(), 1000)
     }
