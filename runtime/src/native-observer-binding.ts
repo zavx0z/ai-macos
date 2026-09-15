@@ -1,6 +1,8 @@
 import type { ObservedEvent, ObserverCoverage } from "@meta/shared/contracts"
 import {
   nativeObserverRequestSchema,
+  nativeObserverResponseSchema,
+  nativeObserverResponseMatches,
   type NativeObserverSnapshot,
 } from "@meta/native/protocol"
 import {
@@ -9,6 +11,7 @@ import {
 } from "./observer-hub.ts"
 
 const OBSERVER_CONTROL_MS = 1_000
+const OBSERVER_PREPARE_MS = 6_000
 
 export type NativeObserverBinding = Readonly<{
   hub: RuntimeNativeObserverHub
@@ -21,7 +24,9 @@ export type NativeObserverBinding = Readonly<{
 export async function createNativeObserverBinding(options: {
   native: NativeObserverClient
   onGap?: (error: Error) => void
+  signal?: AbortSignal
 }): Promise<NativeObserverBinding> {
+  options.signal?.throwIfAborted()
   const generation = options.native.generation
   if (generation === undefined) throw new Error("Native observer handshake не завершён")
   const prepare = nativeObserverRequestSchema.parse({
@@ -30,34 +35,65 @@ export async function createNativeObserverBinding(options: {
     requestId: `observer-prepare:${crypto.randomUUID()}`,
     ...generation,
     command: "prepare",
-    deadlineAt: new Date(Date.now() + OBSERVER_CONTROL_MS).toISOString(),
+    deadlineAt: new Date(Date.now() + OBSERVER_PREPARE_MS).toISOString(),
   })
   const prepareController = new AbortController()
+  const onCallerAbort = () => prepareController.abort(options.signal?.reason)
+  options.signal?.addEventListener("abort", onCallerAbort, { once: true })
+  if (options.signal?.aborted) onCallerAbort()
   const prepareTimer = setTimeout(
     () => prepareController.abort("observer prepare deadline"),
-    OBSERVER_CONTROL_MS,
+    OBSERVER_PREPARE_MS,
   )
-  let snapshot: NativeObserverSnapshot
-  try {
-    const response = await settle(options.native.observer(prepare, {
+  const preparing = Promise.resolve().then(async () => {
+    prepareController.signal.throwIfAborted()
+    const response = nativeObserverResponseSchema.parse(await options.native.observer(prepare, {
       signal: prepareController.signal,
       checkpoint: () => { prepareController.signal.throwIfAborted() },
-    }), OBSERVER_CONTROL_MS, "observer prepare")
+    }))
+    if (!nativeObserverResponseMatches(prepare, response, options.native.loadedBuildId)) throw new Error("Observer prepare response не соответствует request/binding")
+    return response
+  })
+  let snapshot: NativeObserverSnapshot | undefined
+  try {
+    const response = await settle(preparing, OBSERVER_PREPARE_MS, "observer prepare", prepareController.signal)
     if (!response.ok) throw new Error(response.error.message)
     snapshot = structuredClone(response.snapshot)
+    prepareController.signal.throwIfAborted()
+  } catch (error) {
+    if (snapshot !== undefined) {
+      await stopObserver(options.native, snapshot.observerInstanceRef).catch(cause => {
+        options.onGap?.(new Error("Observer cleanup после отмены не подтверждён", { cause }))
+      })
+    } else {
+      void preparing.then(async response => {
+        if (!response.ok) return
+        await stopObserver(options.native, response.snapshot.observerInstanceRef).catch(cause => {
+          options.onGap?.(new Error("Late observer cleanup не подтверждён", { cause }))
+        })
+      }, () => undefined)
+    }
+    throw error
   } finally {
     clearTimeout(prepareTimer)
+    options.signal?.removeEventListener("abort", onCallerAbort)
   }
 
-  const hub = new RuntimeNativeObserverHub({
-    native: options.native,
-    snapshot,
-    onGap: options.onGap,
-  })
+  let hub: RuntimeNativeObserverHub
   try {
+    options.signal?.throwIfAborted()
+    hub = new RuntimeNativeObserverHub({
+      native: options.native,
+      snapshot,
+      onGap: options.onGap,
+    })
     hub.start()
   } catch (error) {
-    await stopObserver(options.native, snapshot.observerInstanceRef).catch(() => undefined)
+    try {
+      await stopObserver(options.native, snapshot.observerInstanceRef)
+    } catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], "Observer startup и cleanup не подтверждены")
+    }
     throw error
   }
 
@@ -110,17 +146,22 @@ async function stopObserver(
   }
 }
 
-async function settle<T>(promise: Promise<T>, timeoutMs: number, stage: string): Promise<T> {
+async function settle<T>(promise: Promise<T>, timeoutMs: number, stage: string, signal?: AbortSignal): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined
+  let onAbort: (() => void) | undefined
   try {
     return await Promise.race([
       promise,
       new Promise<never>((_, reject) => {
+        onAbort = () => reject(signal?.reason ?? new Error(`${stage} отменён`))
+        signal?.addEventListener("abort", onAbort, { once: true })
+        if (signal?.aborted) onAbort()
         timer = setTimeout(() => reject(new Error(`${stage} не завершён bounded`)), timeoutMs)
       }),
     ])
   } finally {
     if (timer !== undefined) clearTimeout(timer)
+    if (onAbort !== undefined) signal?.removeEventListener("abort", onAbort)
   }
 }
 

@@ -373,11 +373,15 @@ function deviceVerifier(
       if (target.kind !== "device-browser-instance") throw new Error("Device browser instance expected")
       control(signal).checkpoint()
       adapter.assertConnectedExact(target.ref)
+      const forward = await driver.forwardStatus?.(signal)
+      if (forward?.state !== "owned") throw new Error("Android forward ownership не подтверждено")
     },
     async verifyRemoved(target: OperationTarget, signal: AbortSignal) {
       if (target.kind !== "device-browser-instance") throw new Error("Device browser instance expected")
       control(signal).checkpoint()
       adapter.assertDisconnectedExact(target.ref)
+      const forward = await driver.forwardStatus?.(signal)
+      if (forward?.state !== "absent") throw new Error("Android forward removal не подтверждено")
     },
     async verifyCompletion(_request: DeviceBrowserOperationRequest, result: AdapterResult<DeviceBrowserOperationResult>) {
       proof.assertVerified(result)
@@ -388,6 +392,8 @@ function deviceVerifier(
         control(signal).checkpoint()
         await driver.disconnect(serial, localPort)
         control(signal).checkpoint()
+        const forward = await driver.forwardStatus?.(signal)
+        if (forward?.state !== "absent") throw new Error("Android recovery требует доказанно отсутствующий forward")
       })
     },
   }

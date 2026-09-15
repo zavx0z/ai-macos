@@ -406,7 +406,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
               const signal = AbortSignal.any([AbortSignal.timeout(6000), preparationAbort.signal])
               await windows.inventory({ signal, checkpoint() { signal.throwIfAborted() } })
               signal.throwIfAborted()
-              observerBinding = await createNativeObserverBinding({ native: source, onGap(error) {
+              observerBinding = await createNativeObserverBinding({ native: source, signal: preparationAbort.signal, onGap(error) {
                 observerState = "unavailable"
                 observerReason = error.message
                 refreshCapabilities()

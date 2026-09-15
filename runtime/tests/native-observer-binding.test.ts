@@ -167,6 +167,67 @@ async function first(binding: NativeObserverBinding) {
 }
 
 describe("C3 native observer lifecycle binding", () => {
+  test("prepare использует6s, coverage/stop сохраняют1s", async () => {
+    const value = fixture()
+    const original = value.native.observer.bind(value.native)
+    const budgets = new Map<string, number>()
+    value.native.observer = async (request, control) => {
+      budgets.set(request.command, Date.parse(request.deadlineAt) - Date.now())
+      return original(request, control)
+    }
+    const binding = await createNativeObserverBinding({ native: value.native })
+    await binding.coverage()
+    await binding.close()
+    expect(budgets.get("prepare")).toBeGreaterThan(5500)
+    expect(budgets.get("prepare")).toBeLessThanOrEqual(6000)
+    expect(budgets.get("coverage")).toBeLessThanOrEqual(1000)
+    expect(budgets.get("stop")).toBeLessThanOrEqual(1000)
+  })
+
+  test("pre-aborted caller не вызывает native prepare", async () => {
+    const value = fixture()
+    const caller = new AbortController()
+    caller.abort(new Error("caller cancelled"))
+    await expect(createNativeObserverBinding({ native: value.native, signal: caller.signal })).rejects.toThrow("caller cancelled")
+    expect(value.calls).toEqual([])
+  })
+
+  test("отмена prepare возвращается сразу; late ACK очищается fresh stop signal", async () => {
+    const value = fixture()
+    const original = value.native.observer.bind(value.native)
+    const caller = new AbortController()
+    let entered!: () => void
+    let release!: () => void
+    let stopped!: () => void
+    const started = new Promise<void>(resolve => { entered = resolve })
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const cleanup = new Promise<void>(resolve => { stopped = resolve })
+    let prepareSignal: AbortSignal | undefined
+    let stopWasAborted: boolean | undefined
+    value.native.observer = async (request, control) => {
+      if (request.command === "prepare") {
+        prepareSignal = control.signal
+        entered()
+        await gate
+      }
+      const response = await original(request, control)
+      if (request.command === "stop") {
+        stopWasAborted = control.signal.aborted
+        stopped()
+      }
+      return response
+    }
+    const pending = createNativeObserverBinding({ native: value.native, signal: caller.signal })
+    await started
+    caller.abort(new Error("caller cancelled"))
+    await expect(pending).rejects.toThrow("caller cancelled")
+    expect(prepareSignal?.aborted).toBe(true)
+    release()
+    await cleanup
+    expect(stopWasAborted).toBe(false)
+    expect(value.calls).toEqual(["prepare", "stop"])
+  }, 1000)
+
   test("prepare немедленно запускает sole PUSH hub и close вызывает exact stop", async () => {
     const value = fixture()
     const gaps: Error[] = []
