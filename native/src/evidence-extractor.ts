@@ -14,6 +14,7 @@ import {
   nativeWindowTransitionResultSchema,
 } from "./protocol.ts"
 import type { NativeEvidenceBinder } from "./adapter.ts"
+import { nativeHitTestResultSchema } from "./hit-test-protocol.ts"
 
 export interface RuntimeNativeEvidenceAuthority {
   registerSourceExtractor(
@@ -57,6 +58,19 @@ export function extractNativeEvidenceReports(bytes: Uint8Array): readonly Native
   const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
   const frame = parseWireJson(nativeTransportResponseFrameSchema, text)
   if (frame.channel === "response" && frame.payload.ok) {
+    const hit = nativeHitTestResultSchema.safeParse(frame.payload.result)
+    if (hit.success) {
+      if (hit.data.status !== "confirmed") return []
+      if (hit.data.operationId !== frame.payload.operationId || !sameNativeGeneration(hit.data.interactionTarget.ref, frame.payload)) {
+        throw new Error("Point-hit response содержит другой operation или generation")
+      }
+      return [nativeEvidenceReportSchema.parse({
+        factKind: "point-hit", sourceResponseRef: hit.data.sourceResponseRef,
+        inventoryId: hit.data.inventoryId, inventoryRevision: hit.data.inventoryRevision, displayLayoutRevision: hit.data.displayLayoutRevision,
+        observedAt: hit.data.observedAt, observationId: hit.data.observationId, frameRef: hit.data.frameRef,
+        regionIndex: hit.data.regionIndex, imagePoint: hit.data.imagePoint, interactionTarget: hit.data.interactionTarget, expectedSpace: "macos-screen",
+      })]
+    }
     const bundle = applicationBundleResolutionSchema.safeParse(frame.payload.result)
     if (bundle.success) {
       if (!sameNativeGeneration(bundle.data.target.ref, frame.payload)) throw new Error("Bundle resolution содержит другую native generation")

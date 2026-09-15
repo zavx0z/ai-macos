@@ -83,6 +83,15 @@ class FakeTransport implements NativeTransport {
       })
       return
     }
+    if (frame.channel === "observer") {
+      this.push({ kind: "message", frame: { channel: "observer", payload: {
+        kind: "observer-response", protocolVersion: "1", requestId: frame.payload.requestId, ...generation,
+        command: frame.payload.command, nativeBuildId: "native-build-1", ok: false,
+        error: { code: "permission-denied", message: "Fixture observer недоступен", stage: "observer-prepare",
+          retryable: false, replayAllowed: false, recoveryAction: "inspect-health" },
+      } } })
+      return
+    }
     if (frame.channel === "request" && frame.payload.method === "input.execute") {
       const fence = frame.payload.operation.fence
       this.push({
@@ -231,6 +240,75 @@ function inputRequest() {
 }
 
 describe("NativeBrokerAdapter", () => {
+  test("mutationDelivery подтверждает только зарегистрированный predispatch context", async () => {
+    const transport = new FakeTransport()
+    const adapter = new NativeBrokerAdapter({ ...evidenceOptions, host: host(), transport,
+      ledgerSink: { persist: async () => { throw new Error("ledger не ожидался") } } })
+    try {
+      await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "delivery-handshake",
+        runtimeEpoch: generation.runtimeEpoch, loginSessionId: generation.loginSessionId, runtimeBuildId: "runtime-build-1",
+        expectedNativeBuildId: "native-build-1", capabilitySchemaVersion: "1" })
+      const request = nativeInputExecutionRequestSchema.parse(inputRequest())
+      expect(() => adapter.mutationDelivery.assertNeverAttempted(request.operation)).toThrow("never-attempted")
+      adapter.mutationDelivery.register(request.operation)
+      expect(() => adapter.mutationDelivery.assertNeverAttempted(request.operation)).not.toThrow()
+      await expect(adapter.request(nativeInputExecutionRequestSchema, request, nativeInputExecutionResponseSchema,
+        { signal: AbortSignal.abort(new Error("pre-aborted")), checkpoint: () => undefined })).rejects.toThrow("pre-aborted")
+      expect(() => adapter.mutationDelivery.assertNeverAttempted(request.operation)).not.toThrow()
+      await adapter.request(nativeInputExecutionRequestSchema, request, nativeInputExecutionResponseSchema,
+        { signal: new AbortController().signal, checkpoint: () => undefined })
+      adapter.mutationDelivery.register(request.operation)
+      expect(() => adapter.mutationDelivery.assertNeverAttempted(request.operation)).toThrow("never-attempted")
+      expect(() => adapter.mutationDelivery.register({ ...request.operation, inventoryRevision: 2 })).toThrow()
+      const failed = nativeInputExecutionRequestSchema.parse({ ...request, requestId: "send-failed", operation: {
+        ...request.operation, operationId: "send-failed-operation", fence: { ...request.operation.fence, counter: 2 },
+      } })
+      adapter.mutationDelivery.register(failed.operation)
+      transport.send = async () => { throw new Error("send rejected") }
+      await expect(adapter.request(nativeInputExecutionRequestSchema, failed, nativeInputExecutionResponseSchema,
+        { signal: new AbortController().signal, checkpoint: () => undefined })).rejects.toThrow("send rejected")
+      expect(() => adapter.mutationDelivery.assertNeverAttempted(failed.operation)).toThrow("never-attempted")
+    } finally { await adapter.close() }
+  })
+  test("PUSH observer event сохраняет instance и имеет единственного consumer", async () => {
+    const transport = new FakeTransport()
+    const adapter = new NativeBrokerAdapter({ ...evidenceOptions, host: host(), transport,
+      ledgerSink: { persist: async () => { throw new Error("ledger не ожидался") } } })
+    const controller = new AbortController()
+    try {
+      await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "events-handshake",
+        runtimeEpoch: generation.runtimeEpoch, loginSessionId: generation.loginSessionId, runtimeBuildId: "runtime-build-1",
+        expectedNativeBuildId: "native-build-1", capabilitySchemaVersion: "1" })
+      const first = adapter.events(controller.signal)[Symbol.asyncIterator]()
+      const pending = first.next()
+      const second = adapter.events(controller.signal)[Symbol.asyncIterator]()
+      await expect(second.next()).rejects.toThrow("один host observer consumer")
+      transport.push({ kind: "message", frame: { channel: "event", payload: {
+        observerInstanceRef: "observer-instance", ...generation,
+        event: { eventId: "event-1", ...generation, cursor: "cursor-1", sequence: 1, observedAt: now, kind: "input", source: "unknown" },
+      } } })
+      const item = await pending
+      expect(item.value?.observerInstanceRef).toBe("observer-instance")
+      expect(item.value?.eventId).toBe("event-1")
+      await first.return?.()
+    } finally { controller.abort(); await adapter.close() }
+  })
+  test("observer channel сохраняет typed отказ без объявления ready", async () => {
+    const transport = new FakeTransport()
+    const adapter = new NativeBrokerAdapter({ ...evidenceOptions, host: host(), transport,
+      ledgerSink: { persist: async () => { throw new Error("ledger не ожидался") } } })
+    try {
+      await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "observer-handshake",
+        runtimeEpoch: generation.runtimeEpoch, loginSessionId: generation.loginSessionId, runtimeBuildId: "runtime-build-1",
+        expectedNativeBuildId: "native-build-1", capabilitySchemaVersion: "1" })
+      const response = await adapter.observer({ kind: "observer", protocolVersion: "1", requestId: "observer-prepare",
+        ...generation, command: "prepare", deadlineAt: deadline }, { signal: new AbortController().signal, checkpoint: () => undefined })
+      expect(response.ok).toBe(false)
+      if (response.ok) throw new Error("Fixture не должен объявить observer готовым")
+      expect(response.error.code).toBe("permission-denied")
+      expect(transport.sent.at(-1)?.channel).toBe("observer")
+    } finally { await adapter.close() }
+  })
   test("pre-aborted request не отправляется и не занимает requestId/binary waiter", async () => {
     const transport = new FakeTransport()
     const adapter = new NativeBrokerAdapter({

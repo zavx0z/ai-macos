@@ -32,8 +32,7 @@ typedef NSDictionary *_Nullable (^MetaObserverFocusResolver)(
 - (void)recordWindowStructureTarget:(NSDictionary *)target;
 - (void)recordLifecycle:(NSString *)lifecycle
       nextLoginSessionId:(nullable NSString *)nextLoginSessionId;
-- (void)recordCurrentSessionReadiness:(NSString *)state
-                              evidence:(NSString *)evidence;
+- (void)recordCurrentSessionReadiness:(NSDictionary *)readiness;
 - (NSDictionary *)currentSessionReadiness;
 - (void)recordCoverageKind:(NSString *)kind
                  available:(BOOL)available

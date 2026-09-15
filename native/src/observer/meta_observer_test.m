@@ -31,8 +31,16 @@ static void mark_all_coverage_ready(MetaNativeObserver *observer) {
   [observer recordCoverageKind:@"window-structure"
                      available:YES
                         reason:nil];
-  [observer recordCurrentSessionReadiness:@"active-unlocked"
-                                  evidence:@"fixture-session-probe"];
+  [observer recordCoverageKind:@"lifecycle" available:YES reason:nil];
+  [observer recordCurrentSessionReadiness:@{
+    @"state" : @"active-console",
+    @"lockState" : @"unknown",
+    @"userId" : @501,
+    @"onConsole" : @YES,
+    @"loginDone" : @YES,
+    @"auditSessionId" : @42,
+    @"evidence" : @"fixture-session-probe",
+  }];
 }
 
 static void test_exact_synthetic_ownership_and_focus(void) {
@@ -103,10 +111,8 @@ static void test_subscription_gap_and_target_generation(void) {
   [sessionUnknown recordCoverageKind:@"window-structure"
                            available:YES
                               reason:nil];
-  [sessionUnknown recordCoverageKind:@"lifecycle"
-                           available:YES
-                              reason:nil];
-  assert([sessionUnknown.coverage[@"state"] isEqual:@"unavailable"]);
+  [sessionUnknown recordCoverageKind:@"lifecycle" available:YES reason:nil];
+  assert([sessionUnknown.coverage[@"state"] isEqual:@"ready"]);
   assert([sessionUnknown.currentSessionReadiness[@"state"]
       isEqual:@"unknown"]);
 
@@ -123,10 +129,13 @@ static void test_subscription_gap_and_target_generation(void) {
   MetaNativeObserver *locked =
       [[MetaNativeObserver alloc] initWithGeneration:generation()];
   mark_all_coverage_ready(locked);
-  [locked recordCurrentSessionReadiness:@"locked"
-                                evidence:@"fixture-lock-event"];
-  assert([locked.coverage[@"state"] isEqual:@"unavailable"]);
-  assert([locked.currentSessionReadiness[@"state"] isEqual:@"locked"]);
+  [locked recordCurrentSessionReadiness:@{
+    @"state" : @"unknown",
+    @"lockState" : @"locked",
+    @"evidence" : @"fixture-lock-event",
+  }];
+  assert([locked.coverage[@"state"] isEqual:@"ready"]);
+  assert([locked.currentSessionReadiness[@"lockState"] isEqual:@"locked"]);
 
   MetaNativeObserver *foreign =
       [[MetaNativeObserver alloc] initWithGeneration:generation()];

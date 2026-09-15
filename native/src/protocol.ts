@@ -37,6 +37,12 @@ import { nativeClipboardRequestSchema, nativeClipboardResponseSchema, NATIVE_CLI
 export * from "./clipboard-protocol.ts"
 import { nativePermissionsRequestSchema, nativePermissionsResponseSchema } from "./permissions-protocol.ts"
 export * from "./permissions-protocol.ts"
+import { nativeHeldRecoveryRequestSchema, nativeHeldRecoveryResponseSchema } from "./recovery-protocol.ts"
+export * from "./recovery-protocol.ts"
+import { nativeObserverRequestSchema, nativeObserverResponseSchema, nativeObserverEventEnvelopeSchema } from "./observer-protocol.ts"
+export * from "./observer-protocol.ts"
+import { nativeHitTestRequestSchema, nativeHitTestResponseSchema } from "./hit-test-protocol.ts"
+export * from "./hit-test-protocol.ts"
 import {
   nativeApplicationResolveRequestSchema, nativeApplicationResolveResponseSchema,
   nativeApplicationLaunchRequestSchema, nativeApplicationLaunchResponseSchema,
@@ -701,6 +707,7 @@ export const nativeCaptureReleaseRequestSchema = createNativeMutationRequestEnve
 export const nativeCaptureReleaseResponseSchema = createNativeResponseEnvelopeSchema(nativeCaptureReleaseResultSchema)
 
 export const nativeMethodRequestSchema = z.union([
+  nativeHitTestRequestSchema,
   nativeApplicationResolveRequestSchema,
   nativeApplicationLaunchRequestSchema,
   nativeApplicationQuitRequestSchema,
@@ -716,6 +723,7 @@ export const nativeMethodRequestSchema = z.union([
 ])
 
 export const nativeMethodResponseSchema = z.union([
+  nativeHitTestResponseSchema,
   nativeApplicationResolveResponseSchema,
   nativeApplicationLaunchResponseSchema,
   nativeApplicationQuitResponseSchema,
@@ -731,6 +739,8 @@ export const nativeMethodResponseSchema = z.union([
 ])
 
 export const nativeTransportRequestFrameSchema = z.discriminatedUnion("channel", [
+  z.strictObject({ channel: z.literal("held-recovery"), payload: nativeHeldRecoveryRequestSchema }),
+  z.strictObject({ channel: z.literal("observer"), payload: nativeObserverRequestSchema }),
   z.strictObject({ channel: z.literal("permissions"), payload: nativePermissionsRequestSchema }),
   z.strictObject({ channel: z.literal("clipboard"), payload: nativeClipboardRequestSchema }),
   z.strictObject({ channel: z.literal("handshake"), payload: nativeHandshakeRequestSchema }),
@@ -744,6 +754,8 @@ export const nativeTransportRequestFrameSchema = z.discriminatedUnion("channel",
 ])
 
 export const nativeTransportResponseFrameSchema = z.discriminatedUnion("channel", [
+  z.strictObject({ channel: z.literal("held-recovery"), payload: nativeHeldRecoveryResponseSchema }),
+  z.strictObject({ channel: z.literal("observer"), payload: nativeObserverResponseSchema }),
   z.strictObject({ channel: z.literal("permissions"), payload: nativePermissionsResponseSchema }),
   z.strictObject({ channel: z.literal("clipboard"), payload: nativeClipboardResponseSchema }),
   z.strictObject({ channel: z.literal("handshake"), payload: nativeHandshakeResponseSchema }),
@@ -752,7 +764,7 @@ export const nativeTransportResponseFrameSchema = z.discriminatedUnion("channel"
   z.strictObject({ channel: z.literal("heartbeat"), payload: nativeHeartbeatAckSchema }),
   z.strictObject({ channel: z.literal("cancel"), payload: nativeCancelAckSchema }),
   z.strictObject({ channel: z.literal("drain"), payload: nativeDrainAckSchema }),
-  z.strictObject({ channel: z.literal("event"), payload: observedEventSchema }),
+  z.strictObject({ channel: z.literal("event"), payload: z.union([nativeObserverEventEnvelopeSchema, observedEventSchema]) }),
   z.strictObject({ channel: z.literal("cleanup"), payload: nativeCaptureCleanupResponseSchema }),
   z.strictObject({
     channel: z.literal("ledger-persist"),

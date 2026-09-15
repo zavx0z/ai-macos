@@ -126,9 +126,7 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   NSString *_lastEvent;
   NSString *_startCursor;
   NSString *_cursor;
-  NSString *_sessionState;
-  NSString *_sessionEvidence;
-  NSString *_sessionObservedAt;
+  NSDictionary *_sessionReadiness;
 }
 
 - (instancetype)initWithGeneration:(NSDictionary *)generation {
@@ -159,9 +157,12 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
     _cursor = _startCursor;
     _sequence = 1;
     _reason = @"Observer не запущен";
-    _sessionState = @"unknown";
-    _sessionEvidence = @"Current session state не подтверждён";
-    _sessionObservedAt = _startedAt;
+    _sessionReadiness = @{
+      @"state" : @"unknown",
+      @"lockState" : @"unknown",
+      @"evidence" : @"Current session state не подтверждён",
+      @"observedAt" : _startedAt,
+    };
   }
   return self;
 }
@@ -283,11 +284,11 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                                           usingBlock:^(__unused NSNotification *note) {
                                             [weakSelf recordLifecycle:lifecycle
                                                    nextLoginSessionId:nil];
-                                            [weakSelf recordCurrentSessionReadiness:
-                                                          [lifecycle isEqual:@"sleep"]
-                                                              ? @"inactive"
-                                                              : @"unknown"
-                                                                       evidence:name];
+                                            [weakSelf recordCurrentSessionReadiness:@{
+                                              @"state" : [lifecycle isEqual:@"sleep"] ? @"inactive" : @"unknown",
+                                              @"lockState" : @"unknown",
+                                              @"evidence" : name,
+                                            }];
                                             [weakSelf markUnavailable:@"Session lifecycle изменился; требуется новый observer snapshot"];
                                           }]];
   }
@@ -298,8 +299,11 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                                  queue:NSOperationQueue.mainQueue
                             usingBlock:^(__unused NSNotification *note) {
                               [weakSelf recordUnresolvedFocus:@"Workspace session стала inactive; lock/Fast User Switching не различены"];
-                              [weakSelf recordCurrentSessionReadiness:@"inactive"
-                                                              evidence:@"NSWorkspaceSessionDidResignActiveNotification"];
+                              [weakSelf recordCurrentSessionReadiness:@{
+                                @"state" : @"inactive",
+                                @"lockState" : @"unknown",
+                                @"evidence" : @"NSWorkspaceSessionDidResignActiveNotification",
+                              }];
                             }]];
   [_workspaceTokens
       addObject:[workspaceCenter
@@ -308,8 +312,11 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                                  queue:NSOperationQueue.mainQueue
                             usingBlock:^(__unused NSNotification *note) {
                               [weakSelf recordUnresolvedFocus:@"Workspace session снова active; unlocked state требует нового positive evidence"];
-                              [weakSelf recordCurrentSessionReadiness:@"unknown"
-                                                              evidence:@"NSWorkspaceSessionDidBecomeActiveNotification"];
+                              [weakSelf recordCurrentSessionReadiness:@{
+                                @"state" : @"unknown",
+                                @"lockState" : @"unknown",
+                                @"evidence" : @"NSWorkspaceSessionDidBecomeActiveNotification",
+                              }];
                             }]];
   NSDistributedNotificationCenter *distributed =
       NSDistributedNotificationCenter.defaultCenter;
@@ -326,22 +333,15 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                                        usingBlock:^(__unused NSNotification *note) {
                                          [weakSelf recordLifecycle:lifecycle
                                                 nextLoginSessionId:nil];
-                                         [weakSelf recordCurrentSessionReadiness:
-                                                       [lifecycle isEqual:@"lock"]
-                                                           ? @"locked"
-                                                           : @"unknown"
-                                                                    evidence:name];
+                                         [weakSelf recordCurrentSessionReadiness:@{
+                                           @"state" : @"unknown",
+                                           @"lockState" : [lifecycle isEqual:@"lock"] ? @"locked" : @"unknown",
+                                           @"evidence" : name,
+                                         }];
                                          [weakSelf markUnavailable:@"Lock state изменился; требуется новый observer snapshot"];
                                        }]];
   }
-  [_lock lock];
-  BOOL sessionReady = [_sessionState isEqual:@"active-unlocked"];
-  [_lock unlock];
-  [self recordCoverageKind:@"lifecycle"
-                 available:sessionReady
-                    reason:sessionReady
-                               ? nil
-                               : @"Initial active-unlocked session state не подтверждён"];
+  [self recordCoverageKind:@"lifecycle" available:YES reason:nil];
   _heartbeatTimer = [NSTimer
       scheduledTimerWithTimeInterval:0.25
                               repeats:YES
@@ -690,11 +690,6 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                  available:(BOOL)available
                     reason:(NSString *)reason {
   [_lock lock];
-  if ([kind isEqual:@"lifecycle"] && available &&
-      ![_sessionState isEqual:@"active-unlocked"]) {
-    available = NO;
-    reason = @"Lifecycle coverage требует positive active-unlocked evidence";
-  }
   if ([kind isEqual:@"input"]) _inputCoverage = available;
   else if ([kind isEqual:@"focus"]) _focusCoverage = available;
   else if ([kind isEqual:@"window-structure"]) _windowCoverage = available;
@@ -743,31 +738,41 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   [_lock unlock];
 }
 
-- (void)recordCurrentSessionReadiness:(NSString *)state
-                              evidence:(NSString *)evidence {
-  if (![@[@"active-unlocked", @"locked", @"inactive", @"unknown"]
-          containsObject:state]) {
-    state = @"unknown";
+- (void)recordCurrentSessionReadiness:(NSDictionary *)readiness {
+  NSString *state = readiness[@"state"];
+  NSString *lockState = readiness[@"lockState"];
+  NSString *evidence = readiness[@"evidence"];
+  BOOL valid = [@[@"active-console", @"inactive", @"unknown"]
+                   containsObject:state] &&
+               [@[@"locked", @"unknown"] containsObject:lockState] &&
+               [evidence isKindOfClass:NSString.class] && evidence.length > 0;
+  if ([state isEqual:@"active-console"]) {
+    NSNumber *userId = readiness[@"userId"];
+    NSNumber *onConsole = readiness[@"onConsole"];
+    NSNumber *loginDone = readiness[@"loginDone"];
+    NSNumber *auditSessionId = readiness[@"auditSessionId"];
+    valid = valid && [userId isKindOfClass:NSNumber.class] && userId.longLongValue >= 0 &&
+            [onConsole isEqual:@YES] && [loginDone isEqual:@YES] &&
+            [auditSessionId isKindOfClass:NSNumber.class] &&
+            auditSessionId.longLongValue >= 0;
+  }
+  NSMutableDictionary *value = [@{
+    @"state" : valid ? state : @"unknown",
+    @"lockState" : valid ? lockState : @"unknown",
+    @"evidence" : bounded_reason(valid ? evidence : @"Session readiness facts не прошли validation"),
+    @"observedAt" : observer_time(),
+  } mutableCopy];
+  for (NSString *key in @[@"userId", @"onConsole", @"loginDone", @"auditSessionId"]) {
+    if (valid && readiness[key] != nil) value[key] = readiness[key];
   }
   [_lock lock];
-  _sessionState = [state copy];
-  _sessionEvidence = bounded_reason(evidence);
-  _sessionObservedAt = observer_time();
+  _sessionReadiness = immutable_json_copy(value);
   [_lock unlock];
-  [self recordCoverageKind:@"lifecycle"
-                 available:[state isEqual:@"active-unlocked"]
-                    reason:[state isEqual:@"active-unlocked"]
-                               ? nil
-                               : @"Current session не подтверждена active-unlocked"];
 }
 
 - (NSDictionary *)currentSessionReadiness {
   [_lock lock];
-  NSDictionary *value = @{
-    @"state" : _sessionState,
-    @"evidence" : _sessionEvidence,
-    @"observedAt" : _sessionObservedAt,
-  };
+  NSDictionary *value = immutable_json_copy(_sessionReadiness);
   [_lock unlock];
   return value;
 }

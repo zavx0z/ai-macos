@@ -6,6 +6,7 @@ import {
   nativeLifecycleAckMatches,
   nativeResponseMatchesRequest,
   nativeStatusMatchesRequest,
+  nativeExecutionContextSchema,
   opaqueIdSchema,
   parseWireValue,
   type AdapterControl,
@@ -25,6 +26,7 @@ import {
   type NativeHeartbeatAck,
   type NativeHeartbeatRequest,
   type NativeOperationStatus,
+  type NativeExecutionContext,
   type NativeStatusRequest,
   type ObservedEvent,
   type z,
@@ -44,11 +46,22 @@ import {
 } from "./clipboard-protocol.ts"
 import { nativePermissionsRequestSchema, nativePermissionsResponseSchema, nativePermissionsResponseMatches,
   type NativePermissionsRequest, type NativePermissionsResponse } from "./permissions-protocol.ts"
+import { nativeHeldRecoveryRequestSchema, nativeHeldRecoveryResponseSchema, nativeHeldRecoveryResponseMatches,
+  type NativeHeldRecoveryRequest, type NativeHeldRecoveryResponse } from "./recovery-protocol.ts"
+import { nativeObserverRequestSchema, nativeObserverResponseSchema, nativeObserverResponseMatches,
+  type NativeObserverRequest, type NativeObserverResponse, type NativeObservedEvent } from "./observer-protocol.ts"
+import { nativeHitTestRequestSchema, nativeHitTestResponseSchema, nativeHitTestResultMatches,
+  type NativeHitTestRequest, type NativeHitTestResponse } from "./hit-test-protocol.ts"
 
 export interface NativeTransport {
   send(frame: NativeTransportRequestFrame): Promise<void>
   packets(signal: AbortSignal): AsyncIterable<NativeTransportPacket>
   close(): Promise<void>
+}
+
+export interface NativeMutationDeliveryAuthority {
+  register(wire: NativeExecutionContext): void
+  assertNeverAttempted(wire: NativeExecutionContext): void
 }
 
 export interface NativeSourceResponseRegistrar {
@@ -100,10 +113,26 @@ export class NativeBrokerAdapter implements NativeAdapter {
   readonly #pending = new Map<string, PendingResponse>()
   readonly #expired = new Map<string, number>()
   readonly #seenRequestIds = new Map<string, number>()
+  readonly #mutationDeliveries = new Map<string, { fingerprint: string, registered: boolean, attempted: boolean }>()
+  readonly mutationDelivery: NativeMutationDeliveryAuthority = Object.freeze({
+    register: (wire: NativeExecutionContext) => {
+      const entry = this.#deliveryEntry(wire)
+      entry.registered = true
+    },
+    assertNeverAttempted: (wire: NativeExecutionContext) => {
+      const parsed = parseWireValue(nativeExecutionContextSchema, wire)
+      this.#assertGeneration(parsed)
+      const entry = this.#mutationDeliveries.get(this.#deliveryKey(parsed))
+      if (entry === undefined || !entry.registered || entry.fingerprint !== JSON.stringify(parsed) || entry.attempted) {
+        throw new Error("Native mutation delivery не подтверждает registered never-attempted context")
+      }
+    },
+  })
   readonly #heartbeatRequestIds = new Map<string, number>()
-  readonly #events: Array<{ event: ObservedEvent, bytes: number }> = []
+  readonly #events: Array<{ event: NativeObservedEvent, bytes: number }> = []
   #eventBytes = 0
   #eventGap: Error | undefined
+  #eventConsumerActive = false
   readonly #eventWaiters: EventWaiter[] = []
   readonly #binary = new Map<string, Uint8Array>()
   readonly #binaryWaiters = new Map<string, BinaryWaiter>()
@@ -234,6 +263,25 @@ export class NativeBrokerAdapter implements NativeAdapter {
     return response.payload
   }
 
+  async hitTest(request: NativeHitTestRequest, control: AdapterControl): Promise<NativeHitTestResponse> {
+    const response = await this.request(nativeHitTestRequestSchema, request, nativeHitTestResponseSchema, control)
+    if (response.ok && !nativeHitTestResultMatches(request, response.result)) throw new Error("Native hit-test ответ не совпадает с operation/frame/point")
+    return response
+  }
+
+  async observer(request: NativeObserverRequest, control: AdapterControl): Promise<NativeObserverResponse> {
+    control.signal.throwIfAborted()
+    const parsed = parseWireValue(nativeObserverRequestSchema, request)
+    this.#assertGeneration(parsed)
+    await control.checkpoint("native-before-observer-lifecycle")
+    const response = await this.#exchange("observer", { channel: "observer", payload: parsed }, parsed.requestId, control.signal, parsed.deadlineAt)
+    if (response.channel !== "observer") throw new Error("Native observer response channel не совпадает")
+    const value = parseWireValue(nativeObserverResponseSchema, response.payload)
+    if (!nativeObserverResponseMatches(parsed, value, this.loadedBuildId)) throw new Error("Native observer response identity/instance/cursor не совпадает")
+    await control.checkpoint("native-after-observer-lifecycle")
+    return value
+  }
+
   async permissions(request: NativePermissionsRequest, control: AdapterControl): Promise<NativePermissionsResponse> {
     control.signal.throwIfAborted()
     const parsed = parseWireValue(nativePermissionsRequestSchema, request)
@@ -244,6 +292,19 @@ export class NativeBrokerAdapter implements NativeAdapter {
     const value = parseWireValue(nativePermissionsResponseSchema, response.payload)
     if (!nativePermissionsResponseMatches(parsed, value, this.loadedBuildId)) throw new Error("Native permissions response identity mismatch")
     await control.checkpoint("native-after-passive-permissions")
+    return value
+  }
+
+  async heldRecovery(request: NativeHeldRecoveryRequest, control: AdapterControl): Promise<NativeHeldRecoveryResponse> {
+    control.signal.throwIfAborted()
+    const parsed = parseWireValue(nativeHeldRecoveryRequestSchema, request)
+    this.#assertGeneration(parsed)
+    await control.checkpoint("native-before-passive-held-recovery")
+    const response = await this.#exchange("held-recovery", { channel: "held-recovery", payload: parsed }, parsed.requestId, control.signal, parsed.deadlineAt)
+    if (response.channel !== "held-recovery") throw new Error("Native held recovery response channel mismatch")
+    const value = parseWireValue(nativeHeldRecoveryResponseSchema, response.payload)
+    if (!nativeHeldRecoveryResponseMatches(parsed, value, this.loadedBuildId)) throw new Error("Native held recovery response identity mismatch")
+    await control.checkpoint("native-after-passive-held-recovery")
     return value
   }
 
@@ -329,33 +390,32 @@ export class NativeBrokerAdapter implements NativeAdapter {
     return parsedResponse
   }
 
-  async *events(signal: AbortSignal): AsyncIterable<ObservedEvent> {
-    while (!signal.aborted && !this.#closed) {
-      if (this.#eventGap !== undefined) throw this.#eventGap
-      const current = this.#events.shift()
-      if (current !== undefined) {
-        this.#eventBytes -= current.bytes
-        yield current.event
-        continue
+  async *events(signal: AbortSignal): AsyncIterable<NativeObservedEvent> {
+    if (this.#eventConsumerActive) throw new Error("Native events допускает только один host observer consumer")
+    this.#eventConsumerActive = true
+    try {
+      while (!signal.aborted && !this.#closed) {
+        if (this.#eventGap !== undefined) throw this.#eventGap
+        const current = this.#events.shift()
+        if (current !== undefined) {
+          this.#eventBytes -= current.bytes
+          yield current.event
+          continue
+        }
+        const event = await new Promise<ObservedEvent>((resolve, reject) => {
+          const waiter: EventWaiter = { resolve, reject, signal, onAbort: () => undefined }
+          const onAbort = () => {
+            const index = this.#eventWaiters.indexOf(waiter)
+            if (index >= 0) this.#eventWaiters.splice(index, 1)
+            reject(signal.reason ?? new Error("Native event stream отменён"))
+          }
+          waiter.onAbort = onAbort
+          signal.addEventListener("abort", onAbort, { once: true })
+          this.#eventWaiters.push(waiter)
+        })
+        yield event
       }
-      const event = await new Promise<ObservedEvent>((resolve, reject) => {
-        const waiter: EventWaiter = {
-          resolve,
-          reject,
-          signal,
-          onAbort: () => undefined,
-        }
-        const onAbort = () => {
-          const index = this.#eventWaiters.indexOf(waiter)
-          if (index >= 0) this.#eventWaiters.splice(index, 1)
-          reject(signal.reason ?? new Error("Native event stream отменён"))
-        }
-        waiter.onAbort = onAbort
-        signal.addEventListener("abort", onAbort, { once: true })
-        this.#eventWaiters.push(waiter)
-      })
-      yield event
-    }
+    } finally { this.#eventConsumerActive = false }
   }
 
   async takeBinary(binaryToken: string, expectedLength: number, signal?: AbortSignal): Promise<Uint8Array> {
@@ -398,9 +458,19 @@ export class NativeBrokerAdapter implements NativeAdapter {
     }
     this.#closed = true
     this.#readerAbort.abort(new Error("Native adapter закрыт"))
-    await this.#transport.close()
-    await this.#reader.catch(() => undefined)
-    this.#rejectPending(new Error("Native adapter закрыт"))
+    this.#transportClosing = (async () => {
+      try { await this.#transport.close() }
+      finally {
+        this.#rejectPending(new Error("Native adapter закрыт"))
+        let timer: ReturnType<typeof setTimeout> | undefined
+        try {
+          await Promise.race([this.#reader.catch(() => undefined), new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("Native reader shutdown не подтверждён за bounded deadline")), 1000)
+          })])
+        } finally { if (timer !== undefined) clearTimeout(timer) }
+      }
+    })()
+    await this.#transportClosing
   }
 
   async #exchange(
@@ -460,6 +530,15 @@ export class NativeBrokerAdapter implements NativeAdapter {
         },
         reject,
       })
+      try {
+        if (frame.channel === "request" && frame.payload.intent === "mutation") this.#deliveryEntry(frame.payload.operation).attempted = true
+      } catch (error) {
+        this.#pending.delete(key)
+        signal?.removeEventListener("abort", onAbort)
+        if (timer !== undefined) clearTimeout(timer)
+        reject(error instanceof Error ? error : new Error(String(error)))
+        return
+      }
       void this.#transport.send(frame).catch((error) => {
         this.#pending.delete(key)
         signal?.removeEventListener("abort", onAbort)
@@ -472,6 +551,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
   async #readPackets(): Promise<void> {
     try {
       for await (const packet of this.#transport.packets(this.#readerAbort.signal)) {
+        if (this.#closed) return
         if (packet.kind === "binary") {
           this.#acceptBinary(packet.binaryToken, packet.bytes)
           continue
@@ -486,6 +566,10 @@ export class NativeBrokerAdapter implements NativeAdapter {
 
   async #acceptFrame(frame: NativeTransportResponseFrame, bytes?: Uint8Array): Promise<void> {
     if (frame.channel === "event") {
+      this.#assertGeneration(frame.payload)
+      const event: NativeObservedEvent = "event" in frame.payload
+        ? { ...frame.payload.event, observerInstanceRef: frame.payload.observerInstanceRef }
+        : frame.payload
       const waiter = this.#eventWaiters.shift()
       if (waiter === undefined) {
         const bytes = new TextEncoder().encode(JSON.stringify(frame.payload)).byteLength
@@ -499,12 +583,12 @@ export class NativeBrokerAdapter implements NativeAdapter {
           }
           return
         }
-        this.#events.push({ event: frame.payload, bytes })
+        this.#events.push({ event, bytes })
         this.#eventBytes += bytes
       }
       else {
         waiter.signal.removeEventListener("abort", waiter.onAbort)
-        waiter.resolve(frame.payload)
+        waiter.resolve(event)
       }
       return
     }
@@ -587,7 +671,8 @@ export class NativeBrokerAdapter implements NativeAdapter {
     this.#closed = true
     this.#readerAbort.abort(error)
     this.#rejectPending(error)
-    this.#transportClosing = this.#transport.close().catch(() => undefined)
+    this.#transportClosing = this.#transport.close()
+    void this.#transportClosing.catch(() => undefined)
   }
 
   #pruneRequestTombstones(): void {
@@ -611,6 +696,26 @@ export class NativeBrokerAdapter implements NativeAdapter {
     ) {
       throw new Error("Native request принадлежит другой generation")
     }
+  }
+
+  #deliveryKey(wire: NativeExecutionContext): string {
+    return JSON.stringify([wire.runtimeEpoch, wire.loginSessionId, wire.nativeGeneration, wire.operationId])
+  }
+
+  #deliveryEntry(wire: NativeExecutionContext) {
+    const parsed = parseWireValue(nativeExecutionContextSchema, wire)
+    this.#assertGeneration(parsed)
+    const key = this.#deliveryKey(parsed)
+    const fingerprint = JSON.stringify(parsed)
+    const previous = this.#mutationDeliveries.get(key)
+    if (previous !== undefined) {
+      if (previous.fingerprint !== fingerprint) throw new Error("Native mutation operationId переиспользован с другим context")
+      return previous
+    }
+    if (this.#mutationDeliveries.size >= 10000) throw new Error("Native mutation delivery horizon исчерпан; требуется rotation")
+    const entry = { fingerprint, registered: false, attempted: false }
+    this.#mutationDeliveries.set(key, entry)
+    return entry
   }
 }
 
@@ -645,6 +750,9 @@ export class NativeProcessTransport implements NativeTransport {
   readonly #process
   readonly #decoder = new NativeTransportStreamDecoder()
   #closed = false
+  #closing: Promise<void> | undefined
+  #exitConfirmed = false
+  #exitCode: number | null = null
 
   constructor(helperPath: string, args: readonly string[] = []) {
     if (!helperPath.startsWith("/")) throw new Error("Native helper path должен быть абсолютным")
@@ -653,6 +761,14 @@ export class NativeProcessTransport implements NativeTransport {
       stdout: "pipe",
       stderr: "inherit",
     })
+    void this.#process.exited.then(code => {
+      this.#exitConfirmed = true
+      this.#exitCode = code
+    }, () => undefined)
+  }
+
+  get processStatus(): Readonly<{ pid: number, exitConfirmed: boolean, exitCode: number | null }> {
+    return { pid: this.#process.pid, exitConfirmed: this.#exitConfirmed, exitCode: this.#exitCode }
   }
 
   async send(frame: NativeTransportRequestFrame): Promise<void> {
@@ -680,16 +796,34 @@ export class NativeProcessTransport implements NativeTransport {
   }
 
   async close(): Promise<void> {
-    if (this.#closed) return
+    if (this.#closing !== undefined) return this.#closing
     this.#closed = true
-    this.#process.stdin.end()
-    const exited = await Promise.race([
-      this.#process.exited.then(() => true),
-      new Promise<false>(resolve => setTimeout(() => resolve(false), 1_000)),
-    ])
-    if (!exited) {
-      this.#process.kill()
-      await this.#process.exited
+    this.#closing = this.#closeOwnedChild()
+    return this.#closing
+  }
+
+  async #waitExit(milliseconds: number): Promise<boolean> {
+    if (this.#exitConfirmed) return true
+    return await new Promise<boolean>(resolve => {
+      const timer = setTimeout(() => resolve(false), milliseconds)
+      void this.#process.exited.then(() => {
+        clearTimeout(timer)
+        resolve(true)
+      }, () => {
+        clearTimeout(timer)
+        resolve(false)
+      })
+    })
+  }
+
+  async #closeOwnedChild(): Promise<void> {
+    try { void Promise.resolve(this.#process.stdin.end()).catch(() => undefined) } catch {}
+    if (await this.#waitExit(1000)) return
+    try { this.#process.kill("SIGTERM") } catch {}
+    if (await this.#waitExit(500)) return
+    try { this.#process.kill("SIGKILL") } catch {}
+    if (!await this.#waitExit(1000)) {
+      throw new Error("Owned native child exit не подтверждён после bounded EOF/TERM/KILL")
     }
   }
 }
