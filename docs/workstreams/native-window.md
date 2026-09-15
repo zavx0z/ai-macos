@@ -237,6 +237,31 @@ sh native/scripts/build.sh /tmp/meta-native-build.*/libmeta-native.dylib
 
 ## Следующий шаг
 
+### Первый executable checkpoint
+
+`native/scripts/build-broker.sh <temporary-candidate-output> <build-id>` теперь
+собирает Mach-O x86_64 executable, связывая command loop, native modules и
+clipboard ABI. Путь установленного helper script отвергает. Сборка выполнена
+в `tmp/native-window-check/meta-native-broker`, build ID `native-command-check`;
+сам production binary не запускался.
+
+Новые `native/src/command_loop.m` и `native/src/broker_main.m` реализуют
+framed handshake, проверку actual loaded build/generation, read-only inventory,
+clipboard channel, heartbeat и закрытие admission при drain. Параметры
+`--metadata` и `--doctor` предусмотрены для root installer: doctor вызывает
+только passive Accessibility/post-event/Screen Recording preflight из helper.
+Действующие C1 clipboard operation DTO переиспользуются без native fence.
+
+Проверка `native/tests/command-loop.test.ts`: 2 pass, 5 assertions. Исполняется
+production command loop с injected `FixtureCommandBackend`; системный
+clipboard/AX/capture/input не вызывается. Targeted TypeScript check и
+`git diff --check` проходят.
+
+Это первый executable slice: input, window transitions, capture task/cleanup,
+generic operation status/cancel и observer handlers ещё требуют wiring.
+Неизвестные методы возвращают `unsupported-capability`; candidate не готов
+для installed cutover. Root installer должен дождаться оставшихся handlers.
+
 ### Проверенный checkpoint после resume
 
 `native/src/session-lifecycle.ts` проверен через настоящий `NativeBrokerAdapter`
