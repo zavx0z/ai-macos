@@ -52,6 +52,8 @@ class AuditTransport implements NativeTransport {
   viewVersion: "1" | undefined
   mutationCalls = 0
   inventoryCalls = 0
+  inventoryApplicationStatus?: "denied" | "failed" | "timed-out"
+  inventoryReadFailure = false
   startupPermissionCommands: string[] = []
   startupPermissionGranted?: boolean
   startupPermissionRequested = false
@@ -89,12 +91,26 @@ class AuditTransport implements NativeTransport {
     if (this.fullView && frame.channel === "request" && frame.payload.method === "window.inventory") {
       this.inventoryCalls++
       const request = frame.payload
+      if (this.inventoryReadFailure) {
+        this.#resolve({ kind: "message", frame: { channel: "response", payload: {
+          kind: "response", protocolVersion: "1", requestId: request.requestId,
+          runtimeEpoch: request.runtimeEpoch, loginSessionId: request.loginSessionId, nativeGeneration: request.nativeGeneration,
+          ok: false, error: { code: "deadline-exceeded", message: "Fixture local inventory timeout", stage: "window-inventory",
+            retryable: true, replayAllowed: true, recoveryAction: "retry-read-only" },
+        } } })
+        return
+      }
+      const applicationStatus = this.inventoryApplicationStatus
       this.#resolve({ kind: "message", frame: { channel: "response", payload: {
         kind: "response", protocolVersion: "1", requestId: request.requestId,
         runtimeEpoch: request.runtimeEpoch, loginSessionId: request.loginSessionId, nativeGeneration: request.nativeGeneration,
         ok: true, result: { sourceResponseRef: `source:${request.requestId}`, inventoryId: "inventory:host-view", layoutRef: "layout:host-view",
-          revision: 1, displayLayoutRevision: 1, capturedAt: new Date().toISOString(), complete: true,
-          errors: [], applications: [], windows: [], displays: [] },
+          revision: this.inventoryCalls, displayLayoutRevision: 1, capturedAt: new Date().toISOString(), complete: applicationStatus === undefined,
+          errors: applicationStatus === undefined ? [] : [`Fixture one application AX ${applicationStatus}`],
+          applications: applicationStatus === undefined ? [] : [{ applicationRef: "application:fixture-denied", registrationNonce: "registration:fixture-denied",
+            pid: 21776, launchedAt: "2026-09-15T10:00:00.000Z", name: "Fixture Denied", hidden: "unknown",
+            axStatus: applicationStatus, axReason: `Fixture per-application AX ${applicationStatus}`, windowCount: 0 }],
+          windows: [], displays: [] },
       } } })
       return
     }
@@ -260,6 +276,81 @@ for (const guarded of [false, true]) {
     } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
   })
 }
+
+test("per-application AX denied/failed/timed-out остаются partial inventory и не отзывают Native capabilities", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-partial-ax-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 137 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.inventoryApplicationStatus = "denied"
+  transport.grantStartupPermissions()
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:partial-ax", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+  try {
+    await host.start()
+    await host.ready()
+    const epoch = host.doctor().runtime.runtimeEpoch
+    const client = await host.core.openClientDurable("principal:partial-ax")
+    for (const axStatus of ["denied", "failed", "timed-out"] as const) {
+      transport.inventoryApplicationStatus = axStatus
+      await expect(host.catalog.dispatch(client.session, "get_state", {}, new AbortController().signal)).resolves.toMatchObject({
+        data: { complete: false, applications: [{ name: "Fixture Denied", pid: 21776, axStatus }] },
+      })
+      expect(host.doctor()).toMatchObject({ native: { state: "compatible" }, runtime: { runtimeEpoch: epoch, rotation: { state: "running" } } })
+      expect(host.catalog.descriptors().tools.some(tool => tool.name === "observe")).toBe(true)
+    }
+    expect(transport.inventoryCalls).toBe(3)
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test("authoritative passive Accessibility false отзывает Native capabilities", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-global-ax-revoked-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 138 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.inventoryApplicationStatus = "denied"
+  transport.grantStartupPermissions()
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:global-ax-revoked", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+  try {
+    await host.start()
+    await host.ready()
+    transport.permissions = { accessibility: false, screenRecording: true, postEvents: true, inputMonitoring: true }
+    const client = await host.core.openClientDurable("principal:global-ax-revoked")
+    await expect(host.catalog.dispatch(client.session, "get_state", {}, new AbortController().signal)).resolves.toMatchObject({
+      data: { complete: false },
+    })
+    expect(host.doctor().native).toMatchObject({ state: "unavailable", reason: "Native Accessibility permission revoked" })
+    expect(host.catalog.internal.descriptors().tools.some(tool => tool.name === "list_windows")).toBe(false)
+    await expect(host.catalog.internal.dispatch(client.session, "list_windows", {}, new AbortController().signal)).rejects.toThrow("capabilities unavailable")
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test("локальная inventory read failure не объявляет Native transport недоступным и не запускает rotation", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-local-inventory-failure-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 139 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.grantStartupPermissions()
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:local-inventory-failure", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+  try {
+    await host.start()
+    await host.ready()
+    transport.inventoryReadFailure = true
+    const client = await host.core.openClientDurable("principal:local-inventory-failure")
+    const state = await host.catalog.dispatch(client.session, "get_state", {}, new AbortController().signal)
+    expect(state.data).toMatchObject({ complete: false, errors: [{ stage: "list_windows" }] })
+    expect(host.doctor()).toMatchObject({ native: { state: "compatible" }, runtime: { rotation: { state: "running" } } })
+    expect(host.catalog.descriptors().tools.some(tool => tool.name === "observe")).toBe(true)
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+})
 
 test("startup уже с grants не вызывает request API и активирует observer после passive status", async () => {
   const directory = await mkdtemp(join(tmpdir(), "host-permission-granted-"))

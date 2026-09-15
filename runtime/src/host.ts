@@ -436,11 +436,21 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       transition: windows.transition.bind(windows), inspect: windows.inspect.bind(windows),
       press: windows.press.bind(windows),
       async inventory(control) {
-        try {
-          const inventory = await windows.inventory(control)
-          if (inventory.errors.some(error => error.code === "permission-denied") || inventory.applications.some(app => app.axStatus === "denied")) revokeNative("Native inventory permission revoked")
-          return inventory
-        } catch (error) { revokeNative("Native inventory unavailable"); throw error }
+        const inventory = await windows.inventory(control)
+        const permissionSuspected = inventory.errors.some(error => error.code === "permission-denied")
+          || inventory.applications.some(app => app.axStatus === "denied")
+        if (permissionSuspected) {
+          try {
+            const signal = AbortSignal.any([control.signal, AbortSignal.timeout(1000)])
+            const permissions = await readPassivePermissions(signal)
+            if (!permissions.accessibility) revokeNative("Native Accessibility permission revoked")
+          } catch {
+            control.signal.throwIfAborted()
+            // Ошибка локальной inventory или passive recheck не доказывает
+            // недоступность transport либо глобальный отзыв Accessibility.
+          }
+        }
+        return inventory
       },
     }, { internalAgentMethods: true })
   }
