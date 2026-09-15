@@ -32,6 +32,7 @@ import {
   type OperationTarget,
   type RuntimeClientSession,
   type RuntimeOperationIntent,
+  type ScreenCaptureResult,
   type WindowRecord,
 } from "@meta/shared/contracts"
 import { AgentTargetRegistry } from "../src/agent-targets.ts"
@@ -203,7 +204,17 @@ test("get_state выдаёт exact surface/display/layout handles с явным 
   } })
   expect(desktop.desktopCaptureRequests[0]).toMatchObject({
     caption: "Ожидаю левый display",
+    readinessPolicy: {
+      requiredSteps: ["complete-frame", "permission", "target"],
+      disabledSteps: ["ownership"],
+    },
     target: { kind: "display", target: displayTarget, nativeDisplayId: 11 },
+  })
+  expect(desktop.desktopCaptureResults[0]?.observation).toMatchObject({
+    readiness: { state: "ready", steps: [{ name: "complete-frame", state: "reached" },
+      { name: "permission", state: "reached" }, { name: "target", state: "reached" },
+      { name: "ownership", state: "skipped" }] },
+    captureEvidence: { proof: { kind: "frame-freshness" } },
   })
   const layoutCapture = await fixture.registry.dispatch(client.session, "observe", {
     targetId: layout.targetId,
@@ -213,6 +224,10 @@ test("get_state выдаёт exact surface/display/layout handles с явным 
   expect(layoutCapture.frameRefs).toEqual(["frame:display:1"])
   expect(desktop.desktopCaptureRequests[1]).toMatchObject({
     caption: "Ожидаю полный desktop layout",
+    readinessPolicy: {
+      requiredSteps: ["complete-frame", "permission", "target"],
+      disabledSteps: ["ownership"],
+    },
     target: { kind: "desktop-layout", target: layoutTarget,
       displays: [{ target: displayTarget, nativeDisplayId: 11 }] },
   })
@@ -374,9 +389,20 @@ test("observe both регистрирует elements, скрывает observati
   expect(desktop.inventoryCalls()).toBe(2)
   expect(desktop.captureRequests[0]).toMatchObject({
     caption: "Ожидаю окно Chrome с кнопкой Save",
+    readinessPolicy: {
+      requiredSteps: ["complete-frame", "permission", "target"],
+      disabledSteps: ["ownership"],
+    },
     output: { format: "image/png", scale: 0.5 },
     target: { mappingEvidence: { state: "confirmed", proof: { kind: "cg-ax-correlation" } } },
   })
+  expect(desktop.windowCaptureResults[0]?.observation).toMatchObject({
+    readiness: { state: "ready", steps: [{ name: "complete-frame", state: "reached" },
+      { name: "permission", state: "reached" }, { name: "target", state: "reached" },
+      { name: "ownership", state: "skipped" }] },
+    captureEvidence: { proof: { kind: "frame-freshness" } },
+  })
+  expect(JSON.stringify(desktop.windowCaptureResults[0]?.observation)).not.toContain("pixel-ownership")
   const elementId = (observed.data.elements as Array<{ elementId: string }>)[0]!.elementId
   const scope = fixture.targets.forLineage(fixture.core.clients.lineage(client.session))
   expect(scope.resolveElement(id, elementId).elementId).toBe(elementId)
@@ -520,6 +546,8 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
   const transitions: Array<{ request: z.infer<typeof windowTransitionRequestSchema> }> = []
   const captureRequests: Array<z.infer<typeof captureWindowMethodInputSchema>> = []
   const desktopCaptureRequests: Array<z.infer<typeof captureDesktopMethodInputSchema>> = []
+  const windowCaptureResults: ScreenCaptureResult[] = []
+  const desktopCaptureResults: ScreenCaptureResult[] = []
   const inspectionRequests: Array<z.infer<typeof axInspectionRequestSchema>> = []
   let captureFailure: ContractError | undefined
   let inspectionNodes: AxInspectionResult["nodes"] = [{
@@ -611,10 +639,12 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
         return { operation, frameAvailable: false,
           result: { ok: false as const, error: structuredClone(captureFailure), outcome: successfulOutcome() } }
       }
+      const value = captureResult(input)
+      windowCaptureResults.push(structuredClone(value))
       return {
         operation,
         frameAvailable: true,
-        result: { ok: true as const, value: captureResult(input), outcome: successfulOutcome() },
+        result: { ok: true as const, value, outcome: successfulOutcome() },
       }
     }, captureWindowMethodInputSchema, captureExecutionSchema),
     frames: output => output.result.ok ? ["frame:agent:1"] : [],
@@ -624,11 +654,13 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     ...method(async (context, input) => {
       if (input.target.mappingEvidence.state !== "confirmed") throw new Error("Fixture требует confirmed desktop mapping")
       desktopCaptureRequests.push(input)
+      const value = desktopCaptureResult(input)
+      desktopCaptureResults.push(structuredClone(value))
       return {
         operation: completedOperation(context.session, input.clientRequestId, input.inventoryId,
           input.target.mappingEvidence.proof.inventoryRevision, input.target.target, "native"),
         frameAvailable: true,
-        result: { ok: true as const, value: desktopCaptureResult(input), outcome: successfulOutcome() },
+        result: { ok: true as const, value, outcome: successfulOutcome() },
       }
     }, captureDesktopMethodInputSchema, captureExecutionSchema),
     frames: () => ["frame:display:1"],
@@ -638,6 +670,8 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     transitions,
     captureRequests,
     desktopCaptureRequests,
+    windowCaptureResults,
+    desktopCaptureResults,
     inspectionRequests,
     inventoryCalls: () => inventoryCalls,
     setInspectionNodes(nodes: AxInspectionResult["nodes"]) { inspectionNodes = structuredClone(nodes) },
@@ -999,7 +1033,10 @@ function captureResult(input: z.infer<typeof captureWindowMethodInputSchema>) {
     sha256: "2".repeat(64),
     mime: "image/png" as const,
   }
-  const steps = input.readinessPolicy.requiredSteps.map(name => ({ name, state: "reached" as const, durationMs: 1 }))
+  const steps = [
+    ...input.readinessPolicy.requiredSteps.map(name => ({ name, state: "reached" as const, durationMs: 1 })),
+    ...input.readinessPolicy.disabledSteps.map(name => ({ name, state: "skipped" as const, durationMs: 0, reason: "disabled-by-policy" as const })),
+  ]
   const observation = {
     observationId: publication.observationId,
     ...generation,
@@ -1089,7 +1126,10 @@ function desktopCaptureResult(input: z.infer<typeof captureDesktopMethodInputSch
     sha256: "6".repeat(64),
     mime: "image/png" as const,
   }
-  const steps = input.readinessPolicy.requiredSteps.map(name => ({ name, state: "reached" as const, durationMs: 1 }))
+  const steps = [
+    ...input.readinessPolicy.requiredSteps.map(name => ({ name, state: "reached" as const, durationMs: 1 })),
+    ...input.readinessPolicy.disabledSteps.map(name => ({ name, state: "skipped" as const, durationMs: 0, reason: "disabled-by-policy" as const })),
+  ]
   const observation = {
     observationId: publication.observationId,
     ...generation,
