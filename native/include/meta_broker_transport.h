@@ -14,6 +14,9 @@ typedef void (^MetaTransportFailure)(NSString *reason);
                      onFailure:(MetaTransportFailure)onFailure;
 - (void)start;
 - (BOOL)enqueueFrame:(NSDictionary *)frame;
+// Header и raw bytes занимают один элемент очереди и не перемежаются с JSON.
+// Bytes копируются до возврата; borrowed capture result затем можно освободить.
+- (BOOL)enqueueBinaryFrame:(NSDictionary *)frame bytes:(NSData *)bytes;
 - (void)close;
 @end
 

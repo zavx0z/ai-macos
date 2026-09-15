@@ -29,8 +29,18 @@ mkdir -p "$(dirname -- "$CANDIDATE_OUTPUT")"
   native/src/macos_backend.m native/src/macos_input.m \
   native/src/serialization.m native/src/capture_router.m \
   native/src/capture/meta_capture.m native/src/clipboard/meta_clipboard.m \
-  native/src/command_loop.m native/src/broker_main.m \
+  native/src/command_loop.m native/src/broker_transport.m native/src/broker_main.m \
+  native/src/input_job.m native/src/input_executor.m \
+  native/src/session_identity.c -lbsm \
+  native/src/accessibility/meta_ax_inspector.m \
+  native/src/ax_request.m \
+  native/src/window-actions/meta_window_readback.c \
+  native/src/window-actions/meta_window_actions.c native/src/window-actions/meta_window_actions_macos.m \
+  native/src/window-actions/meta_window_result.m \
+  native/src/code-identity/meta_code_identity.m \
+  native/src/input-target/meta_point_target.m \
   -framework Foundation -framework AppKit -framework ApplicationServices \
   -framework CoreGraphics -framework CoreImage -framework CoreMedia \
   -framework CoreVideo -framework ImageIO -framework ScreenCaptureKit \
+  -framework Security \
   -o "$CANDIDATE_OUTPUT"

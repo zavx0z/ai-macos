@@ -1,5 +1,7 @@
 import {
   nativeEvidenceReportSchema,
+  applicationBundleResolutionSchema,
+  sameNativeGeneration,
   parseWireJson,
   type NativeEvidenceReport,
   type NativeTargetMapping,
@@ -55,6 +57,15 @@ export function extractNativeEvidenceReports(bytes: Uint8Array): readonly Native
   const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
   const frame = parseWireJson(nativeTransportResponseFrameSchema, text)
   if (frame.channel === "response" && frame.payload.ok) {
+    const bundle = applicationBundleResolutionSchema.safeParse(frame.payload.result)
+    if (bundle.success) {
+      if (!sameNativeGeneration(bundle.data.target.ref, frame.payload)) throw new Error("Bundle resolution содержит другую native generation")
+      return [nativeEvidenceReportSchema.parse({
+        factKind: "application-bundle-identity", sourceResponseRef: bundle.data.sourceResponseRef,
+        inventoryId: bundle.data.inventoryId, inventoryRevision: bundle.data.inventoryRevision,
+        displayLayoutRevision: 0, observedAt: bundle.data.observedAt, target: bundle.data.target,
+      })]
+    }
     const inventory = nativeInventoryResultSchema.safeParse(frame.payload.result)
     if (inventory.success) return inventoryReports(frame.payload, inventory.data)
     const transition = nativeWindowTransitionResultSchema.safeParse(frame.payload.result)
@@ -144,6 +155,8 @@ function inventoryReports(
   envelope: { runtimeEpoch: string, loginSessionId: string, nativeGeneration: string },
   inventory: ReturnType<typeof nativeInventoryResultSchema.parse>,
 ): NativeEvidenceReport[] {
+  const generation = { runtimeEpoch: envelope.runtimeEpoch, loginSessionId: envelope.loginSessionId,
+    nativeGeneration: envelope.nativeGeneration }
   const displays = inventory.displays.map(display => ({
     nativeDisplayId: display.nativeDisplayId,
     ref: {
@@ -164,6 +177,47 @@ function inventoryReports(
     target: { kind: "display", ref: display.ref },
     mapping: { kind: "display", display },
   }))
+  if (displays.length > 0) {
+    const layoutTarget = {
+      kind: "desktop-layout" as const,
+      ref: {
+        ...generation,
+        layoutRef: inventory.layoutRef,
+        displayLayoutRevision: inventory.displayLayoutRevision,
+      },
+    }
+    reports.push(nativeEvidenceReportSchema.parse({
+      factKind: "target-resolution",
+      sourceResponseRef: inventory.sourceResponseRef,
+      inventoryId: inventory.inventoryId,
+      inventoryRevision: inventory.revision,
+      displayLayoutRevision: inventory.displayLayoutRevision,
+      observedAt: inventory.capturedAt,
+      target: layoutTarget,
+      mapping: { kind: "desktop-layout", displays },
+    }))
+  }
+  for (const application of inventory.applications) {
+    const process = { ...generation, applicationRef: application.applicationRef, pid: application.pid,
+      launchedAt: application.launchedAt, registrationNonce: application.registrationNonce }
+    const common = { factKind: "native-target-identity" as const, process,
+      sourceResponseRef: inventory.sourceResponseRef, inventoryId: inventory.inventoryId,
+      inventoryRevision: inventory.revision, displayLayoutRevision: inventory.displayLayoutRevision,
+      observedAt: inventory.capturedAt }
+    reports.push(nativeEvidenceReportSchema.parse({ ...common, target: { kind: "application", ref: process } }))
+    for (const window of inventory.windows) {
+      if (window.kind !== "ax-window" || window.applicationRef !== application.applicationRef
+        || window.ownerPid !== application.pid) continue
+      const identity = { ...generation, applicationRef: application.applicationRef }
+      reports.push(nativeEvidenceReportSchema.parse({ ...common,
+        target: { kind: "window", ref: { ...identity, windowRef: window.windowRef } } }))
+      for (const surface of window.surfaces) {
+        if (surface.applicationRef !== application.applicationRef || surface.ownerWindowRef !== window.windowRef) continue
+        reports.push(nativeEvidenceReportSchema.parse({ ...common,
+          target: { kind: "surface", ref: { ...identity, surfaceRef: surface.surfaceRef, ownerWindowRef: surface.ownerWindowRef } } }))
+      }
+    }
+  }
   for (const window of inventory.windows) {
     if (
       window.kind !== "ax-window"
@@ -216,7 +270,8 @@ function transitionReports(
 ): NativeEvidenceReport[] {
   const window = transition.actual
   if (
-    window.mapping !== "corroborated"
+    window.kind !== "ax-window"
+    || window.mapping !== "corroborated"
     || window.cgWindowId === undefined
     || window.axSnapshotRef === undefined
     || window.cgInventoryRef === undefined

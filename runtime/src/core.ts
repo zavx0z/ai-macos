@@ -13,6 +13,10 @@ import {
   nativeStatusMatchesRequest,
   nativeStatusRequestSchema,
   parseWireValue,
+  observationPublicationSchema,
+  observationSchema,
+  type Observation,
+  type ObservationPublication,
   operationOutcomeSchema,
   operationRecordSchema,
   runtimeOperationIntentSchema,
@@ -47,6 +51,8 @@ import { canonicalJson, hmacSha256, randomIdSource, systemClock, type RuntimeClo
 import { ResourceRegistry } from "./resources.ts"
 import { NativeContinuationRegistry } from "./continuations.ts"
 import { BrowserLifetimeCoordinator, type CoordinatedLifecycle } from "./reservations.ts"
+import type { PersistentOperationJournal, StoredOperationEvidence } from "./storage/index.ts"
+import type { StoredClientSession } from "./client-sessions.ts"
 
 type JournalEntry = {
   digest: string
@@ -59,6 +65,8 @@ type JournalEntry = {
   adapterStarted: boolean
   settled: boolean
   lastNativeStatus?: NativeOperationStatus
+  durableRevision: number
+  durableTail: Promise<void>
 }
 
 export interface BackendCompletionVerifier {
@@ -88,11 +96,22 @@ export type RuntimeCoreOptions = {
   completionVerifier?: BackendCompletionVerifier
   nativeSourceIdentity?: NativeEvidenceBinding
   reservationTtlMs?: number
+  operationJournal?: PersistentOperationJournal
+  durableTimeoutMs?: number
+  hmacKeyGeneration?: string
+  clientPersistence?: { sessions: readonly StoredClientSession[], persist(sessions: readonly StoredClientSession[]): Promise<void> }
 }
+
+export type ReserveCapturePublicationRequest = Pick<ObservationPublication,
+  "source" | "captureTarget" | "capturePolicySha256" | "inventoryId" | "inventoryRevision" | "displayLayoutRevision"
+> & { clientRequestId: string, nativeGeneration?: string, ttlMs?: number }
 
 export class RuntimeCore implements RuntimeAdapter {
   readonly generation: RuntimeGeneration
-  readonly capabilities: CapabilitySet
+  #capabilities: CapabilitySet
+  readonly #capabilityListeners = new Set<() => void>()
+  readonly #admissionListeners = new Set<() => void>()
+  #admissionSealed = false
   readonly native?: NativeAdapter
   readonly clients: ClientSessionRegistry
   readonly resources: ResourceRegistry
@@ -119,8 +138,20 @@ export class RuntimeCore implements RuntimeAdapter {
     receipt: CleanupAuthorityReceipt
   }>()
   readonly #hmacKeyGeneration: string
+  readonly #captureReservations = new Map<string, { digest: string, publication: ObservationPublication }>()
+  readonly #observationOwners = new Map<string, string>()
+  readonly #latestObservations = new Map<string, string>()
   readonly #cancelGraceMs: number
   readonly #completionVerifier?: BackendCompletionVerifier
+  readonly #operationJournal?: PersistentOperationJournal
+  readonly #durableTimeoutMs: number
+  readonly #clientPersistence?: RuntimeCoreOptions["clientPersistence"]
+  #credentialTail: Promise<void> = Promise.resolve()
+  readonly #persistedSessions = new Set<string>()
+  #storagePoisoned = false
+  #storageInitialized: boolean
+  #recoveryEvidence: StoredOperationEvidence[] = []
+  readonly #startupRecoveryReasons: string[] = []
   #fenceCounter = 0
 
   constructor(options: RuntimeCoreOptions) {
@@ -131,11 +162,20 @@ export class RuntimeCore implements RuntimeAdapter {
     this.#clock = options.clock ?? systemClock
     this.#ids = options.ids ?? randomIdSource
     this.#secret = options.secret ?? crypto.getRandomValues(new Uint8Array(32))
-    this.#hmacKeyGeneration = this.#ids.next("hmac-key")
+    this.#hmacKeyGeneration = options.hmacKeyGeneration ?? this.#ids.next("hmac-key")
     this.#cancelGraceMs = options.cancelGraceMs ?? 1_000
     this.#completionVerifier = options.completionVerifier
-    this.capabilities = unavailableRuntimeCapabilities(this.#ids.next("runtime-capabilities"))
+    this.#operationJournal = options.operationJournal
+    this.#clientPersistence = options.clientPersistence
+    this.#durableTimeoutMs = options.durableTimeoutMs ?? 1000
+    if (!Number.isSafeInteger(this.#durableTimeoutMs) || this.#durableTimeoutMs < 1 || this.#durableTimeoutMs > 10_000) throw new Error("Durable timeout вне bounds")
+    this.#storageInitialized = options.operationJournal === undefined
+    this.#capabilities = unavailableRuntimeCapabilities(this.#ids.next("runtime-capabilities"))
     this.clients = new ClientSessionRegistry(this.generation, { clock: this.#clock, ids: this.#ids })
+    if (options.clientPersistence !== undefined) {
+      this.clients.restore(options.clientPersistence.sessions)
+      for (const stored of options.clientPersistence.sessions) this.#persistedSessions.add(stored.session.clientSessionId)
+    }
     this.resources = new ResourceRegistry(this.generation, this.#secret, { clock: this.#clock, ids: this.#ids })
     this.browserLifetime = new BrowserLifetimeCoordinator({
       generation: this.generation,
@@ -145,7 +185,7 @@ export class RuntimeCore implements RuntimeAdapter {
       ttlMs: options.reservationTtlMs,
       lookup: id => this.#journal.get(id)?.record,
       stageRecovered: ids => this.#stageLifetimeRecovery(ids),
-      run: (session, intent, request, execute, lifecycle) => this.#runOperation(session, intent, request, execute, lifecycle),
+      run: (session, intent, request, execute, lifecycle, signal) => this.#runOperation(session, intent, request, execute, lifecycle, signal),
     })
     this.reservations = this.browserLifetime.authority
     this.targets = new TargetRegistry(this.generation, { clock: this.#clock })
@@ -196,7 +236,186 @@ export class RuntimeCore implements RuntimeAdapter {
   }
 
   openClient(principalId: string, ttlMs?: number): RuntimeClientCredential {
+    if (this.#clientPersistence !== undefined) throw new Error("Durable host требует openClientDurable")
     return this.clients.open(principalId, ttlMs)
+  }
+
+  async openClientDurable(principalId: string, ttlMs?: number): Promise<RuntimeClientCredential> {
+    return this.#persistCredential(() => this.clients.open(principalId, ttlMs))
+  }
+
+  async resumeClientDurable(resumptionToken: string, ttlMs?: number): Promise<RuntimeClientCredential> {
+    return this.#persistCredential(() => {
+      const lineage = this.clients.resumptionLineage(resumptionToken)
+      if ([...this.#journal.values()].some(entry => !entry.settled && entry.lineageId === lineage)) throw new RuntimeContractError("operation-in-progress", "Client renewal ждёт завершения active operations", "runtime-client")
+      return this.clients.resume(resumptionToken, ttlMs)
+    })
+  }
+
+  async closeClientDurable(session: RuntimeClientSession): Promise<void> {
+    await this.clients.assertActive(session, this.#clock.now())
+    this.disconnectClient(session.clientSessionId)
+    const pending = [...this.#journal.values()].filter(entry => entry.record.clientSessionId === session.clientSessionId && !entry.settled)
+    await Promise.all(pending.map(entry => entry.promise?.catch(() => undefined)))
+    if (this.#clientPersistence !== undefined) await this.#awaitDurable(this.#clientPersistence.persist(this.clients.snapshot()))
+  }
+
+  async #persistCredential(create: () => RuntimeClientCredential): Promise<RuntimeClientCredential> {
+    if (this.#clientPersistence === undefined) return create()
+    const persist = async () => {
+      if (this.#storagePoisoned) throw new Error("Durable storage poisoned")
+      const credential = create()
+      try { await this.#awaitDurable(this.#clientPersistence!.persist(this.clients.snapshot())) }
+      catch (error) { this.#storagePoisoned = true; this.quarantineStartup("Client credential persistence не подтверждена"); throw error }
+      this.#persistedSessions.add(credential.session.clientSessionId)
+      return credential
+    }
+    const pending = this.#credentialTail.then(persist, persist)
+    this.#credentialTail = pending.then(() => undefined, () => undefined)
+    return pending
+  }
+
+  async reserveCapturePublication(session: RuntimeClientSession, request: ReserveCapturePublicationRequest): Promise<ObservationPublication> {
+    await this.clients.assertActive(session, this.#clock.now())
+    const lineage = this.clients.lineage(session)
+    const key = canonicalJson([lineage, request.clientRequestId])
+    const digest = hmacSha256(this.#secret, canonicalJson(request))
+    const existing = this.#captureReservations.get(key)
+    if (existing !== undefined) {
+      if (existing.digest !== digest) throw new Error("Capture clientRequestId содержит другую reservation")
+      if (this.#clock.now().getTime() >= Date.parse(existing.publication.expiresAt)
+        && await this.getOperationByRequest(session, request.clientRequestId) === undefined) throw new Error("Capture reservation receipt-expired")
+      return structuredClone(existing.publication)
+    }
+    const ttlMs = request.ttlMs ?? 120_000
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > 120_000) throw new Error("Capture TTL вне bounds")
+    if (request.nativeGeneration !== undefined && request.nativeGeneration !== this.#nativeGeneration) throw new Error("Capture native generation stale")
+    await this.targets.resolve({ target: request.captureTarget, inventoryId: request.inventoryId,
+      inventoryRevision: request.inventoryRevision, ...this.generation,
+      ...(request.nativeGeneration === undefined ? {} : { nativeGeneration: request.nativeGeneration }),
+      deadlineAt: new Date(this.#clock.now().getTime() + 5000).toISOString() })
+    const concurrent = this.#captureReservations.get(key)
+    if (concurrent !== undefined) {
+      if (concurrent.digest !== digest) throw new Error("Capture clientRequestId содержит другую reservation")
+      return structuredClone(concurrent.publication)
+    }
+    const publication = observationPublicationSchema.parse({
+      source: request.source, captureTarget: request.captureTarget, capturePolicySha256: request.capturePolicySha256,
+      inventoryId: request.inventoryId, inventoryRevision: request.inventoryRevision, displayLayoutRevision: request.displayLayoutRevision,
+      ...this.generation, ...(request.nativeGeneration === undefined ? {} : { nativeGeneration: request.nativeGeneration }),
+      observationId: this.#ids.next("observation"), frameRef: this.#ids.next("frame"), cacheScopeRef: lineage,
+      expiresAt: new Date(this.#clock.now().getTime() + ttlMs).toISOString(),
+    })
+    this.frames.registerPublication(publication)
+    this.#captureReservations.set(key, { digest, publication })
+    return structuredClone(publication)
+  }
+
+  async commitCaptureObservation(session: RuntimeClientSession, publication: ObservationPublication, value: Observation): Promise<Observation> {
+    await this.clients.assertActive(session, this.#clock.now())
+    const lineage = this.clients.lineage(session)
+    const reserved = [...this.#captureReservations.values()].some(item => canonicalJson(item.publication) === canonicalJson(publication))
+    const observation = observationSchema.parse(value)
+    const operation = [...this.#journal.values()].find(entry => entry.lineageId === lineage
+      && entry.record.state === "completed" && entry.record.resources.some(handle => handle.kind === "capture-stream" && handle.resourceRef === publication.observationId))
+    if (!reserved || operation === undefined || publication.cacheScopeRef !== lineage
+      || observation.observationId !== publication.observationId || observation.image.frameRef !== publication.frameRef
+      || observation.runtimeEpoch !== publication.runtimeEpoch || observation.loginSessionId !== publication.loginSessionId
+      || observation.nativeGeneration !== publication.nativeGeneration || observation.source !== publication.source
+      || Date.parse(observation.expiresAt) > Date.parse(publication.expiresAt)
+      || this.#clock.now().getTime() >= Date.parse(publication.expiresAt)
+      || observation.inventoryRevision !== publication.inventoryRevision || observation.displayLayoutRevision !== publication.displayLayoutRevision
+      || canonicalJson(observation.captureTarget) !== canonicalJson(publication.captureTarget)
+      || !this.frames.hasVerified(publication.frameRef, observation.image.sha256)
+      || observation.captureEvidence.state !== "confirmed" || !this.proofs.hasIssued(observation.captureEvidence.proof)) {
+      throw new Error("Capture commit не подтверждён operation/reservation/bytes/proof authority")
+    }
+    const committed = this.observations.register(observation)
+    this.#observationOwners.set(committed.observationId, lineage)
+    this.#latestObservations.set(lineage, committed.observationId)
+    return committed
+  }
+
+  async getObservation(session: RuntimeClientSession, observationId?: string): Promise<Observation | undefined> {
+    await this.clients.assertActive(session, this.#clock.now())
+    const lineage = this.clients.lineage(session)
+    const id = observationId ?? this.#latestObservations.get(lineage)
+    if (id === undefined) return undefined
+    if (this.#observationOwners.get(id) !== lineage) throw new Error("Observation принадлежит другой client lineage")
+    return this.observations.get(id)
+  }
+
+  get capabilities(): CapabilitySet { return structuredClone(this.#capabilities) }
+
+  updateCapabilities(value: CapabilitySet): void {
+    this.#capabilities = capabilitySetSchema.parse(value)
+    for (const listener of this.#capabilityListeners) listener()
+  }
+
+  subscribeCapabilities(listener: () => void): () => void {
+    this.#capabilityListeners.add(listener)
+    return () => { this.#capabilityListeners.delete(listener) }
+  }
+
+  get admissionSealed(): boolean { return this.#admissionSealed }
+
+  async initializeRecovery(): Promise<readonly StoredOperationEvidence[]> {
+    if (this.#operationJournal === undefined) return []
+    if (this.#storageInitialized) return structuredClone(this.#recoveryEvidence)
+    this.sealAdmission()
+    this.#recoveryEvidence = await this.#operationJournal.loadRecoveryEvidence()
+    if (this.#clientPersistence !== undefined && this.#operationJournal.loadAll !== undefined) {
+      for (const { record, revision } of await this.#operationJournal.loadAll()) {
+        const lineageId = this.clients.historicalLineage(record.clientSessionId, record.principalId)
+        if (lineageId === undefined || record.context.loginSessionId !== this.generation.loginSessionId) continue
+        const dedupKey = canonicalJson([this.generation.runtimeEpoch, lineageId, record.context.clientRequestId])
+        const previous = this.#dedup.get(dedupKey)
+        if (previous !== undefined && previous !== record.context.operationId) throw new Error("Historical journal содержит duplicate lineage/request")
+        this.#journal.set(record.context.operationId, {
+          record, digest: record.payloadReceipt.hmacSha256, lineageId, durableRevision: revision,
+          durableTail: Promise.resolve(), controller: new AbortController(), settled: true, adapterStarted: record.outcome.dispatch !== "none",
+        })
+        this.#dedup.set(dedupKey, record.context.operationId)
+      }
+    }
+    this.#storageInitialized = true
+    if (this.#recoveryEvidence.length === 0) this.unsealAdmission()
+    return structuredClone(this.#recoveryEvidence)
+  }
+
+  recoveryEvidence(): readonly StoredOperationEvidence[] { return structuredClone(this.#recoveryEvidence) }
+
+  quarantineStartup(reason: string): void {
+    this.#startupRecoveryReasons.push(reason)
+    this.sealAdmission()
+  }
+
+  startupRecoveryReasons(): readonly string[] { return [...this.#startupRecoveryReasons] }
+
+  sealAdmission(): void {
+    if (this.#admissionSealed) return
+    this.#admissionSealed = true
+    for (const listener of this.#admissionListeners) listener()
+  }
+
+  unsealAdmission(): void {
+    if (!this.#admissionSealed) return
+    if (this.#storagePoisoned || !this.#storageInitialized || this.#recoveryEvidence.length > 0 || this.#startupRecoveryReasons.length > 0 || this.activeOperationCount() !== 0 || this.resources.quarantinedCount() !== 0) throw new Error("Runtime admission нельзя открыть при active/unknown operations")
+    this.#admissionSealed = false
+    for (const listener of this.#admissionListeners) listener()
+  }
+
+  subscribeAdmission(listener: () => void): () => void {
+    this.#admissionListeners.add(listener)
+    return () => { this.#admissionListeners.delete(listener) }
+  }
+
+  async drainOperations(): Promise<void> {
+    this.sealAdmission()
+    const active = [...this.#journal.values()].filter(entry => !entry.settled)
+    for (const entry of active) entry.controller.abort("runtime drain")
+    await Promise.all(active.map(entry => entry.promise?.catch(() => undefined)))
+    if (this.resources.quarantinedCount() > 0 || this.activeOperationCount() > 0) throw new Error("Runtime drain оставил unknown/active operations")
   }
 
   async runOperation<TRequest, TResult>(
@@ -204,8 +423,9 @@ export class RuntimeCore implements RuntimeAdapter {
     intentValue: RuntimeOperationIntent,
     request: TRequest,
     execute: (context: RuntimeOperationContext, request: TRequest) => Promise<AdapterResult<TResult>>,
+    signal?: AbortSignal,
   ): Promise<RuntimeExecution<TResult>> {
-    return this.#runOperation(session, intentValue, request, execute)
+    return this.#runOperation(session, intentValue, request, execute, undefined, signal)
   }
 
   async #runOperation<TRequest, TResult>(
@@ -214,9 +434,11 @@ export class RuntimeCore implements RuntimeAdapter {
     request: TRequest,
     execute: (context: RuntimeOperationContext, request: TRequest) => Promise<AdapterResult<TResult>>,
     lifecycle?: CoordinatedLifecycle,
+    signal?: AbortSignal,
   ): Promise<RuntimeExecution<TResult>> {
     const now = this.#clock.now()
     await this.clients.assertActive(session, now)
+    if (this.#clientPersistence !== undefined && !this.#persistedSessions.has(session.clientSessionId)) throw new Error("Client session не подтверждена durable storage")
     const intent = runtimeOperationIntentSchema.parse(intentValue)
     const domain = intent.precondition.target.kind
     if (lifecycle === undefined && [
@@ -255,10 +477,15 @@ export class RuntimeCore implements RuntimeAdapter {
       }
       if (previous.result !== undefined) return previous.result as RuntimeExecution<TResult>
       if (previous.promise !== undefined) return previous.promise as Promise<RuntimeExecution<TResult>>
-      throw new Error("Operation зарегистрирована без execution promise")
+      throw new RuntimeContractError("receipt-expired", "Сохранён только operation receipt; действие не повторяется", "runtime-dedup", {
+        recoveryAction: "get-operation", context: { operationId: previousOperationId },
+      })
     }
 
     this.#assertIntentAuthority(session, intent, now)
+    if (!this.#storageInitialized) throw new RuntimeContractError("capability-unavailable", "Runtime durable recovery не инициализирована", "runtime-admission")
+    if (this.#admissionSealed) throw new RuntimeContractError("capability-unavailable", "Runtime admission sealed", "runtime-admission")
+    if (signal?.aborted) throw new RuntimeContractError("cancelled", "Operation отменена до admission", "runtime-admission")
     if (lifecycle?.admission !== "stored-cleanup") {
       await this.targets.resolve({
         target: intent.precondition.target,
@@ -273,9 +500,12 @@ export class RuntimeCore implements RuntimeAdapter {
 
     const operationId = this.#ids.next("operation")
     const wire = this.#createWireContext(operationId, session, intent)
-    const resourceExpiry = new Date(Math.min(Date.parse(intent.deadlineAt), now.getTime() + 30_000)).toISOString()
+    const resourceExpiry = new Date(Math.min(Date.parse(intent.deadlineAt), now.getTime() + 120_000)).toISOString()
     const handles = this.resources.acquire(session, operationId, intent.requestedResources, resourceExpiry)
     const controller = new AbortController()
+    const abortFromCaller = () => controller.abort(signal?.reason ?? "caller cancellation")
+    signal?.addEventListener("abort", abortFromCaller, { once: true })
+    if (signal?.aborted) abortFromCaller()
     const record = operationRecordSchema.parse({
       clientSessionId: session.clientSessionId,
       principalId: session.principalId,
@@ -298,6 +528,8 @@ export class RuntimeCore implements RuntimeAdapter {
       controller,
       adapterStarted: false,
       settled: false,
+      durableRevision: 0,
+      durableTail: Promise.resolve(),
     }
     this.#journal.set(operationId, entry)
     this.#dedup.set(dedupKey, operationId)
@@ -305,7 +537,8 @@ export class RuntimeCore implements RuntimeAdapter {
     entry.deadlineTimer = setTimeout(() => controller.abort("operation deadline exceeded"), deadlineDelay)
     const promise = this.#execute(entry, session, handles, request, execute, lifecycle)
     entry.promise = promise as Promise<RuntimeExecution<unknown>>
-    return promise
+    try { return await promise }
+    finally { signal?.removeEventListener("abort", abortFromCaller) }
   }
 
   async getOperation(session: RuntimeClientSession, operationId: string): Promise<OperationRecord | undefined> {
@@ -331,6 +564,7 @@ export class RuntimeCore implements RuntimeAdapter {
     const entry = this.#journal.get(operationId)
     if (entry === undefined) throw new Error("Operation не найдена")
     this.#assertJournalAuthority(session, entry.record)
+    if (entry.record.context.runtimeEpoch !== this.generation.runtimeEpoch) return entry.record
     if (isTerminal(entry.record)) return entry.record
     entry.record = operationRecordSchema.parse({
       ...entry.record,
@@ -410,11 +644,11 @@ export class RuntimeCore implements RuntimeAdapter {
       outcome: stagedOutcome,
       updatedAt: this.#clock.now().toISOString(),
     })
-    const receipt = this.resources.reconcileCleanup(
-      report.operationId,
-      entry.record.resources,
-      report.cleanup,
-    )
+    const cleanupStage = this.resources.prepareCleanup(report.operationId, entry.record.resources, report.cleanup, "quarantined")
+    if (cleanupStage.receipt === undefined) throw new Error("Reconciliation requires complete cleanup receipt")
+    await this.#persist(entry, stagedRecord, cleanupStage.receipt)
+    cleanupStage.commit()
+    const receipt = cleanupStage.receipt
     this.#reconciliationRevisions.set(report.operationId, report.revision)
     this.#reconciliationReceipts.set(report.operationId, {
       revision: report.revision,
@@ -440,10 +674,10 @@ export class RuntimeCore implements RuntimeAdapter {
   }
 
   activeOperationCount(): number {
-    return [...this.#journal.values()].filter(entry => !isTerminal(entry.record)).length
+    return [...this.#journal.values()].filter(entry => !entry.settled).length
   }
 
-  #stageLifetimeRecovery(operationIds: readonly string[]): () => void {
+  async #stageLifetimeRecovery(operationIds: readonly string[]): Promise<() => void> {
     const staged = operationIds.flatMap(id => {
       const entry = this.#journal.get(id)
       if (entry === undefined || !entry.settled) throw new Error("Recovery journal entry отсутствует или active")
@@ -460,11 +694,13 @@ export class RuntimeCore implements RuntimeAdapter {
         outcome: { ...entry.record.outcome, cleanup },
         updatedAt: this.#clock.now().toISOString(),
       })
-      return [{ entry, record, handles, cleanup }]
+      const prepared = this.resources.prepareCleanup(id, handles, cleanup, "quarantined")
+      return [{ entry, record, prepared }]
     })
+    for (const { entry, record, prepared } of staged) await this.#persist(entry, record, prepared.receipt)
     return () => {
-      for (const { entry, record, handles, cleanup } of staged) {
-        this.resources.reconcileCleanup(record.context.operationId, handles, cleanup)
+      for (const { entry, record, prepared } of staged) {
+        prepared.commit()
         entry.record = record
         if (entry.result !== undefined) entry.result = {
           operation: record,
@@ -514,7 +750,9 @@ export class RuntimeCore implements RuntimeAdapter {
     }
     let abortGuard: { promise: Promise<never>, dispose(): void } | undefined
     try {
+      await this.#persist(entry, entry.record)
       await context.control.checkpoint("before-adapter-dispatch")
+      if (this.#admissionSealed) throw new RuntimeContractError("capability-unavailable", "Runtime admission sealed", "runtime-admission")
       await lifecycle?.before(context)
       if (entry.controller.signal.aborted) throw new RuntimeContractError("cancelled", "Operation отменена", "before-adapter-dispatch")
       entry.record = operationRecordSchema.parse({
@@ -522,11 +760,15 @@ export class RuntimeCore implements RuntimeAdapter {
         state: "dispatching",
         updatedAt: this.#clock.now().toISOString(),
       })
+      await this.#persist(entry, entry.record)
+      if (this.#admissionSealed || entry.controller.signal.aborted) throw new RuntimeContractError("cancelled", "Admission отменена до durable dispatch", "runtime-dispatch")
       entry.adapterStarted = true
       abortGuard = this.#createAbortGuard(entry, context)
       const adapterPromise = Promise.resolve().then(() => execute(context, request))
       const rawResult = await Promise.race([adapterPromise, abortGuard.promise])
-      const parsedResult = parseWireValue(adapterResultSchema(z.unknown()), rawResult) as AdapterResult<TResult>
+      const parsedResult = parseWireValue(adapterResultSchema(z.unknown()), rawResult, {
+        maxDepth: 32, maxBytes: context.wire.kind === "clipboard" ? 8 * 1024 * 1024 : 1024 * 1024,
+      }) as AdapterResult<TResult>
       const verifiedNativeStatus = lifecycle === undefined
         ? await Promise.race([this.#verifyBackendCompletion(context, parsedResult), abortGuard.promise])
         : undefined
@@ -559,7 +801,10 @@ export class RuntimeCore implements RuntimeAdapter {
           { recoveryAction: "get-operation" },
         )
       }
-      this.resources.applyCleanup(entry.record.context.operationId, handles, outcome.cleanup)
+      const stagedCleanup = this.resources.prepareCleanup(entry.record.context.operationId, handles, outcome.cleanup)
+      await Promise.race([this.#persist(entry, stagedRecord, stagedCleanup.receipt), abortGuard.promise])
+      if (entry.settled || entry.controller.signal.aborted && !confirmedCancellation) throw new Error("Runtime finalize cancelled during durable write")
+      stagedCleanup.commit()
       commitLifecycle?.()
       const execution = { operation: stagedRecord, result }
       this.#settle(entry, execution)
@@ -578,12 +823,15 @@ export class RuntimeCore implements RuntimeAdapter {
         })
         const stagedRecord = operationRecordSchema.parse({
           ...entry.record,
-          state: "rejected",
+          state: entry.record.state === "registered" ? "rejected" : "failed",
           outcome,
           error: contractError,
           updatedAt: this.#clock.now().toISOString(),
         })
-        this.resources.applyCleanup(entry.record.context.operationId, handles, cleanup)
+        const stagedCleanup = this.resources.prepareCleanup(entry.record.context.operationId, handles, cleanup)
+        try { await this.#persist(entry, stagedRecord, stagedCleanup.receipt) }
+        catch { this.sealAdmission() }
+        stagedCleanup.commit()
         const result: AdapterResult<TResult> = { ok: false, error: contractError, outcome }
         const execution = { operation: stagedRecord, result }
         this.#settle(entry, execution)
@@ -610,6 +858,8 @@ export class RuntimeCore implements RuntimeAdapter {
         ...(entry.lastNativeStatus === undefined ? {} : { nativeStatus: entry.lastNativeStatus }),
       }
       const execution = { operation: stagedRecord, result }
+      try { await this.#persist(entry, stagedRecord) }
+      catch { this.sealAdmission() }
       this.#settle(entry, execution)
       return execution
     } finally {
@@ -759,6 +1009,38 @@ export class RuntimeCore implements RuntimeAdapter {
     entry.result = execution as RuntimeExecution<unknown>
   }
 
+  async #persist(entry: JournalEntry, record: OperationRecord, cleanupReceipt?: CleanupAuthorityReceipt): Promise<void> {
+    if (this.#operationJournal === undefined) return
+    if (this.#storagePoisoned) throw new Error("Durable storage poisoned после unresolved write")
+    const snapshot = structuredClone(record)
+    const revision = ++entry.durableRevision
+    const store = this.#operationJournal
+    const write = async () => {
+      if (this.#storagePoisoned) throw new Error("Durable storage poisoned до queued write")
+      try { await store.persist(snapshot, revision, cleanupReceipt === undefined ? {} : { cleanupReceipt }) }
+      catch (error) {
+        if (this.#storagePoisoned) throw error
+        await store.persist(snapshot, revision, cleanupReceipt === undefined ? {} : { cleanupReceipt })
+      }
+    }
+    const pending = entry.durableTail.then(write, write)
+    entry.durableTail = pending.catch(() => undefined)
+    await this.#awaitDurable(pending)
+  }
+
+  async #awaitDurable(pending: Promise<unknown>): Promise<void> {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([pending, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => {
+          this.#storagePoisoned = true
+          this.quarantineStartup("Durable write deadline: позднее подтверждение не открывает admission")
+          reject(new Error("Durable write deadline"))
+        }, this.#durableTimeoutMs)
+      })])
+    } finally { if (timer !== undefined) clearTimeout(timer) }
+  }
+
   #createWireContext(
     operationId: string,
     session: RuntimeClientSession,
@@ -777,6 +1059,7 @@ export class RuntimeCore implements RuntimeAdapter {
       target: intent.precondition.target,
     }
     switch (intent.precondition.target.kind) {
+      case "application-bundle":
       case "application":
       case "window":
       case "surface":

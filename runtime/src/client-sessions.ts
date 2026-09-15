@@ -1,5 +1,6 @@
 import {
   runtimeClientSessionSchema,
+  z,
   type ClientSessionAuthority,
   type RuntimeClientSession,
   type RuntimeGeneration,
@@ -12,14 +13,16 @@ export type RuntimeClientCredential = {
   resumptionToken: string
 }
 
-type StoredSession = {
-  session: RuntimeClientSession
-  lineageId: string
-  bearerDigest: string
-  resumptionDigest: string
-  disconnected: boolean
-  revoked: boolean
-}
+export const storedClientSessionSchema = z.strictObject({
+  session: runtimeClientSessionSchema,
+  lineageId: z.string().min(1).max(127),
+  bearerDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  resumptionDigest: z.string().regex(/^[a-f0-9]{64}$/),
+  resumptionExpiresAt: z.iso.datetime({ offset: true }).optional(),
+  disconnected: z.boolean(), revoked: z.boolean(),
+})
+export type StoredClientSession = z.infer<typeof storedClientSessionSchema>
+type StoredSession = StoredClientSession
 
 export class ClientSessionRegistry implements ClientSessionAuthority {
   readonly #generation: RuntimeGeneration
@@ -42,10 +45,12 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
     return this.#open(principalId, this.#ids.next("lineage"), ttlMs)
   }
 
-  #open(principalId: string, lineageId: string, ttlMs: number): RuntimeClientCredential {
+  #open(principalId: string, lineageId: string, ttlMs: number, resumeToken?: string): RuntimeClientCredential {
+    if (this.#sessions.size >= 10_000) throw new Error("Client session capacity достигнута")
+    if (!Number.isSafeInteger(ttlMs) || ttlMs < 1 || ttlMs > 120 * 60 * 1000) throw new Error("Client TTL вне bounds")
     const now = this.#clock.now()
     const bearerToken = this.#ids.next("bearer")
-    const resumptionToken = this.#ids.next("resume")
+    const resumptionToken = resumeToken ?? this.#ids.next("resume")
     const session = runtimeClientSessionSchema.parse({
       clientSessionId: this.#ids.next("client"),
       principalId,
@@ -59,6 +64,7 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
       lineageId,
       bearerDigest: sha256(bearerToken),
       resumptionDigest: sha256(resumptionToken),
+      resumptionExpiresAt: new Date(now.getTime() + 24 * 60 * 60 * 1000).toISOString(),
       disconnected: false,
       revoked: false,
     }
@@ -76,12 +82,48 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
   }
 
   resume(resumptionToken: string, ttlMs = 5 * 60 * 1_000): RuntimeClientCredential {
-    const previous = this.#byDigest(this.#resumptionIndex, sha256(resumptionToken))
-    this.#assertStoredActive(previous, this.#clock.now())
+    const previous = this.#resumable(resumptionToken)
+    const credential = this.#open(previous.session.principalId, previous.lineageId, ttlMs, resumptionToken)
     previous.disconnected = true
+    previous.revoked = true
     this.#bearerIndex.delete(previous.bearerDigest)
-    this.#resumptionIndex.delete(previous.resumptionDigest)
-    return this.#open(previous.session.principalId, previous.lineageId, ttlMs)
+    return credential
+  }
+
+  resumptionLineage(resumptionToken: string): string { return this.#resumable(resumptionToken).lineageId }
+
+  #resumable(resumptionToken: string): StoredSession {
+    const previous = this.#byDigest(this.#resumptionIndex, sha256(resumptionToken))
+    if (previous.revoked || previous.session.loginSessionId !== this.#generation.loginSessionId
+      || this.#clock.now().getTime() >= Date.parse(previous.resumptionExpiresAt ?? previous.session.expiresAt)) throw new Error("Resumption credential отозван, истёк или принадлежит другой login session")
+    return previous
+  }
+
+  snapshot(): StoredClientSession[] { return structuredClone([...this.#sessions.values()]) }
+
+  restore(values: readonly StoredClientSession[]): void {
+    if (this.#sessions.size > 0) throw new Error("Client snapshot восстанавливается только при startup")
+    const records = z.array(storedClientSessionSchema).max(10_000).parse(values)
+    const ids = new Set<string>()
+    const resumptions = new Set<string>()
+    for (const stored of records) {
+      if (stored.session.loginSessionId !== this.#generation.loginSessionId || ids.has(stored.session.clientSessionId)) throw new Error("Client snapshot содержит foreign login или duplicate session")
+      ids.add(stored.session.clientSessionId)
+      if (!stored.revoked) {
+        if (resumptions.has(stored.resumptionDigest)) throw new Error("Client snapshot содержит duplicate active resumption")
+        resumptions.add(stored.resumptionDigest)
+      }
+    }
+    for (const stored of records) {
+      this.#sessions.set(stored.session.clientSessionId, stored)
+      if (!stored.revoked) this.#resumptionIndex.set(stored.resumptionDigest, stored.session.clientSessionId)
+      if (!stored.revoked && !stored.disconnected && stored.session.runtimeEpoch === this.#generation.runtimeEpoch) this.#bearerIndex.set(stored.bearerDigest, stored.session.clientSessionId)
+    }
+  }
+
+  historicalLineage(clientSessionId: string, principalId: string): string | undefined {
+    const stored = this.#sessions.get(clientSessionId)
+    return stored?.session.principalId === principalId ? stored.lineageId : undefined
   }
 
   disconnect(clientSessionId: string): void {
@@ -126,7 +168,7 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
   }
 
   #assertStoredActive(stored: StoredSession, now: Date): void {
-    if (stored.revoked) throw new Error("Client session отозвана")
+    if (stored.revoked) throw new Error(stored.disconnected ? "Client session отключена и отозвана" : "Client session отозвана")
     if (
       stored.session.runtimeEpoch !== this.#generation.runtimeEpoch
       || stored.session.loginSessionId !== this.#generation.loginSessionId

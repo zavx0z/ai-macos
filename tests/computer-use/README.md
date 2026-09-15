@@ -6,6 +6,8 @@ API. C2-проверки используют реальные публичны�
 и `ledger.c` через стабильный `META_NATIVE_ABI_VERSION=2`.
 Межклиентский C2 subset использует public `@meta/runtime` и его настоящие
 session, resource, journal, deadline и quarantine authorities.
+Host integration использует реальный `RuntimeHost → UDS → dynamic MCP` path с
+двумя отдельными runtime/MCP client lineages и injected native transport.
 
 Безопасный запуск:
 
@@ -30,7 +32,7 @@ ADB, Accessibility, Screen Recording и не выполняют permission workf
 - A11: public payload/error contract и runtime resumption/dedup.
 - A16: реальный registry сохраняет ambiguous для двух AX-кандидатур и одного CG.
 - A38: public adapter capability schema допускает недоступные optional adapters.
-  Отдельное runtime assertion независимого запуска core ещё не добавлено.
+  RuntimeHost/UDS/MCP проходит без native optional capabilities.
 
 Runtime integration дополнительно проверяет:
 
@@ -40,6 +42,16 @@ Runtime integration дополнительно проверяет:
   отсутствие plaintext payload в journal record.
 - A05/A42: deadline зависшего adapter bounded, unknown cleanup quarantines
   resource и не допускает новый dispatch.
+
+Host/MCP integration дополнительно проверяет:
+
+- client-scoped frame доступен выдавшей lineage и возвращает 404 другой;
+- unavailable method отсутствует в `tools/list` и не достигает executor даже
+  при прямом MCP call;
+- native disconnect отзывает capabilities и приводит к MCP
+  `tools/list_changed`;
+- host drain получает native ACK, завершается bounded и закрывает dynamic
+  catalog admission, сохраняя пассивный health.
 
 `matrix.ts` перечисляет все A01–A45 и отдельно хранит фактически подключённое
 SUT evidence. Наличие parser/native проверки не закрывает live или более высокий
@@ -55,4 +67,28 @@ dependency для будущего injected runtime/native driver.
 - Остаток A42: journal capacity/retention и restart persistence.
 - A31: настоящий private UDS, peer identity и token boundary до executor.
 
-До появления этих exports passing substitute model не добавляется.
+До появления оставшихся owner surfaces passing substitute model не добавляется.
+
+## Исполняемый профиль A01–A45
+
+```bash
+bun tests/computer-use/profile-runner.ts
+```
+
+Runner запускает только safe contract/native/runtime/host-MCP suites и печатает
+JSON с `pass`, `fail` или `not-run` для каждой строки A01–A45. Evidence refs и
+missing evidence записываются отдельно. Частичная зелёная проверка не превращает
+строку с отсутствующим live/transport/durable evidence в `pass`.
+
+Каждый subprocess имеет явный timeout 10–30 секунд и output cap 128–256 КиБ на
+stream. Exit 0 принимается только при ненулевом `pass`, нулевых `fail` и нулевых
+`skip/todo`; timeout, truncation, skipped или zero-test suite становятся `fail`.
+При timeout/output overflow exact child получает SIGTERM, затем после короткого
+grace — SIGKILL; отдельный global deadline отменяет stdout/stderr readers, даже
+если pipe удерживает descendant. Process group и посторонние процессы не
+сигнализируются. Это проверяется реальным TERM-ignoring subprocess fixture.
+
+Текущий safe profile: 8 pass, 0 fail, 37 not-run. Pass получают только A03,
+A06, A08, A09, A10, A11, A38 и A45. A18 получает зелёное native-fixture
+evidence, но остаётся `not-run` из-за обязательной live-части. Runner ничего не
+записывает на диск и не запускает live desktop.

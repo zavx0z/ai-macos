@@ -5,8 +5,173 @@
 Статус: C1 принят. C2 runtime core/evidence/continuation принят scoped ведущим.
 C3 lifetime coordinator связан с RuntimeCore; текущий атомарный checkpoint
 компилируется и проходит 34 runtime tests. Transport foundation принят scoped;
-production catalog/cutover ещё впереди. Следующий checkpoint закрывает
-quarantined/expired recovery и actual Android adapter composition.
+production cutover ещё впереди. Recovery и Android composition приняты scoped;
+следующий checkpoint подключает durable journal и native held-input ledger.
+
+## Checkpoint durable core и host integration
+
+Проверенный lifecycle checkpoint:
+
+- Host использует kernel lease и проверенную очистку stale socket/credential до
+  запуска metadata/helper. Новый integration test принудительно завершает
+  RuntimeHost через SIGKILL, проверяет оставшиеся артефакты и подтверждает
+  успешный новый host с прежней lineage после resume.
+- ClientRenewalCoordinator обновляет credential между calls, до expiry или до
+  длинного метода. Concurrent renew coalesces; active call не теряет bearer.
+  Runtime запрещает resume при ещё active operation этой lineage. Resumption
+  inactivity TTL отделён от пятиминутного bearer и ограничен 24 часами.
+- Explicit UDS close останавливает renewal/catalog polling, сообщает disconnect
+  runtime и ждёт остановки active calls. Thin MCP закрывает свой runtime client;
+  doctor также освобождает временную session. Browser lifetime grace cleanup
+  ещё требует отдельной интеграции.
+- Host heartbeat: один in-flight request, interval 250 ms, deadline 500 ms;
+  failure закрывает admission, drain/close останавливают цикл. Heartbeat IDs
+  имеют отдельное bounded окно 128 IDs/5 секунд и не исчерпывают 24h action IDs.
+- FrameStore ограничен глобально 64 кадрами/128 MiB, по 4 на lineage; expiry
+  удаляет байты и publication metadata. Bounded issued-reference tombstones
+  запрещают повторную публикацию после eviction. Proof/observation metadata
+  имеют capacity и очистку expired записей; browser proof не связывается с
+  native generation смешанного host.
+- Host подключает owner registrars Input/Capture/Browser, но pointer/drag
+  остаются unavailable до настоящего readonly point-hit evidence provider.
+  Browser endpoints задаются только явным host config; Chrome не запускается,
+  Android остаётся explicit opt-in. Window и capture readiness берутся из
+  реальных declared Native capabilities.
+- Последний полный runtime + thin MCP run: **129 pass / 618 assertions**;
+  root typecheck **exit 0**, diff-check **pass**. После него pointer/drag были
+  оставлены fail-closed до production point-hit цепочки; изменение только
+  capability allowlist.
+
+Restart credentials и пассивная идентичность helper:
+
+- Private client state хранит HMAC key generation, ключ, hashes bearer/resumption
+  credentials и exact lineage/session metadata. Checksum, private mode, UID,
+  запрет symlink и размер проверяются при чтении; запись использует atomic fsync.
+- Host подтверждает запись credential до ответа open/resume. Зависшая запись
+  ограничена durable deadline и закрывает admission. Обычный sync open запрещён
+  в durable host; operation требует подтверждённую durable session.
+- После restart старый bearer не действует. Resumption token подтверждает прежнюю
+  lineage в той же login session и выдаёт новый bearer/current epoch. Token
+  сохраняется при resume, чтобы потерянный resume reply можно было безопасно
+  повторить без создания новой lineage.
+- Terminal и unresolved journal metadata загружаются без action replay. Старая
+  lineage читает прежний receipt; fresh principal с тем же именем доступа не
+  получает. Response payload не сохраняется: повтор возвращает receipt-expired
+  со ссылкой на operation, не запускает adapter заново.
+- Native permissions control channel проверяет request/runtime/login/native
+  generation и loaded build. Health возвращает свежие passive grants с
+  SecCode self identity, когда helper её предоставил. При отсутствии подписи
+  или mismatch явно возвращается permissionsUnavailable.
+- Metadata subprocess cleanup теперь TERM → bounded wait → KILL → подтверждение
+  exit; не подтверждённый exit является ошибкой, а не успешным завершением probe.
+- Focused restart/reservations/host/persistence: **17 pass / 114 assertions**.
+  Полный предыдущий runtime run: 96 pass и один устаревший message assertion,
+  после исправления wording соответствующий тест повторно прошёл. Root tsc
+  остановился только на незавершённых installer helpers в параллельной работе.
+- Остаётся: подтверждённое восстановление старого held-input ledger новым
+  helper, bounded retention/session cleanup и live native generation rotation.
+
+Следующий транспортный срез:
+
+- Отдельный adminToken из private credential разрешает только administrative
+  inspect/drain routes. Session bearer и bootstrapToken там отклоняются.
+  Drain проверяет exact epoch/runtime build и, если передан, native build до
+  callback; receipt и повторный inspect должны подтвердить тот же host и нулевые
+  active/quarantined ресурсы. Незавершённый startup recovery блокирует drain.
+- RuntimeUdsClient предоставляет adminInspect/adminDrain; host связывает их с
+  реальным native drain. Method descriptor содержит timeoutMs, и callTool
+  использует актуальный budget из каталога вместо фиксированных пяти секунд.
+- Native metadata stdout ограничен 1 MiB, stderr одновременно читается с
+  пределом 64 KiB; оба потока и subprocess имеют deadline, незавершённый child
+  завершается при выходе из probe. Payload stderr не включается в diagnostics.
+- Проверка transport/registry/clipboard/host: **18 pass / 131 assertions**;
+  root typecheck **exit 0**, diff-check **pass**.
+
+- Core записывает registered и dispatching до вызова adapter. Проверенный
+  terminal record с cleanup receipt сохраняется до освобождения resource.
+  Recovery старых browser operations использует тот же staged durable порядок.
+- Каждая durable write ограничена отдельным deadline. Зависание навсегда
+  закрывает admission; queued writes не обходят poisoned storage. Cancel/drain
+  завершают ожидание, поздний ACK не меняет receipt и не снимает quarantine.
+- Host подключает FileOperationJournal и FileHeldInputLedger из принятого
+  storage-модуля. META_RUNTIME_STATE_DIR задаёт private state directory;
+  по умолчанию используется state рядом с socket. Незавершённые операции и
+  unreleased ledger entries закрывают startup admission и видны в doctor.
+- После process crash новый epoch загружает старые записи только как recovery
+  evidence: action не воспроизводится, новая lineage не получает старую operation.
+  Durable resumption credentials, explicit recovery credential и автоматическая
+  reconciliation после restart пока не реализованы.
+- Host использует registerWindowMethods с сохранением permission-revocation
+  hook. Browser coordinator принимает caller AbortSignal. Resource expiry
+  следует operation deadline с верхним пределом 120 секунд, а не обрывает
+  33-секундную typing operation прежним пределом 30 секунд.
+- Capture publication выдаётся по lineage/clientRequestId, включая concurrent
+  retry; commit требует завершённую операцию, frame и выданный native proof.
+  Browser proof authority и полный capture lifecycle ещё требуют интеграции.
+- Последний полный runtime run: **80 pass / 430 assertions**. Это fake/temp
+  filesystem evidence, включая реальный дочерний process crash; live desktop,
+  installed services и Native helper не запускались и не переключались.
+- Root typecheck в последнем проходе остановился на двух TS2352 в параллельно
+  изменяемом browser-methods.ts; владелец уведомлён. До этих изменений typecheck
+  host/core проходил. Полная приёмка пока не заявляется.
+
+## Checkpoint MethodRegistry, host и clipboard mapper
+
+Доработка после host review:
+
+- Последние catalogue corrections: seal/unseal вызывают admission notification,
+  registry увеличивает revision и фильтрует descriptors тем же
+  availableDuringDrain policy, который использует dispatch. Clipboard descriptors
+  используют concrete Input-owned read/write request/result schemas; union.refine
+  больше не создаёт ложную JSON Schema. Targeted host/registry **6 pass/40
+  assertions**, root typecheck **exit 0**, diff-check **pass**.
+
+- Method definition snapshot фиксируется в register: input/output schema clones,
+  bound execute/frames/isError callbacks и immutable annotations/budgets.
+- Catalogue advertisement и dispatch используют тот же actual host capability
+  snapshot; required dependencies проверяются, native transport close/permission
+  revocation понижают доступность. Clipboard read/write имеют разные annotations.
+- Serialized clipboard profile — explicit 8 MiB на registry, core output, UDS и
+  клиенте, logical text limit остаётся 1 000 000 UTF-8 bytes. Host-owned isError
+  predicate сохраняет partial/native failure semantics в MCP result.
+- Singleton owner acquired до metadata/helper spawn. Core sealAdmission закрывает
+  новые операции до wait/cancel/drain, failure оставляет admission sealed.
+- Optional shared NativeAuditSession schema добавлена. Production host требует
+  verified native metadata UID/auditSessionId, выводит audit:uid:asid и проверяет
+  такое же session в долгоживущем handshake. Static install session env удалён.
+- Последний run: **58 pass/317 assertions** в runtime suite, включая 11 storage
+  tests отдельного владельца; root typecheck **exit 0**, diff-check **pass**.
+
+- `runtime/src/method-registry.ts`: MethodRegistry выводит descriptors из Zod,
+  проверяет active session/input/output, ограничивает execution и сообщает
+  revision/list changes. Input не содержит callback или resource policy.
+- `runtime/src/transport.ts`: UDS `/v1/catalog`, `/v1/tools/:name`, `/v1/frames/:ref`.
+  RuntimeUdsClient публикует `listTools`, `callTool(name,args,signal)`,
+  `subscribeCatalogChanged`, `readFrame`. Frame scope — server client lineage;
+  `callTool` превращает выданные frameRefs в image content только на клиенте.
+- `runtime/src/server.ts` — import-safe entrypoint; `host.ts/createRuntimeHost`
+  конфигурирует machine/build check, native handshake/evidence binding, UDS и
+  начальный каталог health/get/cancel/list_windows/clipboard. Полный action
+  catalogue остаётся следующим integration scope.
+- Env: `META_RUNTIME_SOCKET`, `META_RUNTIME_CREDENTIAL`, `META_NATIVE_HELPER`,
+  `META_NATIVE_BUILD_ID`, `AI_MACOS_EXPECTED_HOSTNAME`.
+  Runtime build внедряется через `__META_RUNTIME_BUILD_ID__`; development fallback
+  только явный `META_RUNTIME_BUILD_ID`. `--doctor` читает уже работающий UDS host.
+- Историческое ограничение этого checkpoint: ledgerSink отклонял persistence.
+  Подключение store описано выше; installed action cutover ещё не выполнен.
+- `RuntimeClipboardHandler` использует настоящие Input schemas/adapter/backend,
+  проверяет registered native receipt, превращает pending в verified complete
+  либо unknown quarantine и исключает clipboard extra из generic AdapterResult.
+  Plaintext не пишется в OperationRecord/report; metadata bounded, unresolved
+  receipt budget блокирует новые действия без silent eviction.
+- Tests clipboard success/mismatch/partial/lost — 4 pass/35 assertions;
+  registry/UDS catalogue/frame isolation — 2 pass/11 assertions.
+- Последний полный runtime run: **48 pass/274 assertions**, включая 7 tests
+  storage-owned slice (файлы storage не менялись). Root typecheck — **exit 0**.
+
+Следующий шаг после scoped checkpoint: принятие storage interfaces → durable
+pre-dispatch journal/native ledger/startup reconciliation, затем полный adapter
+catalogue и host lifecycle. Installed services не переключались.
 
 ## Checkpoint recovery и Android
 

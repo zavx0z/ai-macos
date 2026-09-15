@@ -16,7 +16,13 @@ export interface AcceptanceScenario {
   prerequisite: "C1" | "C2" | "C3" | "C4" | "native-live" | "device-live"
 }
 
-export type AcceptanceSutEvidence = "contract-parser" | "native-c" | "runtime-core"
+export type AcceptanceSutEvidence =
+  | "contract-parser"
+  | "native-c"
+  | "native-window-adapter"
+  | "native-command-loop"
+  | "runtime-core"
+  | "runtime-host-mcp"
 
 // Это реестр приёмки, а не production API и не доказательство полной готовности сценария.
 export const acceptanceScenarios: AcceptanceScenario[] = [
@@ -81,6 +87,10 @@ export const acceptanceSutEvidence: Partial<
   A10: ["contract-parser", "native-c"],
   A11: ["contract-parser", "runtime-core"],
   A16: ["native-c"],
-  A38: ["contract-parser"],
-  A42: ["runtime-core"]
+  A18: ["native-window-adapter"],
+  A38: ["contract-parser", "runtime-host-mcp"],
+  A41: ["runtime-host-mcp"],
+  A42: ["runtime-core", "runtime-host-mcp"],
+  A43: ["runtime-host-mcp"],
+  A45: ["native-command-loop"]
 }

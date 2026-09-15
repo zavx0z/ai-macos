@@ -49,7 +49,7 @@ import {
   nativeCleanupAckSchema,
   nativeCleanupControlSchema,
 } from "./native-lifecycle.ts"
-import { nativeHandshakeRequestSchema, nativeHandshakeResponseSchema } from "./native.ts"
+import { nativeAuditSessionSchema, nativeHandshakeRequestSchema, nativeHandshakeResponseSchema } from "./native.ts"
 import { observedEventSchema, observerCoverageSchema } from "./observer.ts"
 import {
   observationSchema,
@@ -112,6 +112,7 @@ export const contractSchemaRegistry = {
   nativeTextChunk: nativeTextChunkSchema,
   clipboardVersion: clipboardVersionSchema,
   nativeHandshakeRequest: nativeHandshakeRequestSchema,
+  nativeAuditSession: nativeAuditSessionSchema,
   nativeHandshakeResponse: nativeHandshakeResponseSchema,
   nativeStatusRequest: nativeStatusRequestSchema,
   nativeOperationStatus: nativeOperationStatusSchema,

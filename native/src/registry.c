@@ -102,8 +102,11 @@ static bool display_layout_changed(const MetaRegistry *registry,
         break;
       }
     }
-    if (previous == NULL || !same_rect(previous->bounds, source->bounds) ||
-        !same_rect(previous->usable_bounds, source->usable_bounds) ||
+    if (previous == NULL ||
+        previous->bounds.x != source->bounds.x || previous->bounds.y != source->bounds.y ||
+        previous->bounds.width != source->bounds.width || previous->bounds.height != source->bounds.height ||
+        previous->usable_bounds.x != source->usable_bounds.x || previous->usable_bounds.y != source->usable_bounds.y ||
+        previous->usable_bounds.width != source->usable_bounds.width || previous->usable_bounds.height != source->usable_bounds.height ||
         previous->scale != source->scale ||
         previous->rotation_degrees != source->rotation_degrees ||
         previous->main != source->main) {
@@ -538,6 +541,9 @@ bool meta_registry_refresh(MetaRegistry *registry,
   working.snapshot.display_layout_revision =
       registry->snapshot.display_layout_revision +
       (topology_changed ? 1 : 0);
+  snprintf(working.snapshot.layout_ref, sizeof(working.snapshot.layout_ref),
+           "%s:layout:%llu", working.native_generation,
+           (unsigned long long)working.snapshot.display_layout_revision);
   working.snapshot.captured_at_micros = input->captured_at_micros;
   working.snapshot.complete = complete;
   working.snapshot.applications = working.applications;

@@ -83,6 +83,7 @@ int main(void) {
   assert([unresolved[@"kind"] isEqualToString:@"cg-only"]);
   assert(unresolved[@"windowRef"] == nil);
   assert([json[@"displayLayoutRevision"] unsignedLongLongValue] == 1);
+  assert([json[@"layoutRef"] isEqual:@(meta_registry_snapshot(registry)->layout_ref)]);
   CFRelease(data);
   MetaCaptureDisplayRegion region = {
       .displayID = 100,

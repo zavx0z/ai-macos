@@ -11,6 +11,7 @@ import type {
   NativeTransportPacket,
   NativeTransportRequestFrame,
 } from "../src/protocol.ts"
+import { nativeInventoryResultSchema } from "../src/protocol.ts"
 import { NativeWindowAdapter } from "../src/window-adapter.ts"
 import { extractNativeEvidenceReports } from "../src/evidence-extractor.ts"
 import { createRuntimeNativeEvidenceBinder } from "../src/evidence-extractor.ts"
@@ -24,6 +25,7 @@ const generation = {
 const capturedAt = new Date().toISOString()
 
 class InventoryTransport implements NativeTransport {
+  constructor(readonly hidden = false) {}
   readonly #packets: NativeTransportPacket[] = []
   readonly #waiters: Array<(packet: NativeTransportPacket) => void> = []
 
@@ -67,6 +69,7 @@ class InventoryTransport implements NativeTransport {
             result: {
               sourceResponseRef: "inventory-response-1",
               inventoryId: "inventory-1",
+              layoutRef: "native-1:layout:1",
               revision: 1,
               displayLayoutRevision: 1,
               capturedAt,
@@ -173,6 +176,22 @@ class InventoryTransport implements NativeTransport {
   async close(): Promise<void> {}
 
   push(packet: NativeTransportPacket): void {
+    if (this.hidden && packet.kind === "message" && packet.frame.channel === "response" && packet.frame.payload.ok) {
+      const inventory = nativeInventoryResultSchema.parse(packet.frame.payload.result)
+      for (const window of inventory.windows) {
+        if (window.kind !== "ax-window") continue
+        delete window.cgWindowId
+        delete window.axSnapshotRef
+        delete window.cgInventoryRef
+        window.mapping = "unavailable"
+        window.mappingReason = "Скрытое AX окно без CG mapping"
+        window.minimized = "true"
+        window.applicationHidden = "true"
+        window.onScreen = "false"
+        window.spaceVisibility = "not-current"
+      }
+      packet.frame.payload.result = inventory
+    }
     const waiter = this.#waiters.shift()
     if (waiter === undefined) this.#packets.push(packet)
     else waiter(packet)
@@ -312,10 +331,26 @@ describe("NativeWindowAdapter", () => {
     expect(unresolved?.kind).toBe("cg-only")
     if (unresolved?.kind !== "cg-only") throw new Error("ожидалось CG-only window")
     expect(unresolved.cgWindowId).toBe(901)
+    expect(inventory.desktopLayout).toMatchObject({
+      kind: "desktop-layout",
+      target: {
+        kind: "desktop-layout",
+        ref: { layoutRef: "native-1:layout:1", displayLayoutRevision: 1 },
+      },
+    })
+    expect(inventory.desktopLayout?.displays.map(display => display.nativeDisplayId)).toEqual([100, 101])
+    expect(inventory.desktopLayout?.mappingEvidence.state).toBe("confirmed")
+    if (inventory.desktopLayout?.mappingEvidence.state !== "confirmed") {
+      throw new Error("ожидался authoritative desktop layout proof")
+    }
+    expect(inventory.desktopLayout.mappingEvidence.proof.kind).toBe("target-resolution")
     expect(reports.map(report => report.factKind)).toEqual([
       "target-resolution",
       "target-resolution",
+      "target-resolution",
+      "native-target-identity",
       "window-cg-ax-correlation",
+      "native-target-identity",
     ])
     const windowReport = reports.find(report => report.factKind === "window-cg-ax-correlation")
     expect(windowReport?.factKind).toBe("window-cg-ax-correlation")
@@ -326,7 +361,7 @@ describe("NativeWindowAdapter", () => {
     await native.close()
   })
 
-  test("связывает exact native source с реальным runtime evidence authority", async () => {
+  test.each([false, true])("связывает exact native source с runtime, hidden=%s", async hidden => {
     const runtime = new RuntimeCore({
       generation: {
         runtimeEpoch: generation.runtimeEpoch,
@@ -352,7 +387,7 @@ describe("NativeWindowAdapter", () => {
           capabilities: [],
         },
       },
-      transport: new InventoryTransport(),
+      transport: new InventoryTransport(hidden),
       ledgerSink: { persist: async () => { throw new Error("ledger не ожидался") } },
       bindEvidence: createRuntimeNativeEvidenceBinder(runtime.evidence),
     })
@@ -370,10 +405,28 @@ describe("NativeWindowAdapter", () => {
       signal: new AbortController().signal,
       checkpoint: () => undefined,
     })
+    expect(inventory.desktopLayout?.mappingEvidence.state).toBe("confirmed")
+    if (inventory.desktopLayout === undefined) throw new Error("Authoritative desktop layout отсутствует")
+    const layoutResolution = await runtime.targets.resolve({
+      target: inventory.desktopLayout.target,
+      inventoryId: inventory.inventoryId,
+      inventoryRevision: inventory.revision,
+      runtimeEpoch: generation.runtimeEpoch,
+      loginSessionId: generation.loginSessionId,
+      nativeGeneration: generation.nativeGeneration,
+      deadlineAt: new Date(Date.now() + 1_000).toISOString(),
+    })
+    expect(layoutResolution.nativeMapping).toEqual({
+      kind: "desktop-layout",
+      displays: inventory.desktopLayout.displays.map(display => ({
+        nativeDisplayId: display.nativeDisplayId,
+        ref: display.target.ref,
+      })),
+    })
     const window = inventory.windows.find(entry => entry.kind === "ax-window")
     expect(window?.kind).toBe("ax-window")
     if (window?.kind !== "ax-window") throw new Error("AX window отсутствует")
-    expect(window.mappingEvidence?.proof.kind).toBe("cg-ax-correlation")
+    expect(window.mappingEvidence?.proof.kind).toBe(hidden ? undefined : "cg-ax-correlation")
     const resolution = await runtime.targets.resolve({
       target: { kind: "window", ref: window.ref },
       inventoryId: inventory.inventoryId,
@@ -383,7 +436,18 @@ describe("NativeWindowAdapter", () => {
       nativeGeneration: generation.nativeGeneration,
       deadlineAt: new Date(Date.now() + 1_000).toISOString(),
     })
-    expect(resolution.nativeMapping?.kind).toBe("window")
+    expect(resolution.nativeMapping?.kind).toBe(hidden ? undefined : "window")
+    const surface = window.surfaces[0]!
+    const surfaceResolution = await runtime.targets.resolve({
+      target: { kind: "surface", ref: surface.ref }, inventoryId: inventory.inventoryId,
+      inventoryRevision: inventory.revision, ...generation, deadlineAt: new Date(Date.now() + 1000).toISOString(),
+    })
+    expect(surfaceResolution.nativeMapping).toBeUndefined()
+    await expect(runtime.targets.resolve({
+      target: { kind: "window", ref: { ...window.ref, windowRef: "window-foreign" } },
+      inventoryId: inventory.inventoryId, inventoryRevision: inventory.revision, ...generation,
+      deadlineAt: new Date(Date.now() + 1000).toISOString(),
+    })).rejects.toThrow("не зарегистрирован")
     await native.close()
   })
 })

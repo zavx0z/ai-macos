@@ -52,6 +52,17 @@ export type RuntimeProcessRef = z.infer<typeof runtimeProcessRefSchema>
 export const applicationRefSchema = processRefSchema
 export type ApplicationRef = ProcessRef
 
+/** Native-issued identity установленного bundle до появления процесса. */
+export const applicationBundleRefSchema = nativeGenerationSchema.extend({
+  bundleRef: opaqueIdSchema,
+  bundleId: z.string().min(1).max(255),
+  path: z.string().min(1).max(4096).startsWith("/"),
+  device: z.string().regex(/^[0-9]+$/).max(32),
+  inode: z.string().regex(/^[0-9]+$/).max(32),
+  modifiedAtNs: z.string().regex(/^[0-9]+$/).max(32),
+}).strict()
+export type ApplicationBundleRef = z.infer<typeof applicationBundleRefSchema>
+
 export const windowRefSchema = nativeGenerationSchema.extend({
   applicationRef: opaqueIdSchema,
   windowRef: opaqueIdSchema,
@@ -121,6 +132,7 @@ export const clipboardRefSchema = runtimeGenerationSchema.extend({
 export type ClipboardRef = z.infer<typeof clipboardRefSchema>
 
 export const operationTargetSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("application-bundle"), ref: applicationBundleRefSchema }),
   z.strictObject({ kind: z.literal("application"), ref: applicationRefSchema }),
   z.strictObject({ kind: z.literal("window"), ref: windowRefSchema }),
   z.strictObject({ kind: z.literal("surface"), ref: surfaceRefSchema }),
@@ -137,6 +149,7 @@ export const operationTargetSchema = z.discriminatedUnion("kind", [
 export type OperationTarget = z.infer<typeof operationTargetSchema>
 
 export const nativeOperationTargetSchema = z.discriminatedUnion("kind", [
+  z.strictObject({ kind: z.literal("application-bundle"), ref: applicationBundleRefSchema }),
   z.strictObject({ kind: z.literal("application"), ref: applicationRefSchema }),
   z.strictObject({ kind: z.literal("window"), ref: windowRefSchema }),
   z.strictObject({ kind: z.literal("surface"), ref: surfaceRefSchema }),

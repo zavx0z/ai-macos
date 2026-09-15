@@ -441,7 +441,9 @@ bool meta_executor_checkpoint(MetaExecutor *executor, const char *stage) {
   copy_text(executor->status.last_checkpoint,
             sizeof(executor->status.last_checkpoint), stage);
   if (executor->status.cancellation_requested ||
+      (executor->backend.should_cancel != NULL && executor->backend.should_cancel(executor->backend.context)) ||
       now_millis(executor) > executor->deadline_millis) {
+    executor->status.cancellation_requested = true;
     stop_for_reason(executor, META_EXECUTOR_CANCELLED);
     return false;
   }
@@ -487,6 +489,8 @@ bool meta_executor_post_down(MetaExecutor *executor, MetaHeldEventKind kind,
     stop_for_reason(executor, META_EXECUTOR_FAILED);
     return false;
   }
+
+  if (!meta_executor_checkpoint(executor, "after-down-ledger-ack")) return false;
 
   const bool posted = executor->backend.post_held_event(
       executor->backend.context, kind, code, true, executor->synthetic_tag);
@@ -603,6 +607,21 @@ bool meta_executor_post_scroll_event(MetaExecutor *executor,
   executor->status.dispatch_attempts += 1;
   executor->status.dispatch = META_DISPATCH_ATTEMPTED;
   if (!posted) {
+    quarantine(executor);
+    return false;
+  }
+  executor->status.dispatch = META_DISPATCH_PARTIAL;
+  return executor->active;
+}
+
+bool meta_executor_dispatch_action(MetaExecutor *executor,
+                                   bool (*dispatch)(void *context),
+                                   void *context,
+                                   const char *checkpoint) {
+  if (executor == NULL || dispatch == NULL || !meta_executor_checkpoint(executor, checkpoint)) return false;
+  executor->status.dispatch_attempts += 1;
+  executor->status.dispatch = META_DISPATCH_ATTEMPTED;
+  if (!dispatch(context)) {
     quarantine(executor);
     return false;
   }
@@ -764,6 +783,9 @@ MetaExecutorStatus meta_executor_status(const MetaExecutor *executor) {
   }
   MetaExecutorStatus status = executor->status;
   status.held_count = held_count(executor);
+  if (status.held_count > 0 && status.cleanup == META_CLEANUP_COMPLETE) {
+    status.cleanup = META_CLEANUP_INCOMPLETE;
+  }
   return status;
 }
 

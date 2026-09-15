@@ -237,6 +237,111 @@ sh native/scripts/build.sh /tmp/meta-native-build.*/libmeta-native.dylib
 
 ## Следующий шаг
 
+### Window / permissions executable checkpoint
+
+Production loop принимает `window.transition` на общей action queue. Window
+actions используют тот же `MetaExecutor`, fence high-water и cancellation job,
+что и keyboard/text; отдельного mutation executor нет. Добавлен bounded
+external-dispatch callback с собственным счётчиком попытки backend invocation.
+Exact inventory/ref/application/process borrow выполняется до window action;
+для hidden show не требуется предварительный focus. После действия возвращается
+fresh inventory readback. Close различает существующее окно, подтверждённое
+отсутствие и неизвестный результат; sheets проверяются по точному owner.
+При провале самого refresh не выдаётся старый snapshot как свежий.
+
+Добавлен пассивный long-lived `permissions` channel с actual loaded-code
+identity из `SecCodeCopySelf` и `kSecCodeInfoUnique`, а не из caller digest или
+пути другого candidate. Неподписанный/непроверенный code identity не объявляется
+известным. Settings и активный input probe этим каналом не вызываются.
+
+Shortcut подключён к C schedule и durable held-input ledger. Command-loop
+fixture: 12 tests / 52 assertions pass, включая один fence high-water для
+window и input, отказ повторного fence, следующий fence, shortcut и permissions.
+Fixture использует injected backend, не выполняет live desktop действия.
+Full temporary executable `native-window-permissions-check` собирается с
+`-Wall -Wextra -Werror`; production binary не запускался.
+
+Atomic binary transport уже передаёт один header+raw-bytes queue item, отдельно
+ограничивает binary budget и не допускает JSON interleaving. Capture command
+binder находится у capture-owner; observer/focus coverage module — у input-owner.
+Production capture/apps/pointer/observer/readiness/recovery wiring ещё не
+завершено; этот checkpoint не является installed cutover или live acceptance.
+
+### Read-only AX handler checkpoint
+
+`ax.inspect` подключён к action worker через
+`meta_macos_with_ax_target` и `meta_ax_inspect_borrowed_element`. Borrow проверяет
+current inventory/native generation, exact AX ref, application/process
+incarnation и permission. Raw nodes возвращаются через существующий protocol;
+public structured-node mapper находится у выделенного AX helper. Permission и
+stale-target failures возвращаются как typed errors. Cursor paging пока не
+подключён: запрос с cursor отклоняется.
+
+Production build включает `native/src/accessibility/meta_ax_inspector.m`.
+Production request-builder `native/src/ax_request.m` передаёт inspector именно
+`inventory_id` и `inventory_revision` из проверенного borrow, проверяет
+window/surface kind и точный `ownerWindowRef` у surface. Injected regression
+использует этот же builder и настоящий inspector: результат содержит один
+узел, несовпадение kind или owner отвергается. Проверка fixture и сборка
+временного executable с build ID `native-ax-context-check` прошли; live AX
+операции и установленный helper не затрагивались.
+Command-loop suite — 10 tests / 39 assertions pass; temporary candidate
+`native-ax-handler-check` собирается, не запускался. Shared definitions и
+inspector subtree меняет AX helper, inventory/evidence registry — root.
+
+### Audit session metadata checkpoint
+
+Production `--metadata`, `--doctor` и framed handshake теперь содержат `session`
+из `getaudit_addr`, `getuid`, `geteuid` в исполняемом helper. При syscall failure
+или unassigned audit session возвращается `verified:false` с reason; caller
+environment не подставляется. При verified identity native admission сравнивает
+login label с `audit:<uid>:<auditSessionId>`. RuntimeHost отдельно проверяет
+actual handshake session перед readiness; parent-process audit comparison пока
+не заявлен.
+
+`build-broker.sh` связывает `session_identity.c` и `libbsm`. Временный production
+candidate с ID `native-audit-metadata-check` собран, не запускался. Command-loop
+fixture возвращает явно unverified mock session, не вызывает audit syscall:
+8 tests / 33 assertions pass. `git diff --check` проходит.
+
+### Async command loop и keyboard checkpoint
+
+`command_loop.m` теперь использует `MetaBrokerTransport`: control queue отдельно
+от последовательной action queue, main NSRunLoop продолжает работать. Slow AX
+inventory не удерживает heartbeat/drain. При занятой action queue новый action
+отклоняется; requests не копятся в скрытом scheduler.
+
+`MetaInputExecutor` владеет постоянным C executor только на action thread.
+`MetaInputJob` передаёт atomic cancel и immutable status snapshots через
+`NSCondition`; durable ledger ACK ждёт отдельная bounded condition. TS adapter
+продолжает читать control responses, пока ledger sink сохраняет snapshot.
+Дополнительный checkpoint после down ledger ACK предотвращает post после
+полученной отмены; неопределённая pending entry сохраняет quarantine.
+
+Production handlers `input.execute` для key/text подключены к CoreGraphics sink,
+exact focused AX target и текущему inventory ID/revision; status/cancel читают
+job snapshot и меняют только cancel signal. Pointer/shortcut, capture и window
+transitions ещё остаются последующими handler slices.
+
+Проверки: 8 C/Objective-C fixtures pass; adapter + command-loop suites —
+12 tests / 36 assertions pass. Настоящий command loop с injected sink проверяет
+cancel между Unicode clusters и heartbeat/cancel во время ledger ACK wait.
+Production executable собирается с build ID `native-concurrent-input-check`,
+но не запускался. Targeted tsc и diff check проходят.
+
+Scoped async review исправил три случая: input focus использует exact
+`CFEqual(focused, target)` и больше не принимает родительское окно вместо
+focused sheet; rejected ledger sink переводит adapter в `poisoned`, закрывает
+transport и немедленно отклоняет status/cancel; native failures отображаются
+из C status как target-stale/failed, resource-quarantined, cleanup-incomplete
+или cancelled. Если C executor уже принял operation, коррелированный status
+сохраняется и при begin-time verification failure.
+
+После исправлений adapter+command-loop: 15 tests / 49 assertions pass.
+Cancel ACK с `stopped:false` подтверждает лишь запрос. После последующего
+`stopped:true, cleanup:complete` дополнительная status-проверка подтверждает
+неизменность dispatch counter. Production candidate пересобран, но не запущен.
+
 ### Первый executable checkpoint
 
 `native/scripts/build-broker.sh <temporary-candidate-output> <build-id>` теперь

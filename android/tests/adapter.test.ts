@@ -27,7 +27,33 @@ const services: AdapterServices = {
   frames: { async publish() {} },
   observations: { async resolvePoint() { throw new Error("not used") } },
   continuations: { async issue() { throw new Error("not used") }, async registerAcceptedTask() { throw new Error("not used") }, async advanceVerifiedStatus() { throw new Error("not used") }, async markVerifiedTerminal() { throw new Error("not used") } },
-  reservations: { async assertChild() { throw new Error("not used") } },
+  reservations: {
+    async assertChild(request) {
+      if (request.target.kind !== "device-browser-instance" && request.target.kind !== "device-browser-target") throw new Error("device browser target expected")
+      const ref = request.target.ref
+      const instance = "targetId" in ref
+        ? (({ targetId: _target, resourceRef: _resource, ...value }) => value)(ref)
+        : ref
+      return {
+        reservationId: "reservation:fixture",
+        reservationGeneration: "reservation-generation:1",
+        runtimeEpoch: request.session.runtimeEpoch,
+        loginSessionId: request.session.loginSessionId,
+        principalId: request.session.principalId,
+        lineageRef: "lineage:fixture",
+        target: { kind: "device-browser-instance", ref: instance },
+        externalGeneration: {
+          kind: "device-browser",
+          deviceTransportGeneration: instance.transportGeneration,
+          browserTransportGeneration: instance.browserTransportGeneration,
+        },
+        createdAt: "2026-09-15T00:00:00.000Z",
+        expiresAt: "2099-01-01T00:00:00.000Z",
+        state: "active",
+        statusRevision: 1,
+      }
+    },
+  },
 }
 
 function driver(): DeviceBrowserDriver & { connects: string[] } {
@@ -87,6 +113,20 @@ describe("RuntimeDeviceBrowserAdapter", () => {
     const result = await adapter.execute(context(ref, [handle("cdp-target", ref.browserInstanceRef)]), { kind: "connect-instance", instance: ref })
     expect(result.ok).toBe(false)
     expect(fake.connects).toEqual([])
+  })
+
+  test("Android recovery обновляет exact instance только после physical verifier", async () => {
+    const fake = driver()
+    const adapter = new RuntimeDeviceBrowserAdapter(host, services, [{ serial: "phone-a", localPort: 9223, deviceRef: "device:a", initialDeviceTransportGeneration: "usb:1", browserInstanceRef: "android-chrome:a", initialBrowserTransportGeneration: "cdp:0", driver: fake }], () => "cdp:1")
+    const devices = await adapter.listDevices({ signal: new AbortController().signal, checkpoint() {} })
+    const initial = (await adapter.listInstances(devices.devices[0]!.ref, { signal: new AbortController().signal, checkpoint() {} })).instances[0]!.ref
+    const connected = await adapter.execute(context(initial, [handle("cdp-target", initial.browserInstanceRef), handle("adb-device", initial.deviceRef)]), { kind: "connect-instance", instance: initial })
+    if (!connected.ok || connected.value.value.kind !== "instance-connected") throw new Error("Expected connected")
+    const ref = connected.value.value.instance.ref
+    await expect(adapter.recoverDisconnected(ref, async () => { throw new Error("forward removal failed") })).rejects.toThrow("forward removal failed")
+    adapter.assertConnectedExact(ref)
+    await adapter.recoverDisconnected(ref, async () => {})
+    adapter.assertDisconnectedExact(ref)
   })
 })
 

@@ -170,6 +170,7 @@ typedef struct {
 
 typedef struct {
   char inventory_id[META_NATIVE_REF_CAPACITY];
+  char layout_ref[META_NATIVE_REF_CAPACITY];
   char native_generation[META_NATIVE_REF_CAPACITY];
   uint64_t revision;
   uint64_t display_layout_revision;
@@ -379,6 +380,7 @@ typedef struct {
                             const MetaScrollEvent *event,
                             uint64_t synthetic_tag);
   bool (*set_event_flags)(void *context, uint64_t flags);
+  bool (*should_cancel)(void *context);
 } MetaExecutorBackend;
 
 typedef struct MetaExecutor MetaExecutor;
@@ -411,6 +413,12 @@ bool meta_executor_begin(MetaExecutor *executor, const char *operation_id,
                          const char *target_ref, MetaFence fence,
                          uint64_t deadline_millis);
 bool meta_executor_checkpoint(MetaExecutor *executor, const char *stage);
+// Один backend dispatch под существующим fence; callback выполняется только
+// на action worker и не создаёт отдельного executor или ledger.
+bool meta_executor_dispatch_action(MetaExecutor *executor,
+                                   bool (*dispatch)(void *context),
+                                   void *context,
+                                   const char *checkpoint);
 bool meta_executor_post_down(MetaExecutor *executor, MetaHeldEventKind kind,
                              uint32_t code);
 bool meta_executor_post_up(MetaExecutor *executor, MetaHeldEventKind kind,

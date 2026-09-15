@@ -10,6 +10,7 @@
 #include <time.h>
 
 #include "meta_macos.h"
+#include "window-actions/meta_window_readback.h"
 
 typedef struct {
   uint64_t token;
@@ -700,6 +701,42 @@ static AXHandle *resolve_transition_target(MetaMacOSBackend *backend,
   return handle;
 }
 
+MetaAXBorrowStatus meta_macos_with_ax_target(MetaMacOSBackend *backend,
+                                            const char *target_ref,
+                                            const char *inventory_id,
+                                            uint64_t inventory_revision,
+                                            const char *native_generation,
+                                            MetaAXTargetConsumer consume,
+                                            void *context) {
+  if (backend == NULL || target_ref == NULL || inventory_id == NULL || native_generation == NULL || consume == NULL ||
+      target_ref[0] == '\0' || strnlen(target_ref, META_NATIVE_REF_CAPACITY) >= META_NATIVE_REF_CAPACITY) {
+    return META_AX_BORROW_INVALID_REQUEST;
+  }
+  const MetaInventorySnapshot *snapshot = meta_registry_snapshot(backend->registry);
+  if (snapshot == NULL || strcmp(snapshot->inventory_id, inventory_id) != 0 ||
+      snapshot->revision != inventory_revision || strcmp(snapshot->native_generation, native_generation) != 0) {
+    return META_AX_BORROW_TARGET_STALE;
+  }
+  const MetaWindowRecord *record = meta_registry_resolve_target(backend->registry, target_ref);
+  if (record == NULL || record->actionability != META_ACTIONABILITY_AX) return META_AX_BORROW_TARGET_STALE;
+  AXHandle *handle = find_handle(backend, record->ax_token);
+  if (!process_matches(record, handle)) return META_AX_BORROW_TARGET_STALE;
+  if (!AXIsProcessTrusted()) return META_AX_BORROW_PERMISSION_DENIED;
+  MetaAXTargetBorrow borrow = {
+    .element = (AXUIElementRef)CFRetain(handle->element),
+    .target = *record,
+    .launch_time_micros = handle->launch_time_micros,
+    .inventory_revision = snapshot->revision,
+  };
+  snprintf(borrow.native_generation, sizeof(borrow.native_generation), "%s", snapshot->native_generation);
+  snprintf(borrow.inventory_id, sizeof(borrow.inventory_id), "%s", snapshot->inventory_id);
+  AXUIElementSetMessagingTimeout(borrow.element, 0.5f);
+  bool consumed = consume(context, &borrow);
+  CFRelease(borrow.element);
+  if (process_start_micros(borrow.target.pid) != borrow.launch_time_micros) return META_AX_BORROW_TARGET_STALE;
+  return consumed ? META_AX_BORROW_OK : META_AX_BORROW_CONSUMER_FAILED;
+}
+
 static bool element_is_owned_sheet(AXUIElementRef owner,
                                    AXUIElementRef candidate) {
   CFTypeRef sheets_value = NULL;
@@ -743,6 +780,27 @@ static void read_transition_state(AXHandle *handle,
   }
   if (focused_value != NULL) CFRelease(focused_value);
   CFRelease(application);
+}
+
+bool meta_macos_target_is_focused(MetaMacOSBackend *backend, const char *target_ref) {
+  if (backend == NULL || target_ref == NULL || !AXIsProcessTrusted()) return false;
+  const MetaWindowRecord *record = meta_registry_resolve_target(backend->registry, target_ref);
+  if (record == NULL) return false;
+  AXHandle *handle = find_handle(backend, record->ax_token);
+  if (!process_matches(record, handle)) return false;
+  NSRunningApplication *running = [NSRunningApplication runningApplicationWithProcessIdentifier:handle->pid];
+  if (running == nil || running.hidden || NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier != handle->pid ||
+      copy_bool_attribute(handle->element, kAXMinimizedAttribute) == META_TRUE) return false;
+  AXUIElementRef application = AXUIElementCreateApplication(handle->pid);
+  if (application == NULL) return false;
+  AXUIElementSetMessagingTimeout(application, 0.5f);
+  CFTypeRef focused = NULL;
+  AXError error = AXUIElementCopyAttributeValue(application, kAXFocusedWindowAttribute, &focused);
+  const bool exact = error == kAXErrorSuccess && focused != NULL &&
+                     CFGetTypeID(focused) == AXUIElementGetTypeID() && CFEqual(focused, handle->element);
+  if (focused != NULL) CFRelease(focused);
+  CFRelease(application);
+  return exact;
 }
 
 static bool perform_focus(MetaMacOSBackend *backend, const char *window_ref,
@@ -908,40 +966,6 @@ bool meta_macos_set_window_minimized(MetaMacOSBackend *backend,
   return false;
 }
 
-static bool element_still_present(AXHandle *handle,
-                                  bool *sheet_observed) {
-  AXUIElementRef application = AXUIElementCreateApplication(handle->pid);
-  if (application == NULL) return false;
-  AXUIElementSetMessagingTimeout(application, 0.5f);
-  CFTypeRef windows_value = NULL;
-  const AXError error = AXUIElementCopyAttributeValue(
-      application, kAXWindowsAttribute, &windows_value);
-  CFRelease(application);
-  if (error != kAXErrorSuccess || windows_value == NULL ||
-      CFGetTypeID(windows_value) != CFArrayGetTypeID()) {
-    if (windows_value != NULL) CFRelease(windows_value);
-    return true;
-  }
-  bool present = false;
-  CFArrayRef windows = (CFArrayRef)windows_value;
-  for (CFIndex index = 0; index < CFArrayGetCount(windows); index += 1) {
-    AXUIElementRef window =
-        (AXUIElementRef)CFArrayGetValueAtIndex(windows, index);
-    if (CFEqual(window, handle->element)) present = true;
-    CFTypeRef sheets_value = NULL;
-    if (AXUIElementCopyAttributeValue(window, CFSTR("AXSheets"),
-                                      &sheets_value) == kAXErrorSuccess &&
-        sheets_value != NULL &&
-        CFGetTypeID(sheets_value) == CFArrayGetTypeID() &&
-        CFArrayGetCount((CFArrayRef)sheets_value) > 0) {
-      *sheet_observed = true;
-    }
-    if (sheets_value != NULL) CFRelease(sheets_value);
-  }
-  CFRelease(windows);
-  return present;
-}
-
 bool meta_macos_close_window(MetaMacOSBackend *backend,
                              const char *window_ref,
                              MetaWindowTransition *result) {
@@ -950,22 +974,26 @@ bool meta_macos_close_window(MetaMacOSBackend *backend,
   AXHandle *handle =
       resolve_transition_target(backend, window_ref, &record, result);
   if (handle == NULL) return false;
-  result->close_attempted = true;
+  MetaWindowRecord original = *record;
+  uint64_t launch_time = handle->launch_time_micros;
   CFTypeRef button_value = NULL;
   const AXError copy_error = AXUIElementCopyAttributeValue(
       handle->element, kAXCloseButtonAttribute, &button_value);
   AXError close_error = copy_error;
   if (copy_error == kAXErrorSuccess && button_value != NULL &&
       CFGetTypeID(button_value) == AXUIElementGetTypeID()) {
+    result->close_attempted = true;
     close_error = AXUIElementPerformAction((AXUIElementRef)button_value,
                                            kAXPressAction);
-  }
+  } else if (copy_error == kAXErrorSuccess) close_error = kAXErrorNoValue;
   if (button_value != NULL) CFRelease(button_value);
   result->ax_error = close_error == kAXErrorSuccess ? 0 : close_error;
-  bool sheet_observed = false;
-  const bool present = element_still_present(handle, &sheet_observed);
-  result->modal_or_sheet_observed = sheet_observed;
-  result->close_succeeded = close_error == kAXErrorSuccess && !present;
+  // После refresh старые record/handle недействительны. Отсутствие признаётся
+  // только в полном свежем AX inventory того же process incarnation.
+  bool refreshed = meta_macos_refresh_inventory(backend, 5000);
+  const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(backend);
+  meta_window_classify_close(refreshed ? snapshot : NULL, &original, launch_time,
+      process_start_micros(original.pid) == launch_time, close_error == kAXErrorSuccess, result);
   if (result->close_succeeded) {
     result->status = META_TRANSITION_SUCCEEDED;
     return true;

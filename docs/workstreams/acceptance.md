@@ -22,7 +22,8 @@ tri-state, recovery ledger читается через отдельный status
 acceptance-прогон: bounded in-process Runtime subset принят.
 
 Статус: **real-contract passed / real-native ABI v2 passed / runtime core C2
-subset accepted / transport and durable restart pending**.
+subset accepted / RuntimeHost-UDS-dynamic-MCP subset passed / full catalog,
+security and durable restart pending**.
 
 ## Реализовано
 
@@ -36,9 +37,17 @@ subset accepted / transport and durable restart pending**.
 - `tests/computer-use/runtime-sut.test.ts` — два bounded integration scenarios
   реального `RuntimeCore` с injected Native adapter boundary и настоящими
   session/resource authorities.
+- `tests/computer-use/host-mcp-sut.test.ts` — текущий реальный
+  `RuntimeHost → UDS → dynamic MCP` path с двумя client lineages, scoped frame,
+  unavailable capability gate, native disconnect/catalogChanged и bounded drain.
+- `tests/computer-use/profile-runner.ts` — executable safe profile A01–A45 с
+  evidence refs, missing evidence, bounded subprocess/output и честными
+  `pass/fail/not-run`.
+- `tests/computer-use/profile-runner.test.ts` — защита от fiction pass и
+  проверка распространения реального probe failure.
 - `tests/computer-use/matrix.ts` — все A01–A45 и отдельный реестр реально
   подключённого `contract-parser`/`native-c` evidence.
-- `tests/computer-use/matrix.test.ts` — A02/A03/A31 явно не получают evidence от
+- `tests/computer-use/matrix.test.ts` — A02/A31 явно не получают evidence от
   прежних reference-моделей.
 - `tests/computer-use/fixtures/native-event-sink.ts` — сохранён как
   нижнеуровневый fault-injection dependency; сейчас не считается SUT evidence.
@@ -85,10 +94,47 @@ Runtime core suite: 2 integration scenarios pass:
 Это in-process evidence A03, а не A02: отдельных MCP/STDIO процессов suite не
 создаёт. Это также не A31: private UDS/auth boundary здесь не проверяется.
 
+RuntimeHost/UDS/MCP suite: 3 integration scenarios pass:
+
+- два отдельных RuntimeUdsClient + MCP Client проходят через один actual host;
+  frame image получает только выдавшая client lineage, другая получает 404;
+- method с unavailable `browser.instances` не рекламируется и не достигает
+  executor при прямом MCP call;
+- injected native disconnect убирает `list_windows`, вызывает реальное MCP
+  `tools/list_changed`, последующий call не достигает native transport;
+- host drain получает correlated native ACK, укладывается в 500 мс, закрывает
+  dynamic admission/list_windows и оставляет `system_health`.
+
+MCP transport здесь настоящий по request path, но server/client соединены
+InMemoryTransport внутри test process. Поэтому A02 process startup и A31
+cross-user/forged-socket security не закрыты. `createRuntimeMcpServer`
+импортируется из текущего owner source, поскольку `@meta/mcp` не публикует
+package export для test factory.
+
+Executable profile запускает шесть safe SUT probes. Native window adapter test
+даёт A18 native-fixture evidence, но строка остаётся `not-run` без live. Actual
+production command-loop test закрывает fault-injection A45: slow inventory не
+блокирует control heartbeat, а drain проходит sealed-pending → complete.
+
+Каждый probe ограничен timeout 10–30 секунд и output cap 128–256 КиБ на stdout
+и stderr. Exit 0 без passed tests, с `skip/todo`, с truncation или timeout
+отвергается как evidence. Unit tests runner проверяют fiction-pass guard и
+распространение probe failure. Termination выполняется только для exact child:
+SIGTERM → bounded grace → SIGKILL. Отдельный force-deadline отменяет readers и
+возвращает bounded snapshot, если descendant удерживает inherited pipe.
+Behavioral test запускает TERM-ignoring child с краткоживущим descendant и
+подтверждает возврат runner примерно за 180 мс, не ожидая закрытия pipe.
+
+Текущий результат: 8 pass, 0 fail, 37 not-run. Полностью зелёные строки текущего
+профиля: A03, A06, A08, A09, A10, A11, A38, A45. Для остальных partial refs
+сохраняются, но missing live/transport/durable evidence не превращается в pass.
+
 ## Проверки
 
-- `bun test tests/computer-use` — 25 pass, 0 fail, 56 assertions. Compilation C
+- `bun test tests/computer-use` — 33 pass, 0 fail, 88 assertions. Compilation C
   binary с `-Wall -Wextra -Werror` успешна.
+- `bun tests/computer-use/profile-runner.ts` — 8 pass, 0 fail, 37 not-run;
+  шесть probe commands завершились без fail/skip/zero-test.
 - Targeted TypeScript acceptance check — exit 0.
 - Root typecheck по указанию ведущего повторно не запускался; Android сейчас
   редактирует его владелец.
@@ -102,26 +148,31 @@ Package export `@meta/shared/contracts` используется из dependency
 
 ## Remaining prerequisites
 
-1. A02 требует отдельных STDIO client processes над одним runtime/helper;
-   in-process client sessions не заменяют эту проверку.
+1. A02 требует отдельных STDIO client processes и concurrent host startup над
+   одним runtime/helper; два MCP connections in-memory это не заменяют.
 2. A31 требует настоящего private UDS, peer identity и token verification до
    production executor.
-3. Fresh MCP client lineage isolation требует отдельного process/transport
-   evidence; runtime resumption внутри одной principal lineage это не заменяет.
-4. A05 actual UDS timeout/cancel ещё требует принятого transport driver;
+3. Fresh MCP client lineage и frame authority через actual UDS проверены, но
+   reconnect отдельного STDIO process и client-live из настоящей задачи для A43
+   остаются открытыми.
+4. A05 actual UDS timeout/cancel ещё требует отдельного fault driver;
    текущий evidence проверяет runtime deadline/hung adapter и удержание resource
    до cancel ACK/quarantine.
 5. A42 durable journal restart, capacity/retention и bounded pruning ещё не
    проверены этим in-process subset.
 6. Live части A01/A04/A07/A16 и остальная live matrix остаются за C3/C4 и не
    закрываются native binary или parser tests.
+7. A18 имеет native fixture evidence, но actual AX request-builder composition
+   сейчас исправляет native owner: ранее обязательный `inventory_id` не доходил
+   до production inspector. До behavioral seam test и live evidence A18 не
+   получает pass.
 
 ## Следующий шаг
 
-После принятия transport gate добавить отдельные process/UDS drivers
-непосредственно над SUT для A02/A31 и transport-части A05. Не восстанавливать
-reference Runtime/Ledger/security models. A42 расширять только после публикации
-настоящей retention/persistence поверхности.
+Следующий checkpoint: отдельные process/UDS drivers непосредственно над SUT для
+A02/A31 и transport-части A05 после owner fixes, затем полный native
+catalog/capture. Не восстанавливать reference Runtime/Ledger/security models.
+A42 расширять только через настоящую retention/persistence поверхность.
 
 ## UI fixture checkpoint
 

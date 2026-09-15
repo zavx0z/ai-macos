@@ -1,6 +1,9 @@
 import { z } from "zod"
 import {
   displayRefSchema,
+  applicationRefSchema,
+  applicationBundleRefSchema,
+  surfaceRefSchema,
   fenceTokenSchema,
   generationIdSchema,
   nativeOperationTargetSchema,
@@ -19,7 +22,7 @@ import {
   type Point,
   type ProofRef,
 } from "./observations.ts"
-import { isoTimestampSchema } from "./schema.ts"
+import { isoTimestampSchema, structurallyEqual } from "./schema.ts"
 
 export const nativeDisplayMappingSchema = z.strictObject({
   nativeDisplayId: z.number().int().min(1).max(0xffffffff),
@@ -48,6 +51,21 @@ const nativeEvidenceCommonShape = {
 }
 
 export const nativeEvidenceReportSchema = z.discriminatedUnion("factKind", [
+  z.strictObject({
+    factKind: z.literal("application-bundle-identity"),
+    ...nativeEvidenceCommonShape,
+    target: z.strictObject({ kind: z.literal("application-bundle"), ref: applicationBundleRefSchema }),
+  }),
+  z.strictObject({
+    factKind: z.literal("native-target-identity"),
+    ...nativeEvidenceCommonShape,
+    process: applicationRefSchema,
+    target: z.discriminatedUnion("kind", [
+      z.strictObject({ kind: z.literal("application"), ref: applicationRefSchema }),
+      z.strictObject({ kind: z.literal("window"), ref: windowRefSchema }),
+      z.strictObject({ kind: z.literal("surface"), ref: surfaceRefSchema }),
+    ]),
+  }),
   z.strictObject({
     factKind: z.literal("target-resolution"),
     ...nativeEvidenceCommonShape,
@@ -120,6 +138,15 @@ export const nativeEvidenceReportSchema = z.discriminatedUnion("factKind", [
     drained: z.boolean(),
   }),
 ]).superRefine((report, context) => {
+  if (report.factKind === "native-target-identity") {
+    const target = report.target.ref
+    const process = report.process
+    if (target.runtimeEpoch !== process.runtimeEpoch || target.loginSessionId !== process.loginSessionId
+      || target.nativeGeneration !== process.nativeGeneration || target.applicationRef !== process.applicationRef
+      || (report.target.kind === "application" && !structurallyEqual(report.target.ref, process))) {
+      context.addIssue({ code: "custom", path: ["target"], message: "Native target не принадлежит подтверждённому process incarnation" })
+    }
+  }
   if (report.factKind === "target-resolution" && report.mapping.kind === "window") {
     context.addIssue({ code: "custom", path: ["mapping"], message: "window mapping требует window-cg-ax-correlation facts" })
   }
@@ -148,6 +175,8 @@ export const verifiedNativeEvidenceReceiptSchema = z.strictObject({
   displayLayoutRevision: z.number().int().safe().min(0),
   observedAt: isoTimestampSchema,
   factKind: z.enum([
+    "application-bundle-identity",
+    "native-target-identity",
     "target-resolution",
     "window-cg-ax-correlation",
     "frame",
@@ -169,7 +198,7 @@ export interface EvidenceIssuer {
   issueTargetResolution(request: {
     receipt: VerifiedNativeEvidenceReceipt
     target: z.infer<typeof nativeOperationTargetSchema>
-    nativeMapping: NativeTargetMapping
+    nativeMapping?: NativeTargetMapping
   }): Promise<ProofRef>
 
   issueWindowCorrelation(request: {

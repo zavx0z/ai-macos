@@ -4,6 +4,7 @@ import {
   parseWireJson,
   operationRecordSchema,
   runtimeOperationIntentSchema,
+  runtimeClientSessionSchema,
   z,
   type AdapterResult,
   type OperationRecord,
@@ -14,9 +15,11 @@ import {
 import { RuntimeCore } from "./core.ts"
 import { RuntimeContractError, contractErrorFrom } from "./errors.ts"
 import { randomIdSource, type RuntimeIdSource } from "./primitives.ts"
+import { MethodRegistry, type RuntimeMethodResponse, type RuntimeToolDescriptor } from "./method-registry.ts"
+import { ClientRenewalCoordinator } from "./client-renewal.ts"
 
 const MAX_RUNTIME_REQUEST_BYTES = 1024 * 1024
-const MAX_RUNTIME_RESPONSE_BYTES = 1024 * 1024
+const MAX_RUNTIME_RESPONSE_BYTES = 8 * 1024 * 1024
 const RUNTIME_TRANSPORT_TIMEOUT_MS = 5_000
 
 export class RuntimeUnknownDeliveryError extends Error {
@@ -28,6 +31,12 @@ export class RuntimeUnknownDeliveryError extends Error {
     super(message, options)
     this.name = "RuntimeUnknownDeliveryError"
   }
+}
+
+export type RuntimeToolResult = {
+  content: Array<{ type: "text", text: string } | { type: "image", mimeType: "image/png", data: string }>
+  structuredContent?: Record<string, unknown>
+  isError?: boolean
 }
 
 class RuntimeUdsHttpError extends Error {
@@ -43,6 +52,27 @@ export type RuntimeMethodDefinition<Input, Result> = {
 
 type StoredMethod = RuntimeMethodDefinition<unknown, unknown>
 
+const adminInspectionSchema = z.strictObject({
+  running: z.literal(true), runtimeEpoch: z.string().min(1).max(64), runtimeBuildId: z.string().min(1).max(127),
+  nativeBuildId: z.string().min(1).max(127).optional(),
+  activeOperations: z.number().int().min(0), quarantinedResources: z.number().int().min(0),
+})
+const adminDrainRequestSchema = z.strictObject({
+  runtimeEpoch: z.string().min(1).max(64), buildId: z.string().min(1).max(127),
+  nativeBuildId: z.string().min(1).max(127).optional(),
+})
+const adminDrainReceiptSchema = z.strictObject({
+  runtimeEpoch: z.string().min(1).max(64), runtimeBuildId: z.string().min(1).max(127), nativeBuildId: z.string().min(1).max(127),
+  cleanup: z.literal("complete"), activeOperations: z.literal(0), quarantinedResources: z.literal(0),
+})
+export type RuntimeAdminInspection = z.infer<typeof adminInspectionSchema>
+export type RuntimeAdminDrainRequest = z.infer<typeof adminDrainRequestSchema>
+export type RuntimeAdminDrainReceipt = z.infer<typeof adminDrainReceiptSchema>
+export type RuntimeAdminBinding = {
+  inspect(): RuntimeAdminInspection
+  drain(expected: RuntimeAdminDrainRequest, signal: AbortSignal): Promise<RuntimeAdminDrainReceipt>
+}
+
 export type RuntimeTransportOptions = {
   socketPath: string
   credentialPath: string
@@ -50,6 +80,8 @@ export type RuntimeTransportOptions = {
   principalId?: string
   ids?: RuntimeIdSource
   chmod?: typeof chmod
+  catalog?: MethodRegistry
+  admin?: RuntimeAdminBinding
 }
 
 export class RuntimeUdsServer {
@@ -60,8 +92,11 @@ export class RuntimeUdsServer {
   readonly #ids: RuntimeIdSource
   readonly #methods = new Map<string, StoredMethod>()
   readonly #chmod: typeof chmod
+  readonly #catalog?: MethodRegistry
+  readonly #admin?: RuntimeAdminBinding
   #server: ReturnType<typeof Bun.serve> | undefined
   #bootstrapToken: string | undefined
+  #adminToken: string | undefined
   #ownsCredential = false
   #ownsSocket = false
 
@@ -72,9 +107,14 @@ export class RuntimeUdsServer {
     this.#principalId = options.principalId ?? "mcp"
     this.#ids = options.ids ?? randomIdSource
     this.#chmod = options.chmod ?? chmod
+    this.#catalog = options.catalog
+    this.#admin = options.admin === undefined ? undefined : Object.freeze({
+      inspect: options.admin.inspect.bind(options.admin), drain: options.admin.drain.bind(options.admin),
+    })
   }
 
   register<Input, Result>(name: string, definition: RuntimeMethodDefinition<Input, Result>): void {
+    if (this.#catalog !== undefined) throw new Error("Production catalog owns method registration")
     if (!/^[a-z][a-z0-9._-]{0,127}$/.test(name)) throw new Error("Недопустимое имя runtime method")
     if (this.#methods.has(name)) throw new Error(`Runtime method уже зарегистрирован: ${name}`)
     this.#methods.set(name, definition as StoredMethod)
@@ -87,16 +127,19 @@ export class RuntimeUdsServer {
     await mkdir(directory, { recursive: true, mode: 0o700 })
     await this.#chmod(directory, 0o700)
     const bootstrapToken = this.#ids.next("bootstrap")
+    const adminToken = this.#ids.next("admin")
     try {
       await writeFile(this.#credentialPath, JSON.stringify({
         protocolVersion: "1",
         ...this.#core.generation,
         principalId: this.#principalId,
         bootstrapToken,
+        adminToken,
       }), { encoding: "utf8", mode: 0o600, flag: "wx" })
       this.#ownsCredential = true
       await this.#chmod(this.#credentialPath, 0o600)
       this.#bootstrapToken = bootstrapToken
+      this.#adminToken = adminToken
       this.#server = Bun.serve({
         unix: this.#socketPath,
         fetch: request => this.#fetch(request),
@@ -111,6 +154,7 @@ export class RuntimeUdsServer {
       if (this.#ownsCredential) await unlink(this.#credentialPath).catch(() => undefined)
       this.#ownsCredential = false
       this.#bootstrapToken = undefined
+      this.#adminToken = undefined
       throw error
     }
   }
@@ -119,6 +163,7 @@ export class RuntimeUdsServer {
     const server = this.#server
     this.#server = undefined
     this.#bootstrapToken = undefined
+    this.#adminToken = undefined
     if (server !== undefined) server.stop(true)
     await Promise.all([
       this.#ownsSocket ? unlink(this.#socketPath).catch(() => undefined) : undefined,
@@ -131,19 +176,60 @@ export class RuntimeUdsServer {
   async #fetch(request: Request): Promise<Response> {
     try {
       const url = new URL(request.url)
+      if (url.pathname.startsWith("/v1/admin/")) {
+        if (this.#adminToken === undefined || bearerToken(request) !== this.#adminToken) throw new RuntimeContractError("unauthorized", "Неверный admin credential", "runtime-admin")
+        if (this.#admin === undefined) return json({ error: "admin-unavailable" }, 503)
+        const current = adminInspectionSchema.parse(this.#admin.inspect())
+        if (request.method === "GET" && url.pathname === "/v1/admin/inspect") return json(current)
+        if (request.method === "POST" && url.pathname === "/v1/admin/drain") {
+          const expected = await readJson(request, adminDrainRequestSchema)
+          if (current.runtimeEpoch !== expected.runtimeEpoch || current.runtimeBuildId !== expected.buildId
+            || expected.nativeBuildId !== undefined && current.nativeBuildId !== expected.nativeBuildId) throw new Error("Admin drain generation/build mismatch")
+          const receipt = adminDrainReceiptSchema.parse(await this.#admin.drain(expected, request.signal))
+          const after = adminInspectionSchema.parse(this.#admin.inspect())
+          if (receipt.runtimeEpoch !== current.runtimeEpoch || receipt.runtimeBuildId !== current.runtimeBuildId
+            || receipt.nativeBuildId !== current.nativeBuildId || after.runtimeEpoch !== current.runtimeEpoch
+            || after.runtimeBuildId !== current.runtimeBuildId || after.nativeBuildId !== current.nativeBuildId
+            || after.activeOperations !== 0 || after.quarantinedResources !== 0) throw new Error("Admin drain receipt не подтверждает inspected host")
+          return json(receipt)
+        }
+        return json({ error: "not-found" }, 404)
+      }
       if (request.method === "POST" && url.pathname === "/v1/session/open") {
         this.#assertBootstrap(request)
         const body = await readJson(request, sessionOpenSchema)
-        const credential = this.#core.openClient(this.#principalId)
+        const credential = await this.#core.openClientDurable(this.#principalId)
         return json({ ...credential, clientName: body.clientName })
       }
       if (request.method === "POST" && url.pathname === "/v1/session/resume") {
         this.#assertBootstrap(request)
         const body = await readJson(request, sessionResumeSchema)
-        return json(this.#core.clients.resume(body.resumptionToken))
+        return json(await this.#core.resumeClientDurable(body.resumptionToken))
       }
 
       const session = this.#authenticate(request)
+      if (request.method === "POST" && url.pathname === "/v1/session/close") {
+        await readJson(request, z.strictObject({}))
+        await this.#core.closeClientDurable(session)
+        return json({ closed: true })
+      }
+      if (request.method === "GET" && url.pathname === "/v1/catalog") {
+        if (this.#catalog === undefined) return json({ error: "catalog-unavailable" }, 503)
+        return json(this.#catalog.descriptors())
+      }
+      const methodMatch = /^\/v1\/tools\/([^/]+)$/.exec(url.pathname)
+      if (request.method === "POST" && methodMatch !== null) {
+        if (this.#catalog === undefined) return json({ error: "catalog-unavailable" }, 503)
+        const body = parseWireJson(z.record(z.string(), z.json()), await readBoundedText(request, 8 * 1024 * 1024), { maxBytes: 8 * 1024 * 1024, maxDepth: 32 })
+        const result = await this.#catalog.dispatch(session, decodeURIComponent(methodMatch[1]!), body, request.signal)
+        return json(result)
+      }
+      const frameMatch = /^\/v1\/frames\/([^/]+)$/.exec(url.pathname)
+      if (request.method === "GET" && frameMatch !== null) {
+        const frame = this.#core.frames.get(decodeURIComponent(frameMatch[1]!), this.#core.clients.lineage(session))
+        return frame === undefined ? json({ error: "frame-not-found" }, 404)
+          : new Response(frame, { headers: { "content-type": "image/png", "cache-control": "no-store" } })
+      }
       if (request.method === "GET" && url.pathname === "/v1/health") {
         return json({
           ok: true,
@@ -218,26 +304,34 @@ export class RuntimeUdsServer {
 
 export class RuntimeUdsClient {
   readonly #socketPath: string
-  readonly #bootstrapToken: string
+  #bootstrapToken: string
+  #adminToken?: string
+  readonly #credentialPath: string
   #bearerToken: string | undefined
   #resumptionToken: string | undefined
   readonly #timeoutMs: number
+  readonly #renewal: ClientRenewalCoordinator
+  readonly #catalogSubscriptions = new Set<() => void>()
+  #closing?: Promise<void>
 
-  private constructor(socketPath: string, bootstrapToken: string, timeoutMs: number) {
+  private constructor(socketPath: string, credentialPath: string, bootstrapToken: string, timeoutMs: number, adminToken?: string, now?: () => number) {
     this.#socketPath = socketPath
+    this.#credentialPath = credentialPath
     this.#bootstrapToken = bootstrapToken
+    this.#adminToken = adminToken
     this.#timeoutMs = timeoutMs
+    this.#renewal = new ClientRenewalCoordinator({ now, renew: signal => this.#renewCredential(signal) })
   }
 
   static async fromCredentialFile(
     socketPath: string,
     credentialPath: string,
-    options: { timeoutMs?: number } = {},
+    options: { timeoutMs?: number, now?: () => number } = {},
   ): Promise<RuntimeUdsClient> {
     const credential = parseWireJson(bootstrapCredentialSchema, await readFile(credentialPath, "utf8"))
     const timeoutMs = options.timeoutMs ?? RUNTIME_TRANSPORT_TIMEOUT_MS
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error("Runtime client timeout должен быть 1..30000 ms")
-    return new RuntimeUdsClient(socketPath, credential.bootstrapToken, timeoutMs)
+    return new RuntimeUdsClient(socketPath, credentialPath, credential.bootstrapToken, timeoutMs, credential.adminToken, options.now)
   }
 
   async open(clientName: string): Promise<void> {
@@ -249,22 +343,115 @@ export class RuntimeUdsClient {
     const credential = sessionCredentialSchema.parse(response)
     this.#bearerToken = credential.bearerToken
     this.#resumptionToken = credential.resumptionToken
+    this.#renewal.setCredential(credential.session)
   }
 
   async resume(): Promise<void> {
+    await this.#renewal.renewNow()
+  }
+
+  async #renewCredential(signal: AbortSignal) {
     if (this.#resumptionToken === undefined) throw new Error("Нет resumption credential")
+    const bootstrap = parseWireJson(bootstrapCredentialSchema, await readFile(this.#credentialPath, "utf8"))
+    this.#bootstrapToken = bootstrap.bootstrapToken
+    this.#adminToken = bootstrap.adminToken
     const response = await this.#request("/v1/session/resume", {
       method: "POST",
       bootstrap: true,
       body: { resumptionToken: this.#resumptionToken },
+      signal,
     })
     const credential = sessionCredentialSchema.parse(response)
     this.#bearerToken = credential.bearerToken
     this.#resumptionToken = credential.resumptionToken
+    return credential.session
+  }
+
+  close(): Promise<void> {
+    return this.#closing ??= (async () => {
+      this.#renewal.close()
+      for (const unsubscribe of [...this.#catalogSubscriptions]) unsubscribe()
+      if (this.#bearerToken === undefined) return
+      try { await this.#request("/v1/session/close", { method: "POST", body: {}, skipRenewal: true }) }
+      finally { this.#bearerToken = undefined }
+    })()
   }
 
   async health(): Promise<unknown> {
     return this.#request("/v1/health")
+  }
+
+  async adminInspect(): Promise<RuntimeAdminInspection> {
+    return adminInspectionSchema.parse(await this.#request("/v1/admin/inspect", { admin: true }))
+  }
+
+  async adminDrain(expected: RuntimeAdminDrainRequest, signal?: AbortSignal): Promise<RuntimeAdminDrainReceipt> {
+    return adminDrainReceiptSchema.parse(await this.#request("/v1/admin/drain", {
+      method: "POST", admin: true, body: adminDrainRequestSchema.parse(expected), signal,
+    }))
+  }
+
+  async listTools(): Promise<RuntimeToolDescriptor[]> {
+    const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog"))
+    return catalog.tools as RuntimeToolDescriptor[]
+  }
+
+  async callTool(name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<RuntimeToolResult> {
+    try {
+      const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog", { signal }))
+      const descriptor = catalog.tools.find(tool => tool.name === name)
+      if (descriptor === undefined) throw new Error("Method отсутствует в текущем runtime catalogue")
+      const timeoutMs = Math.max(this.#timeoutMs, (descriptor._meta?.timeoutMs ?? 5000) + 1000)
+      const result = methodResponseSchema.parse(await this.#request(`/v1/tools/${encodeURIComponent(name)}`, {
+        method: "POST", body: args, signal, timeoutMs,
+      }))
+      const content: RuntimeToolResult["content"] = [{ type: "text", text: JSON.stringify(result.data) }]
+      for (const frameRef of result.frameRefs) {
+        const bytes = await this.readFrame(frameRef, signal)
+        content.push({ type: "image", mimeType: "image/png", data: Buffer.from(bytes).toString("base64") })
+      }
+      return { content, structuredContent: result.data, ...(result.isError === undefined ? {} : { isError: result.isError }) }
+    } catch (error) {
+      if (typeof args.clientRequestId === "string") {
+        const operation = await this.getOperationByRequest(args.clientRequestId).catch(() => undefined)
+        if (operation !== undefined) return {
+          isError: true,
+          content: [{ type: "text", text: "Tool response не получен; используйте operation status, не повторяйте действие" }],
+          structuredContent: { operation },
+        }
+      }
+      return { isError: true, content: [{ type: "text", text: error instanceof RuntimeUdsHttpError
+        ? error.message : "Runtime transport failed; outcome может требовать status lookup" }] }
+    }
+  }
+
+  async readFrame(frameRef: string, signal?: AbortSignal): Promise<Uint8Array> {
+    const lease = await this.#renewal.enter(this.#timeoutMs * 2, signal)
+    try {
+    const response = await this.#raw(`/v1/frames/${encodeURIComponent(frameRef)}`, { signal: lease.signal })
+    if (!response.ok) throw new RuntimeUdsHttpError(response.status, await readResponseJson(response, this.#timeoutMs))
+    if (response.headers.get("content-type") !== "image/png") throw new Error("Runtime frame response имеет другой MIME")
+    const bytes = await readBoundedBinary(response, 64 * 1024 * 1024, this.#timeoutMs)
+    return bytes
+    } finally { lease.release() }
+  }
+
+  subscribeCatalogChanged(listener: () => void): () => void {
+    const controller = new AbortController()
+    let revision: number | undefined
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const poll = async () => {
+      try {
+        const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog", { signal: controller.signal }))
+        if (revision !== undefined && catalog.revision !== revision) listener()
+        revision = catalog.revision
+      } catch { /* Переподключение каталога повторится на следующем ограниченном запросе. */ }
+      if (!controller.signal.aborted) timer = setTimeout(() => void poll(), 1000)
+    }
+    void poll()
+    const unsubscribe = () => { controller.abort(); if (timer !== undefined) clearTimeout(timer); this.#catalogSubscriptions.delete(unsubscribe) }
+    this.#catalogSubscriptions.add(unsubscribe)
+    return unsubscribe
   }
 
   async invoke<Result>(method: string, intent: RuntimeOperationIntent, payload: unknown): Promise<RuntimeExecution<Result>> {
@@ -287,19 +474,25 @@ export class RuntimeUdsClient {
   }
 
   async getOperation(operationId: string): Promise<OperationRecord | undefined> {
-    const response = await this.#raw(`/v1/operations/${encodeURIComponent(operationId)}`)
+    const lease = await this.#renewal.enter(this.#timeoutMs * 2)
+    try {
+    const response = await this.#raw(`/v1/operations/${encodeURIComponent(operationId)}`, { signal: lease.signal })
     const body = await readResponseJson(response, this.#timeoutMs)
     if (response.status === 404) return undefined
     if (!response.ok) throw new RuntimeUdsHttpError(response.status, body)
     return operationRecordSchema.parse(body)
+    } finally { lease.release() }
   }
 
   async getOperationByRequest(clientRequestId: string): Promise<OperationRecord | undefined> {
-    const response = await this.#raw(`/v1/operations/by-request/${encodeURIComponent(clientRequestId)}`)
+    const lease = await this.#renewal.enter(this.#timeoutMs * 2)
+    try {
+    const response = await this.#raw(`/v1/operations/by-request/${encodeURIComponent(clientRequestId)}`, { signal: lease.signal })
     const body = await readResponseJson(response, this.#timeoutMs)
     if (response.status === 404) return undefined
     if (!response.ok) throw new RuntimeUdsHttpError(response.status, body)
     return operationRecordSchema.parse(body)
+    } finally { lease.release() }
   }
 
   async cancelOperation(operationId: string, reason: string): Promise<OperationRecord> {
@@ -311,8 +504,13 @@ export class RuntimeUdsClient {
 
   async #request(
     path: string,
-    options: { method?: string, body?: unknown, bootstrap?: boolean } = {},
+    options: { method?: string, body?: unknown, bootstrap?: boolean, admin?: boolean, signal?: AbortSignal, timeoutMs?: number, skipRenewal?: boolean } = {},
   ): Promise<unknown> {
+    if (!options.bootstrap && !options.admin && !options.skipRenewal) {
+      const lease = await this.#renewal.enter((options.timeoutMs ?? this.#timeoutMs) + this.#timeoutMs, options.signal)
+      try { return await this.#request(path, { ...options, skipRenewal: true, signal: lease.signal }) }
+      finally { lease.release() }
+    }
     const response = await this.#raw(path, options)
     const body = await readResponseJson(response, this.#timeoutMs)
     if (!response.ok) throw new RuntimeUdsHttpError(response.status, body)
@@ -321,9 +519,10 @@ export class RuntimeUdsClient {
 
   #raw(
     path: string,
-    options: { method?: string, body?: unknown, bootstrap?: boolean } = {},
+    options: { method?: string, body?: unknown, bootstrap?: boolean, admin?: boolean, signal?: AbortSignal, timeoutMs?: number } = {},
   ): Promise<Response> {
-    const token = options.bootstrap ? this.#bootstrapToken : this.#bearerToken
+    const token = options.admin ? this.#adminToken : options.bootstrap ? this.#bootstrapToken : this.#bearerToken
+    const timeoutMs = options.timeoutMs ?? this.#timeoutMs
     if (token === undefined) throw new Error("Runtime UDS client не аутентифицирован")
     return fetch(`http://localhost${path}`, {
       unix: this.#socketPath,
@@ -333,12 +532,24 @@ export class RuntimeUdsClient {
         ...(options.body === undefined ? {} : { "content-type": "application/json" }),
       },
       ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
-      signal: AbortSignal.timeout(this.#timeoutMs),
+      signal: options.signal === undefined ? AbortSignal.timeout(timeoutMs)
+        : AbortSignal.any([options.signal, AbortSignal.timeout(timeoutMs)]),
     })
   }
 }
 
 const sessionOpenSchema = z.strictObject({ clientName: z.string().min(1).max(128) })
+const methodResponseSchema = z.strictObject({ data: z.record(z.string(), z.json()), frameRefs: z.array(z.string().min(1).max(127)).max(4), isError: z.boolean().optional() })
+const catalogResponseSchema = z.strictObject({
+  revision: z.number().int().nonnegative(),
+  tools: z.array(z.strictObject({
+    name: z.string(), title: z.string(), description: z.string(),
+    inputSchema: z.object({ type: z.literal("object") }).passthrough(),
+    outputSchema: z.object({ type: z.literal("object") }).passthrough(),
+    annotations: z.strictObject({ readOnlyHint: z.boolean(), destructiveHint: z.boolean(), openWorldHint: z.boolean() }),
+    _meta: z.strictObject({ maxRequestBytes: z.number().int(), maxResponseBytes: z.number().int(), timeoutMs: z.number().int().min(1).max(120_000).optional() }).optional(),
+  })).max(256),
+})
 const sessionResumeSchema = z.strictObject({ resumptionToken: z.string().min(1).max(256) })
 const cancelSchema = z.strictObject({ reason: z.string().min(1).max(1_024) })
 const bootstrapCredentialSchema = z.strictObject({
@@ -347,9 +558,10 @@ const bootstrapCredentialSchema = z.strictObject({
   loginSessionId: z.string().min(1).max(64),
   principalId: z.string().min(1).max(127),
   bootstrapToken: z.string().min(1).max(256),
+  adminToken: z.string().min(1).max(256).optional(),
 })
 const sessionCredentialSchema = z.strictObject({
-  session: z.unknown(),
+  session: runtimeClientSessionSchema,
   bearerToken: z.string().min(1).max(256),
   resumptionToken: z.string().min(1).max(256),
   clientName: z.string().optional(),
@@ -421,9 +633,13 @@ async function readResponseJson(response: Response, timeoutMs: number): Promise<
 }
 
 export async function readBoundedResponseText(response: Response, maxBytes: number, timeoutMs: number): Promise<string> {
+  return new TextDecoder().decode(await readBoundedBinary(response, maxBytes, timeoutMs))
+}
+
+async function readBoundedBinary(response: Response, maxBytes: number, timeoutMs: number): Promise<Uint8Array> {
   const contentLength = Number(response.headers.get("content-length") ?? 0)
   if (Number.isFinite(contentLength) && contentLength > maxBytes) throw new Error("Runtime response превышает byte limit")
-  if (response.body === null) return ""
+  if (response.body === null) return new Uint8Array()
   const reader = response.body.getReader()
   const chunks: Uint8Array[] = []
   let bytes = 0
@@ -464,7 +680,7 @@ export async function readBoundedResponseText(response: Response, maxBytes: numb
     joined.set(chunk, offset)
     offset += chunk.byteLength
   }
-  return new TextDecoder().decode(joined)
+  return joined
 }
 
 function bearerToken(request: Request): string {

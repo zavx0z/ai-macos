@@ -8,7 +8,7 @@
     ".": "./src/index.ts"
   },
   "scripts": {
-    "start": "bun src/index.ts",
+    "start": "bun src/server.ts",
     "test": "bun test",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
@@ -16,6 +16,9 @@
     "@meta/shared": "workspace:*",
     "@meta/native": "workspace:*",
     "@meta/chrome": "workspace:*",
-    "@meta/android": "workspace:*"
+    "@meta/android": "workspace:*",
+    "@meta/input": "workspace:*",
+    "@meta/screen": "workspace:*",
+    "@meta/window": "workspace:*"
   }
 }

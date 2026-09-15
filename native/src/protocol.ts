@@ -33,10 +33,28 @@ import {
   windowTransitionRequestSchema,
   z,
 } from "@meta/shared/contracts"
-import { nativeClipboardRequestSchema, nativeClipboardResponseSchema } from "./clipboard-protocol.ts"
+import { nativeClipboardRequestSchema, nativeClipboardResponseSchema, NATIVE_CLIPBOARD_WIRE_BYTES } from "./clipboard-protocol.ts"
 export * from "./clipboard-protocol.ts"
+import { nativePermissionsRequestSchema, nativePermissionsResponseSchema } from "./permissions-protocol.ts"
+export * from "./permissions-protocol.ts"
+import {
+  nativeApplicationResolveRequestSchema, nativeApplicationResolveResponseSchema,
+  nativeApplicationLaunchRequestSchema, nativeApplicationLaunchResponseSchema,
+  nativeApplicationQuitRequestSchema, nativeApplicationQuitResponseSchema,
+} from "./applications-protocol.ts"
+export * from "./applications-protocol.ts"
 
 export const NATIVE_FRAME_HEADER_BYTES = 4
+export const NATIVE_CLIPBOARD_FRAME_FLAG = 0x80000000
+
+function decodeMessage(bytes: Uint8Array, clipboardProfile: boolean): NativeTransportResponseFrame {
+  const text = new TextDecoder("utf-8", { fatal: true }).decode(bytes)
+  const frame = parseWireJson(nativeTransportResponseFrameSchema, text, {
+    maxBytes: clipboardProfile ? NATIVE_CLIPBOARD_WIRE_BYTES : MAX_NATIVE_ENVELOPE_BYTES, maxDepth: 32,
+  })
+  if (clipboardProfile && frame.channel !== "clipboard") throw new Error("Clipboard frame profile содержит другой channel")
+  return frame
+}
 
 const nativeRectSchema = z.strictObject({
   x: z.number().finite(),
@@ -149,6 +167,7 @@ export const nativeDisplayRecordSchema = z.strictObject({
 export const nativeInventoryResultSchema = z.strictObject({
   sourceResponseRef: opaqueIdSchema,
   inventoryId: opaqueIdSchema,
+  layoutRef: opaqueIdSchema,
   revision: z.number().int().safe().min(0),
   displayLayoutRevision: z.number().int().safe().min(0),
   capturedAt: z.iso.datetime({ offset: true }),
@@ -171,7 +190,13 @@ export const nativeWindowTransitionResultSchema = z.strictObject({
   observedAt: z.iso.datetime({ offset: true }),
   displays: z.array(nativeDisplayRecordSchema).max(64),
   targetRef: opaqueIdSchema,
-  actual: nativeAXWindowRecordSchema,
+  actual: z.discriminatedUnion("kind", [
+    nativeAXWindowRecordSchema,
+    z.strictObject({ kind: z.literal("closed"), windowRef: opaqueIdSchema, applicationRef: opaqueIdSchema,
+      ownerPid: z.number().int().min(1).max(0x7fffffff), absence: z.literal("confirmed") }),
+    z.strictObject({ kind: z.literal("unknown"), windowRef: opaqueIdSchema, applicationRef: opaqueIdSchema,
+      ownerPid: z.number().int().min(1).max(0x7fffffff), reason: z.string().min(1).max(1024) }),
+  ]),
   changed: z.boolean(),
   partial: z.boolean(),
   newSurface: nativeSurfaceRecordSchema.optional(),
@@ -180,6 +205,12 @@ export const nativeWindowTransitionResultSchema = z.strictObject({
 }).superRefine((result, context) => {
   if (result.targetRef !== result.actual.windowRef) {
     context.addIssue({ code: "custom", path: ["actual"], message: "transition вернул другой target" })
+  }
+  if (result.actual.kind === "closed" && (result.partial || !result.changed || result.errors.length > 0 || result.newSurface !== undefined)) {
+    context.addIssue({ code: "custom", path: ["actual"], message: "Закрытое окно требует подтверждённого полного результата без sheet" })
+  }
+  if (result.actual.kind === "unknown" && !result.partial) {
+    context.addIssue({ code: "custom", path: ["partial"], message: "Unknown window readback требует partial" })
   }
   if (result.partial && result.errors.length === 0) {
     context.addIssue({ code: "custom", path: ["errors"], message: "partial transition требует reason" })
@@ -670,6 +701,9 @@ export const nativeCaptureReleaseRequestSchema = createNativeMutationRequestEnve
 export const nativeCaptureReleaseResponseSchema = createNativeResponseEnvelopeSchema(nativeCaptureReleaseResultSchema)
 
 export const nativeMethodRequestSchema = z.union([
+  nativeApplicationResolveRequestSchema,
+  nativeApplicationLaunchRequestSchema,
+  nativeApplicationQuitRequestSchema,
   nativeInventoryRequestSchema,
   nativeWindowTransitionRequestSchema,
   nativeAxInspectionRequestSchema,
@@ -682,6 +716,9 @@ export const nativeMethodRequestSchema = z.union([
 ])
 
 export const nativeMethodResponseSchema = z.union([
+  nativeApplicationResolveResponseSchema,
+  nativeApplicationLaunchResponseSchema,
+  nativeApplicationQuitResponseSchema,
   nativeInventoryResponseSchema,
   nativeWindowTransitionResponseSchema,
   nativeAxInspectionResponseSchema,
@@ -694,6 +731,7 @@ export const nativeMethodResponseSchema = z.union([
 ])
 
 export const nativeTransportRequestFrameSchema = z.discriminatedUnion("channel", [
+  z.strictObject({ channel: z.literal("permissions"), payload: nativePermissionsRequestSchema }),
   z.strictObject({ channel: z.literal("clipboard"), payload: nativeClipboardRequestSchema }),
   z.strictObject({ channel: z.literal("handshake"), payload: nativeHandshakeRequestSchema }),
   z.strictObject({ channel: z.literal("request"), payload: nativeMethodRequestSchema }),
@@ -706,6 +744,7 @@ export const nativeTransportRequestFrameSchema = z.discriminatedUnion("channel",
 ])
 
 export const nativeTransportResponseFrameSchema = z.discriminatedUnion("channel", [
+  z.strictObject({ channel: z.literal("permissions"), payload: nativePermissionsResponseSchema }),
   z.strictObject({ channel: z.literal("clipboard"), payload: nativeClipboardResponseSchema }),
   z.strictObject({ channel: z.literal("handshake"), payload: nativeHandshakeResponseSchema }),
   z.strictObject({ channel: z.literal("response"), payload: nativeMethodResponseSchema }),
@@ -741,12 +780,14 @@ export type NativeCapturePollResult = z.infer<typeof nativeCapturePollResultSche
 export type NativeCaptureTaskStatus = z.infer<typeof nativeCaptureTaskStatusSchema>
 
 export function encodeNativeFrame(value: unknown): Uint8Array {
+  const clipboardProfile = typeof value === "object" && value !== null && "channel" in value && value.channel === "clipboard"
   const payload = new TextEncoder().encode(JSON.stringify(value))
-  if (payload.byteLength > MAX_NATIVE_ENVELOPE_BYTES) {
-    throw new Error(`native frame превышает ${MAX_NATIVE_ENVELOPE_BYTES} байт`)
+  const maximum = clipboardProfile ? NATIVE_CLIPBOARD_WIRE_BYTES : MAX_NATIVE_ENVELOPE_BYTES
+  if (payload.byteLength > maximum) {
+    throw new Error(`native frame превышает ${maximum} байт`)
   }
   const frame = new Uint8Array(NATIVE_FRAME_HEADER_BYTES + payload.byteLength)
-  new DataView(frame.buffer).setUint32(0, payload.byteLength, false)
+  new DataView(frame.buffer).setUint32(0, (payload.byteLength | (clipboardProfile ? NATIVE_CLIPBOARD_FRAME_FLAG : 0)) >>> 0, false)
   frame.set(payload, NATIVE_FRAME_HEADER_BYTES)
   return frame
 }
@@ -756,6 +797,7 @@ export function parseNativeRequestFrame(text: string): NativeTransportRequestFra
 }
 
 export class NativeFrameDecoder {
+  #clipboardProfile = false
   readonly #header = new Uint8Array(NATIVE_FRAME_HEADER_BYTES)
   #headerLength = 0
   #payload: Uint8Array | undefined
@@ -771,8 +813,11 @@ export class NativeFrameDecoder {
         this.#headerLength += copied
         offset += copied
         if (this.#headerLength < NATIVE_FRAME_HEADER_BYTES) continue
-        const length = new DataView(this.#header.buffer).getUint32(0, false)
-        if (length === 0 || length > MAX_NATIVE_ENVELOPE_BYTES) {
+        const encodedLength = new DataView(this.#header.buffer).getUint32(0, false)
+        this.#clipboardProfile = (encodedLength & NATIVE_CLIPBOARD_FRAME_FLAG) !== 0
+        const length = encodedLength & 0x7fffffff
+        const maximum = this.#clipboardProfile ? NATIVE_CLIPBOARD_WIRE_BYTES : MAX_NATIVE_ENVELOPE_BYTES
+        if (length === 0 || length > maximum) {
           throw new Error("native frame length превышает предел или пуст")
         }
         this.#payload = new Uint8Array(length)
@@ -783,8 +828,7 @@ export class NativeFrameDecoder {
       this.#payloadLength += copied
       offset += copied
       if (this.#payloadLength !== this.#payload.byteLength) continue
-      const text = new TextDecoder("utf-8", { fatal: true }).decode(this.#payload)
-      frames.push(parseWireJson(nativeTransportResponseFrameSchema, text))
+      frames.push(decodeMessage(this.#payload, this.#clipboardProfile))
       this.#headerLength = 0
       this.#payload = undefined
       this.#payloadLength = 0
@@ -804,6 +848,7 @@ export type NativeTransportPacket =
   | { kind: "binary", binaryToken: string, bytes: Uint8Array }
 
 export class NativeTransportStreamDecoder {
+  #clipboardProfile = false
   readonly #header = new Uint8Array(NATIVE_FRAME_HEADER_BYTES)
   #headerLength = 0
   #message: Uint8Array | undefined
@@ -842,8 +887,11 @@ export class NativeTransportStreamDecoder {
         this.#headerLength += copied
         offset += copied
         if (this.#headerLength < NATIVE_FRAME_HEADER_BYTES) continue
-        const length = new DataView(this.#header.buffer).getUint32(0, false)
-        if (length === 0 || length > MAX_NATIVE_ENVELOPE_BYTES) {
+        const encodedLength = new DataView(this.#header.buffer).getUint32(0, false)
+        this.#clipboardProfile = (encodedLength & NATIVE_CLIPBOARD_FRAME_FLAG) !== 0
+        const length = encodedLength & 0x7fffffff
+        const maximum = this.#clipboardProfile ? NATIVE_CLIPBOARD_WIRE_BYTES : MAX_NATIVE_ENVELOPE_BYTES
+        if (length === 0 || length > maximum) {
           throw new Error("native frame length превышает предел или пуст")
         }
         this.#message = new Uint8Array(length)
@@ -855,8 +903,7 @@ export class NativeTransportStreamDecoder {
       offset += copied
       if (this.#messageLength !== this.#message.byteLength) continue
       const messageBytes = this.#message
-      const text = new TextDecoder("utf-8", { fatal: true }).decode(messageBytes)
-      const frame = parseWireJson(nativeTransportResponseFrameSchema, text)
+      const frame = decodeMessage(messageBytes, this.#clipboardProfile)
       this.#headerLength = 0
       this.#message = undefined
       this.#messageLength = 0

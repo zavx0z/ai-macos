@@ -184,6 +184,37 @@ describe("persistent operation journal", () => {
     expect((await stat(join(directory, file!))).mode & 0o777).toBe(0o600)
   })
 
+  test("loadAll возвращает terminal и unfinished metadata без replay", async () => {
+    const root = await temporaryDirectory("journal-load-all")
+    const directory = join(root, "journal")
+    const store = new FileOperationJournal(directory)
+    const terminal = operationRecord("completed")
+    const unfinished = operationRecordSchema.parse({
+      ...operationRecord(),
+      context: {
+        ...operationRecord().context,
+        operationId: "operation:2",
+        clientRequestId: "request:2",
+      },
+    })
+    await store.persist(terminal, 4)
+    await store.persist(unfinished, 2)
+
+    const all = (await new FileOperationJournal(directory).loadAll())
+      .sort((left, right) => {
+        return left.record.context.operationId.localeCompare(
+          right.record.context.operationId,
+        )
+      })
+    expect(all).toEqual([
+      { revision: 4, record: terminal },
+      { revision: 2, record: unfinished },
+    ])
+    expect(await new FileOperationJournal(directory).loadRecoveryEvidence()).toEqual([
+      { revision: 2, record: unfinished },
+    ])
+  })
+
   test("монотонно обновляет revision, повторяет identical и отклоняет conflict", async () => {
     const root = await temporaryDirectory("journal-revision")
     const store = new FileOperationJournal(join(root, "journal"))

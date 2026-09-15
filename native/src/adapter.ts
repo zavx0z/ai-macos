@@ -39,8 +39,11 @@ import {
 } from "./protocol.ts"
 import {
   clipboardResponseMatches, nativeClipboardRequestSchema, nativeClipboardResponseSchema,
+  NATIVE_CLIPBOARD_WIRE_BYTES,
   type NativeClipboardRequest, type NativeClipboardResponse,
 } from "./clipboard-protocol.ts"
+import { nativePermissionsRequestSchema, nativePermissionsResponseSchema, nativePermissionsResponseMatches,
+  type NativePermissionsRequest, type NativePermissionsResponse } from "./permissions-protocol.ts"
 
 export interface NativeTransport {
   send(frame: NativeTransportRequestFrame): Promise<void>
@@ -97,6 +100,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
   readonly #pending = new Map<string, PendingResponse>()
   readonly #expired = new Map<string, number>()
   readonly #seenRequestIds = new Map<string, number>()
+  readonly #heartbeatRequestIds = new Map<string, number>()
   readonly #events: Array<{ event: ObservedEvent, bytes: number }> = []
   #eventBytes = 0
   #eventGap: Error | undefined
@@ -105,6 +109,8 @@ export class NativeBrokerAdapter implements NativeAdapter {
   readonly #binaryWaiters = new Map<string, BinaryWaiter>()
   readonly #reader: Promise<void>
   #closed = false
+  #poisoned: Error | undefined
+  #transportClosing: Promise<void> | undefined
   #rotationSealed = false
   #ledgerWrites = 0
   readonly #startedAt = Date.now()
@@ -112,7 +118,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
   get sessionState() {
     const rotationRequired = this.#seenRequestIds.size >= 9_000 || Date.now() - this.#startedAt >= 24 * 60 * 60 * 1000
     return {
-      state: this.#closed ? "closed" as const : this.#rotationSealed ? "draining" as const : rotationRequired ? "rotation-required" as const : "ready" as const,
+      state: this.#poisoned !== undefined ? "poisoned" as const : this.#closed ? "closed" as const : this.#rotationSealed ? "draining" as const : rotationRequired ? "rotation-required" as const : "ready" as const,
       requestsUsed: this.#seenRequestIds.size,
       pendingRequests: this.#pending.size,
       pendingBinaries: this.#binary.size + this.#binaryWaiters.size,
@@ -228,14 +234,27 @@ export class NativeBrokerAdapter implements NativeAdapter {
     return response.payload
   }
 
+  async permissions(request: NativePermissionsRequest, control: AdapterControl): Promise<NativePermissionsResponse> {
+    control.signal.throwIfAborted()
+    const parsed = parseWireValue(nativePermissionsRequestSchema, request)
+    this.#assertGeneration(parsed)
+    await control.checkpoint("native-before-passive-permissions")
+    const response = await this.#exchange("permissions", { channel: "permissions", payload: parsed }, parsed.requestId, control.signal, parsed.deadlineAt)
+    if (response.channel !== "permissions") throw new Error("Native permissions response channel mismatch")
+    const value = parseWireValue(nativePermissionsResponseSchema, response.payload)
+    if (!nativePermissionsResponseMatches(parsed, value, this.loadedBuildId)) throw new Error("Native permissions response identity mismatch")
+    await control.checkpoint("native-after-passive-permissions")
+    return value
+  }
+
   async clipboard(request: NativeClipboardRequest, control: AdapterControl): Promise<NativeClipboardResponse> {
     control.signal.throwIfAborted()
-    const parsed = parseWireValue(nativeClipboardRequestSchema, request)
+    const parsed = parseWireValue(nativeClipboardRequestSchema, request, { maxBytes: NATIVE_CLIPBOARD_WIRE_BYTES, maxDepth: 32 })
     this.#assertGeneration(parsed)
     await control.checkpoint("native-before-clipboard")
     const response = await this.#exchange("clipboard", { channel: "clipboard", payload: parsed }, parsed.requestId, control.signal, parsed.deadlineAt)
     if (response.channel !== "clipboard") throw new Error("Native clipboard response channel mismatch")
-    const value = parseWireValue(nativeClipboardResponseSchema, response.payload)
+    const value = parseWireValue(nativeClipboardResponseSchema, response.payload, { maxBytes: NATIVE_CLIPBOARD_WIRE_BYTES, maxDepth: 32 })
     if (!clipboardResponseMatches(parsed, value)) throw new Error("Native clipboard response identity mismatch")
     return value
   }
@@ -373,7 +392,10 @@ export class NativeBrokerAdapter implements NativeAdapter {
   }
 
   async close(): Promise<void> {
-    if (this.#closed) return
+    if (this.#closed) {
+      await this.#transportClosing
+      return
+    }
     this.#closed = true
     this.#readerAbort.abort(new Error("Native adapter закрыт"))
     await this.#transport.close()
@@ -397,12 +419,15 @@ export class NativeBrokerAdapter implements NativeAdapter {
     }
     const key = `${expectedChannel}:${requestId}`
     this.#pruneRequestTombstones()
-    if (this.#seenRequestIds.has(requestId)) throw new Error(`Native requestId уже использован: ${requestId}`)
+    if (this.#seenRequestIds.has(requestId) || this.#heartbeatRequestIds.has(requestId)) throw new Error(`Native requestId уже использован: ${requestId}`)
     if (this.#seenRequestIds.size >= 10_000 && frame.channel !== "drain") throw new Error("Native session exhausted: разрешён только runtime drain")
     if (this.#seenRequestIds.size >= 10_128) throw new Error("Native session exhausted: reserve drain requests исчерпан, требуется runtime quarantine")
     if (this.#pending.size >= 128) throw new Error("Native concurrent request limit исчерпан")
     if (this.#pending.has(key)) throw new Error(`Native request уже ожидается: ${requestId}`)
-    this.#seenRequestIds.set(requestId, Date.now() + 24 * 60 * 60 * 1000)
+    if (frame.channel === "heartbeat") {
+      if (this.#heartbeatRequestIds.size >= 128) throw new Error("Native heartbeat recent correlation capacity exceeded")
+      this.#heartbeatRequestIds.set(requestId, Date.now() + 5000)
+    } else this.#seenRequestIds.set(requestId, Date.now() + 24 * 60 * 60 * 1000)
     return await new Promise<NativeTransportResponseFrame>((resolve, reject) => {
       const remainingMs = deadlineAt === undefined ? undefined : Date.parse(deadlineAt) - Date.now()
       if (remainingMs !== undefined && remainingMs <= 0) {
@@ -412,7 +437,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
       let timer: ReturnType<typeof setTimeout> | undefined
       const expire = (error: Error) => {
         this.#pending.delete(key)
-        this.#expired.set(key, Date.now() + 24 * 60 * 60 * 1000)
+        this.#expired.set(key, Date.now() + (frame.channel === "heartbeat" ? 5000 : 24 * 60 * 60 * 1000))
         reject(error)
       }
       const onAbort = () => {
@@ -455,7 +480,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
       }
       if (!this.#closed) throw new Error("Native transport завершился до close")
     } catch (error) {
-      if (!this.#closed) this.#rejectPending(error instanceof Error ? error : new Error(String(error)))
+      if (!this.#closed) this.#poison(error instanceof Error ? error : new Error(String(error)))
     }
   }
 
@@ -484,19 +509,21 @@ export class NativeBrokerAdapter implements NativeAdapter {
       return
     }
     if (frame.channel === "ledger-persist") {
+      if (this.#ledgerWrites >= 8) throw new Error("Native ledger ACK queue overflow")
       this.#ledgerWrites += 1
-      try {
-      const ack = await this.ledgerSink.persist(frame.payload.requestId, frame.payload.snapshot)
-      if (!heldInputLedgerAckMatches(frame.payload.requestId, frame.payload.snapshot, ack)) {
-        throw new Error("Ledger sink вернул некоррелированный durable ACK")
-      }
-      await this.#transport.send(nativeTransportRequestFrameSchema.parse({
-        channel: "ledger-ack",
-        payload: ack,
-      }))
-      } finally {
-        this.#ledgerWrites -= 1
-      }
+      void (async () => {
+        try {
+          const ack = await this.ledgerSink.persist(frame.payload.requestId, frame.payload.snapshot)
+          if (!heldInputLedgerAckMatches(frame.payload.requestId, frame.payload.snapshot, ack)) {
+            throw new Error("Ledger sink вернул некоррелированный durable ACK")
+          }
+          await this.#transport.send(nativeTransportRequestFrameSchema.parse({ channel: "ledger-ack", payload: ack }))
+        } catch (cause) {
+          this.#poison(cause instanceof Error ? cause : new Error(String(cause)))
+        } finally {
+          this.#ledgerWrites -= 1
+        }
+      })()
       return
     }
     if (frame.channel === "binary") {
@@ -554,8 +581,18 @@ export class NativeBrokerAdapter implements NativeAdapter {
     this.#eventWaiters.length = 0
   }
 
+  #poison(error: Error): void {
+    if (this.#closed) return
+    this.#poisoned = error
+    this.#closed = true
+    this.#readerAbort.abort(error)
+    this.#rejectPending(error)
+    this.#transportClosing = this.#transport.close().catch(() => undefined)
+  }
+
   #pruneRequestTombstones(): void {
     const now = Date.now()
+    for (const [id, expiresAt] of this.#heartbeatRequestIds) if (expiresAt <= now) this.#heartbeatRequestIds.delete(id)
     for (const [key, expiresAt] of this.#expired) {
       if (expiresAt <= now) this.#expired.delete(key)
     }

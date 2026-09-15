@@ -28,6 +28,7 @@ import {
   type RuntimeOperationContext,
   type RuntimeResourceHandle,
   verifyAndPublishBinaryFrame,
+  structurallyEqual,
 } from "@meta/shared/contracts"
 import { CdpHttp, type CdpTarget } from "@meta/shared"
 import { CdpBrowserDriver } from "@meta/chrome/adapter"
@@ -93,6 +94,7 @@ export class RuntimeDeviceBrowserAdapter implements DeviceBrowserAdapter {
   private inventoryRevision = 0
   private inventorySequence = 0
   private readonly targetFingerprints = new Map<string, string>()
+  private readonly recoveredRefs = new Set<string>()
 
   constructor(
     readonly host: AdapterHostContext,
@@ -213,6 +215,36 @@ export class RuntimeDeviceBrowserAdapter implements DeviceBrowserAdapter {
     }
   }
 
+  async recoverDisconnected(
+    reference: DeviceBrowserInstanceRecord["ref"],
+    verifyPhysicalDisconnect: () => Promise<void>,
+  ): Promise<void> {
+    const configured = this.configured.get(reference.serial)
+    if (!configured || configured.instance.browserInstanceRef !== reference.browserInstanceRef) {
+      throw new Error("Android recovery instance not configured")
+    }
+    await verifyPhysicalDisconnect()
+    configured.state = "disconnected"
+    configured.reason = "recovered-physical-disconnect"
+    this.recoveredRefs.add(JSON.stringify(reference))
+    this.inventoryRevision += 1
+  }
+
+  assertConnectedExact(reference: DeviceBrowserInstanceRecord["ref"]): void {
+    const configured = this.configured.get(reference.serial)
+    if (!configured || !structurallyEqual(configured.instance, reference) || configured.state !== "connected") {
+      throw new Error("Exact Android browser instance is not connected")
+    }
+  }
+
+  assertDisconnectedExact(reference: DeviceBrowserInstanceRecord["ref"]): void {
+    if (this.recoveredRefs.has(JSON.stringify(reference))) return
+    const configured = this.configured.get(reference.serial)
+    if (!configured || !structurallyEqual(configured.instance, reference) || configured.state === "connected") {
+      throw new Error("Exact Android browser physical disconnect is not verified")
+    }
+  }
+
   private async executeAuthorized(
     context: RuntimeOperationContext<DeviceExecutionContext>,
     request: DeviceBrowserOperationRequest,
@@ -326,8 +358,10 @@ export class RuntimeDeviceBrowserAdapter implements DeviceBrowserAdapter {
 
   private snapshotBase() {
     this.inventorySequence += 1
+    this.inventoryRevision += 1
     return {
       inventoryId: `android-inventory:${this.inventorySequence}`,
+      inventoryRevision: this.inventoryRevision,
       ...this.host.generation,
       capturedAt: this.now().toISOString(),
       complete: true,

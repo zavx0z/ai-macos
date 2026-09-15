@@ -52,6 +52,7 @@ type Runner = (
   request: Request,
   execute: (context: RuntimeOperationContext, request: Request) => Promise<AdapterResult<Result>>,
   lifecycle: CoordinatedLifecycle,
+  signal?: AbortSignal,
 ) => Promise<RuntimeExecution<Result>>
 
 // Этот интерфейс предоставляет host composition, а не транспортный caller.
@@ -92,7 +93,7 @@ export class BrowserLifetimeCoordinator {
   readonly #slots = new Map<string, Slot>()
   readonly #byId = new Map<string, Slot>()
   readonly #ttlMs: number
-  readonly #stageRecovered: (operationIds: readonly string[]) => () => void
+  readonly #stageRecovered: (operationIds: readonly string[]) => Promise<() => void>
   readonly authority: LifetimeReservationAuthority & {
     resume(session: RuntimeClientSession, reservationId: string): Promise<LifetimeReservationHandle>
     inspect(session: RuntimeClientSession, target: OperationTarget): Promise<LifetimeReservationHandle | undefined>
@@ -106,7 +107,7 @@ export class BrowserLifetimeCoordinator {
     clock?: RuntimeClock
     ids?: RuntimeIdSource
     ttlMs?: number
-    stageRecovered: (operationIds: readonly string[]) => () => void
+    stageRecovered: (operationIds: readonly string[]) => Promise<() => void>
   }) {
     this.#generation = options.generation
     this.#clients = options.clients
@@ -144,6 +145,7 @@ export class BrowserLifetimeCoordinator {
     bindingId: string,
     intent: RuntimeOperationIntent,
     requestValue: unknown,
+    signal?: AbortSignal,
   ): Promise<RuntimeExecution<Result>> {
     await this.#clients.assertActive(session, this.#clock.now())
     const binding = this.#bindings.get(bindingId)
@@ -283,7 +285,7 @@ export class BrowserLifetimeCoordinator {
         return (binding.adapter as DeviceBrowserAdapter).execute({ ...received, wire: received.wire }, value as DeviceBrowserOperationRequest)
       }
       throw new Error("Domain context не совпадает с configured adapter")
-    }, lifecycle)
+    }, lifecycle, signal)
   }
 
   async #assertChild(request: ReservationChildRequest): Promise<LifetimeReservationHandle> {
@@ -302,6 +304,7 @@ export class BrowserLifetimeCoordinator {
     session: RuntimeClientSession,
     bindingId: string,
     intent: RuntimeOperationIntent,
+    signal?: AbortSignal,
   ): Promise<RuntimeExecution<Result>> {
     await this.#clients.assertActive(session, this.#clock.now())
     const target = instanceTarget(intent.precondition.target)
@@ -344,7 +347,7 @@ export class BrowserLifetimeCoordinator {
         if (slot === undefined || context === undefined || !result.ok) throw new Error("Recovery не завершено")
         await binding.verifier.verifyRemoved(target, context.control.signal)
         await this.#clients.assertActive(session, this.#clock.now())
-        const commitPrevious = this.#stageRecovered([...slot.operationIds])
+        const commitPrevious = await this.#stageRecovered([...slot.operationIds])
         return () => {
           commitPrevious()
           slot!.state = "released"
@@ -361,7 +364,7 @@ export class BrowserLifetimeCoordinator {
         }
       },
       failed: () => { if (slot !== undefined) { delete slot.disconnecting; this.#quarantine(slot) } },
-    })
+    }, signal)
   }
 
   async #resume(session: RuntimeClientSession, id: string): Promise<LifetimeReservationHandle> {
