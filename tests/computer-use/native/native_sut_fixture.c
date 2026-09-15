@@ -23,10 +23,12 @@ typedef struct {
   size_t fail_persist_call;
   size_t fail_persist_from_call;
   size_t event_count;
+  size_t cleanup_count;
   struct {
     MetaHeldEventKind kind;
     uint32_t code;
     bool down;
+    bool cleanup;
   } events[32];
 } InjectedBackend;
 
@@ -83,7 +85,26 @@ static bool injected_post(void *context, MetaHeldEventKind kind, uint32_t code,
   backend->events[backend->event_count].kind = kind;
   backend->events[backend->event_count].code = code;
   backend->events[backend->event_count].down = down;
+  backend->events[backend->event_count].cleanup = false;
   backend->event_count += 1;
+  return true;
+}
+
+static bool injected_cleanup_up(void *context, MetaHeldEventKind kind,
+                                uint32_t code, uint64_t synthetic_tag) {
+  InjectedBackend *backend = context;
+  if (synthetic_tag == 0 || backend->event_count >= 32) return false;
+  backend->events[backend->event_count].kind = kind;
+  backend->events[backend->event_count].code = code;
+  backend->events[backend->event_count].down = false;
+  backend->events[backend->event_count].cleanup = true;
+  backend->event_count += 1;
+  backend->cleanup_count += 1;
+  return true;
+}
+
+static bool injected_before_dispatch(void *context) {
+  (void)context;
   return true;
 }
 
@@ -95,6 +116,8 @@ static MetaExecutor *create_executor(InjectedBackend *backend,
       .verify_target = injected_verify_target,
       .persist_ledger = injected_persist,
       .post_held_event = injected_post,
+      .post_cleanup_up = injected_cleanup_up,
+      .before_dispatch = injected_before_dispatch,
   };
   return meta_executor_create(native_generation, 500, callbacks);
 }
@@ -127,6 +150,7 @@ static int scenario_a04_target_checkpoint(void) {
   CHECK(status.cleanup == META_CLEANUP_COMPLETE);
   CHECK(backend.event_count == 2);
   CHECK(backend.events[0].down && !backend.events[1].down);
+  CHECK(backend.events[1].cleanup);
   meta_executor_destroy(executor);
   return 0;
 }
@@ -168,6 +192,7 @@ static int scenario_a07_cancel_after_down(void) {
   CHECK(entry_count == 1 && entries[0].state == META_LEDGER_RELEASED);
   CHECK(backend.event_count == 2);
   CHECK(backend.events[0].down && !backend.events[1].down);
+  CHECK(backend.events[1].cleanup);
   meta_executor_destroy(executor);
   return 0;
 }
@@ -189,7 +214,9 @@ static int scenario_a08_lost_down_ack(void) {
   CHECK(status.dispatch == META_DISPATCH_UNKNOWN);
   CHECK(status.cleanup == META_CLEANUP_UNKNOWN);
   CHECK(status.quarantined);
-  CHECK(backend.event_count == 1 && backend.events[0].down);
+  CHECK(backend.event_count == 2 && backend.events[0].down);
+  CHECK(!backend.events[1].down && backend.events[1].cleanup);
+  CHECK(backend.cleanup_count == 1);
   CHECK(!meta_executor_begin(executor, "operation-replay", "window-1",
                              fence("runtime-1", "native-1", 2), 1000));
   meta_executor_destroy(executor);
@@ -213,17 +240,17 @@ static int scenario_a08_persist_failure_with_existing_hold(void) {
   const size_t entry_count =
       meta_executor_copy_ledger(executor, entries, 4);
   const MetaExecutorStatus status = meta_executor_status(executor);
-  CHECK(entry_count == 1 && entries[0].code == 55);
-  CHECK(entries[0].state == META_LEDGER_RELEASED);
-  CHECK(status.held_count == 0);
-  CHECK(!status.quarantined);
-  CHECK(status.cleanup == META_CLEANUP_COMPLETE);
+  CHECK(entry_count == 2 && entries[0].code == 55 && entries[1].code == 56);
+  CHECK(status.held_count == 2);
+  CHECK(status.quarantined);
+  CHECK(status.cleanup == META_CLEANUP_UNKNOWN);
   CHECK(backend.event_count == 2);
   CHECK(backend.events[0].code == 55 && backend.events[0].down);
-  CHECK(backend.events[1].code == 55 && !backend.events[1].down);
-  CHECK(meta_executor_begin(executor, "operation-after-cleanup", "window-1",
-                            fence("runtime-1", "native-1", 2), 1000));
-  CHECK(meta_executor_cancel(executor));
+  CHECK(backend.events[1].code == 55 && !backend.events[1].down &&
+        backend.events[1].cleanup);
+  CHECK(backend.cleanup_count == 1);
+  CHECK(!meta_executor_begin(executor, "operation-after-unknown", "window-1",
+                             fence("runtime-1", "native-1", 2), 1000));
   meta_executor_destroy(executor);
   return 0;
 }
@@ -232,7 +259,7 @@ static int scenario_a08_persist_cleanup_unknown(void) {
   InjectedBackend backend = {
       .now = 100,
       .target_valid = true,
-      .fail_persist_from_call = 3,
+      .fail_persist_from_call = 5,
   };
   MetaExecutor *executor = create_executor(&backend, "native-1");
   CHECK(executor != NULL);
@@ -240,18 +267,22 @@ static int scenario_a08_persist_cleanup_unknown(void) {
   CHECK(meta_executor_begin(executor, "operation-a08-unknown", "window-1",
                             fence("runtime-1", "native-1", 1), 1000));
   CHECK(meta_executor_post_down(executor, META_EVENT_KEY, 55));
-  CHECK(!meta_executor_post_down(executor, META_EVENT_KEY, 56));
+  CHECK(meta_executor_post_down(executor, META_EVENT_KEY, 56));
+  CHECK(!meta_executor_cancel(executor));
   MetaLedgerEntry entries[4] = {0};
   const size_t entry_count =
       meta_executor_copy_ledger(executor, entries, 4);
   const MetaExecutorStatus status = meta_executor_status(executor);
-  CHECK(entry_count >= 1 && entries[0].code == 55);
-  CHECK(entries[0].state == META_LEDGER_UNCERTAIN);
-  CHECK(status.held_count == 1);
+  CHECK(entry_count == 2);
+  CHECK(status.held_count == 2);
   CHECK(status.quarantined);
   CHECK(status.cleanup == META_CLEANUP_UNKNOWN);
-  CHECK(backend.event_count == 1);
+  CHECK(backend.event_count == 4);
   CHECK(backend.events[0].code == 55 && backend.events[0].down);
+  CHECK(backend.events[1].code == 56 && backend.events[1].down);
+  CHECK(backend.events[2].cleanup && backend.events[2].code == 56);
+  CHECK(backend.events[3].cleanup && backend.events[3].code == 55);
+  CHECK(backend.cleanup_count == 2);
   CHECK(!meta_executor_begin(executor, "operation-after-unknown", "window-1",
                              fence("runtime-1", "native-1", 2), 1000));
   meta_executor_destroy(executor);

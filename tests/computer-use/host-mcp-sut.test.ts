@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { mkdtemp, rm } from "node:fs/promises"
+import { access, mkdtemp, rm } from "node:fs/promises"
 import { hostname, tmpdir } from "node:os"
 import { join, resolve } from "node:path"
 
@@ -22,7 +22,9 @@ const sdkTypesEntry = Bun.resolveSync(
   mcpPackageDirectory
 )
 const mcpServerEntry = resolve(mcpPackageDirectory, "src/runtime-mcp.ts")
+const hostLockEntry = resolve(mcpPackageDirectory, "../runtime/src/host-lock.ts")
 const { createRuntimeHost, RuntimeUdsClient } = await import(runtimePackageEntry)
+const { acquireHostLock } = await import(hostLockEntry)
 const { z } = await import(contractsPackageEntry)
 const { Client } = await import(sdkClientEntry)
 const { InMemoryTransport } = await import(sdkMemoryEntry)
@@ -43,12 +45,14 @@ class InjectedNativeTransport {
   readonly packetsQueue: unknown[] = []
   requestCalls = 0
   drainCalls = 0
+  handshakeCalls = 0
   closed = false
   ended = false
   private waiter?: (packet: unknown | undefined) => void
 
   async send(frame: Record<string, any>): Promise<void> {
     if (frame.channel === "handshake") {
+      this.handshakeCalls += 1
       this.push({
         kind: "message",
         frame: {
@@ -61,6 +65,7 @@ class InjectedNativeTransport {
             loginSessionId: frame.payload.loginSessionId,
             nativeGeneration: "native-host-acceptance",
             nativeBuildId: "native-build-host-acceptance",
+            recoveryDomainVersion: "1",
             capabilitySchemaVersion: "1",
             installRoot: "/tmp/native-host-acceptance",
             process: {
@@ -74,6 +79,113 @@ class InjectedNativeTransport {
               producerRef: "native-host-acceptance",
               capabilities: this.capabilities
             }
+          }
+        }
+      })
+      return
+    }
+    if (frame.channel === "heartbeat") {
+      this.push({
+        kind: "message",
+        frame: {
+          channel: "heartbeat",
+          payload: {
+            requestId: frame.payload.requestId,
+            runtimeEpoch: frame.payload.runtimeEpoch,
+            loginSessionId: frame.payload.loginSessionId,
+            nativeGeneration: frame.payload.nativeGeneration,
+            accepted: true,
+            quarantined: false,
+            acknowledgedAt: new Date().toISOString()
+          }
+        }
+      })
+      return
+    }
+    if (frame.channel === "request" && frame.payload.method === "window.inventory") {
+      this.push({
+        kind: "message",
+        frame: {
+          channel: "response",
+          payload: {
+            kind: "response",
+            protocolVersion: "1",
+            requestId: frame.payload.requestId,
+            runtimeEpoch: frame.payload.runtimeEpoch,
+            loginSessionId: frame.payload.loginSessionId,
+            nativeGeneration: frame.payload.nativeGeneration,
+            ok: true,
+            result: {
+              sourceResponseRef: `source:${frame.payload.requestId}`,
+              inventoryId: "inventory-host-acceptance",
+              layoutRef: "layout-host-acceptance",
+              revision: 1,
+              displayLayoutRevision: 1,
+              capturedAt: new Date().toISOString(),
+              complete: true,
+              errors: [],
+              applications: [],
+              windows: [],
+              displays: []
+            }
+          }
+        }
+      })
+      return
+    }
+    if (frame.channel === "observer") {
+      const now = new Date().toISOString()
+      const generation = {
+        runtimeEpoch: frame.payload.runtimeEpoch,
+        loginSessionId: frame.payload.loginSessionId,
+        nativeGeneration: frame.payload.nativeGeneration
+      }
+      this.push({
+        kind: "message",
+        frame: {
+          channel: "observer",
+          payload: {
+            kind: "observer-response",
+            protocolVersion: "1",
+            requestId: frame.payload.requestId,
+            command: frame.payload.command,
+            ...generation,
+            nativeBuildId: "native-build-host-acceptance",
+            ok: true,
+            snapshot: {
+              observerInstanceRef: "observer-host-acceptance",
+              inventoryId: "inventory-host-acceptance",
+              inventoryRevision: 1,
+              indexRevision: 1,
+              coverage: {
+                state: "ready",
+                ...generation,
+                coverageStartCursor: "cursor-host-start",
+                cursor: "cursor-host-start",
+                nextSequence: 1,
+                startedAt: now,
+                coveredFrom: now,
+                coveredThrough: now,
+                heartbeatAt: now,
+                coveredKinds: ["input", "focus", "window-structure", "lifecycle"],
+                droppedEvents: 0,
+                gapDetected: false
+              },
+              sessionReadiness: {
+                state: "active-console",
+                lockState: "unknown",
+                userId: process.getuid?.() ?? 501,
+                auditSessionId: 1,
+                onConsole: true,
+                loginDone: true,
+                evidence: "Injected fixture passive facts",
+                observedAt: now
+              },
+              secureInput: "off"
+            },
+            ...(frame.payload.command === "events"
+              ? { fromCursor: frame.payload.afterCursor, events: [] }
+              : {})
           }
         }
       })
@@ -327,15 +439,33 @@ test("native disconnect меняет MCP catalog и не допускает unav
     fixture.credentialPath,
     "acceptance-mcp-disconnect"
   )
+  let connectionClosed = false
+  let hostCloseAttempted = false
   try {
-    expect((await connection.client.listTools()).tools.some(
+    const runtimeNames = (await connection.runtimeClient.listTools()).map(
+      (tool: any) => tool.name
+    )
+    const mcpNames = (await connection.client.listTools()).tools.map(
+      (tool: any) => tool.name
+    )
+    expect({ runtimeNames, mcpNames }).toEqual({
+      runtimeNames: expect.arrayContaining(["get_state"]),
+      mcpNames: expect.arrayContaining(["get_state"])
+    })
+    expect(fixture.host.catalog.internal.descriptors().tools.some(
       (tool: any) => tool.name === "list_windows"
     )).toBe(true)
+    expect((await connection.client.listTools()).tools.some(
+      (tool: any) => tool.name === "list_windows"
+    )).toBe(false)
     const changed = waitForCatalogChange(connection.client)
     transport.disconnect()
     await changed
-    expect((await connection.client.listTools()).tools.some(
+    expect(fixture.host.catalog.internal.descriptors().tools.some(
       (tool: any) => tool.name === "list_windows"
+    )).toBe(false)
+    expect((await connection.client.listTools()).tools.some(
+      (tool: any) => tool.name === "get_state"
     )).toBe(false)
     const rejected = await connection.client.callTool({
       name: "list_windows",
@@ -343,10 +473,23 @@ test("native disconnect меняет MCP catalog и не допускает unav
     })
     expect(rejected.isError).toBe(true)
     expect(transport.requestCalls).toBe(0)
-  } finally {
     await connection.client.close()
     await connection.server.close()
-    await fixture.host.close()
+    connectionClosed = true
+    hostCloseAttempted = true
+    await expect(fixture.host.close()).rejects.toThrow("часть подтверждений отсутствует")
+    expect(transport.closed).toBe(true)
+    await expect(access(fixture.socketPath)).rejects.toMatchObject({ code: "ENOENT" })
+    await expect(access(fixture.credentialPath)).rejects.toMatchObject({ code: "ENOENT" })
+    const release = await acquireHostLock(fixture.socketPath)
+    await release()
+    expect(transport.handshakeCalls).toBe(1)
+  } finally {
+    if (!connectionClosed) {
+      await connection.client.close()
+      await connection.server.close()
+    }
+    if (!hostCloseAttempted) await fixture.host.close()
     await rm(fixture.directory, { recursive: true, force: true })
   }
 })
@@ -361,6 +504,9 @@ test("RuntimeHost bounded drain закрывает dynamic MCP admission и по
   )
   try {
     expect((await connection.client.listTools()).tools.some(
+      (tool: any) => tool.name === "get_state"
+    )).toBe(true)
+    expect(fixture.host.catalog.internal.descriptors().tools.some(
       (tool: any) => tool.name === "list_windows"
     )).toBe(true)
     const changed = waitForCatalogChange(connection.client)
@@ -371,7 +517,7 @@ test("RuntimeHost bounded drain закрывает dynamic MCP admission и по
     expect(transport.drainCalls).toBe(1)
     await changed
     const after = await connection.client.listTools()
-    expect(after.tools.some((tool: any) => tool.name === "list_windows")).toBe(false)
+    expect(after.tools.some((tool: any) => tool.name === "get_state")).toBe(false)
     expect(after.tools.some((tool: any) => tool.name === "system_health")).toBe(true)
   } finally {
     await connection.client.close()

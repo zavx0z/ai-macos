@@ -72,10 +72,10 @@ describe("real native C SUT with injected backend", () => {
   test("A08: потерянный ACK после down даёт unknown и quarantine", () =>
     expectScenario("a08-lost-down-ack"))
 
-  test("A08: разовый persist failure второго down завершает bounded cleanup", () =>
+  test("A08: persist failure второго down сохраняет unknown ledger после physical cleanup", () =>
     expectScenario("a08-persist-existing-hold"))
 
-  test("A08: persist failure во время cleanup даёт unknown и запрещает begin", () =>
+  test("A08: broken cleanup persistence освобождает все live-owned holds один раз", () =>
     expectScenario("a08-persist-cleanup-unknown"))
 
   test("A09: watchdog живого helper прекращает будущие events", () =>
