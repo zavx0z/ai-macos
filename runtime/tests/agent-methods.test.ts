@@ -26,6 +26,7 @@ import {
   type AxInspectionResult,
   type BrowserInstanceRecord,
   type BrowserOperationRequest,
+  type ContractError,
   type NativeAdapter,
   type NativeExecutionContext,
   type OperationTarget,
@@ -38,6 +39,7 @@ import { agentObservedStateSchema, registerAgentMethods } from "../src/agent-met
 import { captureDesktopMethodInputSchema, captureExecutionSchema, captureWindowMethodInputSchema } from "../src/capture-methods.ts"
 import { RuntimeCore } from "../src/core.ts"
 import { MethodRegistry } from "../src/method-registry.ts"
+import { RuntimeContractError } from "../src/errors.ts"
 
 const generation = { runtimeEpoch: "runtime:agent", loginSessionId: "login:agent" }
 const nativeGeneration = "native:agent"
@@ -384,6 +386,48 @@ test("observe both регистрирует elements, скрывает observati
   expect(() => scope.resolveElement(id, elementId)).toThrow("latest target snapshot")
 })
 
+test("failed capture сохраняет typed contract error и реальный operationId без user payload", async () => {
+  const fixture = createFixture()
+  const desktop = registerDesktop(fixture)
+  desktop.setCaptureFailure({
+    code: "permission-denied",
+    message: "Screen Recording permission revoked",
+    stage: "screen-capture",
+    retryable: false,
+    replayAllowed: false,
+    recoveryAction: "get-operation",
+    context: { operationId: "operation:forged", resourceRef: "resource:screen", checkpoint: "capture-native" },
+  })
+  registerBrowsers(fixture)
+  registerAgentMethods(fixture.registry, fixture.core, fixture.targets, { ids: sequenceIds() })
+  const client = fixture.core.openClient("principal:capture-error")
+  const state = await fixture.registry.dispatch(client.session, "get_state", { kind: "window" }, new AbortController().signal)
+  const targetId = (state.data.windows as Array<{ targetId: string }>)[0]!.targetId
+  const privateCaption = "PRIVATE CAPTION MUST NOT LEAK"
+  let failure: unknown
+  try {
+    await fixture.registry.dispatch(client.session, "observe", {
+      targetId,
+      mode: "screenshot",
+      caption: privateCaption,
+    }, new AbortController().signal)
+  } catch (error) { failure = error }
+  expect(failure).toBeInstanceOf(RuntimeContractError)
+  const contract = (failure as RuntimeContractError).contract
+  expect(contract).toMatchObject({
+    code: "permission-denied",
+    message: "Screen Recording permission revoked",
+    stage: "screen-capture",
+    retryable: false,
+    replayAllowed: false,
+    recoveryAction: "get-operation",
+    context: { resourceRef: "resource:screen", checkpoint: "capture-native" },
+  })
+  expect(contract.context?.operationId).toStartWith("operation:agent-window-capture:")
+  expect(contract.context?.operationId).not.toBe("operation:forged")
+  expect(JSON.stringify(contract)).not.toContain(privateCaption)
+})
+
 test("get_tabs подключает только выбранный profile и возвращает новое generation binding", async () => {
   const fixture = createFixture()
   registerDesktop(fixture)
@@ -477,6 +521,7 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
   const captureRequests: Array<z.infer<typeof captureWindowMethodInputSchema>> = []
   const desktopCaptureRequests: Array<z.infer<typeof captureDesktopMethodInputSchema>> = []
   const inspectionRequests: Array<z.infer<typeof axInspectionRequestSchema>> = []
+  let captureFailure: ContractError | undefined
   let inspectionNodes: AxInspectionResult["nodes"] = [{
     elementRef: { ...generation, nativeGeneration, applicationRef: appRef.applicationRef,
       snapshotId: "snapshot:agent:1", elementRef: "element:save" },
@@ -560,14 +605,20 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     ...method(async (context, input) => {
       if (input.target.mappingEvidence.state !== "confirmed") throw new Error("Fixture требует confirmed mapping")
       captureRequests.push(input)
+      const operation = completedOperation(context.session, input.clientRequestId, input.inventoryId,
+        input.target.mappingEvidence.proof.inventoryRevision, input.target.target, "native", "read")
+      if (captureFailure !== undefined) {
+        return { operation, frameAvailable: false,
+          result: { ok: false as const, error: structuredClone(captureFailure), outcome: successfulOutcome() } }
+      }
       return {
-        operation: completedOperation(context.session, input.clientRequestId, input.inventoryId,
-          input.target.mappingEvidence.proof.inventoryRevision, input.target.target, "native"),
+        operation,
         frameAvailable: true,
         result: { ok: true as const, value: captureResult(input), outcome: successfulOutcome() },
       }
     }, captureWindowMethodInputSchema, captureExecutionSchema),
-    frames: () => ["frame:agent:1"],
+    frames: output => output.result.ok ? ["frame:agent:1"] : [],
+    isError: output => !output.result.ok,
   })
   fixture.registry.register("capture_desktop", {
     ...method(async (context, input) => {
@@ -590,6 +641,7 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
     inspectionRequests,
     inventoryCalls: () => inventoryCalls,
     setInspectionNodes(nodes: AxInspectionResult["nodes"]) { inspectionNodes = structuredClone(nodes) },
+    setCaptureFailure(error: ContractError | undefined) { captureFailure = error === undefined ? undefined : structuredClone(error) },
   }
 }
 

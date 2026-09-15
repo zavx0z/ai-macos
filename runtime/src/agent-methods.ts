@@ -2,6 +2,8 @@ import {
   browserOperationResources,
   structurallyEqual,
   observationSchema,
+  contractErrorSchema,
+  opaqueIdSchema,
   type Observation,
   z,
   type AdapterResult,
@@ -26,6 +28,7 @@ import { AgentOperations, type AgentMutationContext } from "./agent-operations.t
 import { AgentTargetRegistry, type AgentElementHandle, type AgentTargetActionResolution, type AgentTargetScope } from "./agent-targets.ts"
 import { canonicalJson } from "./primitives.ts"
 import type { AgentViewBindings } from "./agent-view-bindings.ts"
+import { RuntimeContractError } from "./errors.ts"
 
 export const agentTargetIdSchema = z.string().min(1).max(127)
 const targetId = agentTargetIdSchema
@@ -966,7 +969,28 @@ export class RuntimeAgentMethods {
   ): Promise<RuntimeMethodResponse> {
     signal.throwIfAborted()
     const response = await this.#registry.internal.dispatch(session, name, input, signal)
-    if (response.isError) throw new Error(`Internal runtime method ${name} failed`)
+    if (response.isError) {
+      const result = objectRecord(response.data.result)
+      const parsed = contractErrorSchema.safeParse(objectRecord(result?.error))
+      if (parsed.success) {
+        const operation = objectRecord(response.data.operation)
+        const operationContext = objectRecord(operation?.context)
+        const operationId = opaqueIdSchema.safeParse(operationContext?.operationId)
+        const context = {
+          ...(parsed.data.context ?? {}),
+          ...(operationId.success ? { operationId: operationId.data } : {}),
+        }
+        throw new RuntimeContractError(parsed.data.code, parsed.data.message, parsed.data.stage, {
+          retryable: parsed.data.retryable,
+          replayAllowed: parsed.data.replayAllowed,
+          recoveryAction: parsed.data.recoveryAction,
+          ...(Object.keys(context).length === 0 ? {} : { context }),
+        })
+      }
+      throw new RuntimeContractError("internal-error", `Internal runtime method ${name} вернул malformed error`, "agent-method-dispatch", {
+        recoveryAction: "get-operation",
+      })
+    }
     return response
   }
 
@@ -983,6 +1007,12 @@ export class RuntimeAgentMethods {
   #pruneObservations(): void {
     while (this.#observations.size > 128) this.#observations.delete(this.#observations.keys().next().value!)
   }
+}
+
+function objectRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
 }
 
 export function registerAgentMethods(
