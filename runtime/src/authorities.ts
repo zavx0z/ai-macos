@@ -202,6 +202,14 @@ export class ProofRegistry implements ProofAuthority {
       throw new Error("Native-bound proof требует exact native generation в authority context")
     }
   }
+
+  hasIssued(proof: ProofRef): boolean {
+    const stored = this.#proofs.get(proof.proofRef)
+    return stored !== undefined && canonicalJson(stored) === canonicalJson(proof)
+      && this.#clock.now().getTime() < Date.parse(stored.expiresAt)
+      && stored.runtimeEpoch === this.#runtime.runtimeEpoch && stored.loginSessionId === this.#runtime.loginSessionId
+      && (stored.nativeGeneration === undefined || stored.nativeGeneration === this.#nativeGeneration)
+  }
 }
 
 export type NativeEvidenceBinding = {

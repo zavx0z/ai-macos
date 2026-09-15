@@ -22,6 +22,7 @@ export async function main(): Promise<void> {
     socketPath: required("META_RUNTIME_SOCKET"), credentialPath: required("META_RUNTIME_CREDENTIAL"),
     runtimeBuildId: embeddedBuildId ?? required("META_RUNTIME_BUILD_ID"),
     expectedNativeBuildId: required("META_NATIVE_BUILD_ID"),
+    ...(process.env.META_RUNTIME_STATE_DIR === undefined ? {} : { stateDirectory: process.env.META_RUNTIME_STATE_DIR }),
     expectedHostname: required("AI_MACOS_EXPECTED_HOSTNAME"), helperPath: required("META_NATIVE_HELPER"),
   })
   await host.start()

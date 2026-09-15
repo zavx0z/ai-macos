@@ -106,27 +106,39 @@ export class ResourceRegistry implements ResourceAuthority, CleanupAuthority {
   }
 
   applyCleanup(operationId: string, handles: readonly RuntimeResourceHandle[], value: unknown): CleanupAuthorityReceipt | undefined {
+    const staged = this.prepareCleanup(operationId, handles, value)
+    staged.commit()
+    return staged.receipt
+  }
+
+  prepareCleanup(operationId: string, handles: readonly RuntimeResourceHandle[], value: unknown, from: "active" | "quarantined" = "active") {
     const cleanup = cleanupOutcomeSchema.parse(value)
     if (cleanup.state === "pending") throw new Error("Pending cleanup не является backend completion")
     if (!cleanupCoversExactHandles(handles, cleanup)) throw new Error("Cleanup не покрывает exact operation resources")
-    if (handles.length === 0) return this.#issueReceipt(operationId, handles)
-    if (cleanup.scope !== "owned") throw new Error("Operation resources потеряны в cleanup")
-    const planned = cleanup.resources.map(resource => {
+    if (handles.length > 0 && cleanup.scope !== "owned") throw new Error("Operation resources потеряны в cleanup")
+    const planned = (cleanup.scope === "owned" ? cleanup.resources : []).map(resource => {
       const key = resourceKey(resource.handle)
       const slot = this.#slots.get(key)
       const stored = slot?.issued
       if (
         stored === undefined
-        || slot?.current.state !== "active"
+        || slot?.current.state !== from
         || stored.operationId !== operationId
         || canonicalJson(stored) !== canonicalJson(resource.handle)
       ) {
         throw new Error("Cleanup содержит чужой resource")
       }
-      return { resource, key, stored }
+      return { resource, key, stored, current: slot.current }
     })
-    const receipt = cleanup.state === "complete" ? this.#issueReceipt(operationId, handles) : undefined
-    for (const { resource, key, stored } of planned) {
+    const receipt = cleanup.state === "complete" ? this.#makeReceipt(operationId, handles) : undefined
+    let committed = false
+    return { receipt, commit: () => {
+      if (committed) return
+      for (const item of planned) {
+        if (this.#slots.get(item.key)?.current !== item.current) throw new Error("Cleanup changed during durable staging")
+      }
+      if (receipt !== undefined) this.#receipts.set(receipt.receiptId, receipt)
+      for (const { resource, key, stored } of planned) {
       if (resource.outcome === "released") {
         this.#slots.delete(key)
         this.#tombstones.set(stored.leaseId, {
@@ -139,8 +151,9 @@ export class ResourceRegistry implements ResourceAuthority, CleanupAuthority {
         if (slot === undefined) throw new Error("Resource slot исчез во время cleanup commit")
         this.#slots.set(key, { issued: slot.issued, current: Object.freeze({ ...slot.current, state: "quarantined" }) })
       }
-    }
-    return receipt
+      }
+      committed = true
+    } }
   }
 
   quarantine(operationId: string): CleanupOutcome {
@@ -203,35 +216,12 @@ export class ResourceRegistry implements ResourceAuthority, CleanupAuthority {
     if (cleanup.state !== "complete" || !cleanupCoversExactHandles(handles, cleanup) || cleanup.scope !== "owned") {
       throw new Error("Late reconciliation требует exact complete/released partition")
     }
-    const planned = cleanup.resources.map(resource => {
-      if (resource.outcome !== "released") throw new Error("Late reconciliation не может сохранить quarantine при complete")
-      const key = resourceKey(resource.handle)
-      const slot = this.#slots.get(key)
-      if (
-        slot === undefined
-        || slot.current.state !== "quarantined"
-        || slot.issued.operationId !== operationId
-        || canonicalJson(slot.issued) !== canonicalJson(resource.handle)
-      ) {
-        throw new Error("Late reconciliation содержит foreign/non-quarantined handle")
-      }
-      return key
-    })
-    const receipt = this.#issueReceipt(operationId, handles)
-    for (const key of planned) {
-      const slot = this.#slots.get(key)
-      if (slot === undefined) throw new Error("Reconciliation slot исчез до commit")
-      this.#slots.delete(key)
-      this.#tombstones.set(slot.issued.leaseId, {
-        issued: slot.issued,
-        current: Object.freeze({ ...slot.issued, state: "revoked" }),
-        receipt,
-      })
-    }
-    return receipt
+    const staged = this.prepareCleanup(operationId, handles, cleanup, "quarantined")
+    staged.commit()
+    return staged.receipt!
   }
 
-  #issueReceipt(operationId: string, handles: readonly RuntimeResourceHandle[]): CleanupAuthorityReceipt {
+  #makeReceipt(operationId: string, handles: readonly RuntimeResourceHandle[]): CleanupAuthorityReceipt {
     const payload = {
       operationId,
       ...this.#generation,
@@ -244,7 +234,6 @@ export class ResourceRegistry implements ResourceAuthority, CleanupAuthority {
       issuedAt: this.#clock.now().toISOString(),
       state: "complete",
     })
-    this.#receipts.set(receipt.receiptId, receipt)
     return receipt
   }
 }

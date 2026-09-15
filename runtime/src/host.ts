@@ -1,6 +1,7 @@
 import { hostname } from "node:os"
+import { dirname, join } from "node:path"
 import {
-  capabilitySetSchema, desktopInventorySnapshotSchema, freezeAdapterHostContext,
+  capabilitySetSchema, freezeAdapterHostContext,
   nativeHandshakeCompatibility, nativeHandshakeRequestSchema, operationRecordSchema, opaqueIdSchema, z,
   nativeAuditSessionSchema, structurallyEqual, parseWireJson,
   type NativeHandshakeResponse,
@@ -16,6 +17,8 @@ import { adapterResultSchema } from "@meta/shared/contracts"
 import { RuntimeUdsServer } from "./transport.ts"
 import { acquireHostLock } from "./host-lock.ts"
 import { composeHostCapabilities } from "./host-capabilities.ts"
+import { FileHeldInputLedger, FileOperationJournal } from "./storage/index.ts"
+import { registerWindowMethods } from "./window-methods.ts"
 
 export type RuntimeHostOptions = {
   socketPath: string
@@ -28,6 +31,7 @@ export type RuntimeHostOptions = {
   transport?: NativeTransport
   metadata?: unknown
   transportFactory?: () => NativeTransport
+  stateDirectory?: string
 }
 
 export async function createRuntimeHost(options: RuntimeHostOptions) {
@@ -38,6 +42,9 @@ export async function createRuntimeHost(options: RuntimeHostOptions) {
 }
 
 async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => Promise<void>) {
+  const stateDirectory = options.stateDirectory ?? join(dirname(options.socketPath), "state")
+  const journal = new FileOperationJournal(join(stateDirectory, "operations"))
+  const heldLedger = new FileHeldInputLedger(join(stateDirectory, "held-input"))
   const metadata = options.metadata ?? (options.helperPath === undefined ? undefined : await readNativeMetadata(options.helperPath))
   const session = metadata === undefined ? undefined : nativeAuditSessionSchema.parse(z.object({ session: nativeAuditSessionSchema }).parse(metadata).session)
   if (options.helperPath !== undefined && (session === undefined || !session.verified)) throw new Error("Verified native audit session metadata обязательна")
@@ -74,7 +81,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
         capabilities: { scope: "adapter", schemaVersion: "1", producerRef: adapterInstanceRef, capabilities: [] },
       }),
       transport,
-      ledgerSink: { async persist() { throw new Error("Durable ledger sink не подключён; native mutation закрыта") } },
+      ledgerSink: heldLedger,
       bindEvidence(identity) {
         const binding = { adapterInstanceRef: identity.adapterInstanceRef, backendBuildId: identity.loadedBuildId, nativeGeneration: identity.generation.nativeGeneration }
         return {
@@ -105,8 +112,10 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       native = undefined
     }
   }
+  try {
   runtime = new RuntimeCore({
     generation, runtimeBuildId: options.runtimeBuildId,
+    operationJournal: journal,
     completionVerifier: { async verify(context, result) {
       if (clipboard === undefined) throw new Error("Clipboard completion verifier не подключён")
       await clipboard.verify(context, result)
@@ -116,6 +125,11 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       nativeSourceIdentity: { adapterInstanceRef, backendBuildId: handshake.nativeBuildId, nativeGeneration: handshake.nativeGeneration },
     }),
   })
+  await runtime.initializeRecovery()
+  const heldEvidence = await heldLedger.loadAll()
+  if (heldEvidence.some(evidence => evidence.snapshot.entries.some(entry => entry.state !== "released"))) {
+    runtime.quarantineStartup("Durable native held-input ledger требует explicit recovery")
+  }
   if (native !== undefined && handshake !== undefined) {
     runtime.evidence.registerSourceExtractor({ adapterInstanceRef, backendBuildId: handshake.nativeBuildId, nativeGeneration: handshake.nativeGeneration }, extractNativeEvidenceReports)
     clipboard = new RuntimeClipboardHandler(runtime, native)
@@ -125,7 +139,9 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   const catalog = new MethodRegistry(core)
   const doctor = () => ({
     machine: { hostname: hostname(), matchesExpected: hostname() === options.expectedHostname },
-    runtime: { buildId: options.runtimeBuildId, ...generation, draining },
+    runtime: { buildId: options.runtimeBuildId, ...generation, draining,
+      admissionSealed: core.admissionSealed, recoveryOperations: core.recoveryEvidence().length,
+      recoveryReasons: [...core.startupRecoveryReasons()] },
     native: native === undefined || handshake === undefined
       ? { state: "unavailable" as const, reason: nativeError ?? "native helper not configured" }
       : nativeError !== undefined ? { state: "unavailable" as const, reason: nativeError }
@@ -135,7 +151,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   })
   const doctorSchema = z.strictObject({
     machine: z.strictObject({ hostname: z.string(), matchesExpected: z.boolean() }),
-    runtime: z.strictObject({ buildId: z.string(), runtimeEpoch: z.string(), loginSessionId: z.string(), draining: z.boolean() }),
+    runtime: z.strictObject({ buildId: z.string(), runtimeEpoch: z.string(), loginSessionId: z.string(), draining: z.boolean(),
+      admissionSealed: z.boolean(), recoveryOperations: z.number().int().min(0), recoveryReasons: z.array(z.string()) }),
     native: z.union([
       z.strictObject({ state: z.literal("unavailable"), reason: z.string() }),
       z.strictObject({ state: z.literal("compatible"), buildId: z.string(), generation: z.string() }),
@@ -162,13 +179,12 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   })
   if (native !== undefined) {
     const windows = new NativeWindowAdapter({ native, services: core.services })
-    catalog.register("list_windows", {
-      title: "Инвентаризация рабочего стола", description: "Все обнаруженные AX и CG-only окна с поколениями, displays и completeness.",
-      input: z.strictObject({}), output: desktopInventorySnapshotSchema, readOnly: true, timeoutMs: 6000,
-      requiredCapabilities: ["desktop.windows.all", "desktop.applications", "desktop.displays"],
-      async execute(context) {
+    registerWindowMethods(catalog, core, {
+      host: windows.host, services: windows.services, capabilities: windows.capabilities,
+      transition: windows.transition.bind(windows), inspect: windows.inspect.bind(windows),
+      async inventory(control) {
         try {
-          const inventory = await windows.inventory({ signal: context.signal, checkpoint() { if (context.signal.aborted) throw new Error("Inventory cancelled") } })
+          const inventory = await windows.inventory(control)
           if (inventory.errors.some(error => error.code === "permission-denied") || inventory.applications.some(app => app.axStatus === "denied")) revokeNative("Native inventory permission revoked")
           return inventory
         } catch (error) { revokeNative("Native inventory unavailable"); throw error }
@@ -211,6 +227,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     },
     async close() { core.sealAdmission(); await uds.stop(); await native?.close(); await releaseLock() },
   }
+  } catch (error) { await native?.close(); throw error }
 }
 
 async function readNativeMetadata(helperPath: string): Promise<unknown> {

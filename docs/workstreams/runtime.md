@@ -5,8 +5,38 @@
 Статус: C1 принят. C2 runtime core/evidence/continuation принят scoped ведущим.
 C3 lifetime coordinator связан с RuntimeCore; текущий атомарный checkpoint
 компилируется и проходит 34 runtime tests. Transport foundation принят scoped;
-production catalog/cutover ещё впереди. Следующий checkpoint закрывает
-quarantined/expired recovery и actual Android adapter composition.
+production cutover ещё впереди. Recovery и Android composition приняты scoped;
+следующий checkpoint подключает durable journal и native held-input ledger.
+
+## Checkpoint durable core и host integration
+
+- Core записывает registered и dispatching до вызова adapter. Проверенный
+  terminal record с cleanup receipt сохраняется до освобождения resource.
+  Recovery старых browser operations использует тот же staged durable порядок.
+- Каждая durable write ограничена отдельным deadline. Зависание навсегда
+  закрывает admission; queued writes не обходят poisoned storage. Cancel/drain
+  завершают ожидание, поздний ACK не меняет receipt и не снимает quarantine.
+- Host подключает FileOperationJournal и FileHeldInputLedger из принятого
+  storage-модуля. META_RUNTIME_STATE_DIR задаёт private state directory;
+  по умолчанию используется state рядом с socket. Незавершённые операции и
+  unreleased ledger entries закрывают startup admission и видны в doctor.
+- После process crash новый epoch загружает старые записи только как recovery
+  evidence: action не воспроизводится, новая lineage не получает старую operation.
+  Durable resumption credentials, explicit recovery credential и автоматическая
+  reconciliation после restart пока не реализованы.
+- Host использует registerWindowMethods с сохранением permission-revocation
+  hook. Browser coordinator принимает caller AbortSignal. Resource expiry
+  следует operation deadline с верхним пределом 120 секунд, а не обрывает
+  33-секундную typing operation прежним пределом 30 секунд.
+- Capture publication выдаётся по lineage/clientRequestId, включая concurrent
+  retry; commit требует завершённую операцию, frame и выданный native proof.
+  Browser proof authority и полный capture lifecycle ещё требуют интеграции.
+- Последний полный runtime run: **80 pass / 430 assertions**. Это fake/temp
+  filesystem evidence, включая реальный дочерний process crash; live desktop,
+  installed services и Native helper не запускались и не переключались.
+- Root typecheck в последнем проходе остановился на двух TS2352 в параллельно
+  изменяемом browser-methods.ts; владелец уведомлён. До этих изменений typecheck
+  host/core проходил. Полная приёмка пока не заявляется.
 
 ## Checkpoint MethodRegistry, host и clipboard mapper
 
@@ -50,8 +80,8 @@ quarantined/expired recovery и actual Android adapter composition.
   `META_NATIVE_BUILD_ID`, `AI_MACOS_EXPECTED_HOSTNAME`.
   Runtime build внедряется через `__META_RUNTIME_BUILD_ID__`; development fallback
   только явный `META_RUNTIME_BUILD_ID`. `--doctor` читает уже работающий UDS host.
-- Пока durable store не подключён к host, его native ledgerSink отклоняет
-  persistence: этот entrypoint не предназначен для installed action cutover.
+- Историческое ограничение этого checkpoint: ledgerSink отклонял persistence.
+  Подключение store описано выше; installed action cutover ещё не выполнен.
 - `RuntimeClipboardHandler` использует настоящие Input schemas/adapter/backend,
   проверяет registered native receipt, превращает pending в verified complete
   либо unknown quarantine и исключает clipboard extra из generic AdapterResult.
