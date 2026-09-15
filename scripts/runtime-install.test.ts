@@ -17,6 +17,7 @@ import {
 } from "./runtime-install.ts"
 
 const roots: string[] = []
+type FakeStartupPermissionState = "not-required" | "checking" | "requesting" | "waiting" | "ready" | "restart-needed" | "timed-out" | "failed"
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map(async path => {
@@ -129,6 +130,127 @@ test("failed doctor атомарно возвращает previous helper, relea
   expect(await readlink(join(options.paths.installRoot, "current"))).toBe(firstPlan.release.releasePath)
   expect(await readFile(options.paths.stableHelperPath)).toEqual(firstHelper)
   expect(await readFile(options.paths.launchAgentPath)).toEqual(firstPlist)
+})
+
+test("installer пассивно ждёт startup permissions и после ready проверяет observer/view", async () => {
+  const fixture = await createFixture()
+  const options = {
+    ...fixture.options,
+    requiredCapabilities: ["input.pointer"] as const,
+    permissionWaitMs: 500,
+  }
+  const plan = await planRuntimeInstall(options)
+  fixture.runner.startupPermissionStatesByBuild.set(plan.release.runtimeBuildId,
+    ["checking", "requesting", "waiting", "ready"])
+  fixture.runner.observerUnavailableCountsByBuild.set(plan.release.runtimeBuildId, 1)
+
+  const result = await applyRuntimeInstall(plan, options)
+
+  expect(result.state).toBe("installed")
+  expect(fixture.runner.doctorCalls).toBe(5)
+  expect(fixture.runner.permissionUiRequests).toBe(0)
+})
+
+test("post-grant observer preparation может временно держать чистую admission закрытой", async () => {
+  const fixture = await createFixture()
+  const options = { ...fixture.options, requiredCapabilities: ["input.pointer"] as const }
+  const plan = await planRuntimeInstall(options)
+  fixture.runner.startupPermissionStatesByBuild.set(plan.release.runtimeBuildId, ["ready"])
+  fixture.runner.observerUnavailableCountsByBuild.set(plan.release.runtimeBuildId, 1)
+  fixture.runner.sealAdmissionWhileObserverPreparingBuilds.add(plan.release.runtimeBuildId)
+
+  const result = await applyRuntimeInstall(plan, options)
+
+  expect(result.state).toBe("installed")
+  expect(fixture.runner.doctorCalls).toBe(2)
+})
+
+test("foundation без observer capabilities не требует observer/view readiness", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  fixture.runner.observerUnavailableCountsByBuild.set(plan.release.runtimeBuildId, 100)
+
+  const result = await applyRuntimeInstall(plan, fixture.options)
+
+  expect(result.state).toBe("installed")
+  expect(fixture.runner.doctorCalls).toBe(1)
+})
+
+test("permission deadline не обновляется после ready-to-waiting flap", async () => {
+  const fixture = await createFixture()
+  const options = {
+    ...fixture.options,
+    requiredCapabilities: ["input.pointer"] as const,
+    permissionWaitMs: 160,
+  }
+  const plan = await planRuntimeInstall(options)
+  fixture.runner.startupPermissionStatesByBuild.set(plan.release.runtimeBuildId, ["waiting", "ready", "waiting"])
+  fixture.runner.observerUnavailableCountsByBuild.set(plan.release.runtimeBuildId, 100)
+  fixture.runner.sealAdmissionWhileObserverPreparingBuilds.add(plan.release.runtimeBuildId)
+
+  await expect(applyRuntimeInstall(plan, options)).rejects.toThrow("startup permission wait deadline exceeded")
+  expect(fixture.runner.doctorCalls).toBeLessThanOrEqual(4)
+})
+
+test("исчерпанный startup permission budget откатывает предыдущий release", async () => {
+  const fixture = await createFixture()
+  const firstPlan = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(firstPlan, fixture.options)
+  const firstHelper = await readFile(fixture.options.paths.stableHelperPath)
+
+  fixture.runner.commit = "f".repeat(40)
+  fixture.runner.loaded = true
+  const inspection: RuntimeInspection = {
+    running: true,
+    runtimeEpoch: "runtime:permission-timeout",
+    runtimeBuildId: firstPlan.release.runtimeBuildId,
+    nativeBuildId: firstPlan.release.nativeBuildId,
+    activeOperations: 0,
+    quarantinedResources: 0,
+  }
+  const options = { ...fixture.options, runtimeAdmin: successfulAdmin(inspection), permissionWaitMs: 120 }
+  const update = await planRuntimeInstall(options)
+  fixture.runner.startupPermissionStatesByBuild.set(update.release.runtimeBuildId, ["waiting"])
+
+  await expect(applyRuntimeInstall(update, options)).rejects.toThrow("startup permission wait deadline exceeded")
+  expect(await readlink(join(options.paths.installRoot, "current"))).toBe(firstPlan.release.releasePath)
+  expect(await readFile(options.paths.stableHelperPath)).toEqual(firstHelper)
+  expect(fixture.runner.permissionUiRequests).toBe(0)
+})
+
+test("pending permissions с чужим owner identity завершаются сразу без ожидания", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  fixture.runner.startupPermissionStatesByBuild.set(plan.release.runtimeBuildId, ["waiting"])
+  fixture.runner.wrongPermissionIdentityForBuild.add(plan.release.runtimeBuildId)
+
+  await expect(applyRuntimeInstall(plan, { ...fixture.options, permissionWaitMs: 500 }))
+    .rejects.toThrow("другой permission owner path/cdhash")
+  expect(fixture.runner.doctorCalls).toBe(1)
+  expect(fixture.runner.permissionUiRequests).toBe(0)
+})
+
+test("уже готовые startup permissions проходят doctor без human wait", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  fixture.runner.startupPermissionStatesByBuild.set(plan.release.runtimeBuildId, ["ready"])
+
+  const result = await applyRuntimeInstall(plan, { ...fixture.options, permissionWaitMs: 0 })
+
+  expect(result.state).toBe("installed")
+  expect(fixture.runner.doctorCalls).toBe(1)
+  expect(fixture.runner.permissionUiRequests).toBe(0)
+})
+
+test("denied grants без explicit pending startup state отклоняются сразу", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  fixture.runner.legacyDeniedBuilds.add(plan.release.runtimeBuildId)
+
+  await expect(applyRuntimeInstall(plan, { ...fixture.options, permissionWaitMs: 500 }))
+    .rejects.toThrow("не подтвердил passive TCC grants")
+  expect(fixture.runner.doctorCalls).toBe(1)
+  expect(fixture.runner.permissionUiRequests).toBe(0)
 })
 
 test("symlink helper и foreign signing identity блокируются до cutover", async () => {
@@ -436,14 +558,25 @@ class FakeRunner implements CommandRunner {
   printCalls = 0
   doctorUnavailableCount = 0
   doctorCalls = 0
+  permissionUiRequests = 0
   auditSessionId = 1
   readonly unavailableCapabilities = new Set<string>()
+  readonly startupPermissionStatesByBuild = new Map<string, FakeStartupPermissionState[]>()
+  readonly startupPermissionIndexesByBuild = new Map<string, number>()
+  readonly observerUnavailableCountsByBuild = new Map<string, number>()
+  readonly sealAdmissionWhileObserverPreparingBuilds = new Set<string>()
+  readonly wrongPermissionIdentityForBuild = new Set<string>()
+  readonly legacyDeniedBuilds = new Set<string>()
   launchProgram = ""
   launchPlist = ""
 
   constructor(readonly repositoryRoot: string) {}
 
   async run(file: string, args: readonly string[]): Promise<CommandResult> {
+    if (args.includes("--request-permissions")) {
+      this.permissionUiRequests++
+      return fail("installer не должен запрашивать permission UI")
+    }
     if (file === "git" && args[0] === "rev-parse") return ok(`${this.commit}\n`)
     if (file === "git" && args[0] === "status") return ok("")
     if (file === "/bin/launchctl" && args[0] === "print") {
@@ -502,18 +635,49 @@ class FakeRunner implements CommandRunner {
       const releasePath = await readlink(file.slice(0, -"/runtime".length))
       const manifest = JSON.parse(await readFile(join(releasePath, "manifest.json"), "utf8"))
       if (manifest.builds.runtimeBuildId === this.failDoctorForBuild) return fail("doctor failed")
+      const runtimeBuildId = manifest.builds.runtimeBuildId as string
+      const permissionStates = this.startupPermissionStatesByBuild.get(runtimeBuildId)
+      const permissionIndex = this.startupPermissionIndexesByBuild.get(runtimeBuildId) ?? 0
+      const permissionState = permissionStates?.[Math.min(permissionIndex, permissionStates.length - 1)] ?? "ready"
+      if (permissionStates !== undefined) this.startupPermissionIndexesByBuild.set(runtimeBuildId, permissionIndex + 1)
+      const pendingPermissions = ["checking", "requesting", "waiting", "restart-needed"].includes(permissionState)
+      const observerUnavailableCount = this.observerUnavailableCountsByBuild.get(runtimeBuildId) ?? 0
+      const observerReady = !pendingPermissions && observerUnavailableCount === 0
+      if (!pendingPermissions && observerUnavailableCount > 0) {
+        this.observerUnavailableCountsByBuild.set(runtimeBuildId, observerUnavailableCount - 1)
+      }
+      const permissionsGranted = !pendingPermissions && !this.legacyDeniedBuilds.has(runtimeBuildId)
+        && permissionState !== "failed" && permissionState !== "timed-out"
+      const permissionOwnerPath = this.wrongPermissionIdentityForBuild.has(runtimeBuildId)
+        ? join(this.repositoryRoot, "input/bin/foreign-helper")
+        : join(this.repositoryRoot, "input/bin/meta-input-helper")
+      const startup = this.legacyDeniedBuilds.has(runtimeBuildId) ? {} : { startup: { permissions: {
+        state: permissionState,
+        required: ["accessibility", "screenRecording", "postEvents", "inputMonitoring"],
+        missing: permissionsGranted ? [] : ["accessibility", "screenRecording", "postEvents", "inputMonitoring"],
+        requestIssued: !["not-required", "checking"].includes(permissionState),
+      } } }
+      const admissionSealed = pendingPermissions
+        || (!observerReady && this.sealAdmissionWhileObserverPreparingBuilds.has(runtimeBuildId))
       return ok(JSON.stringify({ isError: false, structuredContent: {
         runtime: { buildId: manifest.builds.runtimeBuildId, draining: false,
-          admissionSealed: false, recoveryOperations: 0, recoveryReasons: [] },
+          admissionSealed, recoveryOperations: 0,
+          recoveryReasons: pendingPermissions ? ["Startup permissions pending"] : [] },
+        observer: { state: observerReady ? "ready" : "preparing", reason: "fixture", viewReady: observerReady },
         native: { state: "compatible", buildId: manifest.builds.nativeBuildId },
         permissions: {
-          accessibility: { granted: true, helperPath: join(this.repositoryRoot, "input/bin/meta-input-helper"), cdhash: manifest.artifacts.nativeHelper.cdhash },
-          screenRecording: { granted: true, ownerPath: join(this.repositoryRoot, "input/bin/meta-input-helper"), cdhash: manifest.artifacts.nativeHelper.cdhash },
+          accessibility: { granted: permissionsGranted, helperPath: permissionOwnerPath, cdhash: manifest.artifacts.nativeHelper.cdhash },
+          screenRecording: { granted: permissionsGranted, ownerPath: permissionOwnerPath, cdhash: manifest.artifacts.nativeHelper.cdhash },
+          postEvents: { granted: permissionsGranted, helperPath: permissionOwnerPath, cdhash: manifest.artifacts.nativeHelper.cdhash },
+          inputMonitoring: { granted: permissionsGranted, helperPath: permissionOwnerPath, cdhash: manifest.artifacts.nativeHelper.cdhash },
         },
+        ...startup,
         capabilities: { capabilities: CAPABILITY_IDS.map(id => ({
           id,
           state: this.unavailableCapabilities.has(id) ? "unavailable" : "ready",
         })) },
+        activeOperations: 0,
+        quarantinedResources: 0,
       } }))
     }
     if (file === "/bin/launchctl" && args[0] === "bootstrap") {

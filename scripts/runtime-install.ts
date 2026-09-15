@@ -29,6 +29,11 @@ export const HELPER_SIGNING_IDENTIFIER = "com.meta.input.helper"
 const RELEASE_FORMAT = "meta-ai-macos-runtime-release-v1"
 const MAX_COMMAND_OUTPUT = 8 * 1024 * 1024
 const MAX_BROWSER_CONFIG_BYTES = 64 * 1024
+const STARTUP_PERMISSION_NAMES = ["accessibility", "screenRecording", "postEvents", "inputMonitoring"] as const
+const PENDING_STARTUP_PERMISSION_STATES = new Set(["checking", "requesting", "waiting", "restart-needed"])
+const OBSERVER_REQUIRED_CAPABILITIES = new Set<CapabilityId>([
+  "runtime.user-interference", "input.keyboard", "input.pointer", "input.drag", "input.interaction",
+])
 export type RuntimeReadinessProfile = "full" | "foundation" | "desktop-browser-selected"
 
 export type DeferredCapability = {
@@ -97,6 +102,7 @@ export type RuntimeInstallOptions = {
   runtimeAdmin?: RuntimeAdmin
   testOnlyAllowNonCanonicalRoot?: boolean
   doctorTimeoutMs?: number
+  permissionWaitMs?: number
   browserConfig?: string
   readinessProfile?: RuntimeReadinessProfile
   requiredCapabilities?: readonly CapabilityId[]
@@ -199,6 +205,7 @@ export type ReleaseManifest = {
     candidateCdhash: string
     automaticGrantPreservation: false
     requiredPassiveChecks: readonly ["accessibility", "screen-recording"]
+      | readonly ["accessibility", "screen-recording", "post-events", "input-monitoring"]
   }
 }
 
@@ -455,7 +462,8 @@ async function applyRuntimeInstallLocked(
     && previous.plistBytes !== undefined
     && new TextDecoder().decode(previous.plistBytes) === plist
   if (sameRelease) {
-    const doctor = await runDoctor(plan, options.runner, release.manifest, doctorTimeout(options))
+    const doctor = await runDoctor(plan, options.runner, release.manifest,
+      doctorTimeout(options), permissionWait(options))
     return {
       state: "already-installed",
       releaseId: plan.release.releaseId,
@@ -498,7 +506,8 @@ async function applyRuntimeInstallLocked(
     await checked(options.runner, "/usr/bin/plutil", ["-lint", paths.launchAgentPath])
     await checked(options.runner, "/bin/launchctl", ["bootstrap", plan.service.domain, paths.launchAgentPath])
     await options.failpoint?.("after-bootstrap")
-    const doctor = await runDoctor(plan, options.runner, release.manifest, doctorTimeout(options))
+    const doctor = await runDoctor(plan, options.runner, release.manifest,
+      doctorTimeout(options), permissionWait(options))
     await discardPendingUpdate(paths)
     return {
       state: previous.currentRelease === plan.release.releasePath
@@ -533,7 +542,7 @@ export async function doctorInstalledRuntime(
   runner: CommandRunner,
 ): Promise<unknown> {
   const manifest = parseManifest(JSON.parse(await readFile(join(plan.release.releasePath, "manifest.json"), "utf8")))
-  return runDoctor(plan, runner, manifest, 10_000)
+  return runDoctor(plan, runner, manifest, 10_000, 600_000)
 }
 
 function installSteps(
@@ -642,7 +651,7 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
         subjectPath: plan.paths.stableHelperPath,
         candidateCdhash: signature.cdhash,
         automaticGrantPreservation: false,
-        requiredPassiveChecks: ["accessibility", "screen-recording"],
+        requiredPassiveChecks: ["accessibility", "screen-recording", "post-events", "input-monitoring"],
       },
     }
     await durableText(join(staging, "manifest.json"), `${stableJson(manifest)}\n`, 0o444)
@@ -801,7 +810,8 @@ async function recoverPendingUpdate(
         alreadyInstalled: true,
       },
     }
-    await runDoctor(oldPlan, options.runner, oldManifest, doctorTimeout(options))
+    await runDoctor(oldPlan, options.runner, oldManifest,
+      doctorTimeout(options), permissionWait(options))
   }
   await discardPendingUpdate(plan.paths)
 }
@@ -875,7 +885,8 @@ async function rollback(
             alreadyInstalled: true,
           },
         }
-        await runDoctor(oldPlan, options.runner, oldManifest, doctorTimeout(options))
+        await runDoctor(oldPlan, options.runner, oldManifest,
+          doctorTimeout(options), permissionWait(options))
       }
     })
   }
@@ -914,11 +925,18 @@ async function runDoctor(
   runner: CommandRunner,
   manifest: ReleaseManifest,
   timeoutMs: number,
+  permissionWaitMs: number,
 ): Promise<unknown> {
   const executable = join(plan.paths.installRoot, "current", "runtime")
-  const deadlineAt = Date.now() + timeoutMs
+  let readinessDeadlineAt = Date.now() + timeoutMs
+  let permissionDeadlineAt: number | undefined
+  let previousPermissionStatePending = false
   let lastFailure = "runtime doctor не ответил"
-  while (Date.now() < deadlineAt) {
+  while (true) {
+    const deadlineAt = previousPermissionStatePending && permissionDeadlineAt !== undefined
+      ? permissionDeadlineAt
+      : readinessDeadlineAt
+    if (Date.now() >= deadlineAt) break
     const result = await runner.run(executable, ["--doctor"], {
       timeoutMs: Math.max(1, Math.min(2_000, deadlineAt - Date.now())),
       env: {
@@ -936,12 +954,18 @@ async function runDoctor(
     structuredContent?: {
       runtime?: { buildId?: string, draining?: boolean, admissionSealed?: boolean,
         recoveryOperations?: number, recoveryReasons?: unknown[] }
+      observer?: { state?: string, viewReady?: boolean }
       native?: { state?: string, buildId?: string }
       permissions?: {
         accessibility?: { granted?: boolean, helperPath?: string, cdhash?: string }
         screenRecording?: { granted?: boolean, ownerPath?: string, cdhash?: string }
+        postEvents?: { granted?: boolean, helperPath?: string, cdhash?: string }
+        inputMonitoring?: { granted?: boolean, helperPath?: string, cdhash?: string }
       }
+      startup?: { permissions?: unknown }
       capabilities?: { capabilities?: Array<{ id?: string, state?: string }> }
+      activeOperations?: number
+      quarantinedResources?: number
     }
     }
     try { doctor = JSON.parse(result.stdout) }
@@ -952,29 +976,73 @@ async function runDoctor(
     }
     const reportedRuntimeBuild = doctor.structuredContent?.runtime?.buildId
     const reportedNativeBuild = doctor.structuredContent?.native?.buildId
-    if (reportedRuntimeBuild !== undefined && reportedRuntimeBuild !== plan.release.runtimeBuildId
-      || reportedNativeBuild !== undefined && reportedNativeBuild !== plan.release.nativeBuildId) {
+    if ((reportedRuntimeBuild !== undefined && reportedRuntimeBuild !== plan.release.runtimeBuildId)
+      || (reportedNativeBuild !== undefined && reportedNativeBuild !== plan.release.nativeBuildId)) {
       throw new Error("Installed runtime doctor обнаружил другой runtime/native build; polling запрещён")
     }
-    if (doctor.isError || reportedRuntimeBuild !== plan.release.runtimeBuildId
+    if (reportedRuntimeBuild !== plan.release.runtimeBuildId
       || doctor.structuredContent?.runtime?.draining !== false
       || doctor.structuredContent?.native?.state !== "compatible"
       || reportedNativeBuild !== plan.release.nativeBuildId) {
       throw new Error("Installed runtime doctor не подтвердил exact runtime/native build IDs")
     }
-    if (doctor.structuredContent.runtime.admissionSealed !== false
-      || doctor.structuredContent.runtime.recoveryOperations !== 0
-      || !Array.isArray(doctor.structuredContent.runtime.recoveryReasons)
-      || doctor.structuredContent.runtime.recoveryReasons.length > 0) {
-      throw new Error("Installed runtime admission закрыта или startup recovery не завершена")
-    }
     const accessibility = doctor.structuredContent?.permissions?.accessibility
     const screenRecording = doctor.structuredContent?.permissions?.screenRecording
-    if (accessibility?.granted !== true || accessibility.helperPath !== plan.paths.stableHelperPath
+    const postEvents = doctor.structuredContent?.permissions?.postEvents
+    const inputMonitoring = doctor.structuredContent?.permissions?.inputMonitoring
+    const requiresExtendedPermissions = (manifest.tcc.requiredPassiveChecks as readonly string[]).includes("post-events")
+    if (accessibility?.helperPath !== plan.paths.stableHelperPath
       || accessibility.cdhash !== manifest.artifacts.nativeHelper.cdhash
-      || screenRecording?.granted !== true || screenRecording.ownerPath !== plan.paths.stableHelperPath
-      || screenRecording.cdhash !== manifest.artifacts.nativeHelper.cdhash) {
+      || screenRecording?.ownerPath !== plan.paths.stableHelperPath
+      || screenRecording.cdhash !== manifest.artifacts.nativeHelper.cdhash
+      || (requiresExtendedPermissions && (postEvents?.helperPath !== plan.paths.stableHelperPath
+        || postEvents.cdhash !== manifest.artifacts.nativeHelper.cdhash
+        || inputMonitoring?.helperPath !== plan.paths.stableHelperPath
+        || inputMonitoring.cdhash !== manifest.artifacts.nativeHelper.cdhash))) {
+      throw new Error("Installed runtime doctor обнаружил другой permission owner path/cdhash; polling запрещён")
+    }
+    const startupPermissions = parseStartupPermissions(doctor.structuredContent?.startup?.permissions)
+    if (startupPermissions?.state === "failed" || startupPermissions?.state === "timed-out") {
+      throw new Error(`Installed runtime startup permissions завершились как ${startupPermissions.state}`)
+    }
+    if (startupPermissions !== undefined && PENDING_STARTUP_PERMISSION_STATES.has(startupPermissions.state)) {
+      if (permissionDeadlineAt === undefined) permissionDeadlineAt = Date.now() + permissionWaitMs
+      previousPermissionStatePending = true
+      if (Date.now() >= permissionDeadlineAt) break
+      lastFailure = `startup permissions ${startupPermissions.state}: ${startupPermissions.missing.join(", ")}`
+      await boundedDelay(permissionPollDelay(permissionWaitMs, permissionDeadlineAt - Date.now()))
+      continue
+    }
+    if (previousPermissionStatePending) {
+      previousPermissionStatePending = false
+      readinessDeadlineAt = Date.now() + timeoutMs
+    }
+    if (accessibility.granted !== true || screenRecording.granted !== true
+      || (requiresExtendedPermissions && (postEvents?.granted !== true || inputMonitoring?.granted !== true))) {
       throw new Error("Installed runtime doctor не подтвердил passive TCC grants exact helper path/cdhash")
+    }
+    const observerRequired = plan.configuration.requiredCapabilities
+      .some(capability => OBSERVER_REQUIRED_CAPABILITIES.has(capability))
+    const observerReady = doctor.structuredContent.observer?.state === "ready"
+      && doctor.structuredContent.observer?.viewReady === true
+    const recoveryClean = doctor.structuredContent.runtime.recoveryOperations === 0
+      && Array.isArray(doctor.structuredContent.runtime.recoveryReasons)
+      && doctor.structuredContent.runtime.recoveryReasons.length === 0
+      && doctor.structuredContent.activeOperations === 0
+      && doctor.structuredContent.quarantinedResources === 0
+    const observerPreparing = observerRequired && !observerReady
+    const sealedPostGrantPreparation = startupPermissions?.state === "ready"
+      && !observerReady && recoveryClean
+      && doctor.structuredContent.runtime.admissionSealed === true
+    if (sealedPostGrantPreparation
+      || (observerPreparing && recoveryClean && doctor.structuredContent.runtime.admissionSealed === false)) {
+      lastFailure = "observer/view ещё не готовы после выдачи startup permissions"
+      await boundedDelay(Math.min(50, Math.max(1, readinessDeadlineAt - Date.now())))
+      continue
+    }
+    if (doctor.isError) throw new Error("Installed runtime doctor вернул ошибку после проверки startup permissions")
+    if (doctor.structuredContent.runtime.admissionSealed !== false || !recoveryClean) {
+      throw new Error("Installed runtime admission закрыта или startup recovery не завершена")
     }
     const capabilityStates = new Map((doctor.structuredContent?.capabilities?.capabilities ?? [])
       .map(capability => [capability.id, capability.state]))
@@ -982,13 +1050,60 @@ async function runDoctor(
     if (missing !== undefined) throw new Error(`Installed runtime не подтвердил required capability ready: ${missing}`)
     return doctor
   }
+  if (previousPermissionStatePending && permissionDeadlineAt !== undefined) {
+    throw new Error(`Installed runtime startup permission wait deadline exceeded: ${lastFailure}`)
+  }
   throw new Error(`Installed runtime doctor readiness deadline exceeded: ${lastFailure}`)
+}
+
+type StartupPermissionsHealth = {
+  state: "not-required" | "checking" | "requesting" | "waiting" | "ready" | "restart-needed" | "timed-out" | "failed"
+  required: string[]
+  missing: string[]
+  requestIssued: boolean
+}
+
+function parseStartupPermissions(value: unknown): StartupPermissionsHealth | undefined {
+  if (value === undefined) return undefined
+  if (value === null || typeof value !== "object") throw new Error("Startup permissions health повреждён")
+  const permissions = value as Partial<StartupPermissionsHealth>
+  const validStates = ["not-required", "checking", "requesting", "waiting", "ready", "restart-needed", "timed-out", "failed"]
+  if (typeof permissions.state !== "string" || !validStates.includes(permissions.state)
+    || !Array.isArray(permissions.required) || !Array.isArray(permissions.missing)
+    || typeof permissions.requestIssued !== "boolean"
+    || permissions.required.some(name => typeof name !== "string"
+      || !(STARTUP_PERMISSION_NAMES as readonly string[]).includes(name))
+    || permissions.missing.some(name => typeof name !== "string"
+      || !(STARTUP_PERMISSION_NAMES as readonly string[]).includes(name))
+    || new Set(permissions.required).size !== STARTUP_PERMISSION_NAMES.length
+    || STARTUP_PERMISSION_NAMES.some(name => !permissions.required!.includes(name))
+    || permissions.missing.some(name => !permissions.required!.includes(name))
+    || permissions.required.length !== STARTUP_PERMISSION_NAMES.length
+    || new Set(permissions.missing).size !== permissions.missing.length
+    || (["ready", "not-required"].includes(permissions.state) && permissions.missing.length > 0)
+    || (["requesting", "waiting", "restart-needed"].includes(permissions.state) && !permissions.requestIssued)) {
+    throw new Error("Startup permissions health повреждён")
+  }
+  return permissions as StartupPermissionsHealth
 }
 
 function doctorTimeout(options: RuntimeInstallOptions): number {
   const timeout = options.doctorTimeoutMs ?? 10_000
   if (!Number.isSafeInteger(timeout) || timeout < 100 || timeout > 30_000) throw new Error("Doctor timeout должен быть 100..30000 ms")
   return timeout
+}
+
+function permissionWait(options: RuntimeInstallOptions): number {
+  const timeout = options.permissionWaitMs ?? 600_000
+  if (!Number.isSafeInteger(timeout) || timeout < 0 || timeout > 600_000) {
+    throw new Error("Permission wait должен быть 0..600000 ms")
+  }
+  return timeout
+}
+
+function permissionPollDelay(permissionWaitMs: number, remainingMs: number): number {
+  const interval = Math.min(500, Math.max(10, Math.floor(permissionWaitMs / 4)))
+  return Math.min(interval, Math.max(1, remainingMs))
 }
 
 async function boundedDelay(ms: number): Promise<void> {
@@ -1171,7 +1286,10 @@ function parseManifest(value: unknown): ReleaseManifest {
       .every(field => Number.isSafeInteger(field) && field >= 0)
     || manifest.tcc?.subjectPath === undefined || manifest.tcc.candidateCdhash !== manifest.artifacts.nativeHelper.cdhash
     || manifest.tcc.automaticGrantPreservation !== false
-    || stableJson(manifest.tcc.requiredPassiveChecks) !== stableJson(["accessibility", "screen-recording"])
+    || ![
+      stableJson(["accessibility", "screen-recording"]),
+      stableJson(["accessibility", "screen-recording", "post-events", "input-monitoring"]),
+    ].includes(stableJson(manifest.tcc.requiredPassiveChecks))
     || manifest.entrypoint?.source !== "scripts/runtime-entry.ts"
     || stableJson(manifest.entrypoint.modes) !== stableJson(["runtime", "doctor", "mcp"])
     || manifest.entrypoint.mcpTransport !== "stdio"
