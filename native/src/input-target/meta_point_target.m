@@ -23,7 +23,7 @@ static bool remaining_millis(MetaPointTargetBackend backend,
   const uint64_t now = backend.monotonic_millis(backend.context);
   if (now < started_at || now - started_at >=
                               META_POINT_TARGET_DEADLINE_MILLIS) {
-    return false;
+    return META_POINT_TARGET_RELATION_NONE;
   }
   *remaining = META_POINT_TARGET_DEADLINE_MILLIS - (now - started_at);
   return true;
@@ -62,7 +62,7 @@ static void release_elements(MetaPointTargetBackend backend,
   }
 }
 
-bool meta_point_matches_borrow_with_backend(
+MetaPointTargetRelation meta_point_relation_to_borrow_with_backend(
     const MetaAXTargetBorrow *borrow,
     double x, double y,
     MetaPointTargetBackend backend) {
@@ -73,20 +73,20 @@ bool meta_point_matches_borrow_with_backend(
        borrow->target.owner_window_ref[0] == '\0') ||
       !isfinite(x) || !isfinite(y) || x < -FLT_MAX || x > FLT_MAX ||
       y < -FLT_MAX || y > FLT_MAX || !valid_backend(backend)) {
-    return false;
+    return META_POINT_TARGET_RELATION_NONE;
   }
 
   const uint64_t started_at = backend.monotonic_millis(backend.context);
-  if (started_at == UINT64_MAX) return false;
+  if (started_at == UINT64_MAX) return META_POINT_TARGET_RELATION_NONE;
   AXUIElementRef system_wide =
       backend.create_system_wide(backend.context);
   AXUIElementRef visited[META_POINT_TARGET_MAX_NODES] = {0};
   size_t visited_count = 0;
-  bool matches = false;
+  MetaPointTargetRelation relation = META_POINT_TARGET_RELATION_NONE;
   if (system_wide == NULL ||
       !prepare_call(backend, system_wide, started_at)) {
     release_elements(backend, system_wide, visited, visited_count);
-    return false;
+    return META_POINT_TARGET_RELATION_NONE;
   }
 
   AXUIElementRef hit = NULL;
@@ -97,13 +97,13 @@ bool meta_point_matches_borrow_with_backend(
   if (hit_error != kAXErrorSuccess || hit == NULL ||
       !deadline_open(backend, started_at)) {
     if (hit != NULL) backend.release(backend.context, hit);
-    return false;
+    return META_POINT_TARGET_RELATION_NONE;
   }
   visited[visited_count++] = hit;
 
   if (!prepare_call(backend, hit, started_at)) {
     release_elements(backend, NULL, visited, visited_count);
-    return false;
+    return META_POINT_TARGET_RELATION_NONE;
   }
   pid_t hit_pid = 0;
   if (backend.get_pid(backend.context, hit, &hit_pid) != kAXErrorSuccess ||
@@ -117,7 +117,11 @@ bool meta_point_matches_borrow_with_backend(
     AXUIElementRef current = visited[visited_count - 1];
     if (!deadline_open(backend, started_at)) break;
     if (backend.equal(backend.context, current, borrow->element)) {
-      matches = deadline_open(backend, started_at);
+      if (deadline_open(backend, started_at)) {
+        relation = visited_count == 1
+                       ? META_POINT_TARGET_RELATION_EXACT
+                       : META_POINT_TARGET_RELATION_OWNED_DESCENDANT;
+      }
       break;
     }
     if (!deadline_open(backend, started_at) ||
@@ -148,7 +152,15 @@ bool meta_point_matches_borrow_with_backend(
   }
 
   release_elements(backend, NULL, visited, visited_count);
-  return matches;
+  return relation;
+}
+
+bool meta_point_matches_borrow_with_backend(
+    const MetaAXTargetBorrow *borrow,
+    double x, double y,
+    MetaPointTargetBackend backend) {
+  return meta_point_relation_to_borrow_with_backend(
+             borrow, x, y, backend) != META_POINT_TARGET_RELATION_NONE;
 }
 
 static uint64_t monotonic_millis(void *context) {
@@ -209,9 +221,10 @@ static void release(void *context, AXUIElementRef element) {
   CFRelease(element);
 }
 
-bool meta_point_matches_borrow(const MetaAXTargetBorrow *borrow,
-                               double x, double y) {
-  return meta_point_matches_borrow_with_backend(
+MetaPointTargetRelation meta_point_relation_to_borrow(
+    const MetaAXTargetBorrow *borrow,
+    double x, double y) {
+  return meta_point_relation_to_borrow_with_backend(
       borrow, x, y, (MetaPointTargetBackend){
                         .monotonic_millis = monotonic_millis,
                         .create_system_wide = create_system_wide,
@@ -222,4 +235,10 @@ bool meta_point_matches_borrow(const MetaAXTargetBorrow *borrow,
                         .equal = equal,
                         .release = release,
                     });
+}
+
+bool meta_point_matches_borrow(const MetaAXTargetBorrow *borrow,
+                               double x, double y) {
+  return meta_point_relation_to_borrow(borrow, x, y) !=
+         META_POINT_TARGET_RELATION_NONE;
 }

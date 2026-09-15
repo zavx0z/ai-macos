@@ -240,6 +240,56 @@ function inputRequest() {
 }
 
 describe("NativeBrokerAdapter", () => {
+  test("late prepare после abort останавливает только выданный observer", async () => {
+    const transport = new FakeTransport()
+    const baseSend = transport.send.bind(transport)
+    let prepare!: Extract<NativeTransportRequestFrame, { channel: "observer" }>["payload"]
+    let notifyPrepare!: () => void
+    let notifyStop!: () => void
+    const prepareSent = new Promise<void>(resolve => { notifyPrepare = resolve })
+    const stopSent = new Promise<void>(resolve => { notifyStop = resolve })
+    let stoppedInstance: string | undefined
+    const snapshot = (ready: boolean) => ({ observerInstanceRef: "late-instance", inventoryId: "inventory", inventoryRevision: 1, indexRevision: 1,
+      coverage: { ...generation, state: ready ? "ready" as const : "unavailable" as const, coverageStartCursor: "start", cursor: "start", nextSequence: 1,
+        startedAt: now, coveredFrom: now, coveredThrough: now, heartbeatAt: now, coveredKinds: ["input", "focus", "window-structure", "lifecycle"] as ("input" | "focus" | "window-structure" | "lifecycle")[],
+        droppedEvents: 0, gapDetected: !ready, ...(!ready ? { reason: "Остановлен" } : {}) },
+      sessionReadiness: { state: "unknown" as const, lockState: "unknown" as const, evidence: "Fixture", observedAt: now }, secureInput: "unknown" as const })
+    transport.send = async frame => {
+      if (frame.channel !== "observer") return baseSend(frame)
+      transport.sent.push(frame)
+      if (frame.payload.command === "prepare") {
+        prepare = frame.payload
+        notifyPrepare()
+        return
+      }
+      stoppedInstance = frame.payload.observerInstanceRef
+      transport.push({ kind: "message", frame: { channel: "observer", payload: {
+        ...generation, kind: "observer-response", protocolVersion: "1", requestId: frame.payload.requestId, command: "stop", nativeBuildId: "native-build-1",
+        ok: true, snapshot: snapshot(false),
+      } } })
+      notifyStop()
+    }
+    const adapter = new NativeBrokerAdapter({ ...evidenceOptions, host: host(), transport, ledgerSink: { persist: async () => { throw new Error("unused") } } })
+    const controller = new AbortController()
+    try {
+      await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "late-handshake", runtimeEpoch: generation.runtimeEpoch,
+        loginSessionId: generation.loginSessionId, runtimeBuildId: "runtime-build-1", expectedNativeBuildId: "native-build-1", capabilitySchemaVersion: "1" })
+      const pending = adapter.observer({ kind: "observer", protocolVersion: "1", requestId: "late-prepare", ...generation,
+        command: "prepare", deadlineAt: new Date(Date.now() + 5000).toISOString() }, { signal: controller.signal, checkpoint: () => undefined })
+      await prepareSent
+      controller.abort(new Error("caller aborted"))
+      await expect(pending).rejects.toThrow("caller aborted")
+      transport.push({ kind: "message", frame: { channel: "observer", payload: {
+        ...generation, kind: "observer-response", protocolVersion: "1", requestId: prepare.requestId, command: "prepare", nativeBuildId: "native-build-1",
+        ok: true, snapshot: snapshot(true),
+      } } })
+      await stopSent
+      expect(stoppedInstance).toBe("late-instance")
+      const health = await adapter.heartbeat({ requestId: "after-orphan-stop", ...generation, deadlineAt: new Date(Date.now() + 1000).toISOString() },
+        { signal: new AbortController().signal, checkpoint: () => undefined })
+      expect(health.accepted).toBe(true)
+    } finally { await adapter.close() }
+  })
   test("mutationDelivery подтверждает только зарегистрированный predispatch context", async () => {
     const transport = new FakeTransport()
     const adapter = new NativeBrokerAdapter({ ...evidenceOptions, host: host(), transport,

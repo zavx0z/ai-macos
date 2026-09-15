@@ -43,6 +43,8 @@ import { nativeObserverRequestSchema, nativeObserverResponseSchema, nativeObserv
 export * from "./observer-protocol.ts"
 import { nativeHitTestRequestSchema, nativeHitTestResponseSchema } from "./hit-test-protocol.ts"
 export * from "./hit-test-protocol.ts"
+import { nativeInputReadinessRequestSchema, nativeInputReadinessResponseSchema } from "./readiness-protocol.ts"
+export * from "./readiness-protocol.ts"
 import {
   nativeApplicationResolveRequestSchema, nativeApplicationResolveResponseSchema,
   nativeApplicationLaunchRequestSchema, nativeApplicationLaunchResponseSchema,
@@ -707,6 +709,7 @@ export const nativeCaptureReleaseRequestSchema = createNativeMutationRequestEnve
 export const nativeCaptureReleaseResponseSchema = createNativeResponseEnvelopeSchema(nativeCaptureReleaseResultSchema)
 
 export const nativeMethodRequestSchema = z.union([
+  nativeInputReadinessRequestSchema,
   nativeHitTestRequestSchema,
   nativeApplicationResolveRequestSchema,
   nativeApplicationLaunchRequestSchema,
@@ -723,6 +726,7 @@ export const nativeMethodRequestSchema = z.union([
 ])
 
 export const nativeMethodResponseSchema = z.union([
+  nativeInputReadinessResponseSchema,
   nativeHitTestResponseSchema,
   nativeApplicationResolveResponseSchema,
   nativeApplicationLaunchResponseSchema,

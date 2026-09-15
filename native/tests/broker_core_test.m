@@ -163,6 +163,15 @@ int main(void) {
     assert(cancelled.capture_tasks_cancelled == 1);
     assert(!cancelled.all_capture_tasks_drained);
     assert(fixture.capture_cancel_count == 1);
+    assert(meta_broker_core_release_drained_operation(
+               broker, "operation-lost-start", true) == 0);
+    MetaBrokerOperationStatus pending_status =
+        meta_broker_core_operation_status(broker, "operation-lost-start");
+    assert(pending_status.capture_task_count == 1);
+    assert(!pending_status.all_capture_tasks_drained);
+    assert(pending_status.cleanup != META_CLEANUP_COMPLETE);
+    assert(pending_status.quarantined);
+    assert(meta_capture_router_active_tasks(capture_router, NULL, 0) == 1);
     assert(meta_broker_core_begin_rotation(broker) == META_BROKER_ROTATION_SEALED_PENDING);
     assert(!meta_executor_begin(executor, "sealed-after-cancel", "window-1", pending_fence, 1000));
     assert(!meta_capture_router_start(capture_router, "sealed-after-cancel", &request,

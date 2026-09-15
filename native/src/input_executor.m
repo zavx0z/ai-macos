@@ -131,6 +131,16 @@ static bool dispatch_external(void *context) {
 
 - (NSDictionary *)executeExternal:(NSDictionary *)request job:(MetaInputJob *)job targetRef:(NSString *)targetRef
                             verify:(BOOL (^)(NSString *))targetVerify action:(NSDictionary *(^)(void))action {
+  return [self executeBound:request job:job targetRef:targetRef verify:targetVerify action:action countDispatch:YES];
+}
+
+- (NSDictionary *)executePrimitive:(NSDictionary *)request job:(MetaInputJob *)job targetRef:(NSString *)targetRef
+                             verify:(BOOL (^)(NSString *))targetVerify action:(NSDictionary *(^)(void))action {
+  return [self executeBound:request job:job targetRef:targetRef verify:targetVerify action:action countDispatch:NO];
+}
+
+- (NSDictionary *)executeBound:(NSDictionary *)request job:(MetaInputJob *)job targetRef:(NSString *)targetRef
+                         verify:(BOOL (^)(NSString *))targetVerify action:(NSDictionary *(^)(void))action countDispatch:(BOOL)countDispatch {
   if (job == nil || targetVerify == nil || action == nil || ![targetRef isKindOfClass:NSString.class]) return nil;
   NSDictionary *operation = job.operation;
   NSDictionary *fence = operation[@"fence"];
@@ -153,13 +163,16 @@ static bool dispatch_external(void *context) {
   if (deadlineDate == nil || remaining <= 0 || ![operation[@"deadlineAt"] isEqual:request[@"deadlineAt"]]) return nil;
   _job = job;
   _externalVerify = [targetVerify copy];
+  _actionDeadline = clock_now(NULL) + (uint64_t)MIN(remaining, 30000);
   __block NSDictionary *value = nil;
   BOOL began = meta_executor_open_runtime_epoch(_executor, token.runtime_epoch, token.login_session_id) &&
       meta_executor_begin(_executor, [operation[@"operationId"] UTF8String], targetRef.UTF8String,
-                           token, clock_now(NULL) + (uint64_t)MIN(remaining, 30000));
+                           token, _actionDeadline);
   BOOL (^dispatch)(void) = ^BOOL { value = action(); return value != nil; };
-  BOOL finished = began && meta_executor_dispatch_action(_executor, dispatch_external, (__bridge void *)dispatch, "native-action") &&
-      meta_executor_finish(_executor);
+  BOOL dispatched = began && (countDispatch
+      ? meta_executor_dispatch_action(_executor, dispatch_external, (__bridge void *)dispatch, "native-action")
+      : meta_executor_checkpoint(_executor, "native-primitive") && dispatch());
+  BOOL finished = dispatched && meta_executor_finish(_executor);
   if (began && !finished) meta_executor_cancel(_executor);
   MetaExecutorStatus status = meta_executor_status(_executor);
   NSDictionary *result = nil;

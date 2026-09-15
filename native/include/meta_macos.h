@@ -50,6 +50,18 @@ typedef struct {
 
 typedef struct MetaMacOSBackend MetaMacOSBackend;
 
+typedef void (*MetaDisplayTopologyChanged)(
+    CGDirectDisplayID display,
+    CGDisplayChangeSummaryFlags flags,
+    void *callback_context);
+typedef struct {
+  void *context;
+  bool (*start)(void *context, MetaDisplayTopologyChanged changed,
+                void *callback_context);
+  bool (*stop)(void *context, MetaDisplayTopologyChanged changed,
+               void *callback_context);
+} MetaDisplayTopologyObserverBackend;
+
 typedef enum {
   META_AX_BORROW_OK,
   META_AX_BORROW_INVALID_REQUEST,
@@ -80,8 +92,13 @@ MetaAXBorrowStatus meta_macos_with_ax_target(MetaMacOSBackend *backend,
                                             void *context);
 
 MetaMacOSBackend *meta_macos_backend_create(const char *native_generation);
+MetaMacOSBackend *meta_macos_backend_create_with_topology_observer(
+    const char *native_generation,
+    MetaDisplayTopologyObserverBackend topology_observer);
+bool meta_macos_display_topology_epoch(const MetaMacOSBackend *backend,
+                                       uint64_t *epoch);
 bool meta_macos_target_is_focused(MetaMacOSBackend *backend, const char *target_ref);
-void meta_macos_backend_destroy(MetaMacOSBackend *backend);
+bool meta_macos_backend_destroy(MetaMacOSBackend *backend);
 const MetaInventorySnapshot *meta_macos_backend_snapshot(
     const MetaMacOSBackend *backend);
 bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,

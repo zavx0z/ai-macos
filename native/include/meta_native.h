@@ -114,6 +114,7 @@ typedef struct {
   size_t display_count;
   bool source_complete;
   uint64_t captured_at_micros;
+  uint64_t display_topology_epoch;
 } MetaInventoryInput;
 
 typedef struct {
@@ -174,6 +175,7 @@ typedef struct {
   char native_generation[META_NATIVE_REF_CAPACITY];
   uint64_t revision;
   uint64_t display_layout_revision;
+  uint64_t display_topology_epoch;
   uint64_t captured_at_micros;
   bool complete;
   const MetaApplicationRecord *applications;

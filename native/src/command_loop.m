@@ -61,6 +61,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
 - (void)handle:(NSDictionary *)frame;
 - (void)shutdown:(int)code;
 - (int)exitCode;
+- (void)pumpObserver;
 @end
 
 @implementation MetaCommandController {
@@ -79,9 +80,13 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   BOOL _admitted;
   BOOL _sealed;
   BOOL _busy;
+  BOOL _observerCommandPending;
   NSString *_activeOperation;
   MetaInputJob *_job;
   MetaOperationReceipts *_receipts;
+  NSMutableSet<NSString *> *_cancelledOperations;
+  NSUInteger _maintenanceCount;
+  NSUInteger _maintenanceBytes;
   atomic_int _exitCode;
   int _requestedExit;
 }
@@ -100,6 +105,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     _requestIds = [NSMutableSet set];
     _heartbeatIds = [NSMutableDictionary dictionary];
     _receipts = [[MetaOperationReceipts alloc] init];
+    _cancelledOperations = [NSMutableSet set];
     _startedAt = timestamp();
     _nonce = NSUUID.UUID.UUIDString;
     atomic_init(&_exitCode, -1);
@@ -110,12 +116,25 @@ static NSDictionary *failure(NSString *code, NSString *message) {
 
 - (int)exitCode { return atomic_load(&_exitCode); }
 
+- (void)pumpObserver {
+  if (_requestedExit >= 0 || !_admitted || ![_backend respondsToSelector:@selector(takeObserverPush:)]) return;
+  NSDictionary *batch = [_backend takeObserverPush:64];
+  if (batch == nil) return;
+  if (batch[@"gapReason"] != nil) { [self shutdown:75]; return; }
+  NSArray *events = batch[@"events"];
+  if (![events isKindOfClass:NSArray.class] || events.count > 64) { [self shutdown:70]; return; }
+  for (NSDictionary *event in events) {
+    [self send:@"event" payload:event];
+    if (_requestedExit >= 0) return;
+  }
+}
+
 - (void)shutdown:(int)code {
   if (_requestedExit >= 0) return;
   _sealed = YES;
   _requestedExit = code;
   [_job channelDisconnected];
-  if (!_busy) {
+  if (!_busy && _maintenanceCount == 0) {
     atomic_store(&_exitCode, code);
   } else {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000000000), _control, ^{
@@ -133,13 +152,35 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   NSDictionary *status = [operationId isEqual:_job.operation[@"operationId"]] ? current :
       [_receipts statusForOperation:operationId requestId:requestId];
   if (status == nil) return nil;
+  NSMutableDictionary *updated = [status mutableCopy];
+  if ([_cancelledOperations containsObject:operationId]) updated[@"cancellationRequested"] = @YES;
   if ([current[@"highWaterFence"][@"counter"] unsignedLongLongValue] > [status[@"highWaterFence"][@"counter"] unsignedLongLongValue]) {
-    NSMutableDictionary *updated = [status mutableCopy];
     updated[@"highWaterFence"] = current[@"highWaterFence"];
     updated[@"restorationAllowed"] = @NO;
-    return updated;
   }
-  return status;
+  return [_backend supplementStatus:updated];
+}
+
+- (BOOL)maintenance:(NSDictionary *)payload work:(NSDictionary *(^)(void))work completed:(void (^)(NSDictionary *))completed {
+  NSUInteger bytes = [NSJSONSerialization dataWithJSONObject:payload options:0 error:NULL].length;
+  if (_maintenanceCount >= 128 || bytes > 4 * 1024 * 1024 || _maintenanceBytes > 4 * 1024 * 1024 - bytes) { [self shutdown:75]; return NO; }
+  _maintenanceCount += 1;
+  _maintenanceBytes += bytes;
+  dispatch_async(_actions, ^{
+    @autoreleasepool {
+      NSDictionary *result = work();
+      dispatch_async(self->_control, ^{
+        self->_maintenanceCount -= 1;
+        self->_maintenanceBytes -= bytes;
+        if (self->_requestedExit >= 0) {
+          if (!self->_busy && self->_maintenanceCount == 0) atomic_store(&self->_exitCode, self->_requestedExit);
+          return;
+        }
+        completed(result);
+      });
+    }
+  });
+  return YES;
 }
 
 - (void)handle:(NSDictionary *)frame {
@@ -148,7 +189,9 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   NSString *channel = frame[@"channel"];
   NSDictionary *payload = frame[@"payload"];
   if (![channel isKindOfClass:NSString.class] || ![payload isKindOfClass:NSDictionary.class]) { [self shutdown:65]; return; }
-  NSString *requestId = payload[@"requestId"];
+  NSDictionary *identityPayload = [channel isEqual:@"cleanup"] ? payload[@"control"] : payload;
+  if (![identityPayload isKindOfClass:NSDictionary.class]) { [self shutdown:65]; return; }
+  NSString *requestId = identityPayload[@"requestId"];
   if ([channel isEqual:@"ledger-ack"]) {
     if (!identifier(requestId, 127)) { [self shutdown:65]; return; }
     [_job deliverLedgerAck:payload];
@@ -187,9 +230,28 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     }];
     return;
   }
-  if (!_admitted || ![payload[@"runtimeEpoch"] isEqual:_runtimeEpoch] || ![payload[@"loginSessionId"] isEqual:_loginSessionId]
-      || ![payload[@"nativeGeneration"] isEqual:_generation] || !future_deadline(payload[@"deadlineAt"])) { [self shutdown:65]; return; }
+  if (!_admitted || ![identityPayload[@"runtimeEpoch"] isEqual:_runtimeEpoch] || ![identityPayload[@"loginSessionId"] isEqual:_loginSessionId]
+      || ![identityPayload[@"nativeGeneration"] isEqual:_generation] || !future_deadline(identityPayload[@"deadlineAt"])) { [self shutdown:65]; return; }
   NSDictionary *identity = @{@"requestId": requestId, @"runtimeEpoch": _runtimeEpoch, @"loginSessionId": _loginSessionId, @"nativeGeneration": _generation};
+  if ([channel isEqual:@"observer"]) {
+    BOOL sealedControl = [@[@"coverage", @"events", @"stop"] containsObject:payload[@"command"]];
+    if ((_sealed && !sealedControl) || _observerCommandPending || ![_backend respondsToSelector:@selector(observer:)]) { [self shutdown:65]; return; }
+    _observerCommandPending = YES;
+    [self maintenance:payload work:^NSDictionary * {
+      return [self->_backend observer:payload];
+    } completed:^(NSDictionary *result) {
+      self->_observerCommandPending = NO;
+      if (result == nil) { [self shutdown:70]; return; }
+      if (![self->_transport enqueueFrame:@{@"channel": @"observer", @"payload": result}]) { [self shutdown:74]; return; }
+      if ([result[@"ok"] isEqual:@YES] && [result[@"command"] isEqual:@"prepare"]) {
+        NSString *instance = result[@"snapshot"][@"observerInstanceRef"];
+        if (![self->_backend respondsToSelector:@selector(activateObserverPush:)] ||
+            ![self->_backend activateObserverPush:instance]) { [self shutdown:75]; return; }
+      }
+      [self pumpObserver];
+    }];
+    return;
+  }
   if ([channel isEqual:@"permissions"]) {
     if (![payload[@"kind"] isEqual:@"permissions"] || ![payload[@"protocolVersion"] isEqual:@"1"]) { [self shutdown:65]; return; }
     NSDictionary *permissions = [_backend permissions];
@@ -205,10 +267,24 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     [self send:channel payload:result];
     return;
   }
+  if ([channel isEqual:@"held-recovery"]) {
+    if (![_backend respondsToSelector:@selector(heldRecovery:owner:)]) { [self shutdown:70]; return; }
+    NSDictionary *owner = @{@"protocolVersion": @"1", @"runtimeEpoch": _runtimeEpoch, @"loginSessionId": _loginSessionId,
+      @"nativeGeneration": _generation, @"nativeBuildId": _buildId};
+    [self maintenance:payload work:^NSDictionary * { return [self->_backend heldRecovery:payload owner:owner]; } completed:^(NSDictionary *result) {
+      if (result == nil) [self shutdown:65];
+      else [self send:channel payload:result];
+    }];
+    return;
+  }
   if ([channel isEqual:@"status"]) {
     NSDictionary *status = [self statusForOperation:payload[@"operationId"] requestId:requestId];
     if (status == nil) { [self shutdown:65]; return; }
-    [self send:channel payload:status];
+    if (_busy) [self send:channel payload:status];
+    else [self maintenance:payload work:^NSDictionary * { return [self->_backend reconcileStatus:status]; } completed:^(NSDictionary *value) {
+      if (value == nil) [self shutdown:70];
+      else [self send:channel payload:value];
+    }];
     return;
   }
   if ([channel isEqual:@"cancel"]) {
@@ -216,8 +292,11 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     NSDictionary *status = [self statusForOperation:payload[@"operationId"] requestId:requestId];
     NSDictionary *acceptedFence = current ? _job.operation[@"fence"] : status[@"acceptedFence"];
     if (acceptedFence == nil || ![payload[@"fence"] isEqual:acceptedFence]) { [self shutdown:65]; return; }
+    [_cancelledOperations addObject:payload[@"operationId"]];
     if (current) [_job requestCancel];
-    BOOL stopped = status != nil && [@[@"finished", @"cancelled", @"failed"] containsObject:status[@"execution"]];
+    if (![self maintenance:payload work:^NSDictionary * { return [self->_backend cancel:payload]; } completed:^(__unused NSDictionary *value) {}]) return;
+    BOOL stopped = status != nil && [@[@"finished", @"cancelled", @"failed"] containsObject:status[@"execution"]] &&
+        [status[@"cleanup"] isEqual:@"complete"] && ![status[@"quarantined"] boolValue];
     NSMutableDictionary *ack = [identity mutableCopy];
     [ack addEntriesFromDictionary:@{@"operationId": payload[@"operationId"], @"fence": payload[@"fence"],
       @"acknowledged": @YES, @"stopped": stopped ? @YES : @NO,
@@ -238,11 +317,23 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   if ([channel isEqual:@"drain"]) {
     _sealed = YES;
     [_job requestCancel];
-    BOOL ready = !_busy && [_backend beginRotation];
+    BOOL ready = !_busy && _maintenanceCount == 0 && [_backend beginRotation];
+    NSMutableSet *operations = [NSMutableSet setWithArray:[_backend pendingOperationIds]];
+    if (_activeOperation != nil) [operations addObject:_activeOperation];
     NSMutableDictionary *ack = [identity mutableCopy];
-    [ack addEntriesFromDictionary:@{@"accepted": @YES, @"activeOperationIds": _activeOperation == nil ? @[] : @[_activeOperation],
+    [ack addEntriesFromDictionary:@{@"accepted": @YES, @"activeOperationIds": operations.allObjects,
       @"cleanup": ready ? @"complete" : @"unknown", @"quarantined": ready ? @NO : @YES}];
     [self send:channel payload:ack];
+    return;
+  }
+  if ([channel isEqual:@"cleanup"]) {
+    MetaBrokerTransport *transport = _transport;
+    [self maintenance:payload work:^NSDictionary * {
+      return [self->_backend cleanupCapture:payload emitBinary:^BOOL(NSDictionary *header, NSData *bytes) { return [transport enqueueBinaryFrame:header bytes:bytes]; }];
+    } completed:^(NSDictionary *result) {
+      if (result == nil) [self shutdown:65];
+      else [self send:@"cleanup" payload:result];
+    }];
     return;
   }
   if (![channel isEqual:@"request"] && ![channel isEqual:@"clipboard"]) { [self shutdown:65]; return; }
@@ -267,8 +358,12 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   BOOL clipboard = [channel isEqual:@"clipboard"];
   BOOL input = [payload[@"method"] isEqual:@"input.execute"] && [payload[@"intent"] isEqual:@"mutation"];
   BOOL window = [payload[@"method"] isEqual:@"window.transition"] && [payload[@"intent"] isEqual:@"mutation"];
+  BOOL capture = [payload[@"method"] isEqual:@"capture.start"] && [payload[@"intent"] isEqual:@"mutation"];
+  BOOL application = [@[@"application.launch", @"application.quit"] containsObject:payload[@"method"]] && [payload[@"intent"] isEqual:@"mutation"];
   BOOL inventory = [payload[@"method"] isEqual:@"window.inventory"] && [payload[@"intent"] isEqual:@"read"] && operation == nil;
   BOOL inspection = [payload[@"method"] isEqual:@"ax.inspect"] && [payload[@"intent"] isEqual:@"read"] && operation == nil;
+  BOOL applicationResolution = [payload[@"method"] isEqual:@"application.resolve"] && [payload[@"intent"] isEqual:@"read"] && operation == nil;
+  BOOL hitTest = [payload[@"method"] isEqual:@"input.hit-test"] && [payload[@"intent"] isEqual:@"read"] && operation != nil;
   NSDictionary *command = payload[@"command"];
   if (clipboard) {
     NSDictionary *target = operation[@"target"];
@@ -278,7 +373,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
         || ![ref[@"runtimeEpoch"] isEqual:_runtimeEpoch] || ![ref[@"loginSessionId"] isEqual:_loginSessionId]
         || ![command isKindOfClass:NSDictionary.class]) { [self shutdown:65]; return; }
   }
-  if (input || window) {
+  if (input || window || capture || application) {
     NSDictionary *actionPayload = payload[@"payload"];
     if (![operation[@"kind"] isEqual:@"native"] || ![operation[@"nativeGeneration"] isEqual:_generation]
         || ![operation[@"fence"] isKindOfClass:NSDictionary.class] || ![operation[@"target"] isKindOfClass:NSDictionary.class]
@@ -294,7 +389,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     if (![ref isKindOfClass:NSDictionary.class] || ![ref[@"runtimeEpoch"] isEqual:_runtimeEpoch] ||
         ![ref[@"loginSessionId"] isEqual:_loginSessionId] || ![ref[@"nativeGeneration"] isEqual:_generation]) { [self shutdown:65]; return; }
   }
-  if (!clipboard && !inventory && !input && !inspection && !window) {
+  if (!clipboard && !inventory && !input && !inspection && !window && !applicationResolution && !capture && !hitTest && !application) {
     response[@"ok"] = @NO;
     response[@"error"] = failure(@"unsupported-capability", @"Native command ещё не подключена к broker");
     [self send:responseChannel payload:response];
@@ -309,15 +404,15 @@ static NSDictionary *failure(NSString *code, NSString *message) {
       dispatch_sync(self->_control, ^{ allowed = !self->_sealed && self->_requestedExit < 0; });
       NSDictionary *result = nil;
       if (allowed && future_deadline(payload[@"deadlineAt"])) {
-        result = input ? [self->_backend executeInput:payload job:job] : window ? [self->_backend executeWindow:payload job:job] : clipboard ? [self->_backend clipboard:command] :
-            inspection ? [self->_backend inspect:payload] : [self->_backend inventory];
+        result = input ? [self->_backend executeInput:payload job:job] : window ? [self->_backend executeWindow:payload job:job] : capture ? [self->_backend startCapture:payload job:job] : application ? [self->_backend executeApplication:payload job:job] : clipboard ? [self->_backend clipboard:command] :
+            inspection ? [self->_backend inspect:payload] : applicationResolution ? [self->_backend resolveApplication:payload] : hitTest ? [self->_backend hitTest:payload] : [self->_backend inventory];
       }
       dispatch_async(self->_control, ^{
-        if (input || window) {
+        if (input || window || capture || application) {
           NSDictionary *terminal = [job statusForRequest:job.requestId];
           if (terminal != nil && ![self->_receipts recordStatus:terminal]) self->_sealed = YES;
         }
-        if ((input || window) && [job heartbeatExpired]) self->_sealed = YES;
+        if ((input || window || capture || application) && [job heartbeatExpired]) self->_sealed = YES;
         self->_busy = NO;
         self->_activeOperation = nil;
         if (self->_requestedExit >= 0) { atomic_store(&self->_exitCode, self->_requestedExit); return; }
@@ -364,9 +459,16 @@ int meta_command_loop_run(id<MetaCommandBackend> backend, NSString *buildId,
   if (transport == nil) return 70;
   controller.transport = transport;
   [transport start];
+  dispatch_source_t observerTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, control);
+  dispatch_source_set_timer(observerTimer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC), 20 * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
+  dispatch_source_set_event_handler(observerTimer, ^{ [controller pumpObserver]; });
+  dispatch_resume(observerTimer);
   while ([controller exitCode] < 0) {
     [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
   }
+  dispatch_source_cancel(observerTimer);
+  dispatch_sync(control, ^{});
+  if ([backend respondsToSelector:@selector(stopObserver)]) [backend stopObserver];
   [transport close];
   controller.transport = nil;
   return [controller exitCode];

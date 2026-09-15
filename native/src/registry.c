@@ -91,6 +91,10 @@ static bool same_rect(MetaRect left, MetaRect right) {
 
 static bool display_layout_changed(const MetaRegistry *registry,
                                    const MetaInventoryInput *input) {
+  if (registry->snapshot.display_topology_epoch !=
+      input->display_topology_epoch) {
+    return true;
+  }
   if (registry->display_count != input->display_count) return true;
   for (size_t index = 0; index < input->display_count; index += 1) {
     const MetaDisplayInput *source = &input->displays[index];
@@ -544,6 +548,7 @@ bool meta_registry_refresh(MetaRegistry *registry,
   snprintf(working.snapshot.layout_ref, sizeof(working.snapshot.layout_ref),
            "%s:layout:%llu", working.native_generation,
            (unsigned long long)working.snapshot.display_layout_revision);
+  working.snapshot.display_topology_epoch = input->display_topology_epoch;
   working.snapshot.captured_at_micros = input->captured_at_micros;
   working.snapshot.complete = complete;
   working.snapshot.applications = working.applications;

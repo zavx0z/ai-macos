@@ -17,6 +17,12 @@
                             verify:(BOOL (^)(NSString *target))verify
                             action:(NSDictionary *(^)(void))action;
 - (MetaExecutor *)executorOnActionWorker;
+// Callback использует только уже fenced C primitives; внешний dispatch не считается.
+- (NSDictionary *)executePrimitive:(NSDictionary *)request
+                                job:(MetaInputJob *)job
+                          targetRef:(NSString *)targetRef
+                             verify:(BOOL (^)(NSString *target))verify
+                             action:(NSDictionary *(^)(void))action;
 - (BOOL)sealForRotation;
 @end
 #endif

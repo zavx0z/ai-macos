@@ -148,8 +148,9 @@ static void test_exact_target(void) {
   Fixture fixture = {.hit = &target};
   MetaAXTargetBorrow target_borrow = borrow(
       &target, META_SURFACE_WINDOW, NULL);
-  assert(meta_point_matches_borrow_with_backend(
-      &target_borrow, 100, 200, backend(&fixture)));
+  assert(meta_point_relation_to_borrow_with_backend(
+             &target_borrow, 100, 200, backend(&fixture)) ==
+         META_POINT_TARGET_RELATION_EXACT);
   assert(fixture.hit_calls == 1);
   assert(fixture.parent_calls == 0);
   assert(fixture.pid_calls == 1);
@@ -164,8 +165,9 @@ static void test_descendant_reaches_exact_target(void) {
   Fixture fixture = {.hit = &button};
   MetaAXTargetBorrow target_borrow = borrow(
       &target, META_SURFACE_WINDOW, NULL);
-  assert(meta_point_matches_borrow_with_backend(
-      &target_borrow, -20, 30, backend(&fixture)));
+  assert(meta_point_relation_to_borrow_with_backend(
+             &target_borrow, -20, 30, backend(&fixture)) ==
+         META_POINT_TARGET_RELATION_OWNED_DESCENDANT);
   assert(fixture.parent_calls == 2);
   assert(fixture.release_calls == 4);
 }
@@ -207,8 +209,9 @@ static void test_ax_failures_are_not_fallbacks(void) {
   };
   MetaAXTargetBorrow target_borrow = borrow(
       &target, META_SURFACE_WINDOW, NULL);
-  assert(!meta_point_matches_borrow_with_backend(
-      &target_borrow, 10, 10, backend(&hit_failure)));
+  assert(meta_point_relation_to_borrow_with_backend(
+             &target_borrow, 10, 10, backend(&hit_failure)) ==
+         META_POINT_TARGET_RELATION_NONE);
   assert(hit_failure.parent_calls == 0);
 
   Node child = {.identity = 2, .pid = 42};

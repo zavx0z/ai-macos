@@ -52,6 +52,8 @@ import { nativeObserverRequestSchema, nativeObserverResponseSchema, nativeObserv
   type NativeObserverRequest, type NativeObserverResponse, type NativeObservedEvent } from "./observer-protocol.ts"
 import { nativeHitTestRequestSchema, nativeHitTestResponseSchema, nativeHitTestResultMatches,
   type NativeHitTestRequest, type NativeHitTestResponse } from "./hit-test-protocol.ts"
+import { nativeInputReadinessRequestSchema, nativeInputReadinessResponseSchema, nativeInputReadinessResultMatches,
+  type NativeInputReadinessRequest, type NativeInputReadinessResponse } from "./readiness-protocol.ts"
 
 export interface NativeTransport {
   send(frame: NativeTransportRequestFrame): Promise<void>
@@ -129,6 +131,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
     },
   })
   readonly #heartbeatRequestIds = new Map<string, number>()
+  readonly #observerPreparations = new Map<string, { request: NativeObserverRequest, expiresAt: number, abandoned: boolean }>()
   readonly #events: Array<{ event: NativeObservedEvent, bytes: number }> = []
   #eventBytes = 0
   #eventGap: Error | undefined
@@ -269,17 +272,42 @@ export class NativeBrokerAdapter implements NativeAdapter {
     return response
   }
 
+  async inputReadiness(request: NativeInputReadinessRequest, control: AdapterControl): Promise<NativeInputReadinessResponse> {
+    const response = await this.request(nativeInputReadinessRequestSchema, request, nativeInputReadinessResponseSchema, control)
+    if (response.ok && !nativeInputReadinessResultMatches(request, response.result)) {
+      throw new Error("Native readiness ответ не совпадает с operation/exact display")
+    }
+    return response
+  }
+
   async observer(request: NativeObserverRequest, control: AdapterControl): Promise<NativeObserverResponse> {
     control.signal.throwIfAborted()
     const parsed = parseWireValue(nativeObserverRequestSchema, request)
     this.#assertGeneration(parsed)
     await control.checkpoint("native-before-observer-lifecycle")
-    const response = await this.#exchange("observer", { channel: "observer", payload: parsed }, parsed.requestId, control.signal, parsed.deadlineAt)
-    if (response.channel !== "observer") throw new Error("Native observer response channel не совпадает")
-    const value = parseWireValue(nativeObserverResponseSchema, response.payload)
-    if (!nativeObserverResponseMatches(parsed, value, this.loadedBuildId)) throw new Error("Native observer response identity/instance/cursor не совпадает")
-    await control.checkpoint("native-after-observer-lifecycle")
-    return value
+    if (parsed.command === "prepare") {
+      for (const [id, entry] of this.#observerPreparations) if (entry.expiresAt <= Date.now()) this.#observerPreparations.delete(id)
+      if (this.#observerPreparations.size >= 128) throw new Error("Native observer prepare retention исчерпан")
+      this.#observerPreparations.set(parsed.requestId, { request: parsed, expiresAt: Date.parse(parsed.deadlineAt) + 10000, abandoned: false })
+    }
+    let value: NativeObserverResponse | undefined
+    try {
+      const response = await this.#exchange("observer", { channel: "observer", payload: parsed }, parsed.requestId, control.signal, parsed.deadlineAt)
+      if (response.channel !== "observer") throw new Error("Native observer response channel не совпадает")
+      value = parseWireValue(nativeObserverResponseSchema, response.payload)
+      if (!nativeObserverResponseMatches(parsed, value, this.loadedBuildId)) throw new Error("Native observer response identity/instance/cursor не совпадает")
+      await control.checkpoint("native-after-observer-lifecycle")
+      this.#observerPreparations.delete(parsed.requestId)
+      return value
+    } catch (error) {
+      const pending = this.#observerPreparations.get(parsed.requestId)
+      if (pending !== undefined) pending.abandoned = true
+      if (value !== undefined && parsed.command === "prepare") {
+        this.#observerPreparations.delete(parsed.requestId)
+        if (value.ok) await this.#stopOrphanObserver(parsed, value)
+      }
+      throw error
+    }
   }
 
   async permissions(request: NativePermissionsRequest, control: AdapterControl): Promise<NativePermissionsResponse> {
@@ -483,7 +511,9 @@ export class NativeBrokerAdapter implements NativeAdapter {
     signal?.throwIfAborted()
     if (this.#closed) throw new Error("Native adapter закрыт")
     frame = nativeTransportRequestFrameSchema.parse(frame)
-    if (this.#rotationSealed && frame.channel !== "drain") throw new Error("Native session draining: runtime rotation выполняется")
+    const sealedControl = ["drain", "cleanup", "status", "cancel", "held-recovery", "permissions"].includes(frame.channel)
+      || (frame.channel === "observer" && frame.payload.command !== "prepare")
+    if (this.#rotationSealed && !sealedControl) throw new Error("Native session draining: runtime rotation выполняется")
     if (this.sessionState.state === "rotation-required" && (frame.channel === "request" || frame.channel === "clipboard")) {
       throw new Error("Native session rotation-required: runtime должен завершить drain и сменить generation")
     }
@@ -627,7 +657,17 @@ export class NativeBrokerAdapter implements NativeAdapter {
     const key = `${frame.channel}:${requestId}`
     const pending = this.#pending.get(key)
     if (pending === undefined) {
-      if (this.#expired.delete(key)) return
+      if (this.#expired.delete(key)) {
+        if (frame.channel === "observer") {
+          const orphan = this.#observerPreparations.get(requestId)
+          this.#observerPreparations.delete(requestId)
+          if (orphan !== undefined && frame.payload.ok) {
+            if (!nativeObserverResponseMatches(orphan.request, frame.payload, this.loadedBuildId)) throw new Error("Late observer prepare identity не совпадает")
+            void this.#stopOrphanObserver(orphan.request, frame.payload).catch(error => this.#poison(error instanceof Error ? error : new Error(String(error))))
+          }
+        }
+        return
+      }
       throw new Error(`Неожиданный native response: ${key}`)
     }
     this.#pending.delete(key)
@@ -700,6 +740,26 @@ export class NativeBrokerAdapter implements NativeAdapter {
 
   #deliveryKey(wire: NativeExecutionContext): string {
     return JSON.stringify([wire.runtimeEpoch, wire.loginSessionId, wire.nativeGeneration, wire.operationId])
+  }
+
+  async #stopOrphanObserver(request: NativeObserverRequest, response: NativeObserverResponse): Promise<void> {
+    if (!response.ok || !nativeObserverResponseMatches(request, response, this.loadedBuildId)) {
+      const error = new Error("Orphan observer не имеет exact identity")
+      this.#poison(error)
+      throw error
+    }
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(new Error("Orphan observer stop deadline")), 1000)
+    try {
+      const stopped = await this.observer({ kind: "observer", protocolVersion: "1", command: "stop", requestId: `observer-stop-${crypto.randomUUID()}`,
+        runtimeEpoch: request.runtimeEpoch, loginSessionId: request.loginSessionId, nativeGeneration: request.nativeGeneration,
+        observerInstanceRef: response.snapshot.observerInstanceRef, deadlineAt: new Date(Date.now() + 1000).toISOString() },
+      { signal: controller.signal, checkpoint: () => undefined })
+      if (!stopped.ok || stopped.snapshot.coverage.state === "ready") throw new Error("Orphan observer stop не подтверждён")
+    } catch (error) {
+      this.#poison(error instanceof Error ? error : new Error(String(error)))
+      throw error
+    } finally { clearTimeout(timer) }
   }
 
   #deliveryEntry(wire: NativeExecutionContext) {

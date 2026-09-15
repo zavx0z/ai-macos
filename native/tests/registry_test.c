@@ -74,6 +74,7 @@ static void test_stable_refs_and_reincarnation(void) {
       .cg_window_count = 1,
       .source_complete = true,
       .captured_at_micros = 1,
+      .display_topology_epoch = 1,
   };
   assert(meta_registry_refresh(registry, &input));
   const MetaInventorySnapshot *snapshot = meta_registry_snapshot(registry);
@@ -94,6 +95,14 @@ static void test_stable_refs_and_reincarnation(void) {
   assert(strcmp(first_window_ref, snapshot->windows[0].window_ref) == 0);
   assert(strcmp(first_application_ref,
                 snapshot->applications[0].application_ref) == 0);
+  const uint64_t previous_layout_revision = snapshot->display_layout_revision;
+  input.display_topology_epoch = 2;
+  input.captured_at_micros = 3;
+  assert(meta_registry_refresh(registry, &input));
+  snapshot = meta_registry_snapshot(registry);
+  assert(snapshot->display_topology_epoch == 2);
+  assert(snapshot->display_layout_revision == previous_layout_revision + 1);
+  assert(strcmp(first_window_ref, snapshot->windows[0].window_ref) == 0);
 
   input.ax_windows = NULL;
   input.ax_window_count = 0;
@@ -180,6 +189,7 @@ static void test_ambiguous_mapping_and_incomplete_apps(void) {
       .cg_windows = cg_windows,
       .cg_window_count = 2,
       .source_complete = true,
+      .display_topology_epoch = 1,
   };
   assert(meta_registry_refresh(registry, &input));
   const MetaInventorySnapshot *snapshot = meta_registry_snapshot(registry);
@@ -249,6 +259,7 @@ static void test_sheet_owner_ax_only_and_displays(void) {
       .displays = displays,
       .display_count = 2,
       .source_complete = true,
+      .display_topology_epoch = 1,
   };
   assert(meta_registry_refresh(registry, &input));
   const MetaInventorySnapshot *snapshot = meta_registry_snapshot(registry);
@@ -318,6 +329,7 @@ static void test_many_ax_windows_cannot_claim_one_cg_window(void) {
       .cg_windows = &cg_window,
       .cg_window_count = 1,
       .source_complete = true,
+      .display_topology_epoch = 1,
   };
   assert(meta_registry_refresh(registry, &input));
   const MetaInventorySnapshot *snapshot = meta_registry_snapshot(registry);
@@ -362,6 +374,7 @@ static void test_failed_refresh_keeps_previous_snapshot(void) {
       .ax_windows = &ax_window,
       .ax_window_count = 1,
       .source_complete = true,
+      .display_topology_epoch = 1,
       .captured_at_micros = 10,
   };
   assert(meta_registry_refresh(registry, &input));

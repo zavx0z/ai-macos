@@ -119,6 +119,7 @@ static bool fixtureScroll(void *context, const MetaScrollEvent *event, uint64_t 
     @"displayLayoutRevision": @0, @"observedAt": @"2026-09-15T00:00:00.000Z", @"displays": @[], @"targetRef": target,
     @"actual": actual, @"changed": @YES, @"partial": @NO, @"errors": @[], @"status": execution[@"status"]};
 }
+- (NSDictionary *)executeApplication:(NSDictionary *)request job:(MetaInputJob *)job { (void)request; (void)job; return nil; }
 @end
 
 int main(int argc, const char **argv) {

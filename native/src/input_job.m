@@ -25,6 +25,7 @@ static NSDictionary *status_fence(MetaFence fence) {
   NSString *_awaitedLedger;
   NSDictionary *_ledgerAck;
   NSDictionary *_status;
+  NSDictionary *(^_observerCoverageProvider)(void);
 }
 
 - (instancetype)initWithRequest:(NSDictionary *)request emitter:(MetaInputJobEmitter)emitter {
@@ -135,6 +136,12 @@ static NSDictionary *status_fence(MetaFence fence) {
   return YES;
 }
 
+- (void)setObserverCoverageProvider:(NSDictionary *(^)(void))provider {
+  [_condition lock];
+  _observerCoverageProvider = [provider copy];
+  [_condition unlock];
+}
+
 - (void)publishStatus:(MetaExecutorStatus)status {
   if (!status.has_accepted_fence) return;
   static NSString *executions[] = {@"idle", @"dispatching", @"cancelling", @"cancelled", @"finished", @"failed", @"interrupted-unknown", @"quarantined"};
@@ -149,12 +156,27 @@ static NSDictionary *status_fence(MetaFence fence) {
   [observer addEntriesFromDictionary:@{@"state": @"unavailable", @"coverageStartCursor": @"observer-0", @"cursor": @"observer-0", @"nextSequence": @1,
     @"startedAt": now, @"coveredFrom": now, @"coveredThrough": now, @"heartbeatAt": now,
     @"coveredKinds": @[], @"droppedEvents": @0, @"gapDetected": @NO, @"reason": @"Native event observer ещё не подключён"}];
+  [_condition lock];
+  NSDictionary *(^coverageProvider)(void) = _observerCoverageProvider;
+  [_condition unlock];
+  NSDictionary *provided = coverageProvider == nil ? nil : coverageProvider();
+  BOOL matching = [provided isKindOfClass:NSDictionary.class];
+  for (NSString *key in generation) matching = matching && [provided[key] isEqual:generation[key]];
+  if (matching) observer = [provided mutableCopy];
+  BOOL observerReady = matching && status.observer_state == META_OBSERVER_READY &&
+      [observer[@"state"] isEqual:@"ready"] && ![observer[@"gapDetected"] boolValue] &&
+      [observer[@"coveredKinds"] isKindOfClass:NSArray.class] &&
+      [NSSet setWithArray:observer[@"coveredKinds"]].count == 4 &&
+      [[NSSet setWithArray:observer[@"coveredKinds"]] isEqualToSet:
+          [NSSet setWithArray:@[@"input", @"focus", @"window-structure", @"lifecycle"]]];
+  static NSString *interference[] = {@"unknown", @"none-observed", @"observed"};
   NSMutableDictionary *value = [generation mutableCopy];
   [value addEntriesFromDictionary:@{@"requestId": _requestId, @"operationId": _operation[@"operationId"],
     @"acceptedFence": status_fence(status.accepted_fence), @"highWaterFence": status_fence(status.has_high_water_fence ? status.high_water_fence : status.accepted_fence),
     @"execution": executions[status.execution], @"dispatch": dispatches[status.dispatch], @"cleanup": cleanups[status.cleanup],
     @"targetVerified": verification[status.target_verification], @"cancellationRequested": status.cancellation_requested ? @YES : @NO,
-    @"userInterference": @"unknown", @"restorationAllowed": @NO, @"quarantined": status.quarantined ? @YES : @NO,
+    @"userInterference": observerReady ? interference[status.user_interference] : @"unknown",
+    @"restorationAllowed": observerReady && status.restoration_allowed ? @YES : @NO, @"quarantined": status.quarantined ? @YES : @NO,
     @"heldCount": @(status.held_count), @"dispatchAttempts": @(status.dispatch_attempts), @"ledgerRevision": @(status.ledger_revision), @"observer": observer}];
   if (status.last_checkpoint[0]) value[@"lastCheckpoint"] = @(status.last_checkpoint);
   [_condition lock];

@@ -13,6 +13,13 @@
 #include "window-actions/meta_window_actions.h"
 #include "window-actions/meta_window_result.h"
 #include "input-target/meta_point_target.h"
+#include "input-target/meta_geometry_probe.h"
+#include "application-command/meta_application_command.h"
+#include "session-state/meta_session_state.h"
+#include "capture-command/meta_capture_command.h"
+#include "hit-test/meta_hit_test_binder.h"
+#include "observer-command/meta_observer_command.h"
+#include "recovery-probe/meta_recovery_probe.h"
 #include <time.h>
 #include <math.h>
 #include <ApplicationServices/ApplicationServices.h>
@@ -28,6 +35,9 @@
 
 @interface MetaSystemCommandBackend : NSObject <MetaCommandBackend>
 - (instancetype)initWithGeneration:(NSString *)generation;
+- (NSDictionary *)applicationRecord:(NSDictionary *)reference;
+- (BOOL)ensureApplications:(NSDictionary *)request;
+- (NSDictionary *)recoveryInfo;
 @end
 
 @interface MetaInspectionBorrowContext : NSObject
@@ -37,6 +47,20 @@
 @end
 @implementation MetaInspectionBorrowContext
 @end
+
+@interface MetaObserverBorrowContext : NSObject
+@property(nonatomic, strong) NSDictionary *generation;
+@property(nonatomic, strong) MetaObserverTargetRecord *record;
+@end
+@implementation MetaObserverBorrowContext
+@end
+
+static bool observer_borrowed(void *context, const MetaAXTargetBorrow *borrow) {
+  MetaObserverBorrowContext *binding = (__bridge MetaObserverBorrowContext *)context;
+  binding.record = meta_observer_target_record_create(borrow, binding.generation[@"runtimeEpoch"],
+      binding.generation[@"loginSessionId"], binding.generation[@"nativeGeneration"]);
+  return binding.record != nil;
+}
 
 static bool inspect_borrowed(void *context, const MetaAXTargetBorrow *borrow) {
   MetaInspectionBorrowContext *binding = (__bridge MetaInspectionBorrowContext *)context;
@@ -53,17 +77,80 @@ static bool verify_window_borrow(void *context, const MetaAXTargetBorrow *borrow
       strcmp(original->window_ref, borrow->target.window_ref) == 0;
 }
 
-typedef struct { double x; double y; } MetaPointCheck;
+typedef struct { double x; double y; const MetaInventorySnapshot *snapshot; MetaMacOSBackend *backend; const char *application; const char *owner; bool surface; MetaPointTargetRelation relation; bool geometryMismatch; } MetaPointCheck;
 static bool verify_point_borrow(void *context, const MetaAXTargetBorrow *borrow) {
-  const MetaPointCheck *point = context;
-  return meta_point_matches_borrow(borrow, point->x, point->y);
+  MetaPointCheck *point = context;
+  if (point->application == NULL || strcmp(point->application, borrow->target.application_ref) != 0 ||
+      (point->surface ? borrow->target.surface_kind == META_SURFACE_WINDOW : borrow->target.surface_kind != META_SURFACE_WINDOW) ||
+      (point->surface && (point->owner == NULL || strcmp(point->owner, borrow->target.owner_window_ref) != 0))) return false;
+  MetaBorrowedGeometryProbe geometry = {0};
+  if (!meta_macos_probe_borrowed_geometry(point->backend, borrow, point->snapshot, &geometry)) return false;
+  if (!geometry.frame_unchanged || !geometry.topology_unchanged) { point->geometryMismatch = true; return false; }
+  point->relation = meta_point_relation_to_borrow(borrow, point->x, point->y);
+  return point->relation != META_POINT_TARGET_RELATION_NONE;
+}
+
+static NSDictionary *application_value(const MetaApplicationRecord *record) {
+  if (record == NULL) return nil;
+  NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+  formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+  return @{@"applicationRef": @(record->application_ref), @"registrationNonce": @(record->registration_nonce),
+    @"pid": @(record->pid), @"bundleId": @(record->bundle_id), @"launchTimeMicros": @(record->launch_time_micros),
+    @"launchedAt": [formatter stringFromDate:[NSDate dateWithTimeIntervalSince1970:(double)record->launch_time_micros / 1000000.0]]};
+}
+
+static BOOL session_allows_input(NSString *loginSessionId) {
+  NSDictionary *session = meta_current_session_readiness(loginSessionId);
+  return [session[@"state"] isEqual:@"active-console"] && [session[@"secureInput"] isEqual:@"off"] &&
+      ![session[@"lockState"] isEqual:@"locked"];
+}
+
+static bool contains_point(MetaRect bounds, double x, double y) {
+  return isfinite(x) && isfinite(y) && x >= bounds.x && y >= bounds.y && x < bounds.x + bounds.width && y < bounds.y + bounds.height;
+}
+
+static bool dispatch_block(void *context) { return ((__bridge BOOL (^)(void))context)(); }
+
+static NSDictionary *unknown_launch_value(NSString *reason, NSDictionary *candidate) {
+  NSMutableDictionary *value = [@{@"state": @"unknown", @"reason": reason, @"errors": @[@{
+    @"code": @"operation-outcome-unknown", @"message": reason, @"stage": @"application-launch", @"retryable": @NO,
+    @"replayAllowed": @NO, @"recoveryAction": @"get-operation"}]} mutableCopy];
+  if (candidate != nil) value[@"candidate"] = candidate;
+  return value;
+}
+
+static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
+  NSDictionary *facts = [(__bridge MetaSystemCommandBackend *)context recoveryInfo];
+  if (facts == nil) return false;
+  output->input_monitoring = [facts[@"inputMonitoring"] boolValue];
+  output->observer_ready = [facts[@"observerReady"] boolValue];
+  output->session_state = [facts[@"sessionState"] isEqual:@"active-console"] ? MetaRecoverySessionStateActiveConsole :
+      [facts[@"sessionState"] isEqual:@"inactive"] ? MetaRecoverySessionStateInactive : MetaRecoverySessionStateUnknown;
+  output->lock_state = [facts[@"lockState"] isEqual:@"locked"] ? MetaRecoveryLockStateLocked : MetaRecoveryLockStateUnknown;
+  output->secure_input = [facts[@"secureInput"] isEqual:@"off"] ? MetaRecoverySecureInputStateOff :
+      [facts[@"secureInput"] isEqual:@"on"] ? MetaRecoverySecureInputStateOn : MetaRecoverySecureInputStateUnknown;
+  return true;
 }
 
 @implementation MetaSystemCommandBackend {
   MetaMacOSBackend *_windows;
   MetaCaptureRouter *_captures;
+  MetaBrokerCore *_core;
+  MetaCaptureCommandBinder *_captureCommands;
+  MetaObserverCommandBinder *_observerCommands;
+  NSDictionary *_observerRequest;
+  NSString *_observerInstance;
+  NSDate *_observerMainDeadline;
+  NSDictionary *_recoveryRequest;
+  NSLock *_asyncLock;
+  NSMutableSet<NSString *> *_captureOperationIds;
+  NSMutableDictionary<NSString *, NSString *> *_applicationTaskRefs;
   MetaMacOSInput *_input;
   MetaInputExecutor *_inputExecutor;
+  MetaApplicationBundles *_bundles;
+  MetaApplicationCommandBinder *_applications;
+  MetaApplicationBackend _applicationBackend;
+  NSString *_inputLoginSession;
   BOOL _sealed;
 }
 
@@ -71,29 +158,63 @@ static bool verify_point_borrow(void *context, const MetaAXTargetBorrow *borrow)
   self = [super init];
   if (self) {
     _windows = meta_macos_backend_create(generation.UTF8String);
+    _asyncLock = [[NSLock alloc] init];
+    _captureOperationIds = [NSMutableSet set];
+    _applicationTaskRefs = [NSMutableDictionary dictionary];
     _captures = meta_capture_router_create(generation.UTF8String, meta_capture_router_default_backend());
     _input = meta_macos_input_create();
+    _applicationBackend = meta_application_system_backend();
     MetaExecutorBackend sink = {.context = _input, .post_held_event = meta_macos_input_post_held,
       .post_text_cluster = meta_macos_input_post_text, .set_event_flags = meta_macos_input_set_flags,
       .post_pointer_event = meta_macos_input_post_pointer, .post_scroll_event = meta_macos_input_post_scroll,
       .post_cleanup_up = meta_macos_input_post_cleanup_up};
     MetaMacOSBackend *windows = _windows;
+    __weak MetaSystemCommandBackend *weakSelf = self;
     _inputExecutor = [[MetaInputExecutor alloc] initWithGeneration:generation sink:sink verify:^BOOL(NSString *target) {
-      return meta_macos_input_preflight() && meta_macos_target_is_focused(windows, target.UTF8String);
+      MetaSystemCommandBackend *owner = weakSelf;
+      return owner != nil && session_allows_input(owner->_inputLoginSession) && meta_macos_input_preflight() && meta_macos_target_is_focused(windows, target.UTF8String);
     }];
-    [_inputExecutor setPointVerifier:^BOOL(NSString *target, double x, double y) {
+    [_inputExecutor setScopedPointVerifier:^BOOL(NSDictionary *target, double x, double y) {
       const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(windows);
-      if (snapshot == NULL) return NO;
-      MetaPointCheck point = {x, y};
-      return meta_macos_with_ax_target(windows, target.UTF8String, snapshot->inventory_id, snapshot->revision,
+      NSDictionary *ref = target[@"ref"];
+      if (snapshot == NULL || ![ref isKindOfClass:NSDictionary.class] || ![ref[@"nativeGeneration"] isEqual:@(snapshot->native_generation)] ||
+          !session_allows_input(ref[@"loginSessionId"]) || !meta_macos_input_preflight()) return NO;
+      BOOL display = [target[@"kind"] isEqual:@"display"];
+      BOOL layout = [target[@"kind"] isEqual:@"desktop-layout"];
+      if (display || layout) {
+        if ([ref[@"displayLayoutRevision"] unsignedLongLongValue] != snapshot->display_layout_revision ||
+            (layout && ![ref[@"layoutRef"] isEqual:@(snapshot->layout_ref)])) return NO;
+        BOOL contained = NO;
+        for (size_t index = 0; index < snapshot->display_count; index += 1) {
+          const MetaDisplayRecord *candidate = &snapshot->displays[index];
+          if ((layout || [ref[@"displayRef"] isEqual:@(candidate->display_ref)]) && contains_point(candidate->bounds, x, y)) contained = YES;
+        }
+        MetaTopologyProbe topology = {0};
+        return contained && meta_macos_probe_topology(windows, snapshot, &topology) && topology.topology_unchanged;
+      }
+      if (![@[@"window", @"surface"] containsObject:target[@"kind"]]) return NO;
+      NSString *targetRef = [target[@"kind"] isEqual:@"window"] ? ref[@"windowRef"] : ref[@"surfaceRef"];
+      if (![targetRef isKindOfClass:NSString.class]) return NO;
+      if (![ref[@"applicationRef"] isKindOfClass:NSString.class]) return NO;
+      BOOL surface = [target[@"kind"] isEqual:@"surface"];
+      if (surface && ![ref[@"ownerWindowRef"] isKindOfClass:NSString.class]) return NO;
+      MetaPointCheck point = {.x = x, .y = y, .snapshot = snapshot, .backend = windows, .application = [ref[@"applicationRef"] UTF8String],
+        .owner = surface ? [ref[@"ownerWindowRef"] UTF8String] : NULL, .surface = surface};
+      return meta_macos_with_ax_target(windows, targetRef.UTF8String, snapshot->inventory_id, snapshot->revision,
           snapshot->native_generation, verify_point_borrow, &point) == META_AX_BORROW_OK;
     }];
-    if (_windows == NULL || _captures == NULL) return nil;
+    _core = meta_broker_core_create([_inputExecutor executorOnActionWorker], _captures);
+    _captureCommands = [[MetaCaptureCommandBinder alloc] initWithRouter:_captures inventoryProvider:^const MetaInventorySnapshot * {
+      return meta_macos_backend_snapshot(windows);
+    } nativeGeneration:generation nativeBuildId:@META_NATIVE_BUILD_ID];
+    if (_windows == NULL || _captures == NULL || _input == NULL || _inputExecutor == nil || _core == NULL || _captureCommands == nil) return nil;
   }
   return self;
 }
 
 - (void)dealloc {
+  _captureCommands = nil;
+  meta_broker_core_destroy(_core);
   _inputExecutor = nil;
   meta_macos_input_destroy(_input);
   meta_macos_backend_destroy(_windows);
@@ -127,6 +248,232 @@ static bool verify_point_borrow(void *context, const MetaAXTargetBorrow *borrow)
   if (data == NULL) return nil;
   NSDictionary *result = [NSJSONSerialization JSONObjectWithData:(__bridge NSData *)data options:0 error:NULL];
   CFRelease(data);
+  return result;
+}
+
+- (NSDictionary *)applicationRecord:(NSDictionary *)reference {
+  const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(_windows);
+  if (snapshot == NULL || ![reference isKindOfClass:NSDictionary.class]) return nil;
+  for (size_t index = 0; index < snapshot->application_count; index += 1) {
+    const MetaApplicationRecord *record = &snapshot->applications[index];
+    if (![reference[@"applicationRef"] isEqual:@(record->application_ref)]) continue;
+    NSDictionary *value = application_value(record);
+    if (![value[@"pid"] isEqual:reference[@"pid"]] || ![value[@"launchedAt"] isEqual:reference[@"launchedAt"]] ||
+        ![value[@"registrationNonce"] isEqual:reference[@"registrationNonce"]]) return nil;
+    MetaApplicationProcess live = {0};
+    if (_applicationBackend.lookup(_applicationBackend.context, record->pid, &live) != META_APPLICATION_LOOKUP_FOUND ||
+        live.launch_time_micros != record->launch_time_micros || strcmp(live.bundle_id, record->bundle_id) != 0) return nil;
+    return value;
+  }
+  return nil;
+}
+
+- (BOOL)ensureApplications:(NSDictionary *)request {
+  if (_applications != nil) return YES;
+  NSDictionary *generation = @{@"runtimeEpoch": request[@"runtimeEpoch"], @"loginSessionId": request[@"loginSessionId"], @"nativeGeneration": request[@"nativeGeneration"]};
+  _bundles = [[MetaApplicationBundles alloc] initWithGeneration:generation];
+  MetaMacOSBackend *windows = _windows;
+  __weak MetaSystemCommandBackend *weakSelf = self;
+  _applications = [[MetaApplicationCommandBinder alloc] initWithGeneration:generation bundles:_bundles backend:_applicationBackend
+    candidateResolver:^NSDictionary *(const MetaApplicationProcess *process, __unused NSDictionary *operation) {
+      if (!meta_macos_refresh_inventory(windows, 5000)) return nil;
+      const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(windows);
+      if (snapshot == NULL) return nil;
+      for (size_t index = 0; index < snapshot->application_count; index += 1) {
+        const MetaApplicationRecord *record = &snapshot->applications[index];
+        if (record->pid == process->pid && record->launch_time_micros == process->launch_time_micros && strcmp(record->bundle_id, process->bundle_id) == 0) return application_value(record);
+      }
+      return nil;
+    } referenceResolver:^NSDictionary *(NSDictionary *reference) { return [weakSelf applicationRecord:reference]; }];
+  return _applications != nil;
+}
+
+- (NSDictionary *)resolveApplication:(NSDictionary *)request {
+  if (![self ensureApplications:request]) return nil;
+  NSDictionary *inventory = [self inventory];
+  if (inventory == nil) return nil;
+  return [_applications resolve:request[@"payload"] evidence:@{@"sourceResponseRef": inventory[@"sourceResponseRef"],
+    @"inventoryId": inventory[@"inventoryId"], @"inventoryRevision": inventory[@"revision"], @"observedAt": inventory[@"capturedAt"]}];
+}
+
+- (NSDictionary *)hitTest:(NSDictionary *)request {
+  NSDictionary *generation = @{@"runtimeEpoch": request[@"runtimeEpoch"], @"loginSessionId": request[@"loginSessionId"], @"nativeGeneration": request[@"nativeGeneration"]};
+  MetaMacOSBackend *windows = _windows;
+  MetaCaptureCommandBinder *captures = _captureCommands;
+  MetaInputExecutor *input = _inputExecutor;
+  __block BOOL geometryMismatch = NO;
+  MetaHitTestCommandBinder *binder = [[MetaHitTestCommandBinder alloc] initWithGeneration:generation
+    snapshotProvider:^const MetaInventorySnapshot * { return meta_macos_backend_snapshot(windows); }
+    frameGeometryLookup:^NSDictionary *(NSString *frameRef) { return [captures lookupFrameGeometry:frameRef]; }
+    pendingFenceValidator:^BOOL(NSDictionary *operation) {
+      MetaExecutorStatus status = meta_executor_status([input executorOnActionWorker]);
+      NSDictionary *fence = operation[@"fence"];
+      if (status.quarantined || status.held_count > 0 || ![fence[@"counter"] isKindOfClass:NSNumber.class]) return NO;
+      uint64_t counter = [fence[@"counter"] unsignedLongLongValue];
+      if (status.has_high_water_fence) {
+        if (![operation[@"runtimeEpoch"] isEqual:@(status.high_water_fence.runtime_epoch)] ||
+            ![operation[@"loginSessionId"] isEqual:@(status.high_water_fence.login_session_id)] ||
+            ![operation[@"nativeGeneration"] isEqual:@(status.high_water_fence.native_generation)]) return NO;
+        if (counter <= status.high_water_fence.counter) return NO;
+      }
+      return counter > 0 && status.execution != META_EXECUTOR_DISPATCHING && status.execution != META_EXECUTOR_CANCELLING;
+    }
+    windowProbe:^MetaHitTestWindowRelation(NSDictionary *target, NSDictionary *destination, const MetaInventorySnapshot *snapshot) {
+      NSDictionary *ref = target[@"ref"];
+      BOOL surface = [target[@"kind"] isEqual:@"surface"];
+      NSString *targetRef = surface ? ref[@"surfaceRef"] : ref[@"windowRef"];
+      if (![targetRef isKindOfClass:NSString.class] || ![ref[@"applicationRef"] isKindOfClass:NSString.class] ||
+          (surface && ![ref[@"ownerWindowRef"] isKindOfClass:NSString.class])) return MetaHitTestWindowRelationUnavailable;
+      if (!meta_macos_target_is_focused(windows, targetRef.UTF8String)) return MetaHitTestWindowRelationNone;
+      MetaPointCheck point = {.x = [destination[@"x"] doubleValue], .y = [destination[@"y"] doubleValue], .snapshot = snapshot, .backend = windows,
+        .application = [ref[@"applicationRef"] UTF8String], .owner = surface ? [ref[@"ownerWindowRef"] UTF8String] : NULL, .surface = surface};
+      MetaAXBorrowStatus borrowed = meta_macos_with_ax_target(windows, targetRef.UTF8String, snapshot->inventory_id, snapshot->revision,
+          snapshot->native_generation, verify_point_borrow, &point);
+      if (point.geometryMismatch) geometryMismatch = YES;
+      if (borrowed != META_AX_BORROW_OK) return MetaHitTestWindowRelationUnavailable;
+      if (!meta_macos_target_is_focused(windows, targetRef.UTF8String)) return MetaHitTestWindowRelationNone;
+      return point.relation == META_POINT_TARGET_RELATION_EXACT ? MetaHitTestWindowRelationExact : MetaHitTestWindowRelationOwnedDescendant;
+    }
+    topologyProbe:^BOOL(const MetaInventorySnapshot *snapshot) {
+      MetaTopologyProbe topology = {0};
+      return meta_macos_probe_topology(windows, snapshot, &topology) && topology.topology_unchanged;
+    }
+    sessionReadinessProvider:^NSDictionary * { return meta_current_session_readiness(generation[@"loginSessionId"]); }];
+  NSDictionary *result = [binder handleRequest:request];
+  return geometryMismatch ? @{@"status": @"observation-stale", @"reason": @"Fresh geometry окна или topology не совпали с captured snapshot"} : result;
+}
+
+- (NSDictionary *)observer:(NSDictionary *)request {
+  NSISO8601DateFormatter *deadlineFormatter = [[NSISO8601DateFormatter alloc] init];
+  deadlineFormatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+  _observerMainDeadline = [deadlineFormatter dateFromString:request[@"deadlineAt"]];
+  if (_observerCommands == nil) {
+    NSDictionary *generation = @{@"runtimeEpoch": request[@"runtimeEpoch"], @"loginSessionId": request[@"loginSessionId"], @"nativeGeneration": request[@"nativeGeneration"]};
+    MetaMacOSBackend *windows = _windows;
+    __weak MetaSystemCommandBackend *weakSelf = self;
+    __block uint64_t indexRevision = 0;
+    MetaObserverCommandBinder *binder = [[MetaObserverCommandBinder alloc] initWithGeneration:generation nativeBuildId:@META_NATIVE_BUILD_ID
+      indexBuilder:^MetaObserverPreparedIndex * {
+        NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 5;
+        if (!meta_macos_refresh_inventory(windows, 5000)) return nil;
+        const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(windows);
+        if (snapshot == NULL || !snapshot->complete) return nil;
+        NSMutableArray *records = [NSMutableArray array];
+        for (size_t index = 0; index < snapshot->window_count; index += 1) {
+          if (NSProcessInfo.processInfo.systemUptime >= deadline) return nil;
+          const MetaWindowRecord *window = &snapshot->windows[index];
+          if (window->surface_kind != META_SURFACE_WINDOW && window->surface_kind != META_SURFACE_SHEET) continue;
+          if (window->actionability != META_ACTIONABILITY_AX || window->target_ref[0] == '\0') continue;
+          if (records.count >= META_OBSERVER_TARGET_INDEX_MAX_RECORDS) return nil;
+          MetaObserverBorrowContext *binding = [[MetaObserverBorrowContext alloc] init];
+          binding.generation = generation;
+          if (meta_macos_with_ax_target(windows, window->target_ref, snapshot->inventory_id, snapshot->revision,
+              snapshot->native_generation, observer_borrowed, (__bridge void *)binding) != META_AX_BORROW_OK) return nil;
+          [records addObject:binding.record];
+        }
+        if (NSProcessInfo.processInfo.systemUptime >= deadline) return nil;
+        MetaObserverTargetIndex *index = [[MetaObserverTargetIndex alloc] init];
+        if (![index replaceRecords:records]) return nil;
+        return meta_observer_prepared_index_create(index, @(snapshot->inventory_id), snapshot->revision, ++indexRevision);
+      }
+      mainExecutor:^BOOL(BOOL (^work)(void)) {
+        if (NSThread.isMainThread) return work();
+        MetaSystemCommandBackend *owner = weakSelf;
+        NSTimeInterval remaining = owner == nil ? 0 : owner->_observerMainDeadline.timeIntervalSinceNow;
+        if (remaining <= 0) return NO;
+        __block BOOL completed = NO;
+        __block BOOL cancelled = NO;
+        NSLock *gate = [[NSLock alloc] init];
+        dispatch_semaphore_t done = dispatch_semaphore_create(0);
+        dispatch_async(dispatch_get_main_queue(), ^{
+          [gate lock]; BOOL skip = cancelled; [gate unlock];
+          BOOL result = skip ? NO : work();
+          [gate lock]; completed = result; [gate unlock];
+          dispatch_semaphore_signal(done);
+        });
+        if (dispatch_semaphore_wait(done, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(MIN(remaining, 6) * NSEC_PER_SEC))) != 0) {
+          [gate lock]; cancelled = YES; [gate unlock];
+          return NO;
+        }
+        return completed;
+      }
+      factory:^MetaNativeObserver *(NSDictionary *identity, MetaObserverTargetIndex *index) {
+        MetaNativeObserver *observer = [[MetaNativeObserver alloc] initWithGeneration:identity];
+        [observer setFocusResolver:^NSDictionary *(pid_t pid, AXUIElementRef element, NSString *notification) {
+          return [index resolveFocusForPid:pid element:element notification:notification];
+        }];
+        return observer;
+      }
+      readinessProvider:^NSDictionary * { return meta_current_session_readiness(generation[@"loginSessionId"]); }
+      instanceIdProvider:^NSString * { return [@"observer-" stringByAppendingString:NSUUID.UUID.UUIDString]; }];
+    [_asyncLock lock];
+    _observerCommands = binder;
+    [_asyncLock unlock];
+  }
+  NSDictionary *result = [_observerCommands handleRequest:request];
+  if ([result[@"ok"] isEqual:@YES]) {
+    _observerRequest = [request copy];
+    _observerInstance = [result[@"command"] isEqual:@"stop"] ? nil : result[@"snapshot"][@"observerInstanceRef"];
+  }
+  return result;
+}
+
+- (BOOL)activateObserverPush:(NSString *)instanceRef {
+  return [_observerCommands activatePushForObserverInstance:instanceRef];
+}
+
+- (NSDictionary *)takeObserverPush:(NSUInteger)maximum {
+  [_asyncLock lock];
+  MetaObserverCommandBinder *binder = _observerCommands;
+  [_asyncLock unlock];
+  return [binder takePushEnvelopes:maximum];
+}
+
+- (void)stopObserver {
+  if (_observerInstance == nil || _observerRequest == nil) return;
+  NSMutableDictionary *request = [_observerRequest mutableCopy];
+  request[@"command"] = @"stop";
+  request[@"requestId"] = [@"observer-stop-" stringByAppendingString:NSUUID.UUID.UUIDString];
+  NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+  formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+  request[@"deadlineAt"] = [formatter stringFromDate:[NSDate dateWithTimeIntervalSinceNow:1]];
+  _observerMainDeadline = [formatter dateFromString:request[@"deadlineAt"]];
+  request[@"observerInstanceRef"] = _observerInstance;
+  [request removeObjectForKey:@"previousObserverInstanceRef"];
+  [request removeObjectForKey:@"afterCursor"];
+  NSDictionary *result = [_observerCommands handleRequest:request];
+  if ([result[@"ok"] isEqual:@YES] && [result[@"command"] isEqual:@"stop"] &&
+      ![result[@"snapshot"][@"coverage"][@"state"] isEqual:@"ready"]) _observerInstance = nil;
+}
+
+- (NSDictionary *)recoveryInfo {
+  NSDictionary *session = meta_current_session_readiness(_recoveryRequest[@"loginSessionId"]);
+  NSDictionary *coverage = nil;
+  NSDictionary *observerSession = nil;
+  if (_observerCommands != nil && _observerInstance != nil) {
+    NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+    formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+    NSDictionary *request = @{@"kind": @"observer", @"protocolVersion": @"1", @"command": @"coverage",
+      @"requestId": [@"recovery-observer-" stringByAppendingString:NSUUID.UUID.UUIDString],
+      @"runtimeEpoch": _recoveryRequest[@"runtimeEpoch"], @"loginSessionId": _recoveryRequest[@"loginSessionId"], @"nativeGeneration": _recoveryRequest[@"nativeGeneration"],
+      @"observerInstanceRef": _observerInstance, @"deadlineAt": [formatter stringFromDate:[NSDate dateWithTimeIntervalSinceNow:1]]};
+    NSDictionary *reply = [_observerCommands handleRequest:request];
+    if ([reply[@"ok"] boolValue]) { coverage = reply[@"snapshot"][@"coverage"]; observerSession = reply[@"snapshot"][@"sessionReadiness"]; }
+  }
+  BOOL ready = [coverage[@"state"] isEqual:@"ready"] && ![coverage[@"gapDetected"] boolValue] &&
+      [coverage[@"coveredKinds"] containsObject:@"input"];
+  return @{@"sessionState": session[@"state"] ?: @"unknown", @"secureInput": session[@"secureInput"] ?: @"unknown",
+    @"lockState": [observerSession[@"lockState"] isEqual:@"locked"] ? @"locked" : @"unknown",
+    @"inputMonitoring": CGPreflightListenEventAccess() ? @YES : @NO, @"observerReady": ready ? @YES : @NO};
+}
+
+- (NSDictionary *)heldRecovery:(NSDictionary *)request owner:(NSDictionary *)owner {
+  _recoveryRequest = request;
+  MetaRecoveryProbeBackend backend = meta_recovery_probe_system_backend();
+  backend.context = (__bridge void *)self;
+  backend.readiness = recovery_readiness;
+  NSDictionary *result = meta_recovery_probe_receive(owner, request, backend);
+  _recoveryRequest = nil;
   return result;
 }
 
@@ -235,8 +582,184 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
 }
 
 - (NSDictionary *)cancel:(NSDictionary *)request {
-  (void)request;
+  NSDictionary *source = request[@"fence"];
+  MetaFence fence = {.counter = [source[@"counter"] unsignedLongLongValue]};
+  snprintf(fence.runtime_epoch, sizeof(fence.runtime_epoch), "%s", [source[@"runtimeEpoch"] UTF8String]);
+  snprintf(fence.login_session_id, sizeof(fence.login_session_id), "%s", [source[@"loginSessionId"] UTF8String]);
+  snprintf(fence.native_generation, sizeof(fence.native_generation), "%s", [source[@"nativeGeneration"] UTF8String]);
+  meta_broker_core_cancel_operation(_core, [request[@"operationId"] UTF8String], fence);
+  [_asyncLock lock]; NSString *task = _applicationTaskRefs[request[@"operationId"]]; [_asyncLock unlock];
+  if (task != nil) {
+    NSDictionary *current = [_applications launchStatus:task requestId:request[@"requestId"] ?: @"cancel-status"];
+    if ([current[@"fence"] isEqual:source]) [_applications cancelLaunch:task requestId:request[@"requestId"] ?: @"cancel-status"];
+  }
   return nil;
+}
+
+- (NSDictionary *)supplementStatus:(NSDictionary *)status {
+  if (![status[@"operationId"] isKindOfClass:NSString.class]) return status;
+  MetaCaptureOperationTaskRecord records[128] = {0};
+  size_t count = meta_capture_router_operation_tasks(_captures, [status[@"operationId"] UTF8String], records, 128);
+  BOOL pending = count > 128;
+  for (size_t index = 0; index < MIN(count, 128); index += 1) {
+    if (!records[index].released && (!records[index].status.drained || records[index].status.cleanup != MetaCaptureCleanupComplete)) pending = YES;
+  }
+  [_asyncLock lock]; NSString *applicationTask = _applicationTaskRefs[status[@"operationId"]]; [_asyncLock unlock];
+  if (applicationTask != nil) {
+    NSDictionary *application = [_applications launchStatus:applicationTask requestId:status[@"requestId"]];
+    if (![application[@"effectiveTerminal"] boolValue]) pending = YES;
+  }
+  if (!pending) return status;
+  NSMutableDictionary *value = [status mutableCopy];
+  value[@"cleanup"] = @"unknown";
+  value[@"quarantined"] = @YES;
+  value[@"restorationAllowed"] = @NO;
+  return value;
+}
+
+- (NSDictionary *)reconcileStatus:(NSDictionary *)status {
+  if ([status[@"cancellationRequested"] boolValue]) {
+    [self cancel:@{@"operationId": status[@"operationId"], @"fence": status[@"acceptedFence"]}];
+    meta_broker_core_release_drained_operation(_core, [status[@"operationId"] UTF8String], false);
+    MetaCaptureOperationTaskRecord records[128] = {0};
+    size_t count = meta_capture_router_operation_tasks(_captures, [status[@"operationId"] UTF8String], records, 128);
+    BOOL released = count <= 128;
+    for (size_t index = 0; index < MIN(count, 128); index += 1) if (!records[index].released) released = NO;
+    if (released) { [_asyncLock lock]; [_captureOperationIds removeObject:status[@"operationId"]]; [_asyncLock unlock]; }
+  }
+  [_asyncLock lock]; NSString *task = _applicationTaskRefs[status[@"operationId"]]; [_asyncLock unlock];
+  if (task != nil) {
+    NSDictionary *application = [_applications finalizeLaunch:task requestId:status[@"requestId"]];
+    if ([application[@"effectiveTerminal"] boolValue] && [_applications releaseLaunch:task]) {
+      [_asyncLock lock]; [_applicationTaskRefs removeObjectForKey:status[@"operationId"]]; [_asyncLock unlock];
+    }
+  }
+  return [self supplementStatus:status];
+}
+
+- (NSArray<NSString *> *)pendingOperationIds {
+  [_asyncLock lock];
+  NSMutableSet *all = [_captureOperationIds mutableCopy];
+  NSDictionary *applications = [_applicationTaskRefs copy];
+  BOOL sealed = _sealed;
+  [_asyncLock unlock];
+  for (NSString *operation in applications) {
+    NSDictionary *status = [_applications launchStatus:applications[operation] requestId:@"pending-operations"];
+    if (!sealed || ![status[@"drained"] boolValue] || [status[@"parentActivationInFlight"] boolValue]) [all addObject:operation];
+  }
+  NSArray *operations = all.allObjects;
+  return operations;
+}
+
+- (NSDictionary *)executeApplication:(NSDictionary *)request job:(MetaInputJob *)job {
+  if (_sealed || ![self ensureApplications:request]) return nil;
+  NSDictionary *operation = job.operation, *payload = request[@"payload"];
+  const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(_windows);
+  if (snapshot == NULL || ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
+      [operation[@"inventoryRevision"] unsignedLongLongValue] != snapshot->revision) return nil;
+  BOOL launch = [request[@"method"] isEqual:@"application.launch"];
+  NSDictionary *reference = launch ? payload[@"bundle"] : payload[@"application"];
+  if (![reference isKindOfClass:NSDictionary.class] || ![reference isEqual:operation[@"target"][@"ref"]] ||
+      ![operation[@"target"][@"kind"] isEqual:launch ? @"application-bundle" : @"application"]) return nil;
+  NSString *targetRef = launch ? reference[@"bundleRef"] : reference[@"applicationRef"];
+  if (![targetRef isKindOfClass:NSString.class]) return nil;
+  NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+  formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+  NSDate *deadlineDate = [formatter dateFromString:operation[@"deadlineAt"]];
+  double remaining = deadlineDate.timeIntervalSinceNow * 1000;
+  if (deadlineDate == nil || remaining <= 0) return nil;
+  uint64_t deadline = _applicationBackend.monotonic_millis(_applicationBackend.context) + (uint64_t)MIN(remaining, 30000);
+  __block BOOL quitConfirmed = NO;
+  __block NSString *launchTask = nil;
+  NSDictionary *execution = [_inputExecutor executeExternal:request job:job targetRef:targetRef verify:^BOOL(NSString *value) {
+    if (![value isEqual:targetRef]) return NO;
+    return launch ? [self->_bundles validateReference:reference] : quitConfirmed || [self applicationRecord:reference] != nil;
+  } action:^NSDictionary * {
+    if (!launch) {
+      NSDictionary *quit = [self->_applications quit:payload operation:operation deadlineMillis:deadline];
+      quitConfirmed = [quit[@"value"][@"state"] isEqual:@"terminated"];
+      return quit;
+    }
+    NSDictionary *state = [self->_applications startLaunch:payload operation:operation requestId:job.requestId deadlineMillis:deadline];
+    launchTask = state[@"launchTaskRef"];
+    if (launchTask == nil) return nil;
+    [self->_asyncLock lock]; self->_applicationTaskRefs[operation[@"operationId"]] = launchTask; [self->_asyncLock unlock];
+    uint64_t waitUntil = deadline > 100 ? deadline - 100 : deadline;
+    while (![state[@"drained"] boolValue] && ![job cancelRequested] && self->_applicationBackend.monotonic_millis(self->_applicationBackend.context) < waitUntil) {
+      usleep(1000);
+      state = [self->_applications launchStatus:launchTask requestId:job.requestId];
+    }
+    if (![state[@"drained"] boolValue] || [job cancelRequested]) {
+      [job requestCancel];
+      [self->_applications cancelLaunch:launchTask requestId:job.requestId];
+    }
+    state = [self->_applications finalizeLaunch:launchTask requestId:job.requestId];
+    if ([payload[@"activate"] boolValue] && [state[@"value"][@"state"] isEqual:@"running"] && ![job cancelRequested]) {
+      if (!session_allows_input(operation[@"loginSessionId"])) {
+        [job requestCancel];
+        [self->_applications cancelLaunch:launchTask requestId:job.requestId];
+      } else {
+        BOOL (^activate)(void) = ^BOOL { return [self->_applications activateLaunch:launchTask deadlineMillis:deadline] != nil; };
+        meta_executor_dispatch_action([self->_inputExecutor executorOnActionWorker], dispatch_block, (__bridge void *)activate, "application-activate");
+      }
+      state = [self->_applications finalizeLaunch:launchTask requestId:job.requestId];
+    }
+    return state;
+  }];
+  if (execution == nil) return nil;
+  NSDictionary *state = execution[@"value"];
+  NSDictionary *value = state[@"value"];
+  if (launch) {
+    if (value == nil) value = unknown_launch_value(@"Launch callback или его reconciliation ещё не завершены", nil);
+    if ([value[@"state"] isEqual:@"running"] && ![execution[@"finished"] boolValue]) value = unknown_launch_value(@"Launch dispatch завершён, но операция отменена или её budget истёк", value[@"application"]);
+    if ([state[@"effectiveTerminal"] boolValue] && [_applications releaseLaunch:launchTask]) {
+      [_asyncLock lock]; [_applicationTaskRefs removeObjectForKey:operation[@"operationId"]]; [_asyncLock unlock];
+    }
+  }
+  if (value == nil) return nil;
+  return @{@"value": value, @"status": [self supplementStatus:execution[@"status"]]};
+}
+
+- (NSDictionary *)startCapture:(NSDictionary *)request job:(MetaInputJob *)job {
+  NSDictionary *operation = job.operation;
+  NSDictionary *target = operation[@"target"], *ref = target[@"ref"];
+  NSString *targetRef = ref[@"windowRef"] ?: ref[@"displayRef"] ?: ref[@"layoutRef"];
+  if (![targetRef isKindOfClass:NSString.class]) return nil;
+  if ([self pendingOperationIds].count >= 128) return nil;
+  MetaMacOSBackend *windows = _windows;
+  NSDictionary *execution = [_inputExecutor executeExternal:request job:job targetRef:targetRef verify:^BOOL(NSString *value) {
+    const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(windows);
+    if (snapshot == NULL || ![value isEqual:targetRef] || ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
+        [operation[@"inventoryRevision"] unsignedLongLongValue] != snapshot->revision || !meta_capture_preflight_screen_recording()) return NO;
+    if (![target[@"kind"] isEqual:@"window"]) return [@[@"display", @"desktop-layout"] containsObject:target[@"kind"]];
+    for (size_t index = 0; index < snapshot->window_count; index += 1) {
+      MetaWindowRecord record = snapshot->windows[index];
+      if ([targetRef isEqual:@(record.window_ref)] && [ref[@"applicationRef"] isEqual:@(record.application_ref)]) {
+        return meta_macos_with_ax_target(windows, targetRef.UTF8String, snapshot->inventory_id, snapshot->revision,
+            snapshot->native_generation, verify_window_borrow, &record) == META_AX_BORROW_OK;
+      }
+    }
+    return NO;
+  } action:^NSDictionary * {
+    NSError *error = nil;
+    return [self->_captureCommands startRequest:request error:&error];
+  }];
+  if (execution[@"value"] != nil) {
+    [_asyncLock lock]; [_captureOperationIds addObject:operation[@"operationId"]]; [_asyncLock unlock];
+  }
+  if (execution[@"value"] != nil && ![execution[@"finished"] boolValue]) {
+    [self cancel:@{@"operationId": operation[@"operationId"], @"fence": operation[@"fence"]}];
+  }
+  return execution[@"value"];
+}
+
+- (NSDictionary *)cleanupCapture:(NSDictionary *)request emitBinary:(BOOL (^)(NSDictionary *, NSData *))emitBinary {
+  NSError *error = nil;
+  NSDictionary *result = [_captureCommands cleanupRequest:request emitBinary:emitBinary error:&error];
+  if ([request[@"control"][@"purpose"] isEqual:@"release"] && [result[@"ack"][@"cleanup"] isEqual:@"complete"]) {
+    [_asyncLock lock]; [_captureOperationIds removeObject:request[@"control"][@"operationId"]]; [_asyncLock unlock];
+  }
+  return result;
 }
 
 - (NSDictionary *)executeInput:(NSDictionary *)request job:(MetaInputJob *)job {
@@ -245,6 +768,19 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
   if (snapshot == NULL || ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
       [operation[@"inventoryRevision"] unsignedLongLongValue] != snapshot->revision) return nil;
   if (operation[@"observationRef"] != nil && [operation[@"observationRef"][@"displayLayoutRevision"] unsignedLongLongValue] != snapshot->display_layout_revision) return nil;
+  NSDictionary *scope = operation[@"target"], *ref = scope[@"ref"];
+  if ([@[@"window", @"surface"] containsObject:scope[@"kind"]]) {
+    BOOL surface = [scope[@"kind"] isEqual:@"surface"], matches = NO;
+    NSString *targetRef = surface ? ref[@"surfaceRef"] : ref[@"windowRef"];
+    for (size_t index = 0; index < snapshot->window_count; index += 1) {
+      const MetaWindowRecord *record = &snapshot->windows[index];
+      if ([targetRef isEqual:@(record->target_ref)] && [ref[@"applicationRef"] isEqual:@(record->application_ref)] &&
+          (surface ? record->surface_kind != META_SURFACE_WINDOW : record->surface_kind == META_SURFACE_WINDOW) &&
+          (!surface || [ref[@"ownerWindowRef"] isEqual:@(record->owner_window_ref)])) matches = YES;
+    }
+    if (!matches) return nil;
+  }
+  _inputLoginSession = operation[@"loginSessionId"];
   return [_inputExecutor execute:request job:job];
 }
 
@@ -328,9 +864,20 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
 
 - (BOOL)beginRotation {
   _sealed = YES;
-  BOOL inputReady = [_inputExecutor sealForRotation];
-  BOOL captureReady = meta_capture_router_seal_for_rotation(_captures);
-  return inputReady && captureReady;
+  [self stopObserver];
+  meta_broker_core_begin_rotation(_core);
+  for (NSString *operation in [self pendingOperationIds]) {
+    meta_capture_router_cancel_operation(_captures, operation.UTF8String);
+    meta_broker_core_release_drained_operation(_core, operation.UTF8String, false);
+    MetaCaptureOperationTaskRecord records[128] = {0};
+    size_t count = meta_capture_router_operation_tasks(_captures, operation.UTF8String, records, 128);
+    BOOL released = count <= 128;
+    for (size_t index = 0; index < MIN(count, 128); index += 1) if (!records[index].released) released = NO;
+    if (released) { [_asyncLock lock]; [_captureOperationIds removeObject:operation]; [_asyncLock unlock]; }
+  }
+  BOOL coreReady = meta_broker_core_begin_rotation(_core) == META_BROKER_ROTATION_READY;
+  BOOL applicationsReady = _applications == nil || [[_applications drainLaunchesUntil:_applicationBackend.monotonic_millis(_applicationBackend.context)][@"cleanup"] isEqual:@"complete"];
+  return coreReady && applicationsReady && _observerInstance == nil;
 }
 @end
 

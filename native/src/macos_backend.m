@@ -5,6 +5,7 @@
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
+#include <stdatomic.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
@@ -22,11 +23,57 @@ typedef struct {
 
 struct MetaMacOSBackend {
   MetaRegistry *registry;
+  NSCondition *topology_condition;
+  MetaDisplayTopologyObserverBackend topology_observer;
   AXHandle *handles;
   size_t handle_count;
   uint64_t next_handle_token;
   uint64_t refresh_number;
+  uint64_t display_topology_epoch;
+  atomic_size_t topology_callbacks_in_flight;
+  bool topology_observer_ready;
+  bool topology_stopping;
 };
+
+static void display_topology_changed(
+    CGDirectDisplayID display,
+    CGDisplayChangeSummaryFlags flags,
+    void *callback_context) {
+  (void)display;
+  (void)flags;
+  MetaMacOSBackend *backend = callback_context;
+  if (backend == NULL) return;
+  atomic_fetch_add(&backend->topology_callbacks_in_flight, 1);
+  [backend->topology_condition lock];
+  if (!backend->topology_stopping && backend->topology_observer_ready) {
+    if (backend->display_topology_epoch == UINT64_MAX) {
+      backend->topology_observer_ready = false;
+    } else {
+      backend->display_topology_epoch += 1;
+    }
+  }
+  atomic_fetch_sub(&backend->topology_callbacks_in_flight, 1);
+  [backend->topology_condition broadcast];
+  [backend->topology_condition unlock];
+}
+
+static bool start_system_topology_observer(
+    void *context,
+    MetaDisplayTopologyChanged changed,
+    void *callback_context) {
+  (void)context;
+  return CGDisplayRegisterReconfigurationCallback(changed, callback_context) ==
+         kCGErrorSuccess;
+}
+
+static bool stop_system_topology_observer(
+    void *context,
+    MetaDisplayTopologyChanged changed,
+    void *callback_context) {
+  (void)context;
+  return CGDisplayRemoveReconfigurationCallback(changed, callback_context) ==
+         kCGErrorSuccess;
+}
 
 static uint64_t monotonic_millis(void) {
   struct timespec value = {0};
@@ -466,7 +513,12 @@ static bool collect_displays(MetaDisplayInput **displays, size_t *count) {
   return true;
 }
 
-MetaMacOSBackend *meta_macos_backend_create(const char *native_generation) {
+MetaMacOSBackend *meta_macos_backend_create_with_topology_observer(
+    const char *native_generation,
+    MetaDisplayTopologyObserverBackend topology_observer) {
+  if (topology_observer.start == NULL || topology_observer.stop == NULL) {
+    return NULL;
+  }
   MetaMacOSBackend *backend = calloc(1, sizeof(*backend));
   if (backend == NULL) return NULL;
   backend->registry = meta_registry_create(native_generation);
@@ -474,18 +526,70 @@ MetaMacOSBackend *meta_macos_backend_create(const char *native_generation) {
     free(backend);
     return NULL;
   }
+  backend->topology_condition = [[NSCondition alloc] init];
+  backend->topology_observer = topology_observer;
+  backend->display_topology_epoch = 1;
+  atomic_init(&backend->topology_callbacks_in_flight, 0);
   backend->next_handle_token = 1;
+  backend->topology_observer_ready = true;
+  const bool observer_started = topology_observer.start(
+      topology_observer.context, display_topology_changed, backend);
+  if (!observer_started) {
+    backend->topology_observer_ready = false;
+    meta_registry_destroy(backend->registry);
+    backend->topology_condition = nil;
+    free(backend);
+    return NULL;
+  }
   return backend;
 }
 
-void meta_macos_backend_destroy(MetaMacOSBackend *backend) {
-  if (backend == NULL) return;
+MetaMacOSBackend *meta_macos_backend_create(const char *native_generation) {
+  return meta_macos_backend_create_with_topology_observer(
+      native_generation,
+      (MetaDisplayTopologyObserverBackend){
+          .start = start_system_topology_observer,
+          .stop = stop_system_topology_observer,
+      });
+}
+
+bool meta_macos_display_topology_epoch(const MetaMacOSBackend *backend,
+                                       uint64_t *epoch) {
+  if (backend == NULL || epoch == NULL) return false;
+  MetaMacOSBackend *mutable_backend = (MetaMacOSBackend *)backend;
+  [mutable_backend->topology_condition lock];
+  const bool ready = mutable_backend->topology_observer_ready &&
+                     !mutable_backend->topology_stopping &&
+                     mutable_backend->display_topology_epoch != 0;
+  if (ready) *epoch = mutable_backend->display_topology_epoch;
+  [mutable_backend->topology_condition unlock];
+  return ready;
+}
+
+bool meta_macos_backend_destroy(MetaMacOSBackend *backend) {
+  if (backend == NULL) return false;
+  [backend->topology_condition lock];
+  backend->topology_stopping = true;
+  backend->topology_observer_ready = false;
+  [backend->topology_condition unlock];
+  const bool observer_stopped = backend->topology_observer.stop(
+      backend->topology_observer.context, display_topology_changed, backend);
+  // При неудачном remove callback context остаётся целиком живым. Повторный
+  // destroy может завершить teardown после восстановления observer backend.
+  if (!observer_stopped) return false;
+  [backend->topology_condition lock];
+  while (atomic_load(&backend->topology_callbacks_in_flight) > 0) {
+    [backend->topology_condition wait];
+  }
+  [backend->topology_condition unlock];
   for (size_t index = 0; index < backend->handle_count; index += 1) {
     CFRelease(backend->handles[index].element);
   }
   free(backend->handles);
   meta_registry_destroy(backend->registry);
+  backend->topology_condition = nil;
   free(backend);
+  return true;
 }
 
 const MetaInventorySnapshot *meta_macos_backend_snapshot(
@@ -644,7 +748,15 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
       }
       CFRelease(cg_values);
     }
-    if (!collect_displays(&displays, &display_count)) complete = false;
+    uint64_t topology_epoch_before = 0;
+    uint64_t topology_epoch_after = 0;
+    const bool topology_epoch_ready = meta_macos_display_topology_epoch(
+        backend, &topology_epoch_before);
+    if (!topology_epoch_ready ||
+        !collect_displays(&displays, &display_count)) complete = false;
+    const bool topology_stable = topology_epoch_ready &&
+        meta_macos_display_topology_epoch(backend, &topology_epoch_after) &&
+        topology_epoch_before == topology_epoch_after;
 
     MetaInventoryInput input = {
         .applications = applications,
@@ -657,8 +769,10 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
         .display_count = display_count,
         .source_complete = complete,
         .captured_at_micros = unix_micros(),
+        .display_topology_epoch = topology_epoch_before,
     };
-    const bool refreshed = meta_registry_refresh(backend->registry, &input);
+    const bool refreshed = topology_stable &&
+        meta_registry_refresh(backend->registry, &input);
     if (refreshed) prune_handles(backend);
     free_application_inputs(applications, application_count);
     free_ax_window_inputs(ax_windows, ax_window_count);
