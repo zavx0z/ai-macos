@@ -102,6 +102,35 @@ class InjectedNativeTransport {
       })
       return
     }
+    if (frame.channel === "permissions") {
+      const { deadlineAt: _, ...identity } = frame.payload
+      this.push({
+        kind: "message",
+        frame: {
+          channel: "permissions",
+          payload: {
+            ...identity,
+            kind: "permissions-response",
+            nativeBuildId: "native-build-host-acceptance",
+            accessibility: true,
+            postEvents: true,
+            screenRecording: true,
+            inputMonitoring: true,
+            capabilities: {
+              scope: "adapter",
+              schemaVersion: "1",
+              producerRef: "native-host-acceptance",
+              capabilities: this.capabilities
+            },
+            codeIdentity: {
+              helperPath: "/tmp/native-host-acceptance",
+              cdhash: "a".repeat(40)
+            }
+          }
+        }
+      })
+      return
+    }
     if (frame.channel === "request" && frame.payload.method === "window.inventory") {
       this.push({
         kind: "message",

@@ -339,6 +339,7 @@ describe("C1 browser and device inventory surfaces", () => {
   test("browser list возвращает snapshots и exact instance-target relation", () => {
     expect(browserInstanceSnapshotSchema.parse({
       inventoryId: "browser-inventory:1",
+      inventoryRevision: 1,
       runtimeEpoch,
       loginSessionId,
       capturedAt: now,
@@ -348,6 +349,7 @@ describe("C1 browser and device inventory surfaces", () => {
     }).instances).toHaveLength(1)
     const targetSnapshot = {
       inventoryId: "target-inventory:1",
+      inventoryRevision: 2,
       runtimeEpoch,
       loginSessionId,
       capturedAt: now,
@@ -394,6 +396,7 @@ describe("C1 browser and device inventory surfaces", () => {
     }).state).toBe("unauthorized")
     const snapshot = {
       inventoryId: "android-targets:1",
+      inventoryRevision: 3,
       runtimeEpoch,
       loginSessionId,
       capturedAt: now,
