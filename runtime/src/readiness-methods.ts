@@ -49,10 +49,11 @@ export function registerReadinessMethods(
   registry: MethodRegistry,
   core: RuntimeCore,
   native: RuntimeInputReadinessNative,
-  options: { now?: () => Date } = {},
+  options: { now?: () => Date, visibility?: "public" | "internal" } = {},
 ): void {
   const now = options.now ?? (() => new Date())
   registry.register("input_readiness", {
+    visibility: options.visibility ?? "public",
     title: "Проверить готовность ввода",
     description: "Выполняет адресованный active-event probe на выбранном display и подтверждает возврат указателя.",
     input: inputReadinessMethodInputSchema,

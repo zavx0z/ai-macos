@@ -119,15 +119,19 @@ export const INPUT_METHOD_BUDGETS = Object.freeze({
 
 export type RegisterInputMethodsOptions = Readonly<{
   now?: () => Date
+  visibility?: "public" | "internal"
 }>
 
 export function registerInputMethods(
-  registry: MethodRegistry,
+  catalog: MethodRegistry,
   core: RuntimeCore,
   input: DesktopInputAdapter,
   options: RegisterInputMethodsOptions = {},
 ): void {
   const now = options.now ?? (() => new Date())
+  const registry: Pick<MethodRegistry, "register"> = {
+    register: (name, definition) => catalog.register(name, { ...definition, visibility: options.visibility ?? "public" }),
+  }
   registerAction(registry, core, input, {
     name: "mouse_move",
     title: "Навести указатель",
@@ -208,7 +212,7 @@ export function registerInputMethods(
 }
 
 function registerAction(
-  registry: MethodRegistry,
+  registry: Pick<MethodRegistry, "register">,
   core: RuntimeCore,
   input: DesktopInputAdapter,
   definition: {

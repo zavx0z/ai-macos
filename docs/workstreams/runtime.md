@@ -10,6 +10,30 @@ startup recovery receipts и управляемая rotation; pointer readiness 
 
 ## Последующий проверенный integration slice
 
+Базовая high-level Host composition подключена:
+
+- Один AgentTargetRegistry и один AgentViewGuard/AgentViewBindings используют
+  sole observer hub. Actual helper требует negotiated RecoveryDomain v1 и
+  ViewAdmission v1; Native authorizer связан с actual Core operation до первого
+  ввода. Пока observer/view gate не готовы, protected methods не доступны.
+- Public get_state/observe/show_window, status/cancel, check_input и guarded
+  keyboard/pointer/AX registrars подключены к host. Service input/AX methods
+  internal и не вызываются по угаданному имени снаружи. Специализированные
+  browser/Android, app/window lifecycle и capture сохраняются; list_displays
+  оставляет exact display discovery для специализированного capture.
+- press_shortcut исполняет bounded sequence одной Core operation через настоящий
+  Guard/Bindings в тесте; cross-operation continuation отсутствует. Новый вызов
+  требует fresh observe. Hover уже предоставляется pointer registrar.
+- Runtime view rejection после durable grant не превращается в quarantine,
+  если зарегистрированная Native delivery authority доказывает zero mutation
+  sends. Core возвращает failed/cancelled receipt с complete cleanup; attempted
+  delivery не получает этот shortcut. Проверен actual Core/Input/NativeAdapter.
+- Последний runtime + thin MCP run: **283 pass / 1319 assertions**. Diff-check
+  чистый. Latest typecheck остановился на двух ошибках в параллельном guard
+  display-target extension; предыдущий scoped typecheck проходил.
+- Native C atomic gate acceptance и coverage surfaces/display pointer остаются
+  отдельными final gates. Это не полный live acceptance и не installed cutover.
+
 Domain recovery и restart-liveness:
 
 - Новый DomainRecoveryStore использует весь persisted possible-hold set, а не

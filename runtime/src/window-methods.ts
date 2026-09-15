@@ -53,8 +53,9 @@ export type RuntimeWindowAdapter = WindowAdapter & {
 }
 
 /** Каталог использует точные refs из inventory; resources и fence выдаёт runtime. */
-export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCore, windows: RuntimeWindowAdapter): void {
+export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCore, windows: RuntimeWindowAdapter, options: { internalAgentMethods?: boolean } = {}): void {
   registry.register("list_windows", {
+    visibility: options.internalAgentMethods ? "internal" : "public",
     title: "Окна и приложения",
     description: "Полная инвентаризация AX и CG-only окон, включая скрытые и свёрнутые. app — точное системное имя; pid различает одноимённые процессы.",
     input: z.strictObject({ app: z.string().min(1).max(1024).optional(), pid: z.number().int().min(1).max(0x7fffffff).optional() }),
@@ -99,6 +100,7 @@ export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCor
   })
 
   registry.register("inspect_accessibility", {
+    visibility: options.internalAgentMethods ? "internal" : "public",
     title: "Дерево Accessibility",
     description: "Читает bounded AX snapshot точного окна или sheet. Element refs действуют только в возвращённом snapshot; неполный результат явно помечен.",
     input: z.strictObject({ ...snapshotInput, request: axInspectionRequestSchema }),
@@ -120,6 +122,7 @@ export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCor
   if (windows.press === undefined) return
   const press = windows.press.bind(windows)
   registry.register("press_accessibility", {
+    visibility: options.internalAgentMethods ? "internal" : "public",
     title: "Выполнить AXPress",
     description: "Выполняет semantic AXPress точного ElementRef из retained snapshot без координатного fallback.",
     input: axPressMethodInputSchema,

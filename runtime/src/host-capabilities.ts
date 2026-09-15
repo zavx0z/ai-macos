@@ -7,13 +7,13 @@ const implementedNative: readonly CapabilityId[] = [
   "desktop.applications", "desktop.windows.all", "desktop.displays", "input.clipboard",
   "desktop.window.identity", "desktop.window.show", "desktop.window.lifecycle", "desktop.ax",
   "desktop.application.lifecycle",
-  "capture.desktop", "capture.window", "capture.observation", "input.keyboard", "input.readiness",
+  "capture.desktop", "capture.window", "capture.observation", "input.keyboard", "input.pointer", "input.drag", "input.readiness",
 ]
 const browserCapabilities: readonly CapabilityId[] = [
   "browser.instances", "browser.targets", "browser.observe", "browser.readiness", "browser.resources", "android.chrome",
 ]
 
-export function composeHostCapabilities(producerRef: string, native?: CapabilitySet, unavailableReason = "Native backend unavailable", browser?: CapabilitySet, observerReady = false): CapabilitySet {
+export function composeHostCapabilities(producerRef: string, native?: CapabilitySet, unavailableReason = "Native backend unavailable", browser?: CapabilitySet, observerReady = false, viewReady = false): CapabilitySet {
   const statuses = new Map(CAPABILITY_IDS.map(id => [id, {
     id, state: "unavailable" as "ready" | "unavailable" | "degraded" | "unsupported" | "unknown",
     reason: "Capability implementation не подключена к host",
@@ -31,7 +31,11 @@ export function composeHostCapabilities(producerRef: string, native?: Capability
     statuses.set(capability.id, { ...capability, reason: capability.reason ?? "Configured browser implementation" })
   }
   if (native !== undefined && observerReady) statuses.set("runtime.user-interference", { id: "runtime.user-interference", state: "ready", reason: "Native observer PUSH continuity connected" })
-  if (!observerReady) statuses.set("input.keyboard", { id: "input.keyboard", state: "unavailable", reason: "Native observer continuity не подтверждена" })
+  if (!observerReady || !viewReady) {
+    for (const id of ["input.keyboard", "input.pointer", "input.drag"] as const) statuses.set(id, {
+      id, state: "unavailable", reason: "Native view admission и observer continuity не подтверждены",
+    })
+  }
   for (let pass = 0; pass < CAPABILITY_IDS.length; pass++) {
     for (const id of CAPABILITY_IDS) {
       const current = statuses.get(id)!

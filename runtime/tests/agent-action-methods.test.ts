@@ -21,6 +21,8 @@ import { AgentTargetRegistry } from "../src/agent-targets.ts"
 import { RuntimeCore } from "../src/core.ts"
 import { registerInputMethods } from "../src/input-methods.ts"
 import { MethodRegistry } from "../src/method-registry.ts"
+import { AgentViewGuard } from "../src/agent-view-guard.ts"
+import { AgentViewBindings } from "../src/agent-view-bindings.ts"
 
 const generation = { runtimeEpoch: "runtime:agent-actions", loginSessionId: "login:agent-actions" }
 const nativeGeneration = "native:agent-actions"
@@ -31,6 +33,24 @@ const windowRef = {
   windowRef: "window:agent-actions",
 }
 const target = { kind: "window" as const, ref: windowRef }
+
+test("press_shortcut отправляет всю sequence одной tracked Core operation через view binding", async () => {
+  const fixture = createFixture({ realView: true })
+  const client = fixture.core.openClient("principal:shortcut")
+  const targetId = await discoverTarget(fixture, client.session)
+  await fixture.views!.observe(client.session, targetId, target, async () => true, result => result)
+  try {
+  const result = await fixture.registry.dispatch(client.session, "press_shortcut", {
+    targetId, sequence: ["cmd+l", "escape"], delayMs: 20,
+  }, new AbortController().signal)
+  expect(fixture.input.actions).toEqual([{ kind: "shortcut", shortcuts: ["cmd+l", "escape"], delayMs: 20 }])
+  expect(result.data).toMatchObject({ targetId, outcome: { state: "completed", effect: "unverified" } })
+  expect(fixture.core.operationCount()).toBe(1)
+  await expect(fixture.registry.dispatch(client.session, "press_shortcut", { targetId, sequence: ["not-a-real-key"] }, new AbortController().signal)).rejects.toThrow()
+  expect(fixture.input.actions).toHaveLength(1)
+  await expect(fixture.registry.dispatch(client.session, "press_shortcut", { targetId, sequence: ["escape"] }, new AbortController().signal)).rejects.toThrow("fresh observe")
+  } finally { await fixture.guard?.close(); await fixture.core.closeClientLifecycle() }
+})
 
 test("type_text и press_key используют private request IDs и возвращают только короткий outcome", async () => {
   const fixture = createFixture()
@@ -130,6 +150,7 @@ function createFixture(options: {
   targetNow?: () => Date
   actionTtlMs?: number
   controlRetentionMs?: number
+  realView?: boolean
 } = {}) {
   const native = new FixtureNative()
   const core = new RuntimeCore({
@@ -165,10 +186,36 @@ function createFixture(options: {
     ...(options.actionTtlMs === undefined ? {} : { actionTtlMs: options.actionTtlMs }),
     ...(options.controlRetentionMs === undefined ? {} : { controlRetentionMs: options.controlRetentionMs }),
   })
-  const methods = new RuntimeAgentMethods(registry, core, targets)
+  const guard = options.realView ? new AgentViewGuard({ generation: { ...generation, nativeGeneration },
+    resolveTarget: (lineage, targetId) => targets.forLineage(lineage).resolveAction(targetId),
+    observer: {
+      observerInstanceRef: "observer:shortcut",
+      async coverage() {
+        const now = new Date().toISOString()
+        return { state: "ready", ...generation, nativeGeneration, coverageStartCursor: "cursor:shortcut", cursor: "cursor:shortcut",
+          nextSequence: 1, startedAt: now, coveredFrom: now, coveredThrough: now, heartbeatAt: now,
+          coveredKinds: ["input", "focus", "window-structure", "lifecycle"], droppedEvents: 0, gapDetected: false }
+      },
+      async *subscribe(options = {}) {
+        const signal = options.signal
+        if (!signal?.aborted) await new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve(), { once: true }))
+      },
+    },
+  }) : undefined
+  const views = guard === undefined ? undefined : new AgentViewBindings(core, guard)
+  if (views !== undefined) input.authorizeView = core.bindNativeViewAdmission(views.authorizeNative)
+  const methods = new RuntimeAgentMethods(registry, core, targets, { views: views ?? {
+    observe: (_session, _targetId, _target, capture) => capture(),
+    run: async (session, _targetId, requestId, mode, action) => {
+      await core.clients.assertActive(session, new Date())
+      expect(requestId).toMatch(/^agent-request:/)
+      expect(mode).toBe("keyboard")
+      return action()
+    },
+  } })
   methods.register()
   registerAgentActionMethods(registry, methods)
-  return { core, input, native, readinessCalls: () => readinessCalls, registry }
+  return { core, input, native, guard, views, readinessCalls: () => readinessCalls, registry }
 }
 
 async function discoverTarget(fixture: ReturnType<typeof createFixture>, session: ReturnType<RuntimeCore["openClient"]>["session"]) {
@@ -177,6 +224,7 @@ async function discoverTarget(fixture: ReturnType<typeof createFixture>, session
 }
 
 class FixtureInput {
+  authorizeView?: ReturnType<RuntimeCore["bindNativeViewAdmission"]>
   readonly actions: InputAction[] = []
   cancelMode = false
   #started!: () => void
@@ -188,6 +236,7 @@ class FixtureInput {
     context: RuntimeOperationContext<NativeExecutionContext>,
     action: InputAction,
   ): Promise<AdapterResult<InputActionResult>> {
+    await this.authorizeView?.(context.wire, { method: "input.execute", actionKind: action.kind })
     this.actions.push(structuredClone(action))
     this.#started()
     if (this.cancelMode) {

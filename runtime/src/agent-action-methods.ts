@@ -5,8 +5,8 @@ import {
   z,
   type RuntimeClientSession,
 } from "@meta/shared/contracts"
-import { keyActionSchema, textActionSchema } from "@meta/input/actions"
-import { planKey } from "@meta/input/action-plan"
+import { keyActionSchema, textActionSchema, shortcutActionSchema } from "@meta/input/actions"
+import { planKey, planShortcuts } from "@meta/input/action-plan"
 import { AgentOperations, type AgentOperationOutcome } from "./agent-operations.ts"
 import { agentTargetIdSchema, type RuntimeAgentMethods } from "./agent-methods.ts"
 import type { InputMethodOutput } from "./input-methods.ts"
@@ -124,6 +124,21 @@ export class RuntimeAgentActionMethods {
       ),
     })
 
+    this.registry.register("press_shortcut", {
+      title: "Выполнить последовательность клавиш",
+      description: "Выполняет bounded shortcut sequence одной Core operation по fresh view; после неё требуется новый observe.",
+      input: z.strictObject({ targetId: agentTargetIdSchema, sequence: shortcutActionSchema.shape.shortcuts,
+        delayMs: shortcutActionSchema.shape.delayMs }).superRefine((input, context) => {
+        try { planShortcuts({ shortcuts: input.sequence, delayMs: input.delayMs }) }
+        catch (error) { context.addIssue({ code: "custom", path: ["sequence"], message: error instanceof Error ? error.message : "Invalid shortcut sequence" }) }
+      }),
+      output: actionResultSchema, readOnly: false, destructive: true, timeoutMs: 10_000,
+      maxRequestBytes: 64 * 1024, maxResponseBytes: 4096,
+      requiredCapabilities: ["desktop.windows.all", "input.keyboard", "input.readiness", "runtime.operations"],
+      execute: (context, input) => this.#keyboardAction(context.session, input.targetId, "press-shortcut",
+        { kind: "shortcut", shortcuts: input.sequence, delayMs: input.delayMs }, "keyboard_shortcut", context.signal),
+    })
+
     this.registry.register("get_target_status", {
       title: "Состояние действий цели",
       description: "Возвращает bounded authoritative outcome действий текущей client lineage.",
@@ -161,9 +176,9 @@ export class RuntimeAgentActionMethods {
   async #keyboardAction(
     session: RuntimeClientSession,
     targetId: string,
-    actionName: "type-text" | "press-key",
-    action: { kind: "text", text: string } | { kind: "key", key: string, modifiers: string[] },
-    method: "keyboard_type" | "keyboard_key",
+    actionName: "type-text" | "press-key" | "press-shortcut",
+    action: { kind: "text", text: string } | { kind: "key", key: string, modifiers: string[] } | { kind: "shortcut", shortcuts: string[], delayMs: number },
+    method: "keyboard_type" | "keyboard_key" | "keyboard_shortcut",
     signal: AbortSignal,
   ) {
     return actionResultSchema.parse(await this.operations.runTrackedMutation(
@@ -177,7 +192,7 @@ export class RuntimeAgentActionMethods {
           context.binding,
           context.signal,
         )
-        const response = await this.#dispatch(session, method, {
+        const response = await this.methods.withViewAction(session, targetId, context.clientRequestId, "keyboard", () => this.#dispatch(session, method, {
           clientRequestId: context.clientRequestId,
           precondition: {
             target: binding.target,
@@ -185,7 +200,7 @@ export class RuntimeAgentActionMethods {
             inventoryRevision: binding.inventoryRevision,
           },
           action,
-        }, context.signal)
+        }, context.signal))
         const output = response.data as InputMethodOutput
         if (
           output.operation.context.clientRequestId !== context.clientRequestId

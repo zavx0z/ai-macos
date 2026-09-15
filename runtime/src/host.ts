@@ -5,6 +5,7 @@ import {
   capabilitySetSchema, freezeAdapterHostContext,
   nativeHandshakeCompatibility, nativeHandshakeRequestSchema, operationRecordSchema, opaqueIdSchema, z,
   nativeAuditSessionSchema, structurallyEqual, parseWireJson,
+  desktopInventorySnapshotSchema,
   type NativeHandshakeResponse,
 } from "@meta/shared/contracts"
 import { NativeBrokerAdapter, NativeProcessTransport, type NativeTransport } from "@meta/native/adapter"
@@ -44,6 +45,13 @@ import { startRuntimeRotation } from "./rotation.ts"
 import { StartupHeldRecovery } from "./startup-held-recovery.ts"
 import { FileLifetimeStore } from "./lifetime-state.ts"
 import { createNativeObserverBinding, type NativeObserverBinding } from "./native-observer-binding.ts"
+import { AgentTargetRegistry } from "./agent-targets.ts"
+import { AgentViewGuard } from "./agent-view-guard.ts"
+import { AgentViewBindings } from "./agent-view-bindings.ts"
+import { registerAgentMethods } from "./agent-methods.ts"
+import { registerAgentActionMethods } from "./agent-action-methods.ts"
+import { registerAgentPointerMethods } from "./agent-pointer-methods.ts"
+import { registerAgentAxMethods } from "./agent-ax-methods.ts"
 
 export type RuntimeHostOptions = {
   socketPath: string
@@ -102,6 +110,9 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   let clientSweep: ReturnType<typeof setInterval> | undefined
   let browserHost: ReturnType<typeof createBrowserHostComposition> | undefined
   let observerBinding: NativeObserverBinding | undefined
+  let viewGuard: AgentViewGuard | undefined
+  let viewBindings: AgentViewBindings | undefined
+  let viewReady = false
   let observerState: "unavailable" | "preparing" | "ready" = "unavailable"
   let observerReason = "Observer не подготовлен"
   let backendPreparation: Promise<void> | undefined
@@ -150,6 +161,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
         ...generation, runtimeBuildId: options.runtimeBuildId, expectedNativeBuildId: options.expectedNativeBuildId,
         capabilitySchemaVersion: "1",
         ...(options.helperPath === undefined ? {} : { requiredRecoveryDomainVersion: "1" }),
+        ...(options.helperPath === undefined ? {} : { requiredViewAdmissionVersion: "1" }),
       })
       handshake = await native.handshake(request, AbortSignal.timeout(5000))
       const mismatch = nativeHandshakeCompatibility(request, handshake)
@@ -200,13 +212,33 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     clipboard = new RuntimeClipboardHandler(runtime, native)
   }
   const core = runtime
+  const agentTargets = new AgentTargetRegistry({ generation })
+  if (native !== undefined && handshake?.viewAdmissionVersion === "1" && handshake.recoveryDomainVersion === "1") {
+    const authorize = core.bindNativeViewAdmission(async context => {
+      if (!viewReady || viewBindings === undefined) throw new Error("Runtime view admission ещё не готов")
+      return viewBindings.authorizeNative(context)
+    })
+    native.configureViewAdmissionAuthorizer(async (wire, operation, control) => {
+      control.signal.throwIfAborted()
+      return authorize(wire, operation)
+    })
+  }
   browserHost = createBrowserHostComposition(core, options.browser ?? {})
   await core.browserLifetime.restorePersisted()
   const refreshCapabilities = () => core.updateCapabilities(composeHostCapabilities("host:runtime",
     native === undefined || nativeError !== undefined ? undefined : handshake?.capabilities,
-    nativeError, browserHost?.capabilitySet, observerState === "ready"))
+    nativeError, browserHost?.capabilitySet, observerState === "ready", viewReady))
   refreshCapabilities()
   const catalog = new MethodRegistry(core)
+  const agentMethods = registerAgentMethods(catalog, core, agentTargets, { views: {
+    observe: (session, targetId, target, capture, complete) => viewBindings === undefined
+      ? capture() : viewBindings.observe(session, targetId, target, capture, complete),
+    run: (session, targetId, requestId, mode, action) => {
+      if (!viewReady || viewBindings === undefined) throw new Error("Protected action требует готовый Native view admission")
+      return viewBindings.run(session, targetId, requestId, mode, action)
+    },
+  } })
+  registerAgentActionMethods(catalog, agentMethods)
   const recoverStartup = async (operationId?: string, signal?: AbortSignal) => {
     signal?.throwIfAborted()
     const result = await startupRecovery.recover(operationId, signal)
@@ -232,9 +264,9 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       registerApplicationMethods(catalog, core, new NativeApplicationAdapter({ native, services: core.services }))
     }
     const adapterHost = freezeAdapterHostContext({ generation, runtimeBuildId: options.runtimeBuildId, capabilities: handshake.capabilities })
-    registerInputMethods(catalog, core, new DesktopInputAdapter(adapterHost, core.services, native))
+    registerInputMethods(catalog, core, new DesktopInputAdapter(adapterHost, core.services, native), { visibility: "internal" })
     if (handshake.capabilities.capabilities.some(capability => capability.id === "input.readiness" && capability.state === "ready")) {
-      registerReadinessMethods(catalog, core, native)
+      registerReadinessMethods(catalog, core, native, { visibility: "internal" })
     }
     registerCaptureMethods(catalog, core, new RuntimeScreenAdapter(adapterHost, core.services,
       new ProtocolNativeCaptureDriver(new NativeCaptureClient(native, core.continuations))))
@@ -245,7 +277,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       admissionSealed: core.admissionSealed, recoveryOperations: core.recoveryEvidence().length,
       recoveryReasons: [...core.startupRecoveryReasons()], clients: core.clientLifecycleStatus(),
       rotation: rotation?.status() ?? { state: "running" as const } },
-    observer: { state: observerState, reason: observerReason },
+    observer: { state: observerState, reason: observerReason, viewReady },
     native: native === undefined || handshake === undefined
       ? { state: "unavailable" as const, reason: nativeError ?? "native helper not configured" }
       : nativeError !== undefined ? { state: "unavailable" as const, reason: nativeError }
@@ -254,7 +286,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     activeOperations: core.activeOperationCount(), quarantinedResources: core.resources.quarantinedCount(),
   })
   const doctorSchema = z.strictObject({
-    observer: z.strictObject({ state: z.enum(["unavailable", "preparing", "ready"]), reason: z.string() }),
+    observer: z.strictObject({ state: z.enum(["unavailable", "preparing", "ready"]), reason: z.string(), viewReady: z.boolean() }),
     machine: z.strictObject({ hostname: z.string(), matchesExpected: z.boolean() }),
     runtime: z.strictObject({ buildId: z.string(), runtimeEpoch: z.string(), loginSessionId: z.string(), draining: z.boolean(),
       admissionSealed: z.boolean(), recoveryOperations: z.number().int().min(0), recoveryReasons: z.array(z.string()),
@@ -309,6 +341,18 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   if (native !== undefined) {
     const windows = new NativeWindowAdapter({ native, services: core.services })
     windowAdapter = windows
+    const { applications: _applicationShape, windows: _windowShape, ...displayShape } = desktopInventorySnapshotSchema.shape
+    catalog.register("list_displays", {
+      title: "Дисплеи и topology",
+      description: "Возвращает exact display refs и inventory для специализированного desktop capture; ввод не выполняется.",
+      input: z.strictObject({}), output: z.strictObject(displayShape),
+      readOnly: true, timeoutMs: 6000, requiredCapabilities: ["desktop.displays"],
+      async execute(context) {
+        const snapshot = desktopInventorySnapshotSchema.parse(await windows.inventory({ signal: context.signal, checkpoint() { context.signal.throwIfAborted() } }))
+        const { applications: _applications, windows: _windows, ...displaySnapshot } = snapshot
+        return displaySnapshot
+      },
+    })
     if (handshake?.capabilities.capabilities.some(capability => capability.id === "input.readiness" && capability.state === "ready")) {
       registerCheckInputMethod(catalog, { native, windows })
     }
@@ -323,7 +367,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
           return inventory
         } catch (error) { revokeNative("Native inventory unavailable"); throw error }
       },
-    })
+    }, { internalAgentMethods: true })
   }
   if (clipboard !== undefined && handshake?.capabilities.capabilities.some(capability => capability.id === "input.clipboard" && capability.state === "ready")) {
     const handler = clipboard
@@ -352,6 +396,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     await core.drainClientGrace()
     await core.browserLifetime.shutdownLineage(undefined, signal)
     await backendPreparation
+    await viewGuard?.close()
+    viewReady = false
     await observerBinding?.close()
     if (core.recoveryEvidence().length > 0 || core.startupRecoveryReasons().length > 0) throw new Error("Startup recovery не завершена")
     if (native === undefined || handshake === undefined) return { cleanup: "complete" as const }
@@ -418,6 +464,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       if (clientSweep !== undefined) clearInterval(clientSweep)
       await core.closeClientLifecycle()
       await backendPreparation
+      await viewGuard?.close()
+      viewReady = false
       await observerBinding?.close()
       await heartbeat?.stop()
       await uds.stop()
@@ -428,6 +476,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   return {
     core, catalog, doctor, recoverStartup, prepareRecoveryRestart,
+    async ready() { await backendPreparation },
     async start() {
       try {
         if (native !== undefined && handshake !== undefined) heartbeat = startRuntimeHeartbeat({ native,
@@ -448,6 +497,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
               signal.throwIfAborted()
               observerBinding = await createNativeObserverBinding({ native: source, signal: preparationAbort.signal, onGap(error) {
                 observerState = "unavailable"
+                viewReady = false
+                void viewGuard?.close()
                 observerReason = error.message
                 refreshCapabilities()
               } })
@@ -458,6 +509,16 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
               const coverage = await observerBinding.coverage()
               observerState = coverage.state === "ready" ? "ready" : "unavailable"
               observerReason = coverage.reason ?? "Native PUSH coverage подтверждено; session/SecureInput проверяются отдельно"
+              if (observerState === "ready" && handshake?.viewAdmissionVersion === "1" && handshake.recoveryDomainVersion === "1") {
+                viewGuard = new AgentViewGuard({ generation: { ...generation, nativeGeneration: handshake.nativeGeneration }, observer: observerBinding.hub,
+                  resolveTarget: (lineage, targetId) => agentTargets.forLineage(lineage).resolveAction(targetId) })
+                await viewGuard.start()
+                preparationAbort.signal.throwIfAborted()
+                viewBindings = new AgentViewBindings(core, viewGuard)
+                viewReady = true
+                const pointer = registerAgentPointerMethods(catalog, agentMethods)
+                registerAgentAxMethods(catalog, core, agentTargets, agentMethods, agentMethods.operations, pointer)
+              }
             } catch (error) {
               observerState = "unavailable"
               observerReason = error instanceof Error ? error.message : "Observer preparation failed"

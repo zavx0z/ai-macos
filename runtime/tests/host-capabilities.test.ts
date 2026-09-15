@@ -23,7 +23,8 @@ test("полный Native handshake не объявляет отсутствую
     capabilities: CAPABILITY_IDS.map(id => ({ id, state: "ready" as const })),
   }
   const preparing = composeHostCapabilities("host", native)
-  const ready = composeHostCapabilities("host", native, undefined, undefined, true)
+  const ready = composeHostCapabilities("host", native, undefined, undefined, true, true)
+  expect(capabilityIsReady(composeHostCapabilities("host", native, undefined, undefined, true), "input.keyboard")).toBe(false)
   expect(capabilityIsReady(preparing, "input.keyboard")).toBe(false)
   expect(capabilityIsReady(preparing, "runtime.user-interference")).toBe(false)
   expect(capabilityIsReady(ready, "input.keyboard")).toBe(true)
@@ -31,7 +32,10 @@ test("полный Native handshake не объявляет отсутствую
   for (const id of ["capture.desktop", "capture.window", "capture.observation", "desktop.application.lifecycle", "input.readiness"] as const) {
     expect(capabilityIsReady(ready, id)).toBe(true)
   }
-  for (const id of ["input.interaction", "input.pointer", "input.drag"] as const) {
+  for (const id of ["input.pointer", "input.drag"] as const) {
+    expect(capabilityIsReady(ready, id)).toBe(true)
+  }
+  for (const id of ["input.interaction"] as const) {
     expect(capabilityIsReady(ready, id)).toBe(false)
   }
 })

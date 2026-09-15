@@ -10,6 +10,7 @@ import {
   canonicalRecoveryJson,
   type NativeRecoveryDescriptor,
   type NativeRecoveryGrant,
+  type ContractError,
   clipboardExecutionContextSchema,
   deviceExecutionContextSchema,
   nativeExecutionContextSchema,
@@ -78,6 +79,7 @@ type JournalEntry = {
   durableRevision: number
   durableTail: Promise<void>
   recoveryPending?: Promise<NativeRecoveryGrant>
+  viewFailure?: ContractError
 }
 
 export interface BackendCompletionVerifier {
@@ -369,9 +371,18 @@ export class RuntimeCore implements RuntimeAdapter {
       await checkpoint()
       const context: RuntimeViewAdmissionContext = Object.freeze({ wire: structuredClone(wire), session: structuredClone(entry!.session!),
         lineageId: entry!.lineageId, operation: Object.freeze(operation), control: Object.freeze({ signal: entry!.controller.signal, checkpoint }) })
-      const proof = await provider(context)
-      await checkpoint()
-      return proof
+      try {
+        const proof = await provider(context)
+        await checkpoint()
+        return proof
+      } catch (error) {
+        entry!.viewFailure = error instanceof RuntimeContractError ? error.contract : {
+          code: entry!.controller.signal.aborted ? "cancelled" : "observation-stale",
+          message: error instanceof Error ? error.message.slice(0, 2048) : "View admission не подтверждён",
+          stage: "view-admission", retryable: false, replayAllowed: false, recoveryAction: "capture-new-observation",
+        }
+        throw error
+      }
     }
   }
 
@@ -1007,9 +1018,18 @@ export class RuntimeCore implements RuntimeAdapter {
       if (context.wire.kind === "native") this.#nativeDelivery?.register(context.wire)
       const adapterPromise = Promise.resolve().then(() => execute(context, request))
       const rawResult = await Promise.race([adapterPromise, abortGuard.promise])
-      const parsedResult = parseWireValue(adapterResultSchema(z.unknown()), rawResult, {
+      let parsedResult = parseWireValue(adapterResultSchema(z.unknown()), rawResult, {
         maxDepth: 32, maxBytes: context.wire.kind === "clipboard" ? 8 * 1024 * 1024 : 1024 * 1024,
       }) as AdapterResult<TResult>
+      if (!parsedResult.ok && parsedResult.nativeStatus === undefined && entry.viewFailure !== undefined
+        && context.wire.kind === "native" && this.#nativeDelivery !== undefined) {
+        try {
+          this.#nativeDelivery.assertNeverAttempted(context.wire)
+          parsedResult = { ok: false, error: entry.viewFailure, outcome: operationOutcomeSchema.parse({
+            ...entry.record.outcome, dispatch: "none", dispatchAttempts: 0, cleanup: releasedCleanup(handles), restoration: "not-applicable",
+          }) }
+        } catch { /* Неопределённая delivery сохраняет исходный unknown outcome. */ }
+      }
       const verifiedNativeStatus = lifecycle === undefined
         ? await Promise.race([this.#verifyBackendCompletion(context, parsedResult), abortGuard.promise])
         : undefined
@@ -1054,8 +1074,17 @@ export class RuntimeCore implements RuntimeAdapter {
       await entry.recoveryPending?.catch(() => undefined)
       if (entry.result !== undefined) return entry.result as RuntimeExecution<TResult>
       lifecycle?.failed(entry.adapterStarted)
-      const contractError = contractErrorFrom(error, "runtime-execute")
-      if (!entry.adapterStarted) {
+      let contractError = contractErrorFrom(error, "runtime-execute")
+      let rejectedViewBeforeSend = false
+      if (entry.viewFailure !== undefined && context.wire.kind === "native" && this.#nativeDelivery !== undefined) {
+        try {
+          this.#nativeDelivery.assertNeverAttempted(context.wire)
+          rejectedViewBeforeSend = true
+          contractError = entry.viewFailure
+        }
+        catch { /* Attempted Native mutation не получает predispatch release. */ }
+      }
+      if (!entry.adapterStarted || rejectedViewBeforeSend) {
         const cleanup = releasedCleanup(handles)
         const outcome = operationOutcomeSchema.parse({
           ...entry.record.outcome,
@@ -1065,7 +1094,8 @@ export class RuntimeCore implements RuntimeAdapter {
         })
         const stagedRecord = operationRecordSchema.parse({
           ...entry.record,
-          state: entry.record.state === "registered" ? "rejected" : "failed",
+          state: rejectedViewBeforeSend && contractError.code === "cancelled" ? "cancelled"
+            : entry.record.state === "registered" ? "rejected" : "failed",
           outcome,
           error: contractError,
           updatedAt: this.#clock.now().toISOString(),
