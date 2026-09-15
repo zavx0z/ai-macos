@@ -277,7 +277,6 @@ static BOOL same_logical_frame(NSDictionary *value,
       !integer(observation_ref[@"inventoryRevision"],
                9007199254740991ULL, &observation_revision) ||
       operation_revision != snapshot->revision ||
-      observation_revision != snapshot->revision ||
       ![operation[@"inventoryId"] isEqual:@(snapshot->inventory_id)] ||
       ![request[@"nativeGeneration"]
           isEqual:@(snapshot->native_generation)]) {
@@ -296,14 +295,13 @@ static BOOL same_logical_frame(NSDictionary *value,
       ![geometry[@"frameRef"] isEqual:frame_ref] ||
       ![geometry[@"observationId"]
           isEqual:observation_ref[@"observationId"]] ||
-      ![geometry[@"inventoryId"] isEqual:operation[@"inventoryId"]] ||
       !integer(geometry[@"inventoryRevision"], 9007199254740991ULL,
                &geometry_revision) ||
       !integer(geometry[@"displayLayoutRevision"], 9007199254740991ULL,
                &geometry_layout_revision) ||
       !integer(observation_ref[@"displayLayoutRevision"],
                9007199254740991ULL, &observation_layout_revision) ||
-      geometry_revision != snapshot->revision ||
+      geometry_revision != observation_revision ||
       geometry_layout_revision != snapshot->display_layout_revision ||
       observation_layout_revision != snapshot->display_layout_revision ||
       ![observation_ref[@"proofRef"] isKindOfClass:NSString.class] ||

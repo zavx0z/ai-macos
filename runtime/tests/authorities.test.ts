@@ -323,13 +323,15 @@ test("FrameStore принимает только runtime-preissued frameRef и s
   })
   runtime.evidence.registerSourceResponse(binding, "native-response:frame", new TextEncoder().encode(JSON.stringify(frameReport)))
   const receipt = await runtime.evidence.bind(binding).publish(frameReport)
-  expect((await runtime.evidence.issueFrameFreshness({
+  const frameProof = await runtime.evidence.issueFrameFreshness({
     receipt,
     observationId: publication.observationId,
     frameRef: publication.frameRef,
     captureTarget: displayTarget,
     frameSha256: base.expectedSha256,
-  })).kind).toBe("frame-freshness")
+  })
+  expect(frameProof.kind).toBe("frame-freshness")
+  expect(Date.parse(frameProof.expiresAt) - Date.parse(frameProof.issuedAt)).toBe(120_000)
   await expect(runtime.evidence.issueFrameFreshness({
     receipt,
     observationId: publication.observationId,

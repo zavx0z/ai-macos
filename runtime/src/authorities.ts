@@ -1,4 +1,5 @@
 import {
+  MAX_OBSERVATION_POINT_CAPTURE_AGE_MS,
   authorizeObservationPoint,
   evidenceReportMatchesReceipt,
   interactionPointProofSchema,
@@ -412,7 +413,7 @@ export class NativeEvidenceAuthority implements EvidenceIssuer {
       subject: request.captureTarget,
       inventoryRevision: request.receipt.inventoryRevision,
       displayLayoutRevision: request.receipt.displayLayoutRevision,
-      ttlMs: 10_000,
+      ttlMs: MAX_OBSERVATION_POINT_CAPTURE_AGE_MS,
     })
   }
 
@@ -752,7 +753,7 @@ export class ObservationRegistry implements ObservationResolver {
       inventoryRevision: request.operation.inventoryRevision,
       displayLayoutRevision: request.observationRef.displayLayoutRevision,
       deadlineAt: request.operation.deadlineAt,
-      maxFrameAgeMs: 5_000,
+      maxFrameAgeMs: MAX_OBSERVATION_POINT_CAPTURE_AGE_MS,
       now: this.#clock.now(),
     })
   }

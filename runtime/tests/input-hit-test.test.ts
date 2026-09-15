@@ -70,7 +70,7 @@ const observation = observationSchema.parse({
   caption: "Ожидаю увидеть окно и Dock на основном дисплее",
   backend: { name: "fake-capture", buildId: "capture-build:hit" },
   capturedAt: "2026-09-15T10:00:00.000Z",
-  expiresAt: "2026-09-15T10:01:00.000Z",
+  expiresAt: "2026-09-15T10:03:00.000Z",
   inventoryRevision: 4,
   displayLayoutRevision: 3,
   source: "display-composite",
@@ -123,7 +123,7 @@ function operation(target: HitTarget): NativeExecutionContext {
     principalId: "principal:hit",
     ...generation,
     inventoryId: "inventory:hit",
-    inventoryRevision: 4,
+    inventoryRevision: 5,
     observationRef: {
       observationId: observation.observationId,
       inventoryRevision: 4,
@@ -159,7 +159,7 @@ function confirmed(
     inventoryId: nativeRequest.operation.inventoryId,
     inventoryRevision: nativeRequest.operation.inventoryRevision,
     displayLayoutRevision: nativeRequest.payload.observationRef.displayLayoutRevision,
-    observedAt: "2026-09-15T10:00:02.000Z",
+    observedAt: "2026-09-15T10:00:20.000Z",
     observationId: nativeRequest.payload.observationRef.observationId,
     frameRef: nativeRequest.payload.frameRef,
     regionIndex: nativeRequest.payload.expectedRegionIndex,
@@ -197,12 +197,15 @@ function confirmed(
 
 function fixture(options: {
   result?: (request: NativeHitTestRequest) => NativeHitTestResult
+  now?: string
 } = {}) {
+  const clock = { now: () => new Date(options.now ?? "2026-09-15T10:00:20.000Z") }
   const core = new RuntimeCore({
     generation,
     runtimeBuildId: "runtime-build:hit",
     nativeGeneration,
     nativeSourceIdentity: binding,
+    clock,
   })
   core.evidence.registerSourceExtractor(binding, extractNativeEvidenceReports)
   core.observations.register(observation)
@@ -237,7 +240,7 @@ function fixture(options: {
   let id = 0
   const provider = new RuntimeNativePointHitProvider({
     native,
-    now: { now: () => new Date("2026-09-15T10:00:03.000Z") },
+    now: clock,
     ids: { next: prefix => `${prefix}:${++id}` },
   })
   const checkpoints: string[] = []
@@ -254,7 +257,7 @@ function fixture(options: {
 }
 
 describe("C3 runtime native point-hit provider", () => {
-  test("window point публикует raw-backed receipt, а proof выпускает ObservationRegistry owner", async () => {
+  test("20-second capture provenance получает fresh point proof на новой inventory", async () => {
     const value = fixture()
     const requestValue = request(windowTarget)
     const receipt = await value.provider.provide(requestValue, observation, value.control)
@@ -271,10 +274,12 @@ describe("C3 runtime native point-hit provider", () => {
       factKind: "point-hit",
       sourceResponseRef: "source-response:window",
       inventoryId: "inventory:hit",
-      inventoryRevision: 4,
+      inventoryRevision: 5,
       nativeGeneration,
     })
     expect(value.core.proofs.hasIssued(interactionProof.proof)).toBe(true)
+    expect(Date.parse(interactionProof.proof.expiresAt) - Date.parse(interactionProof.proof.issuedAt))
+      .toBe(5_000)
     expect(value.checkpoints).toEqual([
       "point-hit-prepare",
       "point-hit-response",
@@ -289,6 +294,19 @@ describe("C3 runtime native point-hit provider", () => {
 
     expect(receipt).toMatchObject({ factKind: "point-hit", sourceResponseRef: "source-response:display" })
     expect(value.calls()).toBe(1)
+  })
+
+  test("capture provenance старше 120 секунд не доходит до native", async () => {
+    const value = fixture({ now: "2026-09-15T10:02:00.001Z" })
+    const requestValue = request(windowTarget)
+    requestValue.operation = {
+      ...requestValue.operation,
+      deadlineAt: "2026-09-15T10:02:30.000Z",
+    }
+
+    await expect(value.provider.provide(requestValue, observation, value.control))
+      .rejects.toThrow("capture provenance age")
+    expect(value.calls()).toBe(0)
   })
 
   test("failure не публикует point proof", async () => {

@@ -1,4 +1,5 @@
 import {
+  MAX_OBSERVATION_POINT_CAPTURE_AGE_MS,
   NATIVE_PROTOCOL_VERSION,
   mapObservationPointGeometry,
   nativeEvidenceReportSchema,
@@ -142,6 +143,10 @@ export class RuntimeNativePointHitProvider {
     const mapped = mapObservationPointGeometry(observation, request.imagePoint)
     if (mapped.space.kind !== "macos-screen") {
       throw new Error("Stored point не принадлежит macos-screen region")
+    }
+    if (Date.parse(mapped.frameTimestamp)
+      < this.#clock.now().getTime() - MAX_OBSERVATION_POINT_CAPTURE_AGE_MS) {
+      throw new Error("Observation region старше разрешённого capture provenance age")
     }
     return mapped
   }

@@ -82,7 +82,7 @@ static NSDictionary *geometry(NSDictionary *capture_target,
     @"captureTarget" : capture_target,
     @"capturedAt" : @"2020-09-15T09:00:00.000Z",
     @"expiresAt" : expiry,
-    @"inventoryId" : @"inventory-1",
+    @"inventoryId" : @"inventory-capture-1",
     @"inventoryRevision" : @1,
     @"displayLayoutRevision" : @1,
     @"imageSize" : @{@"widthPx" : @100, @"heightPx" : @100},
@@ -132,8 +132,8 @@ static NSDictionary *request(NSDictionary *target) {
     @"loginSessionId" : @"login-1",
     @"nativeGeneration" : @"native-1",
     @"deadlineAt" : @"2099-09-15T10:00:00.000Z",
-    @"inventoryId" : @"inventory-1",
-    @"inventoryRevision" : @1,
+    @"inventoryId" : @"inventory-current-2",
+    @"inventoryRevision" : @2,
     @"observationRef" : observation,
     @"fence" : @{
       @"runtimeEpoch" : @"runtime-1",
@@ -203,7 +203,7 @@ static void prepare_fixture(Fixture *fixture, NSDictionary *capture_target,
   snprintf(fixture->display.display_ref, sizeof(fixture->display.display_ref),
            "%s", "display-1");
   fixture->snapshot = (MetaInventorySnapshot){
-      .revision = 1,
+      .revision = 2,
       .display_layout_revision = 1,
       .captured_at_micros = 1,
       .complete = true,
@@ -215,7 +215,7 @@ static void prepare_fixture(Fixture *fixture, NSDictionary *capture_target,
       .display_count = 1,
   };
   snprintf(fixture->snapshot.inventory_id,
-           sizeof(fixture->snapshot.inventory_id), "%s", "inventory-1");
+           sizeof(fixture->snapshot.inventory_id), "%s", "inventory-current-2");
   snprintf(fixture->snapshot.native_generation,
            sizeof(fixture->snapshot.native_generation), "%s", "native-1");
   snprintf(fixture->snapshot.layout_ref, sizeof(fixture->snapshot.layout_ref),
@@ -283,7 +283,11 @@ static MetaHitTestCommandBinder *binder(Fixture *fixture) {
 static void test_exact_window_owner(void) {
   Fixture fixture;
   prepare_fixture(&fixture, window_target(), true);
-  NSDictionary *result = [binder(&fixture) handleRequest:request(window_target())];
+  NSDictionary *input = request(window_target());
+  assert([input[@"operation"][@"inventoryRevision"] isEqual:@2]);
+  assert([input[@"payload"][@"observationRef"][@"inventoryRevision"]
+      isEqual:@1]);
+  NSDictionary *result = [binder(&fixture) handleRequest:input];
   assert([result[@"status"] isEqual:@"confirmed"]);
   assert([result[@"scope"] isEqual:@"window"]);
   assert([result[@"hitRelation"] isEqual:@"exact"]);
@@ -369,6 +373,15 @@ static void test_moved_window_and_topology_change_fail(void) {
   assert(topology.window_calls == 0);
   assert(topology.topology_calls == 1);
   release_fixture(&topology);
+
+  Fixture reconnected;
+  prepare_fixture(&reconnected, display_target(), false);
+  reconnected.snapshot.display_layout_revision = 2;
+  result = [binder(&reconnected) handleRequest:request(display_target())];
+  assert([result[@"status"] isEqual:@"observation-stale"]);
+  assert(reconnected.window_calls == 0);
+  assert(reconnected.topology_calls == 0);
+  release_fixture(&reconnected);
 }
 
 static void test_generation_cross_and_point_mismatch_fail(void) {

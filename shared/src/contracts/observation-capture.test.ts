@@ -154,7 +154,7 @@ describe("C1 observation proof and coordinates", () => {
     await expect(authorizeObservationPoint(proofAuthority, {
       ...request,
       inventoryRevision: 5,
-    })).rejects.toThrow("generations/revisions")
+    })).rejects.toThrow("proof authority")
     await expect(authorizeObservationPoint(proofAuthority, {
       ...request,
       imagePoint: { x: 26, y: 40 },

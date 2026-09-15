@@ -52,17 +52,6 @@ export const targetPreconditionSchema = z.strictObject({
   inventoryId: opaqueIdSchema,
   inventoryRevision: z.number().int().safe().min(0),
   observationRef: observationRefSchema.optional(),
-}).superRefine((precondition, context) => {
-  if (
-    precondition.observationRef !== undefined
-    && precondition.observationRef.inventoryRevision !== precondition.inventoryRevision
-  ) {
-    context.addIssue({
-      code: "custom",
-      path: ["observationRef", "inventoryRevision"],
-      message: "observation и target должны ссылаться на одну inventory revision",
-    })
-  }
 })
 export type TargetPrecondition = z.infer<typeof targetPreconditionSchema>
 
@@ -102,9 +91,6 @@ export const nativeExecutionContextSchema = nativeExecutionContextBaseSchema.sup
   ) {
     context.addIssue({ code: "custom", path: ["target"], message: "native target принадлежит другому generation" })
   }
-  if (operation.observationRef !== undefined && operation.observationRef.inventoryRevision !== operation.inventoryRevision) {
-    context.addIssue({ code: "custom", path: ["observationRef"], message: "observation revision не совпадает с operation" })
-  }
 })
 export type NativeExecutionContext = z.infer<typeof nativeExecutionContextSchema>
 
@@ -141,16 +127,11 @@ function assertContextTargetGeneration(
     runtimeEpoch: string
     loginSessionId: string
     target: { ref: { runtimeEpoch: string, loginSessionId: string } }
-    observationRef?: ObservationRef
-    inventoryRevision: number
   },
   context: z.RefinementCtx,
 ): void {
   if (!sameRuntimeGeneration(operation, operation.target.ref)) {
     context.addIssue({ code: "custom", path: ["target"], message: "target принадлежит другой runtime/login generation" })
-  }
-  if (operation.observationRef !== undefined && operation.observationRef.inventoryRevision !== operation.inventoryRevision) {
-    context.addIssue({ code: "custom", path: ["observationRef"], message: "observation revision не совпадает с operation" })
   }
 }
 

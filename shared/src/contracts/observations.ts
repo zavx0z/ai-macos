@@ -372,6 +372,8 @@ export type ResolveStoredObservationPointRequest = {
   expectedSpace: "macos-screen"
 }
 
+export const MAX_OBSERVATION_POINT_CAPTURE_AGE_MS = 120_000
+
 export async function authorizeObservationPoint(
   proofs: ProofAuthority,
   request: ResolveObservationPointRequest,
@@ -379,8 +381,10 @@ export async function authorizeObservationPoint(
   assertObservationFreshness(request.observation, request)
   const mapped = mapObservationPointGeometry(request.observation, request.imagePoint)
   if (mapped.space.kind !== request.expectedSpace) throw new Error("Observation point принадлежит другой coordinate space")
-  if (Date.parse(mapped.frameTimestamp) < request.now.getTime() - request.maxFrameAgeMs) {
-    throw new Error("Observation region старше разрешённого frame age")
+  const captureAgeLimit = Math.min(request.maxFrameAgeMs, MAX_OBSERVATION_POINT_CAPTURE_AGE_MS)
+  if (!Number.isFinite(captureAgeLimit) || captureAgeLimit <= 0
+    || Date.parse(mapped.frameTimestamp) < request.now.getTime() - captureAgeLimit) {
+    throw new Error("Observation region старше разрешённого capture provenance age")
   }
   const ownership = interactionPointProofSchema.parse(request.interactionProof)
   if (
@@ -472,11 +476,10 @@ export function assertObservationFreshness(
   if (
     observation.runtimeEpoch !== authority.runtimeEpoch
     || observation.loginSessionId !== authority.loginSessionId
-    || observation.inventoryRevision !== authority.inventoryRevision
     || observation.displayLayoutRevision !== authority.displayLayoutRevision
     || !sameTarget(observation.captureTarget, authority.expectedCaptureTarget)
   ) {
-    throw new Error("Observation не совпадает с текущими generations/revisions/target")
+    throw new Error("Observation provenance не совпадает с generations/layout/target")
   }
   if (Date.parse(observation.capturedAt) > nowMs + maxFutureSkewMs) throw new Error("Observation capturedAt находится в будущем")
   if (authority.nativeGeneration !== undefined && observation.nativeGeneration !== authority.nativeGeneration) {
