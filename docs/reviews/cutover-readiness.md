@@ -1,154 +1,110 @@
-# Готовность удаления legacy source
+# Готовность установленного computer-use и удаления legacy source
 
-Дата проверки: 15 сентября 2026 года.
+Срез ведущего: 16 сентября 2026 года. Source checks, установленная сборка и
+реальные действия проверяются отдельно. Зелёные unit tests не закрывают live gates.
 
-## Последний live-результат
+## Установленная версия
 
-Установлен `ddbc47a`, release `release-a67256009679ca47e9d55ec0`, runtime/native
-build suffix `8d601ba712326b6fb985481e`. Все четыре права сохранены.
-Новая задача с direct MCP получила все 36 инструментов. A02/A31 подтверждены
-subprocess/security tests; источник этих проверок — `f2a668e` и `6dfd0ae`.
+Последний подтверждённый installed checkpoint — source `990e548`, release
+`release-87f82221cfe2798f2c1d11c0`, runtime/native build suffix
+`70f57be1e9fe2dce6fd970e0`. Последующие коммиты требуют новой установки.
 
-В отдельной AppKit fixture PID 21776 обнаружены два одноимённых окна.
-После исправлений `92339ed`/`a6eb5b3` AX возвращает их разные identifiers,
-исходный текст RU/EN/emoji/composed, значение slider и parent relationships.
-Нулевые размеры невидимых AX-элементов больше не ломают ответ. Ошибки AX
-посторонних приложений не отзывают глобальные права и не запускают rotation.
+- Стабильный подписанный bundle: `Application Support/ai-macos/runtime/computer-use.app`.
+- Executable: `Contents/MacOS/computer-use`; Native: `Contents/Helpers/meta-input-helper`.
+- Имя `computer-use` и тематическая иконка подтверждены скриншотом пользователя.
+- Accessibility, Screen Recording, Post Events и Input Monitoring сохранены
+  после обновления; observer и view ready.
+- Новая Codex-задача получила все 36 direct MCP tools версии `0.4.0`.
+  Старый каталог root-задачи `0.3.0` не используется для приёмки новой версии.
+- Выбран профиль `desktop-browser-selected`: короткий API поверх собственного
+  runtime. `input.interaction`, продолжение клавиатурного ввода между операциями
+  и автоматическое восстановление прежнего фокуса отложены явно.
+- Chrome использует заранее настроенный внешний CDP endpoint. Runtime не
+  запускает другой профиль, чтобы скрыть ошибку обнаружения. Android не проверен
+  live; последнее наблюдение ADB не содержало подключённого устройства.
 
-Проверки target-local geometry, cursor, hit-test и close внесены в `3adf17c`;
-capture теперь не требует полной AX-инвентаризации всех приложений, а отказ
-до создания capture task подтверждается отдельным типизированным признаком.
-Исходная ошибка с номером операции передаётся агенту (`49e01dd`).
+## Подтверждённые реальные действия
 
-Live capture остаётся блокером. Первый допущенный capture не подтвердил
-завершение потока до cancel grace; после managed restart cleanup стал complete.
-Только после этого выполнен один диагностический повтор. Он завершился SIGSEGV
-helper PID 46547, а не успешным кадром. Crash report от 23:42:46 показывает:
-`-[SCStream removeStreamOutput:type:error:]` из
-`-[MetaCaptureSession stoppedWithError:]`, queue `com.meta.capture.state`.
-Исправление teardown проверяется отдельно. Изображение пока не получено;
-pointer, keyboard и active readiness ещё не выполнялись.
+Используется собственная AppKit fixture из
+`tests/computer-use/fixtures/app/main.m`; её stdin hook только читает состояние.
+Все desktop-действия выполняет direct ai-macos MCP в задаче
+«Computer use: финальная проверка установленной версии».
 
-Source removal **не разрешён** до успешного live capture/input и проверки
-устойчивости установленного приложения. Ни один из нижних исторических
-checkpoint не заменяет этот последний результат.
+| Проверка | Наблюдаемый результат |
+| --- | --- |
+| Два одинаковых заголовка | Primary и secondary различаются точными AX identifiers и refs |
+| AX | Возвращаются RU/EN/emoji/composed text, slider value, parent relationships и нулевые frame невидимых элементов |
+| Снимок primary | Получен и просмотрен PNG 280×234; содержание соответствует fixture, cleanup complete, Native generation не изменилась |
+| `check_input` | Move и restore posted/observed/readback confirmed, cursor восстановлен, cleanup complete |
+| `show_window` | Одна операция show успешно возвращает точное окно; ошибочного второго focus и malformed wrapper больше нет |
+| AXPress `fixture.sheet.open` | Одна операция completed, exact target verified, cleanup complete; oracle подтвердил `sheet-opened` и `sheet.open=1` |
 
-Этот документ описывает состояние после installed cutover. Исторические сбои
-и переход к постоянной подписи подробно зафиксированы в
+Основные receipts текущего checkpoint:
+
+- input readiness: `operation:12f644c5-2939-4c56-8dc7-f398242bd564`;
+- AXPress: `operation:95dc9286-c8ae-4bb1-ac1a-e98c80b4625b`;
+- runtime epoch: `runtime:41f8691f-ed6b-44d1-9e70-4fabe86c3594`;
+- Native generation: `native-A61E58EC-E567-4350-85DE-03BD421C7661`.
+
+Receipt `effect: unverified` сам по себе не подтверждает эффект. Для открытия
+sheet отдельным evidence служит read-only oracle самой fixture. Изображения
+просмотрены inline в задаче; локальный PNG-артефакт не заявляется.
+
+## Текущий live blocker
+
+После открытия sheet `get_state` не опубликовал его как отдельную owned surface:
+`surfaces=[]`, хотя fixture подтверждала открытый диалог. Дальнейший ввод не
+выполнялся. Source diagnosis: повторный AX element из `AXSheets` отбрасывался
+как дубль ранее полученного элемента из `AXWindows`, вместе с exact owner proof.
+Исправление collector/registry должно пройти live повтор до закрытия gate.
+
+Primary AX сохраняет `complete=false` при ошибке optional description. API не
+скрывает эту ошибку: `observe(mode:"both")` возвращает aggregate incompleteness,
+а полное изображение может разрешить одно действие того же observation.
+Pointer input отдельно требует image-ready и свежий Native point proof.
+
+Ещё не подтверждены live: закрытие owned sheet, pointer/text/keyboard actions,
+скрытие/сворачивание и точный show, отмена во время ввода, выбранный Chrome target.
+
+## Что исправлено по результатам live
+
+- Ошибки AX одного приложения не отзывают глобальные права.
+- Capture, show и geometry используют доказательство точной цели вместо
+  требования полной AX-инвентаризации всех приложений.
+- ScreenCaptureKit output отсоединяется перед stop. Старый crash в
+  `removeStreamOutput` после stop устранён; последующий live capture успешен.
+- Native публикует и сохраняет проверенные readiness facts кадра; готовность
+  чтения кадра не выдаёт разрешение ввода.
+- `show_window` больше не запускает show и focus отдельными конкурирующими
+  операциями. Частичный результат сохраняет исходную причину и operation ID.
+- Installer сохраняет exact parent/helper witness до bootout. При update
+  завершение Host было быстрым, но пятисекундное ожидание ухода процессов
+  истекло. Повтор через durable recovery успешно завершил установку. Source
+  `73cdebb` увеличивает bounded evidence polling до 60 секунд и сохраняет
+  последний label/parent/helper state в ошибке; bootstrap до ухода старых
+  процессов по-прежнему запрещён.
+
+История подписи и разрешений:
 [`startup-permissions-and-identity.md`](./startup-permissions-and-identity.md).
 
-## Подтверждённый installed checkpoint
+## Gates перед удалением старых исходников
 
-Установлен source commit `c671b7d` в подписанном `computer-use.app` с иконкой.
-LaunchAgent запускает стабильный executable
-`Application Support/ai-macos/runtime/computer-use.app/Contents/MacOS/computer-use`;
-helper расположен внутри того же bundle в `Contents/Helpers/meta-input-helper`.
+| Gate | Статус |
+| --- | --- |
+| A02, A31 | Отдельные subprocess, private UDS/auth/lineage tests подтверждены (`f2a668e`, `6dfd0ae`) |
+| A43 catalog/recovery | Новый installed runtime и 36 tools подтверждены; action acceptance остаётся частичной |
+| Live capture/input | Capture, active probe и AXPress подтверждены; остальные действия перечислены выше |
+| Старые listeners 7878–7882 | Собственные legacy services остановлены ранее; архивные процессы не затрагивались |
+| Старый Chrome CDP LaunchAgent | Exact plist/job отсутствуют; уже работающий browser не остановлен |
+| Reverse imports | Повторный source audit выполнен; Android tests мигрированы отдельно |
+| Installer/source doctor | До удаления `input/bin` нужно убрать обязательную зависимость v2 installer от legacy parent directory, сохранив безопасный v1 rollback |
+| Manifests/entrypoints/docs | Нужна одна согласованная migration/removal delta и обновление lockfile |
 
-При приёмке в 18:02:23 installed runtime подтвердил все четыре права,
-`startup.permissions.state: ready`, `observer.state: ready`, `viewReady: true`
-и profile `desktop-browser-selected`. Installed launcher вернул каталог
-`ai-macos-runtime-catalog` версии `0.4.0` с 36 tools. Диагностический client
-выполнил только initialize, `tools/list` и passive `system_health`.
+`scripts/legacy-source-removal-plan.json` остаётся планом, не фактом удаления.
+`input/bin/meta-input-helper` является локальным ignored legacy artifact,
+а не source-controlled helper установленного bundle. Нельзя удалять его
+слепым `git rm` или затрагивать `computer-use.app` при очистке исходников.
 
-## Новый live recovery blocker
-
-В 18:05:11 runtime был перезапущен через managed recovery. Root после
-установки его не перезапускал. `launchctl` показал `runs: 2` и предыдущий
-`last exit code: 0`.
-
-Последующая проверка нашла durable restart receipt предыдущего epoch:
-`state: restart-safe-quarantined`, `operationIds: []`, Native PID 89646 завершён
-с exit code 75 в 18:05:10.971 UTC. Это подтверждает managed recovery после
-завершения Native; конкретная ветвь exit 75 в старом релизе не логировалась.
-
-Новый runtime epoch `a0a3…` сохранил все четыре grants, но observer prepare
-завершился причиной `Observer index, identity или readiness недоступны`.
-Admission осталась закрытой, поэтому catalog сократился до восьми
-диагностических tools.
-
-Resumed acceptance task уже достигла нового direct MCP runtime, то есть A43
-подтвердила переключение на installed launcher. Полная A43 acceptance не
-пройдена: после restart runtime не восстановил observer и основной каталог.
-Этот recovery regression сейчас анализируют владельцы Native и Runtime.
-
-Source checkpoint `f9925a1` добавил типизированную причину Native prepare,
-ограниченные повторные попытки только после доказанного отсутствия незавершённого
-observer и журнал lifecycle без пользовательского содержимого.
-
-Попытка обновить работающий app выявила отдельную ошибку установщика.
-В 21:43:57.049 по местному времени launchd отклонил bootstrap с внутренним
-кодом 37 «Operation already in progress»; удаление старой службы завершилось
-в 21:43:57.071. `bootout` вернулся раньше фактического удаления. Rollback
-загрузил предыдущий `c671b7d`, и тот снова подтвердил права и observer ready.
-До повторного обновления требуется проверка исчезновения exact службы и
-прежних процессов; фиксированная задержка не заменяет это доказательство.
-
-Для обычного нового окна выбран более простой контракт: полученное от
-подписанного AX-источника событие с неизвестным target инвалидирует все views,
-но само по себе не означает потерю событий. Существующий optional target
-уже поддерживает это поведение. Настоящие ошибки подписки/последовательности
-остаются fail-closed; новый supervisor или протокол смены epoch не вводятся.
-
-Отдельно текущая root-задача сохраняет прежнее соединение package version
-`0.3.0`. Его stale catalog не является причиной нового regression и не служит
-evidence нового installed runtime.
-
-## Решение по removal
-
-Legacy source пока удалять нельзя. Installed cutover подтвердил Host wiring и
-реальный запуск установленного приложения. Остаются независимые preconditions:
-
-| Gate | Состояние | Требуемое закрытие |
-| --- | --- | --- |
-| A02 | Проверяется | Отдельные runtime/MCP subprocess checks принятого entrypoint |
-| A31 | Проверяется | Private socket peer/token boundary без legacy transport |
-| A43 | Достигнут новый runtime, acceptance failed | Observer и полный 36-tool catalog должны восстановиться после restart в новой Codex-задаче |
-| Reverse imports | Требует повтора перед deletion delta | Ни один сохраняемый consumer не ссылается на удаляемый file или symbol |
-
-Один diagnostic client не разрешает deletion. Успешная первоначальная приёмка
-также не заменяет проверку startup recovery после самостоятельного restart.
-
-## Stable app и legacy helper
-
-Текущий runtime является реальным подписанным bundle, а не symlink на release:
-
-- stable app: `Application Support/ai-macos/runtime/computer-use.app`;
-- runtime: `Contents/MacOS/computer-use`;
-- helper: `Contents/Helpers/meta-input-helper`;
-- immutable release выбирается отдельным symlink `current`.
-
-Старый source-controlled `input/bin/meta-input-helper` оставлен нетронутым. Он
-не является stable TCC subject нового bundle. Будущая source-removal delta не
-должна удалять или перезаписывать вложенный helper установленного приложения.
-
-## Актуальность removal plan
-
-`scripts/legacy-source-removal-plan.json` содержит 73 repository-relative
-`deleteFiles`; повторный scan подтвердил существование всех 73 путей. Новые
-Host, installer, signed bundle и launcher files не попали в delete scope.
-
-Перед применением списка нужен новый symbol-level reverse import scan. Особенно
-важны сохраняемые части смешанных modules: Chrome adapter dependencies и
-Android target helpers.
-
-## Что дальше
-
-1. Исправить и проверить observer recovery после самостоятельного restart.
-2. Повторить A43 в новой задаче: installed `0.4.0`, полный каталог и
-   согласованный сценарий.
-3. Закрыть A02 отдельными subprocess checks.
-4. Закрыть A31 на private UDS peer/token boundary.
-5. Повторить exact reverse-import scan и migration-before-delete checks.
-6. Только после этих evidence сформировать одну reviewable deletion delta,
-   обновить manifests и один раз перегенерировать `bun.lock`.
-7. После удаления повторить source/full checks, installed doctor и fresh-task
-   catalog verification.
-
-До выполнения этих шагов removal plan остаётся планом с закрытым admission, а
-не разрешением на удаление.
-
-## Граница текущей проверки
-
-В этом checkpoint выполнены только чтение source/reviews, проверка наличия
-`deleteFiles` и актуализация документации. Live UI, services, installation,
-keychain, permissions и legacy files не изменялись.
+Внешние REST consumers перечислены в [`../legacy-callers.md`](../legacy-callers.md).
+Они требуют отдельной миграции в своих репозиториях; совместимость старого REST
+с новым runtime не обещается. Их код в этой задаче не изменяется.
