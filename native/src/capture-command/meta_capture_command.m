@@ -100,6 +100,12 @@ static BOOL positive_i32(id value, int32_t *result) {
   return YES;
 }
 
+static BOOL dimensions_fit(uint64_t width, uint64_t height,
+                           uint64_t max_pixels) {
+  return width > 0 && height > 0 && max_pixels > 0 &&
+         width <= max_pixels / height;
+}
+
 static BOOL copy_identifier(NSString *value, char output[META_NATIVE_REF_CAPACITY]) {
   if (!valid_string(value, META_NATIVE_REF_CAPACITY - 1)) return NO;
   return [value getCString:output
@@ -245,6 +251,49 @@ static BOOL mapping_displays_match(const MetaInventorySnapshot *snapshot,
   }
   if (![covered_native_ids isEqualToSet:native_ids]) return NO;
   return YES;
+}
+
+static BOOL layout_displays_match(const MetaInventorySnapshot *snapshot,
+                                  NSArray *targets,
+                                  NSArray *mappings,
+                                  NSString *runtime_epoch,
+                                  NSString *login_session_id,
+                                  NSString *native_generation,
+                                  uint64_t display_layout_revision) {
+  if (![targets isKindOfClass:[NSArray class]] ||
+      ![mappings isKindOfClass:[NSArray class]] || targets.count == 0 ||
+      targets.count > 64 || targets.count != mappings.count) {
+    return NO;
+  }
+  NSMutableSet *matched = [NSMutableSet set];
+  for (NSDictionary *target in targets) {
+    if (![target isKindOfClass:[NSDictionary class]] ||
+        ![target[@"kind"] isEqual:@"display"]) {
+      return NO;
+    }
+    uint32_t display_id = 0;
+    if (!positive_u32(target[@"nativeDisplayId"], &display_id)) return NO;
+    NSDictionary *target_ref = target[@"target"][@"ref"];
+    NSDictionary *mapping_match = nil;
+    for (NSDictionary *mapping in mappings) {
+      if ([mapping[@"nativeDisplayId"] isEqual:@(display_id)]) {
+        mapping_match = mapping;
+        break;
+      }
+    }
+    uint64_t revision = 0;
+    if (mapping_match == nil || [matched containsObject:@(display_id)] ||
+        !same_ref(mapping_match[@"ref"], target_ref) ||
+        !same_generation(target_ref, runtime_epoch, login_session_id,
+                         native_generation) ||
+        !unsigned_integer(target_ref[@"displayLayoutRevision"], &revision) ||
+        revision != display_layout_revision ||
+        find_display(snapshot, target_ref[@"displayRef"], display_id) == NULL) {
+      return NO;
+    }
+    [matched addObject:@(display_id)];
+  }
+  return matched.count == mappings.count;
 }
 
 static BOOL copy_fence(NSDictionary *value, MetaFence *fence) {
@@ -396,14 +445,28 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
     return nil;
   }
   NSString *target_kind = target_wrapper[@"kind"];
-  if ([target_kind isEqual:@"desktop-layout"]) {
-    fail(error, MetaCaptureCommandUnsupportedTarget,
-         @"Desktop layout требует router-owned aggregate capture task");
+  NSDate *operation_deadline = date_from_iso(request[@"deadlineAt"]);
+  NSTimeInterval remaining_seconds =
+      [operation_deadline timeIntervalSinceDate:NSDate.date];
+  if (operation_deadline == nil || remaining_seconds <= 0) {
+    fail(error, MetaCaptureCommandStaleAuthority,
+         @"Capture operation deadline уже истёк");
+    return nil;
+  }
+  uint64_t remaining_milliseconds = MAX(
+      1, (uint64_t)floor(remaining_seconds * 1000.0));
+  if (remaining_milliseconds < 2) {
+    fail(error, MetaCaptureCommandStaleAuthority,
+         @"Capture operation deadline не оставляет cleanup budget");
     return nil;
   }
   MetaCaptureRequest native_request = meta_capture_request_default();
-  native_request.captureTimeoutMilliseconds = [payload[@"captureTimeoutMs"] unsignedIntValue];
-  native_request.stopTimeoutMilliseconds = [payload[@"stopTimeoutMs"] unsignedIntValue];
+  native_request.stopTimeoutMilliseconds = (uint32_t)MIN(
+      [payload[@"stopTimeoutMs"] unsignedLongLongValue],
+      MAX(1, remaining_milliseconds / 2));
+  native_request.captureTimeoutMilliseconds = (uint32_t)MIN(
+      [payload[@"captureTimeoutMs"] unsignedLongLongValue],
+      remaining_milliseconds - native_request.stopTimeoutMilliseconds);
   native_request.maxPixels = [capture[@"output"][@"maxPixels"] unsignedLongLongValue];
   native_request.maxEncodedBytes = [capture[@"output"][@"maxEncodedBytes"] unsignedLongLongValue];
   native_request.outputScale = [capture[@"output"][@"scale"] doubleValue];
@@ -417,7 +480,98 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
                                              [rect[@"width"] doubleValue],
                                              [rect[@"height"] doubleValue]);
   }
-  if ([target_kind isEqual:@"display"] &&
+  MetaCaptureRequest *layout_children = NULL;
+  size_t layout_child_count = 0;
+  MetaCaptureLayoutTaskRequest layout_request = {0};
+  if ([target_kind isEqual:@"desktop-layout"] &&
+      [native_mapping[@"kind"] isEqual:@"desktop-layout"]) {
+    NSArray *targets = target_wrapper[@"displays"];
+    NSArray *mappings = native_mapping[@"displays"];
+    if (![capture[@"source"] isEqual:@"display-composite"] ||
+        ![capture[@"clip"][@"kind"] isEqual:@"full-target"] ||
+        ![target[@"ref"][@"layoutRef"] isEqual:@(snapshot->layout_ref)] ||
+        !layout_displays_match(snapshot, targets, mappings, runtime_epoch,
+                               login_session_id, self.nativeGeneration,
+                               layout_revision)) {
+      fail(error, MetaCaptureCommandStaleAuthority,
+           @"Desktop layout mapping не совпадает с текущей topology");
+      return nil;
+    }
+    layout_child_count = mappings.count;
+    layout_children = calloc(layout_child_count, sizeof(*layout_children));
+    if (layout_children == NULL) {
+      fail(error, MetaCaptureCommandRouterFailure,
+           @"Не удалось выделить bounded layout child requests");
+      return nil;
+    }
+    CGRect layout_bounds = CGRectNull;
+    double maximum_scale = 1;
+    uint64_t total_child_pixels = 0;
+    uint64_t child_encoded_budget = native_request.maxEncodedBytes /
+                                    layout_child_count;
+    for (NSUInteger index = 0; index < mappings.count; index += 1) {
+      NSDictionary *mapping = mappings[index];
+      uint32_t display_id = [mapping[@"nativeDisplayId"] unsignedIntValue];
+      const MetaDisplayRecord *display = find_display(
+          snapshot, mapping[@"ref"][@"displayRef"], display_id);
+      CGRect bounds = CGRectMake(display->bounds.x, display->bounds.y,
+                                 display->bounds.width,
+                                 display->bounds.height);
+      layout_bounds = CGRectIsNull(layout_bounds)
+          ? bounds : CGRectUnion(layout_bounds, bounds);
+      maximum_scale = MAX(maximum_scale, display->scale);
+      uint64_t width = (uint64_t)ceil(bounds.size.width * display->scale *
+                                      native_request.outputScale);
+      uint64_t height = (uint64_t)ceil(bounds.size.height * display->scale *
+                                       native_request.outputScale);
+      uint64_t child_pixels = width > 0 && height > 0 &&
+          width <= UINT64_MAX / height ? width * height : UINT64_MAX;
+      if (width == 0 || height == 0 || width > UINT32_MAX ||
+          height > UINT32_MAX || child_pixels > native_request.maxPixels ||
+          total_child_pixels > native_request.maxPixels - child_pixels ||
+          child_encoded_budget == 0) {
+        free(layout_children);
+        fail(error, MetaCaptureCommandRouterFailure,
+             @"Layout child captures превышают общий budget");
+        return nil;
+      }
+      total_child_pixels += child_pixels;
+      layout_children[index] = native_request;
+      layout_children[index].source = MetaCaptureSourceDisplayComposite;
+      layout_children[index].displayID = display_id;
+      layout_children[index].hasRegion = false;
+      layout_children[index].maxPixels = child_pixels;
+      layout_children[index].maxEncodedBytes = child_encoded_budget;
+    }
+    double pixels_per_point = maximum_scale * native_request.outputScale;
+    uint64_t output_width = (uint64_t)ceil(layout_bounds.size.width *
+                                           pixels_per_point);
+    uint64_t output_height = (uint64_t)ceil(layout_bounds.size.height *
+                                            pixels_per_point);
+    uint32_t max_width = [capture[@"output"][@"maxWidthPx"] unsignedIntValue];
+    uint32_t max_height = [capture[@"output"][@"maxHeightPx"] unsignedIntValue];
+    if (!isfinite(pixels_per_point) || pixels_per_point <= 0 ||
+        output_width == 0 || output_height == 0 || output_width > max_width ||
+        output_height > max_height || output_width > UINT32_MAX ||
+        output_height > UINT32_MAX ||
+        !dimensions_fit(output_width, output_height,
+                        native_request.maxPixels)) {
+      free(layout_children);
+      fail(error, MetaCaptureCommandRouterFailure,
+           @"Desktop layout output превышает общий budget");
+      return nil;
+    }
+    layout_request = (MetaCaptureLayoutTaskRequest){
+        .child_requests = layout_children,
+        .child_count = layout_child_count,
+        .caption = native_request.caption,
+        .output_scale = native_request.outputScale,
+        .max_width_pixels = max_width,
+        .max_height_pixels = max_height,
+        .max_pixels = native_request.maxPixels,
+        .max_encoded_bytes = native_request.maxEncodedBytes,
+    };
+  } else if ([target_kind isEqual:@"display"] &&
       [native_mapping[@"kind"] isEqual:@"display"]) {
     NSDictionary *display_mapping = native_mapping[@"display"];
     NSDictionary *display_ref = display_mapping[@"ref"];
@@ -486,8 +640,14 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
   [self.lock unlock];
   char task_ref_buffer[META_NATIVE_REF_CAPACITY] = {0};
   MetaCaptureTaskStatus status = {0};
-  if (!meta_capture_router_start(self.router, operation_id.UTF8String,
-                                 &native_request, task_ref_buffer, &status)) {
+  BOOL started = layout_children == NULL
+      ? meta_capture_router_start(self.router, operation_id.UTF8String,
+                                  &native_request, task_ref_buffer, &status)
+      : meta_capture_router_start_layout(self.router, operation_id.UTF8String,
+                                         &layout_request, task_ref_buffer,
+                                         &status);
+  free(layout_children);
+  if (!started) {
     [self.lock lock];
     self.pendingStarts -= 1;
     [self.lock unlock];

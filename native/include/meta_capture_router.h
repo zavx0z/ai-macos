@@ -15,6 +15,8 @@ typedef struct {
                  MetaCaptureTaskStatus *status);
   void (*release_task)(void *context, MetaCaptureTaskRef task);
   void (*release_result)(void *context, MetaCaptureResult *result);
+  MetaCaptureResult *(*compose_layout)(
+      void *context, const MetaCaptureLayoutRequest *request);
 } MetaCaptureRouterBackend;
 
 typedef struct MetaCaptureRouter MetaCaptureRouter;
@@ -30,6 +32,26 @@ bool meta_capture_router_start(
     MetaCaptureRouter *router,
     const char *operation_id,
     const MetaCaptureRequest *request,
+    char task_ref[META_NATIVE_REF_CAPACITY],
+    MetaCaptureTaskStatus *status);
+
+typedef struct {
+  const MetaCaptureRequest *child_requests;
+  size_t child_count;
+  CFStringRef caption;
+  double output_scale;
+  uint32_t max_width_pixels;
+  uint32_t max_height_pixels;
+  uint64_t max_pixels;
+  uint64_t max_encoded_bytes;
+} MetaCaptureLayoutTaskRequest;
+
+// Создаёт одну router-owned layout задачу. Child captures остаются приватными
+// ресурсами parent task и никогда не публикуются как самостоятельные taskRef.
+bool meta_capture_router_start_layout(
+    MetaCaptureRouter *router,
+    const char *operation_id,
+    const MetaCaptureLayoutTaskRequest *request,
     char task_ref[META_NATIVE_REF_CAPACITY],
     MetaCaptureTaskStatus *status);
 bool meta_capture_router_status(MetaCaptureRouter *router,

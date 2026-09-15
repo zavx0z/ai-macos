@@ -273,12 +273,10 @@ static bool recovery_readiness(void *context, MetaRecoveryReadiness *output) {
   NSMutableArray *capabilities = [NSMutableArray array];
   for (NSString *identifier in @[@"runtime.identity", @"runtime.transport", @"desktop.applications",
       @"desktop.windows.all", @"desktop.window.identity", @"desktop.window.show", @"desktop.window.lifecycle",
-      @"desktop.displays", @"desktop.ax", @"capture.window", @"capture.observation", @"input.clipboard", @"input.readiness",
+      @"desktop.displays", @"desktop.ax", @"capture.window", @"capture.desktop", @"capture.observation", @"input.clipboard", @"input.readiness",
       @"input.pointer", @"input.drag", @"input.keyboard", @"runtime.user-interference"]) {
     [capabilities addObject:@{@"id": identifier, @"state": @"ready"}];
   }
-  [capabilities addObject:@{@"id": @"capture.desktop", @"state": @"degraded",
-    @"reason": @"Одиночный display подключён; aggregate desktop-layout capture пока не реализован"}];
   [capabilities addObject:@{@"id": @"desktop.application.lifecycle", @"state": @"degraded",
     @"reason": @"Launch и quit подключены; parent callback lifecycle проходит финальную проверку"}];
   [capabilities addObject:@{@"id": @"input.interaction", @"state": @"unavailable",

@@ -24,6 +24,90 @@ static bool block_next_cancel = false;
 static dispatch_semaphore_t cancel_entered;
 static dispatch_semaphore_t cancel_continue;
 
+typedef struct {
+  MetaCaptureCompletion completions[2];
+  MetaCaptureTaskStatus statuses[2];
+  int task_storage[2];
+  size_t start_count;
+  size_t compose_count;
+  size_t release_task_count;
+  size_t release_result_count;
+  dispatch_semaphore_t second_start_entered;
+  dispatch_semaphore_t second_start_continue;
+} LayoutStartRace;
+
+static size_t layout_race_index(LayoutStartRace *race,
+                                MetaCaptureTaskRef task) {
+  for (size_t index = 0; index < 2; index += 1) {
+    if (task == &race->task_storage[index]) return index;
+  }
+  return SIZE_MAX;
+}
+
+static MetaCaptureTaskRef layout_race_start(
+    void *context, const MetaCaptureRequest *request,
+    dispatch_queue_t callback_queue, MetaCaptureCompletion completion) {
+  (void)request;
+  (void)callback_queue;
+  LayoutStartRace *race = context;
+  size_t index = race->start_count++;
+  assert(index < 2);
+  if (index == 1) {
+    dispatch_semaphore_signal(race->second_start_entered);
+    dispatch_semaphore_wait(race->second_start_continue,
+                            DISPATCH_TIME_FOREVER);
+  }
+  race->completions[index] = [completion copy];
+  race->statuses[index] = (MetaCaptureTaskStatus){
+      .revision = 1,
+      .startPending = true,
+      .cleanup = MetaCaptureCleanupPending,
+  };
+  return &race->task_storage[index];
+}
+
+static void layout_race_cancel(void *context, MetaCaptureTaskRef task) {
+  LayoutStartRace *race = context;
+  size_t index = layout_race_index(race, task);
+  assert(index != SIZE_MAX);
+  race->statuses[index].stopRequested = true;
+}
+
+static bool layout_race_status(void *context, MetaCaptureTaskRef task,
+                               MetaCaptureTaskStatus *status) {
+  LayoutStartRace *race = context;
+  size_t index = layout_race_index(race, task);
+  if (index == SIZE_MAX) return false;
+  *status = race->statuses[index];
+  return true;
+}
+
+static void layout_race_release_task(void *context,
+                                     MetaCaptureTaskRef task) {
+  LayoutStartRace *race = context;
+  assert(layout_race_index(race, task) != SIZE_MAX);
+  race->release_task_count += 1;
+}
+
+static void layout_race_release_result(void *context,
+                                       MetaCaptureResult *result) {
+  LayoutStartRace *race = context;
+  free(result);
+  race->release_result_count += 1;
+}
+
+static MetaCaptureResult *layout_race_compose(
+    void *context, const MetaCaptureLayoutRequest *request) {
+  LayoutStartRace *race = context;
+  assert(request->frameCount == 2);
+  race->compose_count += 1;
+  MetaCaptureResult *result = calloc(1, sizeof(*result));
+  result->outcome = MetaCaptureOutcomeFailed;
+  result->cleanup = MetaCaptureCleanupComplete;
+  result->errorCode = MetaCaptureErrorFrameUnavailable;
+  return result;
+}
+
 static MetaCaptureTaskRef fake_start(void *context,
                                      const MetaCaptureRequest *request,
                                      dispatch_queue_t callback_queue,
@@ -407,6 +491,106 @@ int main(void) {
     assert(retained_authorized_receipt.already_released);
     assert(meta_capture_router_forget_released(router, forget_receipt));
     meta_capture_router_destroy(router);
+
+    LayoutStartRace race = {
+        .second_start_entered = dispatch_semaphore_create(0),
+        .second_start_continue = dispatch_semaphore_create(0),
+    };
+    MetaCaptureRouterBackend layout_backend = {
+        .context = &race,
+        .start = layout_race_start,
+        .cancel = layout_race_cancel,
+        .status = layout_race_status,
+        .release_task = layout_race_release_task,
+        .release_result = layout_race_release_result,
+        .compose_layout = layout_race_compose,
+    };
+    MetaCaptureRouter *layout_router =
+        meta_capture_router_create("native-layout-race", layout_backend);
+    assert(layout_router != NULL);
+    MetaCaptureRequest child_requests[2] = {{
+        .abiVersion = META_CAPTURE_ABI_VERSION,
+        .source = MetaCaptureSourceDisplayComposite,
+    }, {
+        .abiVersion = META_CAPTURE_ABI_VERSION,
+        .source = MetaCaptureSourceDisplayComposite,
+    }};
+    MetaCaptureLayoutTaskRequest layout_request = {
+        .child_requests = child_requests,
+        .child_count = 2,
+        .caption = CFSTR("Layout start race"),
+        .output_scale = 1,
+        .max_width_pixels = 10,
+        .max_height_pixels = 10,
+        .max_pixels = 100,
+        .max_encoded_bytes = 1024,
+    };
+    __block bool layout_started = false;
+    typedef struct {
+      char value[META_NATIVE_REF_CAPACITY];
+    } LayoutTaskRefBuffer;
+    __block LayoutTaskRefBuffer layout_task_ref = {0};
+    __block MetaCaptureTaskStatus layout_start_status = {0};
+    dispatch_group_t layout_group = dispatch_group_create();
+    dispatch_group_async(
+        layout_group, dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+          layout_started = meta_capture_router_start_layout(
+              layout_router, "operation-layout-race", &layout_request,
+              layout_task_ref.value, &layout_start_status);
+        });
+    assert(dispatch_semaphore_wait(
+               race.second_start_entered,
+               dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0);
+    assert(race.completions[0] != nil);
+    MetaCaptureResult *first_race_result = calloc(
+        1, sizeof(*first_race_result));
+    first_race_result->outcome = MetaCaptureOutcomeSucceeded;
+    first_race_result->cleanup = MetaCaptureCleanupComplete;
+    first_race_result->source = MetaCaptureSourceDisplayComposite;
+    race.completions[0](first_race_result);
+    MetaCaptureOperationTaskRecord race_record = {0};
+    assert(meta_capture_router_operation_tasks(
+               layout_router, "operation-layout-race", &race_record, 1) == 1);
+    assert(!race_record.result_available);
+    assert(race.compose_count == 0);
+    dispatch_semaphore_signal(race.second_start_continue);
+    assert(dispatch_group_wait(
+               layout_group,
+               dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0);
+    assert(layout_started);
+    assert(layout_start_status.startPending);
+    race.statuses[0] = (MetaCaptureTaskStatus){
+        .revision = 2,
+        .completionDelivered = true,
+        .streamStopped = true,
+        .cleanup = MetaCaptureCleanupComplete,
+        .drained = true,
+    };
+    race.statuses[1] = race.statuses[0];
+    assert(race.completions[1] != nil);
+    MetaCaptureResult *second_race_result = calloc(
+        1, sizeof(*second_race_result));
+    second_race_result->outcome = MetaCaptureOutcomeSucceeded;
+    second_race_result->cleanup = MetaCaptureCleanupComplete;
+    second_race_result->source = MetaCaptureSourceDisplayComposite;
+    race.completions[1](second_race_result);
+    const MetaCaptureResult *layout_result = NULL;
+    MetaCaptureTaskStatus layout_terminal_status = {0};
+    assert(meta_capture_router_result(layout_router, layout_task_ref.value,
+                                      &layout_terminal_status,
+                                      &layout_result));
+    assert(layout_result != NULL);
+    assert(layout_terminal_status.drained);
+    assert(race.compose_count == 1);
+    assert(meta_capture_router_result_done(layout_router, layout_task_ref.value,
+                                           layout_result));
+    bool layout_already_released = false;
+    assert(meta_capture_router_release(layout_router, layout_task_ref.value, false,
+                                      &layout_already_released));
+    assert(!layout_already_released);
+    assert(race.release_task_count == 2);
+    assert(race.release_result_count == 3);
+    meta_capture_router_destroy(layout_router);
   }
   puts("capture router tests passed");
   return 0;

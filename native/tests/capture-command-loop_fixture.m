@@ -14,27 +14,20 @@ typedef struct {
   MetaCaptureTaskStatus status;
   MetaCaptureRequest accepted_request;
   bool completion_scheduled;
+  size_t status_count;
+  int task_storage;
+} FakeCaptureChild;
+
+typedef struct {
+  FakeCaptureChild children[8];
   size_t start_count;
   size_t cancel_count;
   size_t release_task_count;
   size_t release_result_count;
-  size_t status_count;
-  int task_storage;
 } FakeCaptureBackend;
 
-MetaCaptureRequest meta_capture_request_default(void) {
-  return (MetaCaptureRequest){
-      .abiVersion = META_CAPTURE_ABI_VERSION,
-      .outputScale = 1,
-      .captureTimeoutMilliseconds = META_CAPTURE_DEFAULT_TIMEOUT_MS,
-      .stopTimeoutMilliseconds = META_CAPTURE_DEFAULT_STOP_TIMEOUT_MS,
-      .maxFrameAgeMilliseconds = META_CAPTURE_DEFAULT_MAX_FRAME_AGE_MS,
-      .maxPixels = META_CAPTURE_DEFAULT_MAX_PIXELS,
-      .maxEncodedBytes = META_CAPTURE_DEFAULT_MAX_ENCODED_BYTES,
-  };
-}
-
-static MetaCaptureResult *successful_result(void) {
+static MetaCaptureResult *successful_result(
+    const MetaCaptureRequest *request) {
   static const uint8_t png[] = {
       0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d,
       0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
@@ -49,13 +42,13 @@ static MetaCaptureResult *successful_result(void) {
   result->cleanup = MetaCaptureCleanupComplete;
   result->errorCode = MetaCaptureErrorNone;
   result->source = MetaCaptureSourceDisplayComposite;
-  result->caption = CFStringCreateCopy(NULL, CFSTR("Ожидаю увидеть один пиксель fixture display"));
+  result->caption = CFRetain(request->caption);
   result->pngData = CFDataCreate(NULL, png, sizeof(png));
   result->imageWidthPixels = 1;
   result->imageHeightPixels = 1;
   result->encodedBytes = sizeof(png);
   result->capturedAtUnixNanoseconds = 1789466400000000000ULL;
-  result->requestedDisplayID = 10;
+  result->requestedDisplayID = request->displayID;
   result->shareableTargetMatched = true;
   result->beforeTargetMatched = true;
   result->afterTargetMatched = true;
@@ -70,15 +63,18 @@ static MetaCaptureResult *successful_result(void) {
     return NULL;
   }
   result->regionCount = 1;
+  CGRect bounds = request->displayID == 10
+      ? CGRectMake(-1, 0, 1, 1) : CGRectMake(0, 0, 1, 1);
+  double backing_scale = request->displayID == 10 ? 1 : 2;
   result->regions[0] = (MetaCaptureDisplayRegion){
-      .displayID = 10,
-      .displayBoundsPoints = CGRectMake(0, 0, 1, 1),
+      .displayID = request->displayID,
+      .displayBoundsPoints = bounds,
       .imageRectPixels = CGRectMake(0, 0, 1, 1),
-      .destinationRectPoints = CGRectMake(0, 0, 1, 1),
-      .imageToDestination = {.a = 1, .d = 1},
+      .destinationRectPoints = bounds,
+      .imageToDestination = {.a = 1, .d = 1, .tx = bounds.origin.x},
       .frameOrientation = MetaCaptureFrameOrientationDisplayOriented,
-      .backingScaleX = 1,
-      .backingScaleY = 1,
+      .backingScaleX = backing_scale,
+      .backingScaleY = backing_scale,
       .frameTimestampUnixNanoseconds = 1789466400000000000ULL,
   };
   return result;
@@ -89,42 +85,55 @@ static MetaCaptureTaskRef fake_start(void *context,
                                      dispatch_queue_t callback_queue,
                                      MetaCaptureCompletion completion) {
   FakeCaptureBackend *fake = context;
-  fake->accepted_request = *request;
-  fake->callback_queue = callback_queue;
-  fake->completion = [completion copy];
-  fake->start_count += 1;
-  fake->status = (MetaCaptureTaskStatus){
+  if (fake->start_count >= 8) return NULL;
+  FakeCaptureChild *child = &fake->children[fake->start_count++];
+  child->accepted_request = *request;
+  child->callback_queue = callback_queue;
+  child->completion = [completion copy];
+  child->status = (MetaCaptureTaskStatus){
       .revision = 1,
       .startPending = true,
       .cleanup = MetaCaptureCleanupPending,
   };
-  return &fake->task_storage;
+  return &child->task_storage;
+}
+
+static FakeCaptureChild *fake_child(FakeCaptureBackend *fake,
+                                    MetaCaptureTaskRef task) {
+  for (size_t index = 0; index < fake->start_count; index += 1) {
+    if (task == &fake->children[index].task_storage) {
+      return &fake->children[index];
+    }
+  }
+  return NULL;
 }
 
 static void fake_cancel(void *context, MetaCaptureTaskRef task) {
   FakeCaptureBackend *fake = context;
-  if (task != &fake->task_storage) return;
+  FakeCaptureChild *child = fake_child(fake, task);
+  if (child == NULL) return;
   fake->cancel_count += 1;
-  fake->status.revision += 1;
-  fake->status.stopRequested = true;
+  child->status.revision += 1;
+  child->status.stopRequested = true;
 }
 
 static bool fake_status(void *context, MetaCaptureTaskRef task,
                         MetaCaptureTaskStatus *status) {
   FakeCaptureBackend *fake = context;
-  if (task != &fake->task_storage) return false;
-  fake->status_count += 1;
-  *status = fake->status;
-  if (fake->status_count >= 2 && !fake->completion_scheduled &&
-      fake->completion != nil) {
-    fake->completion_scheduled = true;
-    dispatch_queue_t queue = fake->callback_queue == NULL
+  FakeCaptureChild *child = fake_child(fake, task);
+  if (child == NULL) return false;
+  child->status_count += 1;
+  *status = child->status;
+  if (child->status_count >= 2 && !child->completion_scheduled &&
+      child->completion != nil) {
+    child->completion_scheduled = true;
+    dispatch_queue_t queue = child->callback_queue == NULL
                                  ? dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0)
-                                 : fake->callback_queue;
+                                 : child->callback_queue;
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC), queue, ^{
-      MetaCaptureResult *result = successful_result();
+      MetaCaptureResult *result = successful_result(&child->accepted_request);
       if (result == NULL) return;
-      fake->status = (MetaCaptureTaskStatus){
+      child->status = (MetaCaptureTaskStatus){
           .revision = 2,
           .completionDelivered = true,
           .streamStarted = true,
@@ -132,7 +141,7 @@ static bool fake_status(void *context, MetaCaptureTaskRef task,
           .cleanup = MetaCaptureCleanupComplete,
           .drained = true,
       };
-      fake->completion(result);
+      child->completion(result);
     });
   }
   return true;
@@ -140,7 +149,7 @@ static bool fake_status(void *context, MetaCaptureTaskRef task,
 
 static void fake_release_task(void *context, MetaCaptureTaskRef task) {
   FakeCaptureBackend *fake = context;
-  if (task == &fake->task_storage) fake->release_task_count += 1;
+  if (fake_child(fake, task) != NULL) fake->release_task_count += 1;
 }
 
 static void fake_release_result(void *context, MetaCaptureResult *result) {
@@ -150,6 +159,12 @@ static void fake_release_result(void *context, MetaCaptureResult *result) {
   free(result->regions);
   free(result);
   fake->release_result_count += 1;
+}
+
+static MetaCaptureResult *fake_compose_layout(
+    void *context, const MetaCaptureLayoutRequest *request) {
+  (void)context;
+  return meta_capture_compose_layout(request);
 }
 
 static bool fake_post_held(void *context, MetaHeldEventKind kind, uint32_t code,
@@ -187,7 +202,7 @@ static bool fake_cleanup_up(void *context, MetaHeldEventKind kind,
   MetaBrokerCore *_core;
   MetaCaptureCommandBinder *_binder;
   MetaObserverCommandBinder *_observerBinder;
-  MetaDisplayRecord _display;
+  MetaDisplayRecord _displays[2];
   MetaInventorySnapshot _snapshot;
   NSLock *_lock;
   NSMutableSet<NSString *> *_pending;
@@ -203,6 +218,7 @@ static bool fake_cleanup_up(void *context, MetaHeldEventKind kind,
         .status = fake_status,
         .release_task = fake_release_task,
         .release_result = fake_release_result,
+        .compose_layout = fake_compose_layout,
     };
     _router = meta_capture_router_create("native-1", capture_backend);
     MetaExecutorBackend sink = {
@@ -216,22 +232,30 @@ static bool fake_cleanup_up(void *context, MetaHeldEventKind kind,
                       return YES;
                     }];
     _core = meta_broker_core_create([_executor executorOnActionWorker], _router);
-    _display = (MetaDisplayRecord){
+    _displays[0] = (MetaDisplayRecord){
         .display_id = 10,
-        .bounds = {.x = 0, .y = 0, .width = 1, .height = 1},
-        .usable_bounds = {.x = 0, .y = 0, .width = 1, .height = 1},
+        .bounds = {.x = -1, .y = 0, .width = 1, .height = 1},
+        .usable_bounds = {.x = -1, .y = 0, .width = 1, .height = 1},
         .scale = 1,
         .main = true,
     };
-    snprintf(_display.display_ref, sizeof(_display.display_ref), "%s",
+    snprintf(_displays[0].display_ref, sizeof(_displays[0].display_ref), "%s",
              "display-1");
+    _displays[1] = (MetaDisplayRecord){
+        .display_id = 20,
+        .bounds = {.x = 0, .y = 0, .width = 1, .height = 1},
+        .usable_bounds = {.x = 0, .y = 0, .width = 1, .height = 1},
+        .scale = 2,
+    };
+    snprintf(_displays[1].display_ref, sizeof(_displays[1].display_ref), "%s",
+             "display-2");
     _snapshot = (MetaInventorySnapshot){
         .revision = 1,
         .display_layout_revision = 1,
         .captured_at_micros = 1789466400000000ULL,
         .complete = true,
-        .displays = &_display,
-        .display_count = 1,
+        .displays = _displays,
+        .display_count = 2,
     };
     snprintf(_snapshot.inventory_id, sizeof(_snapshot.inventory_id), "%s",
              "inventory-1");
@@ -312,23 +336,70 @@ static bool fake_cleanup_up(void *context, MetaHeldEventKind kind,
 - (NSDictionary *)startCapture:(NSDictionary *)request job:(MetaInputJob *)job {
   NSDictionary *operation = job.operation;
   NSDictionary *target = operation[@"target"];
-  NSString *target_ref = target[@"ref"][@"displayRef"];
-  if (![target[@"kind"] isEqual:@"display"] ||
-      ![target_ref isEqual:@"display-1"] ||
+  BOOL layout = [target[@"kind"] isEqual:@"desktop-layout"];
+  NSString *target_ref = layout ? target[@"ref"][@"layoutRef"]
+                                : target[@"ref"][@"displayRef"];
+  BOOL exact_target = layout ? [target_ref isEqual:@"layout-1"]
+                             : [target[@"kind"] isEqual:@"display"] &&
+                               [target_ref isEqual:@"display-1"];
+  if (!exact_target ||
       ![operation[@"inventoryId"] isEqual:@"inventory-1"] ||
-      ![operation[@"inventoryRevision"] isEqual:@1]) return nil;
+      ![operation[@"inventoryRevision"] isEqual:@1]) {
+    return @{
+      @"nativeError" : @{
+        @"code" : @"invalid-request",
+        @"message" : [NSString stringWithFormat:
+            @"Fixture target mismatch kind=%@ ref=%@ inventory=%@ revision=%@",
+            target[@"kind"], target_ref, operation[@"inventoryId"],
+            operation[@"inventoryRevision"]],
+        @"retryable" : @NO,
+        @"stage" : @"native-execute",
+        @"replayAllowed" : @NO,
+        @"recoveryAction" : @"inspect-health",
+      },
+    };
+  }
+  __block NSError *capture_error = nil;
   NSDictionary *execution = [_executor
       executeExternal:request
                  job:job
            targetRef:target_ref
               verify:^BOOL(NSString *value) {
-                return [value isEqual:@"display-1"];
+                return [value isEqual:target_ref];
               }
               action:^NSDictionary * {
-                NSError *error = nil;
-                return [self->_binder startRequest:request error:&error];
+                return [self->_binder startRequest:request error:&capture_error];
               }];
+  if (execution == nil) {
+    MetaExecutorStatus status = meta_executor_status(
+        [_executor executorOnActionWorker]);
+    return @{
+      @"nativeError" : @{
+        @"code" : @"internal-error",
+        @"message" : [NSString stringWithFormat:
+            @"Fixture external gate rejected layout=%d fence=%llu state=%d quarantined=%d",
+            layout, (unsigned long long)[operation[@"fence"][@"counter"]
+                unsignedLongLongValue], status.execution, status.quarantined],
+        @"retryable" : @NO,
+        @"stage" : @"native-execute",
+        @"replayAllowed" : @NO,
+        @"recoveryAction" : @"inspect-health",
+      },
+    };
+  }
   NSDictionary *value = execution[@"value"];
+  if (value == nil && capture_error != nil) {
+    return @{
+      @"nativeError" : @{
+        @"code" : @"invalid-request",
+        @"message" : capture_error.localizedDescription,
+        @"retryable" : @NO,
+        @"stage" : @"native-execute",
+        @"replayAllowed" : @NO,
+        @"recoveryAction" : @"inspect-health",
+      },
+    };
+  }
   if (value != nil) {
     [_lock lock];
     [_pending addObject:operation[@"operationId"]];

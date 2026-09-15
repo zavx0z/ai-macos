@@ -10,11 +10,19 @@ typedef struct {
   MetaCaptureCompletion completion;
   MetaCaptureTaskStatus status;
   MetaCaptureRequest accepted_request;
+  int task_storage;
+} FakeCaptureChild;
+
+typedef struct {
+  FakeCaptureChild children[16];
   size_t start_count;
   size_t release_task_count;
   size_t release_result_count;
-  int task_storage;
+  size_t compose_count;
 } FakeCaptureBackend;
+
+static MetaCaptureResult *fake_compose_layout(
+    void *context, const MetaCaptureLayoutRequest *request);
 
 MetaCaptureRequest meta_capture_request_default(void) {
   return (MetaCaptureRequest){
@@ -34,35 +42,53 @@ static MetaCaptureTaskRef fake_start(void *context,
                                      MetaCaptureCompletion completion) {
   (void)callback_queue;
   FakeCaptureBackend *fake = context;
-  fake->accepted_request = *request;
-  fake->completion = [completion copy];
-  fake->start_count += 1;
-  fake->status = (MetaCaptureTaskStatus){
+  assert(fake->start_count < 16);
+  FakeCaptureChild *child = &fake->children[fake->start_count++];
+  child->accepted_request = *request;
+  child->completion = [completion copy];
+  child->status = (MetaCaptureTaskStatus){
       .revision = 1,
       .startPending = true,
       .cleanup = MetaCaptureCleanupPending,
   };
-  return &fake->task_storage;
+  return &child->task_storage;
+}
+
+static FakeCaptureChild *fake_child(FakeCaptureBackend *fake,
+                                    MetaCaptureTaskRef task) {
+  for (size_t index = 0; index < fake->start_count; index += 1) {
+    if (task == &fake->children[index].task_storage) {
+      return &fake->children[index];
+    }
+  }
+  return NULL;
+}
+
+static FakeCaptureChild *last_child(FakeCaptureBackend *fake) {
+  assert(fake->start_count > 0);
+  return &fake->children[fake->start_count - 1];
 }
 
 static void fake_cancel(void *context, MetaCaptureTaskRef task) {
   FakeCaptureBackend *fake = context;
-  assert(task == &fake->task_storage);
-  fake->status.stopRequested = true;
-  fake->status.revision += 1;
+  FakeCaptureChild *child = fake_child(fake, task);
+  assert(child != NULL);
+  child->status.stopRequested = true;
+  child->status.revision += 1;
 }
 
 static bool fake_status(void *context, MetaCaptureTaskRef task,
                         MetaCaptureTaskStatus *status) {
   FakeCaptureBackend *fake = context;
-  assert(task == &fake->task_storage);
-  *status = fake->status;
+  FakeCaptureChild *child = fake_child(fake, task);
+  assert(child != NULL);
+  *status = child->status;
   return true;
 }
 
 static void fake_release_task(void *context, MetaCaptureTaskRef task) {
   FakeCaptureBackend *fake = context;
-  assert(task == &fake->task_storage);
+  assert(fake_child(fake, task) != NULL);
   fake->release_task_count += 1;
 }
 
@@ -142,7 +168,15 @@ static NSDictionary *start_request(NSString *inventory_id,
       ? @{
         @"kind" : @"desktop-layout",
         @"target" : target,
-        @"displays" : @[],
+        @"displays" : @[@{
+          @"kind" : @"display",
+          @"target" : display_target(),
+          @"nativeDisplayId" : @10,
+        }, @{
+          @"kind" : @"display",
+          @"target" : @{ @"kind" : @"display", @"ref" : second_display_ref() },
+          @"nativeDisplayId" : @20,
+        }],
       }
       : [target_kind isEqual:@"window"] ? @{
         @"kind" : @"window",
@@ -155,7 +189,16 @@ static NSDictionary *start_request(NSString *inventory_id,
         @"nativeDisplayId" : @10,
       };
   NSDictionary *mapping = [target_kind isEqual:@"desktop-layout"]
-      ? @{ @"kind" : @"desktop-layout", @"displays" : @[] }
+      ? @{
+        @"kind" : @"desktop-layout",
+        @"displays" : @[@{
+          @"nativeDisplayId" : @10,
+          @"ref" : display_ref(),
+        }, @{
+          @"nativeDisplayId" : @20,
+          @"ref" : second_display_ref(),
+        }],
+      }
       : [target_kind isEqual:@"window"] ? @{
         @"kind" : @"window",
         @"cgWindowId" : @77,
@@ -183,7 +226,7 @@ static NSDictionary *start_request(NSString *inventory_id,
     @"runtimeEpoch" : @"runtime-1",
     @"loginSessionId" : @"login-1",
     @"nativeGeneration" : @"native-1",
-    @"deadlineAt" : @"2026-09-15T10:00:10.000Z",
+    @"deadlineAt" : @"2099-09-15T10:00:10.000Z",
     @"operation" : @{
       @"kind" : @"native",
       @"operationId" : @"operation-1",
@@ -299,6 +342,49 @@ static MetaCaptureResult *successful_window_result(void) {
   return result;
 }
 
+static MetaCaptureResult *successful_layout_child(
+    uint32_t display_id, CGRect bounds, double backing_scale) {
+  MetaCaptureResult *result = successful_result(1);
+  result->requestedDisplayID = display_id;
+  result->regions[0].displayID = display_id;
+  result->regions[0].displayBoundsPoints = bounds;
+  result->regions[0].destinationRectPoints = bounds;
+  result->regions[0].backingScaleX = backing_scale;
+  result->regions[0].backingScaleY = backing_scale;
+  return result;
+}
+
+static MetaCaptureResult *fake_compose_layout(
+    void *context, const MetaCaptureLayoutRequest *request) {
+  FakeCaptureBackend *fake = context;
+  assert(request != NULL);
+  assert(request->frameCount == 2);
+  assert(request->maxWidthPixels == 1000);
+  assert(request->maxHeightPixels == 1000);
+  assert(request->frames[0]->cleanup == MetaCaptureCleanupComplete);
+  assert(request->frames[1]->cleanup == MetaCaptureCleanupComplete);
+  fake->compose_count += 1;
+  MetaCaptureResult *result = calloc(1, sizeof(*result));
+  result->outcome = MetaCaptureOutcomeSucceeded;
+  result->cleanup = MetaCaptureCleanupComplete;
+  result->errorCode = MetaCaptureErrorNone;
+  result->source = MetaCaptureSourceDisplayComposite;
+  result->caption = CFRetain(request->caption);
+  result->pngData = CFRetain(request->frames[0]->pngData);
+  result->imageWidthPixels = 4;
+  result->imageHeightPixels = 2;
+  result->encodedBytes = CFDataGetLength(result->pngData);
+  result->capturedAtUnixNanoseconds = 1789466400000000000ULL;
+  result->frameStatus = 0;
+  result->shareableTargetMatched = true;
+  result->regions = calloc(request->frameCount, sizeof(*result->regions));
+  result->regionCount = request->frameCount;
+  for (size_t index = 0; index < request->frameCount; index += 1) {
+    result->regions[index] = request->frames[index]->regions[0];
+  }
+  return result;
+}
+
 int main(void) {
   @autoreleasepool {
     FakeCaptureBackend fake = {0};
@@ -309,26 +395,27 @@ int main(void) {
         .status = fake_status,
         .release_task = fake_release_task,
         .release_result = fake_release_result,
+        .compose_layout = fake_compose_layout,
     };
     MetaCaptureRouter *router = meta_capture_router_create("native-1", backend);
     assert(router != NULL);
     MetaDisplayRecord displays[] = {{
         .display_ref = "display-1",
         .display_id = 10,
-        .bounds = {.x = 0, .y = 0, .width = 2, .height = 2},
+        .bounds = {.x = -2, .y = 0, .width = 2, .height = 2},
         .scale = 1,
     }, {
         .display_ref = "display-2",
         .display_id = 20,
-        .bounds = {.x = 2, .y = 0, .width = 2, .height = 2},
-        .scale = 1,
+        .bounds = {.x = 0, .y = 0, .width = 2, .height = 2},
+        .scale = 2,
     }};
     MetaWindowRecord windows[] = {{
         .window_ref = "window-1",
         .application_ref = "application-1",
         .cg_window_id = 77,
         .pid = 42,
-        .frame = {.x = 0.5, .y = 0.5, .width = 300, .height = 200},
+        .frame = {.x = -1.5, .y = 0.5, .width = 300, .height = 200},
         .mapping = META_MAPPING_CORROBORATED,
     }};
     MetaInventorySnapshot snapshot = {
@@ -360,13 +447,6 @@ int main(void) {
     assert(stale == nil);
     assert(error.code == 2);
     error = nil;
-    NSDictionary *layout = [binder startRequest:
-        start_request(@"inventory-1", 4, @"desktop-layout",
-                      @"2099-09-15T10:02:00.000Z") error:&error];
-    assert(layout == nil);
-    assert(error.code == 3);
-
-    error = nil;
     NSDictionary *expired = [binder startRequest:
         start_request(@"inventory-1", 4, @"display",
                       @"2020-09-15T10:02:00.000Z") error:&error];
@@ -393,8 +473,9 @@ int main(void) {
     assert([started[@"status"][@"startPending"] boolValue]);
     assert(![started[@"status"][@"completionDelivered"] boolValue]);
     assert(fake.start_count == 1);
-    assert(fake.accepted_request.source == MetaCaptureSourceDisplayComposite);
-    assert(fake.accepted_request.displayID == 10);
+    assert(last_child(&fake)->accepted_request.source ==
+           MetaCaptureSourceDisplayComposite);
+    assert(last_child(&fake)->accepted_request.displayID == 10);
 
     NSString *start_status_ref = started[@"statusEvidenceRef"];
     __block NSDictionary *binary_header = nil;
@@ -413,7 +494,7 @@ int main(void) {
     assert([pending[@"ack"][@"quarantined"] boolValue]);
     assert(binary_header == nil && binary_bytes == nil);
 
-    fake.status = (MetaCaptureTaskStatus){
+    last_child(&fake)->status = (MetaCaptureTaskStatus){
         .revision = 2,
         .completionDelivered = true,
         .streamStarted = true,
@@ -421,7 +502,7 @@ int main(void) {
         .cleanup = MetaCaptureCleanupComplete,
         .drained = true,
     };
-    fake.completion(successful_result(1));
+    last_child(&fake)->completion(successful_result(1));
     error = nil;
     NSDictionary *not_emitted = [binder cleanupRequest:
         cleanup_request(@"result", task_ref, 1, start_status_ref,
@@ -534,10 +615,11 @@ int main(void) {
         start_request(@"inventory-1", 4, @"window",
                       @"2099-09-15T10:02:00.000Z") error:&error];
     assert(window_started != nil && error == nil);
-    assert(fake.accepted_request.source == MetaCaptureSourceWindowIsolated);
-    assert(fake.accepted_request.windowID == 77);
-    assert(fake.accepted_request.ownerPID == 42);
-    fake.status = (MetaCaptureTaskStatus){
+    assert(last_child(&fake)->accepted_request.source ==
+           MetaCaptureSourceWindowIsolated);
+    assert(last_child(&fake)->accepted_request.windowID == 77);
+    assert(last_child(&fake)->accepted_request.ownerPID == 42);
+    last_child(&fake)->status = (MetaCaptureTaskStatus){
         .revision = 3,
         .completionDelivered = true,
         .stopRequested = true,
@@ -548,7 +630,7 @@ int main(void) {
     MetaCaptureResult *window_cleanup = calloc(1, sizeof(*window_cleanup));
     window_cleanup->outcome = MetaCaptureOutcomeFailed;
     window_cleanup->cleanup = MetaCaptureCleanupComplete;
-    fake.completion(window_cleanup);
+    last_child(&fake)->completion(window_cleanup);
     assert(meta_capture_router_release_drained_operation(
                router, "operation-1", false) == 1);
     NSString *window_task_ref = window_started[@"captureTaskRef"];
@@ -585,14 +667,14 @@ int main(void) {
         start_request(@"inventory-1", 4, @"window",
                       @"2099-09-15T10:02:00.000Z") error:&error];
     assert(region_started != nil && error == nil);
-    fake.status = (MetaCaptureTaskStatus){
+    last_child(&fake)->status = (MetaCaptureTaskStatus){
         .revision = 4,
         .completionDelivered = true,
         .streamStopped = true,
         .cleanup = MetaCaptureCleanupComplete,
         .drained = true,
     };
-    fake.completion(successful_window_result());
+    last_child(&fake)->completion(successful_window_result());
     __block NSUInteger invalid_region_emissions = 0;
     NSDictionary *invalid_regions = [binder cleanupRequest:
         cleanup_request(@"result", region_started[@"captureTaskRef"], 1,
@@ -612,6 +694,117 @@ int main(void) {
                router, "operation-1", false) == 1);
     assert(fake.release_task_count == 3);
     assert(fake.release_result_count == 3);
+
+    error = nil;
+    NSDictionary *layout_started = [binder startRequest:
+        start_request(@"inventory-1", 4, @"desktop-layout",
+                      @"2099-09-15T10:02:00.000Z") error:&error];
+    assert(layout_started != nil && error == nil);
+    assert([layout_started[@"status"][@"startPending"] boolValue]);
+    assert(fake.start_count == 5);
+    FakeCaptureChild *first_layout = &fake.children[3];
+    FakeCaptureChild *second_layout = &fake.children[4];
+    assert(first_layout->accepted_request.displayID == 10);
+    assert(second_layout->accepted_request.displayID == 20);
+    assert(first_layout->accepted_request.maxEncodedBytes == 500000);
+    assert(second_layout->accepted_request.maxEncodedBytes == 500000);
+    first_layout->status = (MetaCaptureTaskStatus){
+        .revision = 2,
+        .completionDelivered = true,
+        .streamStopped = true,
+        .cleanup = MetaCaptureCleanupComplete,
+        .drained = true,
+    };
+    first_layout->completion(successful_layout_child(
+        10, CGRectMake(-2, 0, 2, 2), 1));
+    NSDictionary *partial_layout = [binder cleanupRequest:
+        cleanup_request(@"result", layout_started[@"captureTaskRef"], 1,
+                        layout_started[@"statusEvidenceRef"],
+                        @"cleanup-layout-partial")
+        emitBinary:^BOOL(NSDictionary *header, NSData *bytes) {
+          (void)header;
+          (void)bytes;
+          return YES;
+        }
+        error:&error];
+    assert(partial_layout != nil);
+    assert([partial_layout[@"poll"][@"state"] isEqual:@"pending"]);
+    assert(fake.compose_count == 0);
+    second_layout->status = (MetaCaptureTaskStatus){
+        .revision = 2,
+        .completionDelivered = true,
+        .streamStopped = true,
+        .cleanup = MetaCaptureCleanupUnknown,
+    };
+    MetaCaptureResult *unknown_child = successful_layout_child(
+        20, CGRectMake(0, 0, 2, 2), 2);
+    unknown_child->cleanup = MetaCaptureCleanupUnknown;
+    second_layout->completion(unknown_child);
+    NSDictionary *partial_status = partial_layout[@"poll"][@"status"];
+    NSDictionary *partial_evidence = partial_layout[@"statusEvidence"];
+    NSDictionary *unknown_layout = [binder cleanupRequest:
+        cleanup_request(@"result", layout_started[@"captureTaskRef"],
+                        [partial_status[@"revision"] unsignedLongLongValue],
+                        partial_evidence[@"statusEvidenceRef"],
+                        @"cleanup-layout-unknown")
+        emitBinary:^BOOL(NSDictionary *header, NSData *bytes) {
+          (void)header;
+          (void)bytes;
+          return YES;
+        }
+        error:&error];
+    assert(unknown_layout != nil);
+    assert([unknown_layout[@"poll"][@"state"] isEqual:@"pending"]);
+    assert([unknown_layout[@"poll"][@"status"][@"cleanup"]
+        isEqual:@"unknown"]);
+    assert(fake.compose_count == 0);
+    second_layout->status = (MetaCaptureTaskStatus){
+        .revision = 3,
+        .completionDelivered = true,
+        .streamStopped = true,
+        .cleanup = MetaCaptureCleanupComplete,
+        .drained = true,
+    };
+    NSDictionary *unknown_status = unknown_layout[@"poll"][@"status"];
+    NSDictionary *unknown_evidence = unknown_layout[@"statusEvidence"];
+    __block NSUInteger layout_emissions = 0;
+    NSDictionary *layout_completed = [binder cleanupRequest:
+        cleanup_request(@"result", layout_started[@"captureTaskRef"],
+                        [unknown_status[@"revision"] unsignedLongLongValue],
+                        unknown_evidence[@"statusEvidenceRef"],
+                        @"cleanup-layout-complete")
+        emitBinary:^BOOL(NSDictionary *header, NSData *bytes) {
+          (void)header;
+          (void)bytes;
+          layout_emissions += 1;
+          return YES;
+        }
+        error:&error];
+    assert(layout_completed != nil && error == nil);
+    assert([layout_completed[@"poll"][@"state"] isEqual:@"completed"]);
+    assert(layout_emissions == 1);
+    assert(fake.compose_count == 1);
+    NSDictionary *layout_result = layout_completed[@"poll"][@"result"];
+    assert([layout_result[@"nativeMapping"][@"kind"]
+        isEqual:@"desktop-layout"]);
+    assert([layout_result[@"frame"][@"regions"] count] == 2);
+    assert([layout_result[@"frame"][@"regions"][0]
+        [@"destinationRect"][@"x"] doubleValue] == -2);
+    NSString *layout_drained = layout_result[@"drainedEvidenceRef"];
+    NSDictionary *layout_release = [binder cleanupRequest:
+        cleanup_request(@"release", layout_started[@"captureTaskRef"],
+                        [layout_completed[@"poll"][@"status"][@"revision"]
+                            unsignedLongLongValue],
+                        layout_drained, @"cleanup-layout-release")
+        emitBinary:^BOOL(NSDictionary *header, NSData *bytes) {
+          (void)header;
+          (void)bytes;
+          return YES;
+        }
+        error:&error];
+    assert(layout_release != nil && error == nil);
+    assert(fake.release_task_count == 5);
+    assert(fake.release_result_count == 6);
     meta_capture_router_destroy(router);
   }
   puts("meta_capture_command_test: ok");

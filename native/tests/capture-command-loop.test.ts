@@ -37,6 +37,7 @@ beforeAll(async () => {
     "broker_core.c",
     "capture_router.m",
     "capture-command/meta_capture_command.m",
+    "capture/meta_capture.m",
     "serialization.m",
     "observer/meta_observer.m",
     "observer-index/meta_observer_target_index.m",
@@ -61,6 +62,16 @@ beforeAll(async () => {
     "Foundation",
     "-framework",
     "CoreGraphics",
+    "-framework",
+    "CoreImage",
+    "-framework",
+    "CoreMedia",
+    "-framework",
+    "CoreVideo",
+    "-framework",
+    "ImageIO",
+    "-framework",
+    "ScreenCaptureKit",
     "-framework",
     "Security",
     "-framework",
@@ -94,8 +105,17 @@ const displayRef = {
   displayLayoutRevision: 1,
 }
 
+const secondDisplayRef = {
+  ...generation,
+  displayRef: "display-2",
+  displayLayoutRevision: 1,
+}
+
 const target = { kind: "display" as const, ref: displayRef }
-const fence = { ...generation, counter: 1 }
+const layoutTarget = {
+  kind: "desktop-layout" as const,
+  ref: { ...generation, layoutRef: "layout-1", displayLayoutRevision: 1 },
+}
 const expectedPng = Uint8Array.from(Buffer.from(
   "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=",
   "base64",
@@ -163,19 +183,107 @@ function screenRequest(now: Date): ScreenCaptureRequest {
   }
 }
 
-function operation(deadlineAt: string) {
+function layoutScreenRequest(now: Date): ScreenCaptureRequest {
+  const issuedAt = now.toISOString()
+  const expiresAt = new Date(now.getTime() + 60_000).toISOString()
+  const display = (ref: typeof displayRef, nativeDisplayId: number) => ({
+    kind: "display" as const,
+    target: { kind: "display" as const, ref },
+    nativeDisplayId,
+    mappingEvidence: {
+      state: "confirmed" as const,
+      claim: `display-${nativeDisplayId}-resolved`,
+      source: "fixture-authority",
+      proof: {
+        proofRef: `proof-target-${nativeDisplayId}`,
+        authorityRef: "authority-1",
+        kind: "target-resolution" as const,
+        subject: { kind: "display" as const, ref },
+        ...generation,
+        inventoryRevision: 1,
+        displayLayoutRevision: 1,
+        issuedAt,
+        expiresAt,
+      },
+    },
+  })
+  const base: Omit<ScreenCaptureRequest, "publication"> = {
+    source: "display-composite",
+    caption: "Ожидаю layout из двух fixture displays",
+    target: {
+      kind: "desktop-layout",
+      target: layoutTarget,
+      mappingEvidence: {
+        state: "confirmed",
+        claim: "desktop-layout-resolved",
+        source: "fixture-authority",
+        proof: {
+          proofRef: "proof-layout-1",
+          authorityRef: "authority-1",
+          kind: "target-resolution",
+          subject: layoutTarget,
+          ...generation,
+          inventoryRevision: 1,
+          displayLayoutRevision: 1,
+          issuedAt,
+          expiresAt,
+        },
+      },
+      displays: [display(displayRef, 10), display(secondDisplayRef, 20)],
+    },
+    clip: { kind: "full-target" },
+    fullPage: false,
+    cursor: "exclude",
+    readinessPolicy: {
+      policyId: "readiness-layout-fixture-1",
+      requiredSteps: ["permission", "target", "complete-frame"],
+      disabledSteps: [],
+    },
+    output: {
+      format: "image/png",
+      scale: 1,
+      maxWidthPx: 4,
+      maxHeightPx: 2,
+      maxPixels: 8,
+      maxEncodedBytes: 1_000_000,
+    },
+  }
+  return {
+    ...base,
+    publication: {
+      observationId: "observation-layout-1",
+      frameRef: "frame-layout-1",
+      source: base.source,
+      captureTarget: layoutTarget,
+      capturePolicySha256: capturePolicySha256(base),
+      ...generation,
+      expiresAt,
+      inventoryId: "inventory-1",
+      inventoryRevision: 1,
+      displayLayoutRevision: 1,
+      cacheScopeRef: "cache-scope-layout-1",
+    },
+  }
+}
+
+function operation(
+  deadlineAt: string,
+  operationId = "operation-1",
+  operationTarget: typeof target | typeof layoutTarget = target,
+  counter = 1,
+) {
   return {
     kind: "native" as const,
-    operationId: "operation-1",
-    clientRequestId: "client-request-1",
+    operationId,
+    clientRequestId: `client-request-${counter}`,
     clientSessionId: "client-1",
     principalId: "principal-1",
     ...generation,
     deadlineAt,
     inventoryId: "inventory-1",
     inventoryRevision: 1,
-    fence,
-    target,
+    fence: { ...generation, counter },
+    target: operationTarget,
   }
 }
 
@@ -184,16 +292,18 @@ function cleanupControl(
   expectedStatusRevision: number,
   expectedDrainedEvidenceRef: string,
   requestId: string,
+  operationId = "operation-1",
+  counter = 1,
 ): NativeCleanupControl {
   return {
     kind: "cleanup-only",
     purpose,
     requestId,
     cleanupRequestId: `cleanup-${purpose}-1`,
-    operationId: "operation-1",
+    operationId,
     ...generation,
-    acceptedFence: fence,
-    currentHighWaterFence: fence,
+    acceptedFence: { ...generation, counter },
+    currentHighWaterFence: { ...generation, counter },
     deadlineAt: new Date(Date.now() + 5_000).toISOString(),
     expectedStatusRevision,
     expectedDrainedEvidenceRef,
@@ -273,6 +383,7 @@ test("production command loop проводит observer ACK перед PUSH и c
       },
     }),
   })
+  let layoutAdapter: NativeBrokerAdapter | undefined
 
   try {
     const handshake = await adapter.handshake({
@@ -443,6 +554,200 @@ test("production command loop проводит observer ACK перед PUSH и c
     expect(released.ack.cleanup).toBe("complete")
     expect(released.alreadyReleased).toBe(false)
 
+    const layoutRegisteredSources: Array<{ ref: string, bytes: Uint8Array }> = []
+    const layoutImmutableSources = new Map<string, string>()
+    const layoutTransport = new NativeProcessTransport(binary)
+    layoutAdapter = new NativeBrokerAdapter({
+      host: {
+        generation: { runtimeEpoch: generation.runtimeEpoch, loginSessionId: generation.loginSessionId },
+        runtimeBuildId: "runtime-build-1",
+        capabilities: {
+          schemaVersion: "1",
+          scope: "adapter",
+          producerRef: "capture-layout-loop-adapter",
+          capabilities: [],
+        },
+      },
+      adapterInstanceRef: "capture-layout-loop-adapter",
+      transport: layoutTransport,
+      ledgerSink: {
+        async persist(requestId, snapshot) {
+          return {
+            requestId,
+            operationId: snapshot.operationId,
+            runtimeEpoch: snapshot.runtimeEpoch,
+            loginSessionId: snapshot.loginSessionId,
+            nativeGeneration: snapshot.nativeGeneration,
+            revision: snapshot.revision,
+            snapshotSha256: heldInputLedgerDigest(snapshot),
+            persistedAt: new Date().toISOString(),
+            durable: true as const,
+          }
+        },
+      },
+      bindEvidence: () => ({
+        publisher: {
+          async publish() {
+            throw new Error("Layout fixture не публикует producer-authored evidence")
+          },
+        },
+        sourceResponses: {
+          register(ref, bytes) {
+            const copy = Uint8Array.from(bytes)
+            const encoded = Buffer.from(copy).toString("base64")
+            const previous = layoutImmutableSources.get(ref)
+            if (previous !== undefined && previous !== encoded) {
+              throw new Error(`Layout source response ref ${ref} переиспользован для других raw bytes`)
+            }
+            layoutImmutableSources.set(ref, encoded)
+            const facts = extractNativeEvidenceReports(copy)
+            if (!facts.some(fact => fact.sourceResponseRef === ref)) {
+              throw new Error(`Layout source response ${ref} не извлекает exact native fact`)
+            }
+            layoutRegisteredSources.push({ ref, bytes: copy })
+          },
+        },
+      }),
+    })
+    const layoutHandshake = await layoutAdapter.handshake({
+      kind: "handshake",
+      protocolVersion: "1",
+      requestId: "layout-handshake-1",
+      runtimeEpoch: generation.runtimeEpoch,
+      loginSessionId: generation.loginSessionId,
+      runtimeBuildId: "runtime-build-1",
+      expectedNativeBuildId: "capture-loop-build",
+      capabilitySchemaVersion: "1",
+    }, AbortSignal.timeout(5_000))
+    expect(layoutHandshake.nativeGeneration).toBe(generation.nativeGeneration)
+
+    const layoutDeadlineAt = new Date(Date.now() + 10_000).toISOString()
+    const layoutRequest = nativeCaptureStartRequestSchema.parse({
+      kind: "request",
+      protocolVersion: "1",
+      requestId: "capture-layout-start-1",
+      ...generation,
+      deadlineAt: layoutDeadlineAt,
+      intent: "mutation",
+      method: "capture.start",
+      operation: operation(layoutDeadlineAt, "operation-layout-1", layoutTarget, 1),
+      payload: {
+        request: layoutScreenRequest(new Date()),
+        nativeMapping: {
+          kind: "desktop-layout",
+          displays: [
+            { nativeDisplayId: 10, ref: displayRef },
+            { nativeDisplayId: 20, ref: secondDisplayRef },
+          ],
+        },
+        captureTimeoutMs: 1_000,
+        stopTimeoutMs: 100,
+      },
+    })
+    const layoutStarted = await layoutAdapter.request(
+      nativeCaptureStartRequestSchema,
+      layoutRequest,
+      nativeCaptureStartResponseSchema,
+      control(),
+    )
+    if (!layoutStarted.ok) throw new Error(JSON.stringify(layoutStarted.error))
+    expect(layoutStarted.ok).toBe(true)
+    expect(layoutStarted.result.status.startPending).toBe(true)
+
+    const layoutPendingRequest = nativeCaptureCleanupRequestSchema.parse({
+      control: cleanupControl(
+        "result",
+        1,
+        layoutStarted.result.statusEvidenceRef,
+        "capture-layout-pending-1",
+        "operation-layout-1",
+        1,
+      ),
+      payload: { captureTaskRef: layoutStarted.result.captureTaskRef },
+    })
+    const layoutPending = await layoutAdapter.cleanup(
+      nativeCaptureCleanupRequestSchema,
+      layoutPendingRequest,
+      nativeCaptureCleanupResponseSchema,
+      control(),
+    )
+    expect(layoutPending.purpose).toBe("result")
+    if (layoutPending.purpose !== "result") throw new Error("Ожидался layout result cleanup")
+    expect(layoutPending.poll.state).toBe("pending")
+
+    await Bun.sleep(30)
+    const layoutCompleteRequest = nativeCaptureCleanupRequestSchema.parse({
+      control: cleanupControl(
+        "result",
+        layoutPending.poll.status.revision,
+        layoutPending.statusEvidence.statusEvidenceRef,
+        "capture-layout-complete-1",
+        "operation-layout-1",
+        1,
+      ),
+      payload: { captureTaskRef: layoutStarted.result.captureTaskRef },
+    })
+    const layoutCompleted = await layoutAdapter.cleanup(
+      nativeCaptureCleanupRequestSchema,
+      layoutCompleteRequest,
+      nativeCaptureCleanupResponseSchema,
+      control(),
+    )
+    expect(layoutCompleted.purpose).toBe("result")
+    if (layoutCompleted.purpose !== "result" || layoutCompleted.poll.state !== "completed") {
+      throw new Error("Layout completion не доставлена")
+    }
+    expect(layoutCompleted.poll.status.cleanup).toBe("complete")
+    expect(layoutCompleted.poll.status.drained).toBe(true)
+    expect(layoutCompleted.poll.result.sourceResponseRef).not.toBe(layoutStarted.result.sourceResponseRef)
+    expect(layoutCompleted.poll.result.nativeMapping).toEqual(layoutRequest.payload.nativeMapping)
+    const layoutFrame = layoutCompleted.poll.result.frame
+    if (layoutFrame === undefined) throw new Error("Layout frame отсутствует")
+    expect(layoutFrame.widthPx).toBe(4)
+    expect(layoutFrame.heightPx).toBe(2)
+    expect(layoutFrame.regions).toHaveLength(2)
+    expect(layoutFrame.regions.map(region => ({
+      nativeDisplayId: region.nativeDisplayId,
+      x: region.destinationRect.x,
+      backingScaleX: region.backingScaleX,
+    }))).toEqual([
+      { nativeDisplayId: 10, x: -1, backingScaleX: 1 },
+      { nativeDisplayId: 20, x: 0, backingScaleX: 2 },
+    ])
+    const layoutBytes = await layoutAdapter.takeBinary(
+      layoutFrame.binaryToken,
+      layoutFrame.encodedBytes,
+      AbortSignal.timeout(3_000),
+    )
+    expect([...layoutBytes.subarray(0, 8)]).toEqual([137, 80, 78, 71, 13, 10, 26, 10])
+    expect(new Bun.CryptoHasher("sha256").update(layoutBytes).digest("hex")).toBe(layoutFrame.sha256)
+    const layoutDrainedEvidenceRef = layoutCompleted.poll.result.drainedEvidenceRef
+    if (layoutDrainedEvidenceRef === undefined) throw new Error("Layout drained evidence отсутствует")
+    const layoutReleaseRequest = nativeCaptureCleanupRequestSchema.parse({
+      control: cleanupControl(
+        "release",
+        layoutCompleted.poll.status.revision,
+        layoutDrainedEvidenceRef,
+        "capture-layout-release-1",
+        "operation-layout-1",
+        1,
+      ),
+      payload: { captureTaskRef: layoutStarted.result.captureTaskRef },
+    })
+    const layoutReleased = await layoutAdapter.cleanup(
+      nativeCaptureCleanupRequestSchema,
+      layoutReleaseRequest,
+      nativeCaptureCleanupResponseSchema,
+      control(),
+    )
+    expect(layoutReleased.purpose).toBe("release")
+    if (layoutReleased.purpose !== "release") throw new Error("Ожидался layout release cleanup")
+    expect(layoutReleased.ack.cleanup).toBe("complete")
+    expect(layoutReleased.alreadyReleased).toBe(false)
+    expect(layoutRegisteredSources.length).toBeGreaterThanOrEqual(2)
+    expect(new Set(layoutRegisteredSources.map(source => source.ref)).size)
+      .toBe(layoutRegisteredSources.length)
+
     const drained = await adapter.drain({
       requestId: "drain-1",
       ...generation,
@@ -461,6 +766,7 @@ test("production command loop проводит observer ACK перед PUSH и c
       expect(sealedObserver.ok).toBe(true)
     }
   } finally {
+    await layoutAdapter?.close()
     await adapter.close()
   }
 }, 20_000)
