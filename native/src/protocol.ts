@@ -33,6 +33,8 @@ import {
   windowTransitionRequestSchema,
   z,
 } from "@meta/shared/contracts"
+import { nativeClipboardRequestSchema, nativeClipboardResponseSchema } from "./clipboard-protocol.ts"
+export * from "./clipboard-protocol.ts"
 
 export const NATIVE_FRAME_HEADER_BYTES = 4
 
@@ -692,6 +694,7 @@ export const nativeMethodResponseSchema = z.union([
 ])
 
 export const nativeTransportRequestFrameSchema = z.discriminatedUnion("channel", [
+  z.strictObject({ channel: z.literal("clipboard"), payload: nativeClipboardRequestSchema }),
   z.strictObject({ channel: z.literal("handshake"), payload: nativeHandshakeRequestSchema }),
   z.strictObject({ channel: z.literal("request"), payload: nativeMethodRequestSchema }),
   z.strictObject({ channel: z.literal("status"), payload: nativeStatusRequestSchema }),
@@ -703,6 +706,7 @@ export const nativeTransportRequestFrameSchema = z.discriminatedUnion("channel",
 ])
 
 export const nativeTransportResponseFrameSchema = z.discriminatedUnion("channel", [
+  z.strictObject({ channel: z.literal("clipboard"), payload: nativeClipboardResponseSchema }),
   z.strictObject({ channel: z.literal("handshake"), payload: nativeHandshakeResponseSchema }),
   z.strictObject({ channel: z.literal("response"), payload: nativeMethodResponseSchema }),
   z.strictObject({ channel: z.literal("status"), payload: nativeOperationStatusSchema }),
