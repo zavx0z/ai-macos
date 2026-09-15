@@ -20,12 +20,14 @@ type RuntimeArtifactName = typeof RUNTIME_ARTIFACT_NAMES[number]
 const MAX_MANIFEST_BYTES = 1024 * 1024
 const MAX_RUNTIME_BYTES = 128 * 1024 * 1024
 const MAX_INFO_PLIST_BYTES = 64 * 1024
+const MAX_ICON_BYTES = 16 * 1024 * 1024
 const MAX_CODE_RESOURCES_BYTES = 4 * 1024 * 1024
 const MAX_COMMAND_OUTPUT = 1024 * 1024
 const MAX_UNIX_SOCKET_BYTES = 103
 
 const V2_APPLICATION_PATH = "computer-use.app"
 const V2_INFO_PLIST_PATH = "computer-use.app/Contents/Info.plist"
+const V2_ICON_PATH = "computer-use.app/Contents/Resources/computer-use.icns"
 const V2_RUNTIME_PATH = "computer-use.app/Contents/MacOS/computer-use"
 const V2_HELPER_PATH = "computer-use.app/Contents/Helpers/meta-input-helper"
 
@@ -117,6 +119,7 @@ type InstalledManifestV2 = {
     application: SignedArtifact & {
       path: typeof V2_APPLICATION_PATH
       infoPlist: { path: typeof V2_INFO_PLIST_PATH, sha256: string, bytes: number }
+      icon?: { path: typeof V2_ICON_PATH, sha256: string, bytes: number }
     }
     runtime: { path: typeof V2_RUNTIME_PATH, sha256: string, bytes: number }
     nativeHelper: SignedArtifact & {
@@ -289,24 +292,39 @@ async function verifyApplication(
   const macOSPath = join(contentsPath, "MacOS")
   const helpersPath = join(contentsPath, "Helpers")
   const signaturePath = join(contentsPath, "_CodeSignature")
+  const resourcesPath = join(contentsPath, "Resources")
   await assertNode(fs, applicationPath, "directory", uid, 0o555)
   await assertNode(fs, contentsPath, "directory", uid, 0o555)
   await assertNode(fs, macOSPath, "directory", uid, 0o555)
   await assertNode(fs, helpersPath, "directory", uid, 0o555)
   await assertNode(fs, signaturePath, "directory", uid, 0o555)
+  if (manifest.artifacts.application.icon !== undefined) {
+    await assertNode(fs, resourcesPath, "directory", uid, 0o555)
+  }
   await assertExactEntries(fs, applicationPath, ["Contents"])
-  await assertExactEntries(fs, contentsPath, ["Helpers", "Info.plist", "MacOS", "_CodeSignature"])
+  await assertExactEntries(fs, contentsPath, manifest.artifacts.application.icon === undefined
+    ? ["Helpers", "Info.plist", "MacOS", "_CodeSignature"]
+    : ["Helpers", "Info.plist", "MacOS", "Resources", "_CodeSignature"])
   await assertExactEntries(fs, macOSPath, ["computer-use"])
   await assertExactEntries(fs, helpersPath, ["meta-input-helper"])
   await assertExactEntries(fs, signaturePath, ["CodeResources"])
+  if (manifest.artifacts.application.icon !== undefined) {
+    await assertExactEntries(fs, resourcesPath, ["computer-use.icns"])
+  }
 
   const infoPlistPath = join(pathRoot, manifest.artifacts.application.infoPlist.path)
   const runtimePath = join(pathRoot, manifest.artifacts.runtime.path)
   const helperPath = join(pathRoot, manifest.artifacts.nativeHelper.path)
   const infoPlist = await assertArtifact(fs, infoPlistPath,
     manifest.artifacts.application.infoPlist, uid, 0o444, MAX_INFO_PLIST_BYTES)
-  if (new TextDecoder().decode(infoPlist) !== applicationInfoPlist()) {
+  if (new TextDecoder().decode(infoPlist) !== applicationInfoPlist(
+    manifest.artifacts.application.icon !== undefined,
+  )) {
     throw new Error("Installed application Info.plist не соответствует exact identity contract")
+  }
+  if (manifest.artifacts.application.icon !== undefined) {
+    await assertArtifact(fs, join(pathRoot, manifest.artifacts.application.icon.path),
+      manifest.artifacts.application.icon, uid, 0o444, MAX_ICON_BYTES)
   }
   await assertArtifact(fs, runtimePath, manifest.artifacts.runtime, uid, 0o555, MAX_RUNTIME_BYTES)
   await assertArtifact(fs, helperPath, manifest.artifacts.nativeHelper, uid, 0o555, MAX_RUNTIME_BYTES)
@@ -403,8 +421,11 @@ function parseManifestV2(value: object): InstalledManifestV2 {
     && exactKeys(manifest.source, ["clean", "commit", "repositoryRoot"])
     && exactKeys(manifest.builds, ["nativeBuildId", "runtimeBuildId"])
     && exactKeys(manifest.artifacts, ["application", "nativeHelper", "runtime"])
-    && exactKeys(application, ["cdhash", "designatedRequirement", "infoPlist", "path", "signingIdentifier"])
+    && exactKeys(application, application?.icon === undefined
+      ? ["cdhash", "designatedRequirement", "infoPlist", "path", "signingIdentifier"]
+      : ["cdhash", "designatedRequirement", "icon", "infoPlist", "path", "signingIdentifier"])
     && exactKeys(application?.infoPlist, ["bytes", "path", "sha256"])
+    && (application?.icon === undefined || exactKeys(application.icon, ["bytes", "path", "sha256"]))
     && exactKeys(runtime, ["bytes", "path", "sha256"])
     && exactKeys(helper, ["auditSession", "bytes", "cdhash", "designatedRequirement", "path", "sha256", "signingIdentifier"])
     && exactKeys(audit, ["auditSessionId", "auditUserId", "effectiveUid", "source", "uid", "verified"])
@@ -422,6 +443,8 @@ function parseManifestV2(value: object): InstalledManifestV2 {
     || typeof manifest.builds.runtimeBuildId !== "string" || manifest.builds.runtimeBuildId.length < 1
     || typeof manifest.builds.nativeBuildId !== "string" || manifest.builds.nativeBuildId.length < 1
     || application.path !== V2_APPLICATION_PATH || application.infoPlist.path !== V2_INFO_PLIST_PATH
+    || application.icon !== undefined && (application.icon.path !== V2_ICON_PATH
+      || !validBytes(application.icon.bytes, MAX_ICON_BYTES) || !validDigest(application.icon.sha256))
     || runtime.path !== V2_RUNTIME_PATH || helper.path !== V2_HELPER_PATH
     || manifest.stableApplication.path !== V2_APPLICATION_PATH
     || manifest.entrypoint.path !== V2_RUNTIME_PATH || manifest.entrypoint.source !== "scripts/runtime-entry.ts"
@@ -522,7 +545,7 @@ function certificateRequirement(identifier: string, certificateSha1: string): st
   return `certificate leaf = H"${certificateSha1}" and identifier "${identifier}"`
 }
 
-function applicationInfoPlist(): string {
+function applicationInfoPlist(icon: boolean): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -531,7 +554,7 @@ function applicationInfoPlist(): string {
   <key>CFBundleName</key><string>computer-use</string>
   <key>CFBundleDisplayName</key><string>computer-use</string>
   <key>CFBundleExecutable</key><string>computer-use</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
+${icon ? "  <key>CFBundleIconFile</key><string>computer-use.icns</string>\n" : ""}  <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSBackgroundOnly</key><true/>
 </dict>

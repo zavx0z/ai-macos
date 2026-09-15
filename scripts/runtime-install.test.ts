@@ -118,7 +118,9 @@ test("dry-run строит reviewable plan без login identity и execute пу
     stableApplication: { path: "computer-use.app" },
     artifacts: {
       application: { path: "computer-use.app", signingIdentifier: RUNTIME_SIGNING_IDENTIFIER,
-        infoPlist: { path: "computer-use.app/Contents/Info.plist" } },
+        infoPlist: { path: "computer-use.app/Contents/Info.plist" },
+        icon: { path: "computer-use.app/Contents/Resources/computer-use.icns",
+          sha256: sha256("fixture-computer-use-icon"), bytes: "fixture-computer-use-icon".length } },
       runtime: { path: "computer-use.app/Contents/MacOS/computer-use" },
       nativeHelper: { path: "computer-use.app/Contents/Helpers/meta-input-helper",
         signingIdentifier: HELPER_SIGNING_IDENTIFIER,
@@ -138,6 +140,10 @@ test("dry-run строит reviewable plan без login identity и execute пу
   expect(plist).toContain("META_RUNTIME_BROWSER_CONFIG")
   expect(plist).toContain("META_RUNTIME_MANAGED")
   expect(plist).not.toContain("META_LOGIN_SESSION_ID")
+  expect(await readFile(join(plan.release.releasePath,
+    "computer-use.app/Contents/Info.plist"), "utf8")).toContain("CFBundleIconFile")
+  expect(await readFile(join(fixture.options.paths.installRoot,
+    "computer-use.app/Contents/Resources/computer-use.icns"), "utf8")).toBe("fixture-computer-use-icon")
   expect(await readFile(join(fixture.options.paths.installRoot,
     "computer-use.app", "Contents/Helpers/meta-input-helper"), "utf8")).toContain(plan.release.nativeBuildId)
   await expect(lstat(fixture.options.paths.stableHelperPath)).rejects.toThrow()
@@ -171,6 +177,135 @@ test("generated v2 release и stable app запускаются реальным
     runtimePath: join(stableApplication, "Contents/MacOS/computer-use"), exitCode: 0 })
   expect(spawned).toEqual([{ file: join(stableApplication, "Contents/MacOS/computer-use"),
     args: ["--mcp"], cwd: stableApplication }])
+})
+
+test("icon variant отклоняет missing icon и неверный manifest digest", async () => {
+  for (const variant of ["missing", "digest"] as const) {
+    const fixture = await createFixture()
+    const plan = await planRuntimeInstall(fixture.options)
+    await applyRuntimeInstall(plan, fixture.options)
+    const manifestPath = join(plan.release.releasePath, "manifest.json")
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
+    await chmod(plan.release.releasePath, 0o700)
+    if (variant === "missing") {
+      const application = join(plan.release.releasePath, "computer-use.app")
+      await makeRemovable(application)
+      await rm(join(application, "Contents/Resources/computer-use.icns"))
+      await rm(join(application, "Contents/Resources"), { recursive: true })
+      for (const directory of [application, join(application, "Contents"), join(application, "Contents/MacOS"),
+        join(application, "Contents/Helpers"), join(application, "Contents/_CodeSignature")]) await chmod(directory, 0o555)
+      for (const file of [join(application, "Contents/Info.plist"),
+        join(application, "Contents/_CodeSignature/CodeResources")]) await chmod(file, 0o444)
+      for (const file of [join(application, "Contents/MacOS/computer-use"),
+        join(application, "Contents/Helpers/meta-input-helper")]) await chmod(file, 0o555)
+    } else {
+      manifest.artifacts.application.icon.sha256 = "f".repeat(64)
+      await chmod(manifestPath, 0o600)
+      await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
+      await chmod(manifestPath, 0o444)
+    }
+    await chmod(plan.release.releasePath, 0o555)
+    const repeated = await planRuntimeInstall(fixture.options)
+
+    await expect(applyRuntimeInstall(repeated, fixture.options))
+      .rejects.toThrow(variant === "missing" ? "icon presence" : "icon digest")
+  }
+})
+
+test("v2 manifest без icon остаётся exact rollback-compatible variant", async () => {
+  const fixture = await createFixture()
+  const plan = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(plan, fixture.options)
+  const manifestPath = join(plan.release.releasePath, "manifest.json")
+  const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
+  const releaseApplication = join(plan.release.releasePath, "computer-use.app")
+  const stableApplication = join(fixture.options.paths.installRoot, "computer-use.app")
+  for (const application of [releaseApplication, stableApplication]) {
+    await makeRemovable(application)
+    await rm(join(application, "Contents/Resources/computer-use.icns"))
+    await rm(join(application, "Contents/Resources"), { recursive: true })
+    await writeFile(join(application, "Contents/Info.plist"),
+      (await readFile(join(application, "Contents/Info.plist"), "utf8"))
+        .replace("  <key>CFBundleIconFile</key><string>computer-use.icns</string>\n", ""))
+    for (const directory of [application, join(application, "Contents"), join(application, "Contents/MacOS"),
+      join(application, "Contents/Helpers"), join(application, "Contents/_CodeSignature")]) {
+      await chmod(directory, 0o555)
+    }
+    for (const file of [join(application, "Contents/Info.plist"),
+      join(application, "Contents/_CodeSignature/CodeResources")]) await chmod(file, 0o444)
+    for (const file of [join(application, "Contents/MacOS/computer-use"),
+      join(application, "Contents/Helpers/meta-input-helper")]) await chmod(file, 0o555)
+  }
+  delete manifest.artifacts.application.icon
+  const infoPlistPath = join(releaseApplication, "Contents/Info.plist")
+  manifest.artifacts.application.infoPlist = { path: manifest.artifacts.application.infoPlist.path,
+    sha256: sha256(await readFile(infoPlistPath)), bytes: (await lstat(infoPlistPath)).size }
+  await chmod(releaseApplication, 0o700)
+  await chmod(stableApplication, 0o700)
+  await fixture.runner.run("/usr/bin/codesign", ["--force", "--sign", "-", "--identifier",
+    RUNTIME_SIGNING_IDENTIFIER, releaseApplication])
+  await fixture.runner.run("/usr/bin/codesign", ["--force", "--sign", "-", "--identifier",
+    RUNTIME_SIGNING_IDENTIFIER, stableApplication])
+  for (const application of [releaseApplication, stableApplication]) {
+    for (const directory of [application, join(application, "Contents"), join(application, "Contents/MacOS"),
+      join(application, "Contents/Helpers"), join(application, "Contents/_CodeSignature")]) {
+      await chmod(directory, 0o555)
+    }
+    await chmod(join(application, "Contents/Info.plist"), 0o444)
+    await chmod(join(application, "Contents/_CodeSignature/CodeResources"), 0o444)
+  }
+  const signature = await fixture.runner.run("/usr/bin/codesign", ["--display", "--verbose=4", "-r-", releaseApplication])
+  manifest.artifacts.application.cdhash = signature.stderr.match(/CDHash=([a-f0-9]+)/)?.[1]
+  manifest.artifacts.application.designatedRequirement = signature.stderr.split("\n")
+    .find(line => line.includes("designated =>"))
+  await chmod(join(releaseApplication, "Contents/Info.plist"), 0o444)
+  await chmod(join(stableApplication, "Contents/Info.plist"), 0o444)
+  await chmod(releaseApplication, 0o555)
+  await chmod(stableApplication, 0o555)
+  await chmod(plan.release.releasePath, 0o700)
+  await chmod(manifestPath, 0o600)
+  await writeFile(manifestPath, `${JSON.stringify(manifest)}\n`)
+  await chmod(manifestPath, 0o444)
+  await chmod(plan.release.releasePath, 0o555)
+  fixture.runner.loaded = true
+
+  const options = { ...fixture.options, runtimeAdmin: successfulAdmin({
+    running: true,
+    runtimeEpoch: "runtime:no-icon-v2",
+    runtimeBuildId: plan.release.runtimeBuildId,
+    nativeBuildId: plan.release.nativeBuildId,
+    activeOperations: 0,
+    quarantinedResources: 0,
+  }) }
+  const repeated = await planRuntimeInstall(options)
+  const result = await applyRuntimeInstall(repeated, options)
+  expect(result.state).toBe("already-installed")
+
+  fixture.runner.commit = "c".repeat(40)
+  const updateOptions = { ...fixture.options, runtimeAdmin: successfulAdmin({
+    running: true,
+    runtimeEpoch: "runtime:no-icon-rollback",
+    runtimeBuildId: plan.release.runtimeBuildId,
+    nativeBuildId: plan.release.nativeBuildId,
+    activeOperations: 0,
+    quarantinedResources: 0,
+  }) }
+  const update = await planRuntimeInstall(updateOptions)
+  fixture.runner.failDoctorForBuild = update.release.runtimeBuildId
+  await expect(applyRuntimeInstall(update, updateOptions)).rejects.toThrow("doctor")
+  await expect(lstat(join(stableApplication, "Contents/Resources"))).rejects.toThrow()
+  fixture.runner.failDoctorForBuild = undefined
+  fixture.runner.commit = "a".repeat(40)
+
+  await chmod(releaseApplication, 0o700)
+  await chmod(join(releaseApplication, "Contents"), 0o700)
+  await mkdir(join(releaseApplication, "Contents/Resources"))
+  await writeFile(join(releaseApplication, "Contents/Resources/computer-use.icns"), "phantom")
+  await chmod(join(releaseApplication, "Contents/Resources/computer-use.icns"), 0o444)
+  await chmod(join(releaseApplication, "Contents/Resources"), 0o555)
+  await chmod(join(releaseApplication, "Contents"), 0o555)
+  await chmod(releaseApplication, 0o555)
+  await expect(applyRuntimeInstall(repeated, options)).rejects.toThrow("icon presence")
 })
 
 test("explicit identity мигрирует ad-hoc и сохраняет certificate DR между source updates", async () => {
@@ -1029,10 +1164,12 @@ async function createFixture() {
   const home = join(root, "home")
   await mkdir(join(repositoryPath, "native", "scripts"), { recursive: true })
   await mkdir(join(repositoryPath, "runtime", "src"), { recursive: true })
+  await mkdir(join(repositoryPath, "runtime", "assets"), { recursive: true })
   await mkdir(join(repositoryPath, "input", "bin"), { recursive: true })
   const repositoryRoot = await realpath(repositoryPath)
   await mkdir(join(home, "Library", "LaunchAgents"), { recursive: true })
   await writeFile(join(repositoryRoot, "native", "scripts", "build-broker.sh"), "fixture")
+  await writeFile(join(repositoryRoot, "runtime", "assets", "computer-use.icns"), "fixture-computer-use-icon")
   const runner = new FakeRunner(repositoryRoot)
   const options: RuntimeInstallOptions = {
     paths: {
@@ -1134,7 +1271,11 @@ class FakeRunner implements CommandRunner {
       const identifier = args[args.indexOf("--identifier") + 1]!
       if ((await lstat(target)).isDirectory()) {
         const signatureDirectory = join(target, "Contents/_CodeSignature")
+        await chmod(target, 0o700)
+        await chmod(join(target, "Contents"), 0o700)
         await mkdir(signatureDirectory, { recursive: true })
+        await chmod(signatureDirectory, 0o700)
+        await chmod(join(signatureDirectory, "CodeResources"), 0o600).catch(() => undefined)
         await writeFile(join(signatureDirectory, "CodeResources"),
           `sealed:${identity}:${identifier}:${await signatureContentKey(join(target, "Contents"))}`)
       } else {

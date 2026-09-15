@@ -137,6 +137,62 @@ test("v2 ad-hoc signature проверяется без certificate requirement"
   expect(runner.commandCalls.filter(call => call.args.includes("--test-requirement"))).toHaveLength(0)
 })
 
+test("v2 icon variant проверяет exact Resources tree и digest в immutable и stable app", async () => {
+  const fs = installedV2Fs("identity", true)
+  const runner = new FakeRunner(0)
+  runner.signingMode = "identity"
+  const result = await runInstalledLauncher({
+    expectedHostname: "mac", actualHostname: "mac", homeDirectory: home, uid, fs, runner,
+    serveUnavailable: async () => { throw new Error("must not fallback") },
+  })
+
+  expect(result.state).toBe("launched")
+  expect(fs.files.has(join(applicationPath, "Contents", "Resources", "computer-use.icns"))).toBe(true)
+  expect(fs.files.has(join(stableApplicationPath, "Contents", "Resources", "computer-use.icns"))).toBe(true)
+})
+
+test("v2 icon variant отклоняет missing, phantom и tampered resources до codesign и spawn", async () => {
+  const immutableIcon = join(applicationPath, "Contents", "Resources", "computer-use.icns")
+  const stableIcon = join(stableApplicationPath, "Contents", "Resources", "computer-use.icns")
+  const variants: Array<(fs: MemoryFs) => void> = [
+    fs => {
+      fs.nodes.delete(stableIcon)
+      fs.files.delete(stableIcon)
+    },
+    fs => { fs.directoryEntries.get(join(applicationPath, "Contents", "Resources"))!.push("phantom.icns") },
+    fs => { fs.files.set(immutableIcon, new TextEncoder().encode("tampered-icon")) },
+  ]
+  for (const mutate of variants) {
+    const fs = installedV2Fs("identity", true)
+    mutate(fs)
+    const runner = new FakeRunner(0)
+    runner.signingMode = "identity"
+    const result = await runInstalledLauncher({
+      expectedHostname: "mac", actualHostname: "mac", homeDirectory: home, uid, fs, runner,
+      serveUnavailable: async () => undefined,
+    })
+    expect(result).toEqual({ state: "unavailable", reason: "runtime-unavailable" })
+    expect(runner.calls).toHaveLength(0)
+  }
+})
+
+test("v2 no-icon variant отклоняет phantom Resources directory", async () => {
+  const fs = installedV2Fs()
+  fs.nodes.set(join(applicationPath, "Contents", "Resources"), node("directory", 0o555))
+  fs.directoryEntries.set(join(applicationPath, "Contents", "Resources"), [])
+  fs.directoryEntries.get(join(applicationPath, "Contents"))!.push("Resources")
+  const runner = new FakeRunner(0)
+  runner.signingMode = "identity"
+
+  const result = await runInstalledLauncher({
+    expectedHostname: "mac", actualHostname: "mac", homeDirectory: home, uid, fs, runner,
+    serveUnavailable: async () => undefined,
+  })
+
+  expect(result).toEqual({ state: "unavailable", reason: "runtime-unavailable" })
+  expect(runner.calls).toHaveLength(0)
+})
+
 test("v2 отвергает unexpected leaf, symlink, tampered stable bytes и signature до spawn", async () => {
   const variants: Array<(fs: MemoryFs, runner: FakeRunner) => void> = [
     fs => { fs.directoryEntries.get(applicationPath + "/Contents")!.push("unexpected") },
@@ -210,7 +266,7 @@ test("v2 certificate DR отвергает дополнительный conjunct
 
 test("v2 не доверяет manifest digest для изменённого Info.plist identity", async () => {
   const fs = installedV2Fs()
-  const wrongInfo = new TextEncoder().encode(applicationInfoPlist().replace(
+  const wrongInfo = new TextEncoder().encode(applicationInfoPlist(false).replace(
     "<key>CFBundleDisplayName</key><string>computer-use</string>",
     "<key>CFBundleDisplayName</key><string>runtime</string>",
   ))
@@ -473,9 +529,10 @@ function installedFs(runtimeArtifactName = "computer-use"): MemoryFs {
   return fs
 }
 
-function installedV2Fs(signingMode: "identity" | "adhoc" = "identity"): MemoryFs {
+function installedV2Fs(signingMode: "identity" | "adhoc" = "identity", icon = false): MemoryFs {
   const fs = new MemoryFs()
-  const infoPlist = new TextEncoder().encode(applicationInfoPlist())
+  const infoPlist = new TextEncoder().encode(applicationInfoPlist(icon))
+  const iconBytes = new TextEncoder().encode("computer-use-icon-fixture")
   const runtime = new TextEncoder().encode("immutable-computer-use-app-runtime")
   const helper = new TextEncoder().encode("immutable-computer-use-app-helper")
   const codeResources = new TextEncoder().encode("sealed-code-resources")
@@ -495,6 +552,8 @@ function installedV2Fs(signingMode: "identity" | "adhoc" = "identity"): MemoryFs
       application: {
         path: "computer-use.app",
         infoPlist: { path: "computer-use.app/Contents/Info.plist", sha256: sha256(infoPlist), bytes: infoPlist.byteLength },
+        ...(icon ? { icon: { path: "computer-use.app/Contents/Resources/computer-use.icns",
+          sha256: sha256(iconBytes), bytes: iconBytes.byteLength } } : {}),
         signingIdentifier: "com.meta.ai-macos.runtime",
         designatedRequirement: applicationRequirement,
         cdhash: applicationCdhash,
@@ -538,8 +597,8 @@ function installedV2Fs(signingMode: "identity" | "adhoc" = "identity"): MemoryFs
   fs.resolved.set(join(installRoot, "current"), releasePath)
   fs.setDirectory(releasePath, ["computer-use.app", "manifest.json"], 0o555)
   fs.setFile(join(releasePath, "manifest.json"), manifest, 0o444)
-  addApplication(fs, applicationPath, infoPlist, runtime, helper, codeResources)
-  addApplication(fs, stableApplicationPath, infoPlist, runtime, helper, codeResources)
+  addApplication(fs, applicationPath, infoPlist, runtime, helper, codeResources, icon ? iconBytes : undefined)
+  addApplication(fs, stableApplicationPath, infoPlist, runtime, helper, codeResources, icon ? iconBytes : undefined)
   return fs
 }
 
@@ -550,13 +609,17 @@ function addApplication(
   runtime: Uint8Array,
   helper: Uint8Array,
   codeResources: Uint8Array,
+  icon?: Uint8Array,
 ) {
   const contents = join(root, "Contents")
   const macOS = join(contents, "MacOS")
   const helpers = join(contents, "Helpers")
   const signature = join(contents, "_CodeSignature")
+  const resources = join(contents, "Resources")
   fs.setDirectory(root, ["Contents"], 0o555)
-  fs.setDirectory(contents, ["Helpers", "Info.plist", "MacOS", "_CodeSignature"], 0o555)
+  fs.setDirectory(contents, icon === undefined
+    ? ["Helpers", "Info.plist", "MacOS", "_CodeSignature"]
+    : ["Helpers", "Info.plist", "MacOS", "Resources", "_CodeSignature"], 0o555)
   fs.setDirectory(macOS, ["computer-use"], 0o555)
   fs.setDirectory(helpers, ["meta-input-helper"], 0o555)
   fs.setDirectory(signature, ["CodeResources"], 0o555)
@@ -564,9 +627,13 @@ function addApplication(
   fs.setFile(join(macOS, "computer-use"), runtime, 0o555)
   fs.setFile(join(helpers, "meta-input-helper"), helper, 0o555)
   fs.setFile(join(signature, "CodeResources"), codeResources, 0o444)
+  if (icon !== undefined) {
+    fs.setDirectory(resources, ["computer-use.icns"], 0o555)
+    fs.setFile(join(resources, "computer-use.icns"), icon, 0o444)
+  }
 }
 
-function applicationInfoPlist(): string {
+function applicationInfoPlist(icon: boolean): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -575,7 +642,7 @@ function applicationInfoPlist(): string {
   <key>CFBundleName</key><string>computer-use</string>
   <key>CFBundleDisplayName</key><string>computer-use</string>
   <key>CFBundleExecutable</key><string>computer-use</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
+${icon ? "  <key>CFBundleIconFile</key><string>computer-use.icns</string>\n" : ""}  <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSBackgroundOnly</key><true/>
 </dict>

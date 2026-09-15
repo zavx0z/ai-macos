@@ -33,6 +33,7 @@ const LEGACY_RELEASE_FORMAT = "meta-ai-macos-runtime-release-v1"
 const RELEASE_FORMAT = "meta-ai-macos-runtime-release-v2"
 const APPLICATION_NAME = "computer-use.app"
 const APPLICATION_INFO_PATH = `${APPLICATION_NAME}/Contents/Info.plist` as const
+const APPLICATION_ICON_PATH = `${APPLICATION_NAME}/Contents/Resources/computer-use.icns` as const
 const APPLICATION_RUNTIME_PATH = `${APPLICATION_NAME}/Contents/MacOS/computer-use` as const
 const APPLICATION_HELPER_PATH = `${APPLICATION_NAME}/Contents/Helpers/meta-input-helper` as const
 const RUNTIME_ARTIFACT_NAMES = ["computer-use", "runtime", APPLICATION_RUNTIME_PATH] as const
@@ -41,6 +42,7 @@ type RuntimeArtifactName = typeof RUNTIME_ARTIFACT_NAMES[number]
 type HelperArtifactName = typeof HELPER_ARTIFACT_NAMES[number]
 const MAX_COMMAND_OUTPUT = 8 * 1024 * 1024
 const MAX_BROWSER_CONFIG_BYTES = 64 * 1024
+const MAX_ICON_BYTES = 16 * 1024 * 1024
 const STARTUP_PERMISSION_NAMES = ["accessibility", "screenRecording", "postEvents", "inputMonitoring"] as const
 const PENDING_STARTUP_PERMISSION_STATES = new Set(["checking", "requesting", "waiting", "restart-needed"])
 const OBSERVER_REQUIRED_CAPABILITIES = new Set<CapabilityId>([
@@ -218,6 +220,7 @@ export type ReleaseManifest = {
     application?: {
       path: typeof APPLICATION_NAME
       infoPlist: { path: typeof APPLICATION_INFO_PATH, sha256: string, bytes: number }
+      icon?: { path: typeof APPLICATION_ICON_PATH, sha256: string, bytes: number }
       signingIdentifier: typeof RUNTIME_SIGNING_IDENTIFIER
       designatedRequirement: string
       cdhash: string
@@ -705,11 +708,15 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
   try {
     const applicationPath = join(staging, APPLICATION_NAME)
     const infoPlistPath = join(staging, APPLICATION_INFO_PATH)
+    const iconPath = join(staging, APPLICATION_ICON_PATH)
     const runtimePath = join(staging, APPLICATION_RUNTIME_PATH)
     const nativeHelperPath = join(staging, APPLICATION_HELPER_PATH)
     await mkdir(dirname(runtimePath), { recursive: true, mode: 0o700 })
     await mkdir(dirname(nativeHelperPath), { recursive: true, mode: 0o700 })
-    await writeFile(infoPlistPath, applicationInfoPlist(), { flag: "wx", mode: 0o600 })
+    await mkdir(dirname(iconPath), { recursive: true, mode: 0o700 })
+    await copyFile(join(plan.paths.repositoryRoot, "runtime/assets/computer-use.icns"), iconPath)
+    await chmod(iconPath, 0o600)
+    await writeFile(infoPlistPath, applicationInfoPlist(true), { flag: "wx", mode: 0o600 })
     await checked(options.runner, "/usr/bin/plutil", ["-lint", infoPlistPath])
     await checked(options.runner, process.execPath, [
       "build",
@@ -738,8 +745,9 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
       RUNTIME_SIGNING_IDENTIFIER, plan.signing)
     await sealApplicationModes(applicationPath)
     await assertExactApplicationTopology(applicationPath)
-    const [infoPlistArtifact, runtimeArtifact, nativeArtifact] = await Promise.all([
+    const [infoPlistArtifact, iconArtifact, runtimeArtifact, nativeArtifact] = await Promise.all([
       artifact(infoPlistPath),
+      iconArtifactFromPath(iconPath),
       artifact(runtimePath),
       artifact(nativeHelperPath),
     ])
@@ -747,6 +755,7 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
       format: RELEASE_FORMAT,
       artifacts: {
         application: { path: APPLICATION_NAME, infoPlist: { path: APPLICATION_INFO_PATH, ...infoPlistArtifact },
+          icon: { path: APPLICATION_ICON_PATH, ...iconArtifact },
           signingIdentifier: RUNTIME_SIGNING_IDENTIFIER,
           designatedRequirement: applicationSignature.designatedRequirement, cdhash: applicationSignature.cdhash },
         runtime: { path: APPLICATION_RUNTIME_PATH, ...runtimeArtifact },
@@ -815,11 +824,17 @@ async function verifyReleaseArtifacts(
   }
   if (manifest.format === RELEASE_FORMAT) {
     const application = manifest.artifacts.application!
+    await assertApplicationIconPresence(join(releasePath, application.path), application.icon !== undefined)
     const infoPlistPath = join(releasePath, application.infoPlist.path)
     const infoPlistArtifact = await artifact(infoPlistPath)
     if (stableJson(infoPlistArtifact) !== stableJson({ sha256: application.infoPlist.sha256,
       bytes: application.infoPlist.bytes })) throw new Error("Immutable application Info.plist digest mismatch")
-    if (await readFile(infoPlistPath, "utf8") !== applicationInfoPlist()) {
+    if (application.icon !== undefined) {
+      const iconArtifact = await iconArtifactFromPath(join(releasePath, application.icon.path))
+      if (stableJson(iconArtifact) !== stableJson({ sha256: application.icon.sha256,
+        bytes: application.icon.bytes })) throw new Error("Immutable application icon digest mismatch")
+    }
+    if (await readFile(infoPlistPath, "utf8") !== applicationInfoPlist(application.icon !== undefined)) {
       throw new Error("Application Info.plist не соответствует exact identity contract")
     }
     await verifyApplicationSignature(runner, join(releasePath, application.path), application, manifest.signing!)
@@ -1180,7 +1195,16 @@ async function verifyApplicationCopy(
       bytes: manifest.artifacts.nativeHelper.bytes })) {
     throw new Error("Stable application artifact digest mismatch")
   }
-  if (await readFile(infoPath, "utf8") !== applicationInfoPlist()) {
+  const iconPath = join(applicationPath, "Contents/Resources/computer-use.icns")
+  const expectedIcon = manifest.artifacts.application.icon
+  await assertApplicationIconPresence(applicationPath, expectedIcon !== undefined)
+  if (expectedIcon !== undefined) {
+    const iconArtifact = await iconArtifactFromPath(iconPath)
+    if (stableJson(iconArtifact) !== stableJson({ sha256: expectedIcon.sha256, bytes: expectedIcon.bytes })) {
+      throw new Error("Stable application icon digest mismatch")
+    }
+  }
+  if (await readFile(infoPath, "utf8") !== applicationInfoPlist(expectedIcon !== undefined)) {
     throw new Error("Stable application Info.plist identity mismatch")
   }
   await verifyApplicationSignature(runner, applicationPath, manifest.artifacts.application, manifest.signing)
@@ -1588,7 +1612,7 @@ ${environmentXml}
 `
 }
 
-function applicationInfoPlist(): string {
+function applicationInfoPlist(icon = false): string {
   return `<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -1597,7 +1621,7 @@ function applicationInfoPlist(): string {
   <key>CFBundleName</key><string>computer-use</string>
   <key>CFBundleDisplayName</key><string>computer-use</string>
   <key>CFBundleExecutable</key><string>computer-use</string>
-  <key>CFBundlePackageType</key><string>APPL</string>
+${icon ? "  <key>CFBundleIconFile</key><string>computer-use.icns</string>\n" : ""}  <key>CFBundlePackageType</key><string>APPL</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSBackgroundOnly</key><true/>
 </dict>
@@ -1621,8 +1645,14 @@ async function sealApplicationModes(applicationPath: string): Promise<void> {
   const directories = [applicationPath, join(applicationPath, "Contents"),
     join(applicationPath, "Contents/MacOS"), join(applicationPath, "Contents/Helpers"),
     join(applicationPath, "Contents/_CodeSignature")]
+  if (await exists(join(applicationPath, "Contents/Resources"))) {
+    directories.push(join(applicationPath, "Contents/Resources"))
+  }
   const files = [join(applicationPath, "Contents/Info.plist"),
     join(applicationPath, "Contents/_CodeSignature/CodeResources")]
+  if (await exists(join(applicationPath, "Contents/Resources/computer-use.icns"))) {
+    files.push(join(applicationPath, "Contents/Resources/computer-use.icns"))
+  }
   const executables = [join(applicationPath, "Contents/MacOS/computer-use"),
     join(applicationPath, "Contents/Helpers/meta-input-helper")]
   await Promise.all([
@@ -1636,6 +1666,10 @@ async function assertExactApplicationTopology(applicationPath: string): Promise<
   const expectedDirectories = new Set(["", "Contents", "Contents/MacOS", "Contents/Helpers", "Contents/_CodeSignature"])
   const expectedFiles = new Set(["Contents/Info.plist", "Contents/MacOS/computer-use",
     "Contents/Helpers/meta-input-helper", "Contents/_CodeSignature/CodeResources"])
+  if (await exists(join(applicationPath, "Contents/Resources/computer-use.icns"))) {
+    expectedDirectories.add("Contents/Resources")
+    expectedFiles.add("Contents/Resources/computer-use.icns")
+  }
   const foundDirectories = new Set<string>()
   const foundFiles = new Set<string>()
   async function visit(path: string, relativePath: string): Promise<void> {
@@ -1657,6 +1691,22 @@ async function assertExactApplicationTopology(applicationPath: string): Promise<
   for (const path of expectedDirectories) await assertOwnedNode(join(applicationPath, path), "directory", 0o555)
   for (const path of expectedFiles) await assertOwnedNode(join(applicationPath, path), "file",
     path.endsWith("computer-use") || path.endsWith("meta-input-helper") ? 0o555 : 0o444)
+}
+
+async function assertApplicationIconPresence(applicationPath: string, expected: boolean): Promise<void> {
+  const icon = join(applicationPath, "Contents/Resources/computer-use.icns")
+  const resources = join(applicationPath, "Contents/Resources")
+  const iconPresent = await exists(icon)
+  const resourcesPresent = await exists(resources)
+  if (iconPresent !== expected || resourcesPresent !== expected) {
+    throw new Error("Application icon presence не совпадает с manifest variant")
+  }
+}
+
+async function iconArtifactFromPath(path: string): Promise<{ sha256: string, bytes: number }> {
+  const value = await artifact(path)
+  if (value.bytes > MAX_ICON_BYTES) throw new Error("Application icon превышает 16 MiB")
+  return value
 }
 
 function manifestNativeCdhash(manifest: ReleaseManifest): string | undefined {
@@ -1993,6 +2043,9 @@ function validApplicationManifest(manifest: ReleaseManifest): boolean {
     && application.infoPlist.path === APPLICATION_INFO_PATH
     && /^[a-f0-9]{64}$/.test(application.infoPlist.sha256)
     && Number.isSafeInteger(application.infoPlist.bytes) && application.infoPlist.bytes > 0
+    && (application.icon === undefined || application.icon.path === APPLICATION_ICON_PATH
+      && /^[a-f0-9]{64}$/.test(application.icon.sha256)
+      && Number.isSafeInteger(application.icon.bytes) && application.icon.bytes > 0)
     && application.signingIdentifier === RUNTIME_SIGNING_IDENTIFIER
     && application.designatedRequirement.startsWith("designated =>")
     && /^[a-f0-9]{40,64}$/.test(application.cdhash)
@@ -2007,8 +2060,11 @@ function validV2ExactShape(manifest: ReleaseManifest): boolean {
     && exactKeys(manifest.source, ["clean", "commit", "repositoryRoot"])
     && exactKeys(manifest.builds, ["nativeBuildId", "runtimeBuildId"])
     && exactKeys(manifest.artifacts, ["application", "nativeHelper", "runtime"])
-    && exactKeys(application, ["cdhash", "designatedRequirement", "infoPlist", "path", "signingIdentifier"])
+    && exactKeys(application, application.icon === undefined
+      ? ["cdhash", "designatedRequirement", "infoPlist", "path", "signingIdentifier"]
+      : ["cdhash", "designatedRequirement", "icon", "infoPlist", "path", "signingIdentifier"])
     && exactKeys(application.infoPlist, ["bytes", "path", "sha256"])
+    && (application.icon === undefined || exactKeys(application.icon, ["bytes", "path", "sha256"]))
     && exactKeys(manifest.artifacts.runtime, ["bytes", "path", "sha256"])
     && exactKeys(manifest.artifacts.nativeHelper, ["auditSession", "bytes", "cdhash", "designatedRequirement",
       "path", "sha256", "signingIdentifier"])
