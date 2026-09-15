@@ -38,6 +38,11 @@ Always compare a capture with its caption before acting.
 - `mouse_click` accepts window-local coordinates for a verified target.
 - `mouse_scroll`, `keyboard_type`, `keyboard_key`, and `keyboard_shortcut`
   perform a verified target transaction and require visual verification.
+- `mouse_scroll` uses native wheel **lines**, not pixels. Positive `dy` moves
+  down, negative up. Start with about 8 lines, inspect the returned capture, and
+  adjust. Hundreds of lines can skip the whole document; do not reuse pixel
+  deltas from another automation API. The actual visual distance depends on
+  the application and system scrolling behavior.
 - `clipboard_read` requires an explicit user request to inspect content.
 - `clipboard_write` writes plain text without UI shortcuts.
 

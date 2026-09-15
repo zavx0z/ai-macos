@@ -933,8 +933,12 @@ server.registerTool(
   "mouse_scroll",
   {
     title: "Scroll the mouse",
-    description: "Focus a verified visible target, scroll it, then capture the target before choosing new coordinates.",
-    inputSchema: { ...windowTargetInputSchema, dx: z.number().optional(), dy: z.number().optional() },
+    description: "Focus a verified visible target, scroll in native wheel lines (not pixels), then capture the target before choosing new coordinates. Start with a small step such as 8 lines; large values can skip the entire document.",
+    inputSchema: {
+      ...windowTargetInputSchema,
+      dx: z.number().optional().describe("Horizontal native wheel-line delta, not pixels"),
+      dy: z.number().optional().describe("Vertical native wheel-line delta, not pixels; positive scrolls down, negative up. Start with about 8 lines and inspect the result."),
+    },
     annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
   },
   async ({ app, pid, windowId, index, title, dx, dy }) => targetedInput(
@@ -946,7 +950,7 @@ server.registerTool(
       x: target.x + target.width / 2,
       y: target.y + target.height / 2,
     }),
-    `Scrolled dx=${dx ?? 0}, dy=${dy ?? 0}`,
+    `Scrolled dx=${dx ?? 0}, dy=${dy ?? 0} native wheel lines`,
   ),
 )
 

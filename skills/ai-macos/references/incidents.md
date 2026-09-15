@@ -63,3 +63,17 @@
 - Исправление: screen разрешает цель по стабильному ID и снимает видимую область окна вместе с меню; после захвата повторно проверяет ID и геометрию. Изменившееся окно отклоняется. Focus не переактивирует уже выбранное окно/sheet; если фокус успело забрать другое приложение, выполняется одна явная активация с проверкой. MCP не повторяет focus при восстановлении того же владельца.
 - Проверка: свежий MCP 0.3.0, намеренно устаревшие index/title, успешный capture по ID; [меню формата присутствует](screenshots/2026-09-15-save-format-popup.png). Два MCP regression tests проверяют отсутствие лишнего focus при открытом и закрытом sheet.
 - Ограничение: это снимок видимой композиции, а не изолированное изображение окна. Постороннее перекрытие нужно распознавать по изображению; меню за границами родителя требует desktop capture.
+
+
+## 2026-09-15 — доставленный ввод не гарантирует точность текста в редакторе
+
+- Контекст: Yandex, pid 3355, windowId 6627, editor Дзена; это историческая идентичность из сохранённых ответов, не готовый селектор для нового действия.
+- Ожидание: абзацы совпадут с переданными строками. Факт: Complete DOM содержит три расхождения (`вид. сулицы`, `света. ирабочего места`, `Куда. вэтот`). Для двух абзацев сохранённое сравнение фактических args доказывает input==expected при delayMs=1; raw responses имеют delivered=true и effectVerified=false. Точные args третьего в этом диагностическом файле отсутствуют.
+- Причина: не установлена. Гипотеза исключительно про batching при delay0 не подтверждает эти delay1 случаи. Последний абзац с пометкой delay20 совпал; n=1, другой текст, причинного сравнения и универсальной гарантии нет.
+- Рабочее действие: readback и локальное восстановление до expected в уже разрешённой операции; проверять также границы/типы блоков. По сообщению оркестратора, полное paragraph selection захватило границу и склеило блоки, оператор отменил. Сохранённые кадры 125–127 осмотрены: после замены видна склейка, после Cmd+Z разделение визуально вернулось. PNG совпадают с raw image bytes. Полного post-undo DOM нет; это проверка видимого участка, не всей статьи.
+- Доказательства: `editorial/runs/live-draft-2026-09-15-theatre/publisher/root-input-diagnostics.json`, `root-dom-diagnostic.json`, raw `30`, `32`, `41`, `101`; точные полные пути и SHA-256 — `editorial/runs/ui-lessons-2026-09-15/methodologist/read_log.json` в каноническом dzen. Повторный offline разбор — `replay-results.json` там же.
+- Regression: точное сравнение args/readback; непустой diff отклоняет text acceptance; синтетическая склейка обнаруживается по count/text. Методолог не управлял UI: selection/undo проверены только по сохранённым кадрам, парный delay-тест не выполнялся. Внешние инструкции и настройки этим предложением не меняются.
+
+## 2026-09-15 — scroll deltas mistaken for pixels
+
+Yandex editor navigation alternated dy650, -900, 350, -600 and250 while seeking a nearby paragraph. Native command_scroll uses kCGScrollEventUnitLine, so these values represent wheel lines, not pixels. The MCP schema did not state the units. Clarified tool description, dx/dy field descriptions and API reference without changing native behavior. Start with a small step and verify the resulting viewport; do not claim a fixed pixel distance. The large-step tool arguments are retained in the publisher task history and local operation evidence in canonical dzen.
