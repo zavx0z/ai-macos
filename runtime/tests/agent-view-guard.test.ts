@@ -56,6 +56,28 @@ test("external input, focus, relevant structure и lifecycle инвалидир�
   }
 })
 
+test("targetless focus и window structure инвалидируют все views, но fresh ticket остаётся доступен", async () => {
+  for (const kind of ["focus", "window-structure"] as const) {
+    const value = fixture()
+    const first = value.guard.forLineage(`lineage:global:${kind}:first`)
+    const second = value.guard.forLineage(`lineage:global:${kind}:second`)
+    const firstTarget = windowTarget(`window:global:${kind}:first`)
+    const secondTarget = windowTarget(`window:global:${kind}:second`)
+    const firstTicket = await observe(value, `lineage:global:${kind}:first`, `target:global:${kind}:first`, firstTarget)
+    const secondTicket = await observe(value, `lineage:global:${kind}:second`, `target:global:${kind}:second`, secondTarget)
+    value.observer.push({ kind, source: "unknown" })
+    await expect(first.admit(firstTicket, `operation:global:${kind}:first`)).rejects.toThrow()
+    await expect(second.admit(secondTicket, `operation:global:${kind}:second`)).rejects.toThrow()
+    await expect(value.observer.coverage()).resolves.toMatchObject({ state: "ready", gapDetected: false })
+    const fresh = await observe(value, `lineage:global:${kind}:first`, `target:global:${kind}:first`, firstTarget)
+    await expect(first.admit(fresh, `operation:global:${kind}:fresh`)).resolves.toMatchObject({
+      operationId: `operation:global:${kind}:fresh`,
+    })
+    await first.settleOperation(fresh, operation(`operation:global:${kind}:fresh`, firstTarget, "completed"))
+    await value.guard.close()
+  }
+})
+
 test("own synthetic event и action admission инвалидируют все fresh views", async () => {
   const synthetic = fixture()
   const syntheticScope = synthetic.guard.forLineage("lineage:synthetic")

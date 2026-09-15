@@ -64,6 +64,11 @@ export type ObserverCoverage = z.infer<typeof observerCoverageSchema>
 export const observerStatusSchema = observerCoverageSchema
 export type ObserverStatus = ObserverCoverage
 
+/**
+ * Отсутствующий `target` означает глобальную инвалидизацию: Native подтвердил
+ * источник и непрерывность события, но не приписывает ему непроверенную exact
+ * identity. Такое событие не является coverage gap само по себе.
+ */
 export const observedEventSchema = z.strictObject({
   eventId: opaqueIdSchema,
   runtimeEpoch: generationIdSchema,

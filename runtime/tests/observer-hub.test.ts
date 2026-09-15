@@ -153,7 +153,7 @@ function fixture(options: {
 
 function event(sequence: number, options: {
   instance?: string
-  kind?: "input" | "focus"
+  kind?: "input" | "focus" | "window-structure"
   source?: "synthetic" | "unknown"
 } = {}): NativeObservedEvent {
   const cursor = `cursor:start:s${sequence}`
@@ -175,6 +175,28 @@ async function next(iterable: AsyncIterable<ObservedEvent>): Promise<IteratorRes
 }
 
 describe("C3 runtime native observer hub", () => {
+  test("targetless focus и window structure сохраняют usable continuity", async () => {
+    const value = fixture()
+    value.hub.start()
+    const live = value.hub.subscribe()[Symbol.asyncIterator]()
+    value.queue.push(event(1, { kind: "focus" }))
+    value.queue.push(event(2, { kind: "window-structure" }))
+    expect([(await live.next()).value, (await live.next()).value]).toMatchObject([
+      { kind: "focus", source: "unknown", sequence: 1 },
+      { kind: "window-structure", source: "unknown", sequence: 2 },
+    ])
+    value.setSnapshot({
+      ...snapshot(),
+      coverage: { ...snapshot().coverage, cursor: "cursor:start:s2", nextSequence: 3 },
+    })
+    expect(value.gaps).toEqual([])
+    await expect(value.hub.coverage()).resolves.toMatchObject({ state: "ready", gapDetected: false, nextSequence: 3 })
+    value.queue.push(event(3, { kind: "focus" }))
+    await expect(live.next()).resolves.toMatchObject({ value: { sequence: 3 }, done: false })
+    await live.return?.()
+    await value.hub.close()
+  })
+
   test("длительный PUSH сохраняет continuity после вытеснения старой истории", async () => {
     const value = fixture({ maxHistoryEvents: 3 })
     value.hub.start()
