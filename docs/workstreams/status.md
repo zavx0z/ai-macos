@@ -44,8 +44,11 @@ artifact, фактические macOS permissions, visual result или пол�
   Codex/ChatGPT и сначала оценить целесообразность перехода. Точный
   интерфейс найден в bundled `@oai/cua` 0.2.4 приложения
   `/Applications/ChatGPT.app` и зафиксирован в `docs/computer-use-api.md`.
-  Начатые черновики JS facade/REPL приостановлены. Решение о полной либо
-  частичной совместимости не принято; необходимые исправления core продолжаются.
+  Владимир согласовал удобный слой поверх нашего runtime с точной адресацией;
+  полный REPL отложен. Четыре design-трассы проверены, см.
+  `docs/high-level-agent-api.md` и `docs/reviews/high-level-api-scenarios.md`.
+  Начинается реализация привязок; AXPress и concurrent cancel/status остаются
+  обязательными условиями полной приёмки.
 
 ## Граница готовности
 
