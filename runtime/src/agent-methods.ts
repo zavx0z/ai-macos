@@ -16,9 +16,11 @@ import {
 } from "@meta/shared/contracts"
 import type { RuntimeCore } from "./core.ts"
 import type { MethodRegistry, RuntimeMethodResponse } from "./method-registry.ts"
+import { AgentOperations, type AgentMutationContext } from "./agent-operations.ts"
 import { AgentTargetRegistry, type AgentTargetActionResolution, type AgentTargetScope } from "./agent-targets.ts"
 
-const targetId = z.string().min(1).max(127)
+export const agentTargetIdSchema = z.string().min(1).max(127)
+const targetId = agentTargetIdSchema
 const errorSchema = z.strictObject({ stage: z.string(), message: z.string() })
 const elementSchema = z.strictObject({
   elementId: targetId,
@@ -46,10 +48,27 @@ const browserSchema = z.strictObject({
   state: z.enum(["connected", "degraded", "disconnected"]),
   actionExpiresAt: z.string(),
 })
+const applicationSchema = z.strictObject({
+  name: z.string(),
+  pid: z.number().int(),
+  bundleId: z.string().optional(),
+  hidden: z.enum(["true", "false", "unknown"]),
+  axStatus: z.enum(["ready", "no-windows", "timed-out", "denied", "unavailable", "failed"]),
+  axReason: z.string().optional(),
+  axWindowCount: z.number().int().safe().min(0),
+})
+const unavailableWindowSchema = z.strictObject({
+  pid: z.number().int(),
+  title: z.string(),
+  visibility: z.enum(["true", "false", "unknown"]),
+  reason: z.string(),
+})
 const stateOutputSchema = z.strictObject({
   complete: z.boolean(),
   errors: z.array(errorSchema),
+  applications: z.array(applicationSchema),
   windows: z.array(windowSchema),
+  unavailableWindows: z.array(unavailableWindowSchema),
   browsers: z.array(browserSchema),
 })
 const tabsOutputSchema = z.strictObject({
@@ -65,7 +84,7 @@ const tabsOutputSchema = z.strictObject({
     actionExpiresAt: z.string(),
   })),
 })
-const observedStateSchema = z.strictObject({
+export const agentObservedStateSchema = z.strictObject({
   targetId,
   state: z.string(),
   complete: z.boolean(),
@@ -75,6 +94,7 @@ const observedStateSchema = z.strictObject({
   width: z.number().int().positive().optional(),
   height: z.number().int().positive().optional(),
 })
+const observedStateSchema = agentObservedStateSchema
 
 type BrowserExecution = { result: AdapterResult<BrowserOperationResult> }
 type BrowserCapturePublicRequest = {
@@ -88,9 +108,10 @@ type FreshWindow = {
   window: WindowRecord
 }
 
-type AgentMethodsOptions = {
+export type AgentMethodsOptions = {
   now?: () => Date
   ids?: (prefix: string) => string
+  operations?: AgentOperations
 }
 
 /** Композирует короткие agent DTO только через уже зарегистрированные runtime methods. */
@@ -100,6 +121,7 @@ export class RuntimeAgentMethods {
   readonly #targets: AgentTargetRegistry
   readonly #now: () => Date
   readonly #ids: (prefix: string) => string
+  readonly operations: AgentOperations
   readonly #frames = new Map<string, string>()
   readonly #observations = new Map<string, unknown>()
 
@@ -109,6 +131,7 @@ export class RuntimeAgentMethods {
     this.#targets = targets
     this.#now = options.now ?? (() => new Date())
     this.#ids = options.ids ?? (prefix => `${prefix}:${crypto.randomUUID()}`)
+    this.operations = options.operations ?? new AgentOperations({ runtime: core, targets })
   }
 
   register(): void {
@@ -149,12 +172,20 @@ export class RuntimeAgentMethods {
     this.#registry.register("observe", {
       title: "Наблюдать выбранную цель",
       description: "Возвращает fresh AX, screenshot или оба для exact target handle.",
-      input: z.strictObject({ targetId, mode: z.enum(["ax", "screenshot", "both"]) }),
+      input: z.strictObject({
+        targetId,
+        mode: z.enum(["ax", "screenshot", "both"]),
+        caption: z.string().min(1).max(2_048).optional(),
+      }).superRefine((input, context) => {
+        if (input.mode !== "ax" && input.caption === undefined) {
+          context.addIssue({ code: "custom", path: ["caption"], message: "Screenshot observation требует expectation caption" })
+        }
+      }),
       output: observedStateSchema,
       readOnly: true,
       requiredCapabilities: ["runtime.identity"],
       timeoutMs: 20_000,
-      execute: async (context, input) => this.#observe(context.session, input.targetId, input.mode, context.signal),
+      execute: async (context, input) => this.#observe(context.session, input.targetId, input.mode, input.caption, context.signal),
       frames: output => output.imageId === undefined ? [] : this.#takeFrame(output.imageId),
     })
   }
@@ -169,6 +200,8 @@ export class RuntimeAgentMethods {
     const errors: Array<{ stage: string, message: string }> = []
     let complete = true
     const windows: z.infer<typeof windowSchema>[] = []
+    const applications: z.infer<typeof applicationSchema>[] = []
+    const unavailableWindows: z.infer<typeof unavailableWindowSchema>[] = []
     const browsers: z.infer<typeof browserSchema>[] = []
     if (input.kind !== "browser") {
       try {
@@ -178,14 +211,34 @@ export class RuntimeAgentMethods {
         })
         complete &&= inventory.complete
         errors.push(...publicErrors("list_windows", inventory.errors))
-        const applications = new Map(inventory.applications.map(app => [String(app.ref.applicationRef), app]))
+        const applicationByRef = new Map(inventory.applications.map(app => [String(app.ref.applicationRef), app]))
+        for (const application of inventory.applications) {
+          if (input.app !== undefined && ![application.name, application.bundleId, application.ref.applicationRef].includes(input.app)) continue
+          if (input.pid !== undefined && application.ref.pid !== input.pid) continue
+          applications.push({
+            name: application.name,
+            pid: application.ref.pid,
+            ...(application.bundleId === undefined ? {} : { bundleId: application.bundleId }),
+            hidden: application.hidden,
+            axStatus: application.axStatus,
+            ...(application.axReason === undefined ? {} : { axReason: application.axReason }),
+            axWindowCount: application.windowCount,
+          })
+        }
+        const filteredApplicationPids = new Set(applications.map(application => application.pid))
         for (const window of inventory.windows) {
           if (window.kind !== "ax-window") {
-            complete = false
-            errors.push({ stage: "list_windows", message: `CG-only window не имеет agent target: ${String(window.title ?? "")}` })
+            if (input.pid !== undefined && window.ownerPid !== input.pid) continue
+            if (input.app !== undefined && !filteredApplicationPids.has(window.ownerPid)) continue
+            unavailableWindows.push({
+              pid: window.ownerPid,
+              title: window.title,
+              visibility: window.onScreen,
+              reason: window.reason,
+            })
             continue
           }
-          const application = applications.get(String(window.ref.applicationRef))
+          const application = applicationByRef.get(String(window.ref.applicationRef))
           if (application === undefined) continue
           if (input.app !== undefined && ![application.name, application.bundleId, application.ref.applicationRef].includes(input.app)) continue
           if (input.pid !== undefined && window.ownerPid !== input.pid) continue
@@ -236,7 +289,7 @@ export class RuntimeAgentMethods {
         errors.push(publicError("browser_chrome_instances", error))
       }
     }
-    return stateOutputSchema.parse({ complete, errors, windows, browsers })
+    return stateOutputSchema.parse({ complete, errors, applications, windows, unavailableWindows, browsers })
   }
 
   async #getTabs(session: RuntimeClientSession, browserId: string, signal: AbortSignal) {
@@ -312,38 +365,61 @@ export class RuntimeAgentMethods {
 
   async #showWindow(session: RuntimeClientSession, targetIdValue: string, signal: AbortSignal) {
     await this.#health(session, signal)
+    const show = this.operations.runTrackedMutation(session, targetIdValue, "show-window-show",
+      context => this.#transitionWindow(session, targetIdValue, "show", context), signal)
+    await Promise.resolve()
+    const focus = this.operations.runTrackedMutation(session, targetIdValue, "show-window-focus",
+      context => this.#transitionWindow(session, targetIdValue, "focus", context), signal)
+    await Promise.all([show, focus])
     const scope = this.#scope(session)
-    const selected = scope.resolveAction(targetIdValue)
-    if (selected.target.kind !== "window") throw new Error("show_window требует window target")
-    let fresh = await this.#refreshWindow(session, scope, targetIdValue, selected, signal)
-    for (const kind of ["show", "focus"] as const) {
-      await this.#dispatch(session, "window_transition", {
-        inventoryId: fresh.selected.inventoryId,
-        inventoryRevision: fresh.selected.inventoryRevision,
-        clientRequestId: this.#ids(`agent-window-${kind}`),
-        request: { kind, target: fresh.selected.target.ref },
-      }, signal)
-      fresh = await this.#refreshWindow(session, scope, targetIdValue, fresh.selected, signal)
-    }
+    const fresh = await this.#refreshWindow(session, scope, targetIdValue, scope.resolveAction(targetIdValue), signal)
     return this.#inspectWindow(session, scope, targetIdValue, fresh.selected, signal)
+  }
+
+  async refreshWindowAction(
+    session: RuntimeClientSession,
+    targetIdValue: string,
+    binding: AgentTargetActionResolution,
+    signal: AbortSignal,
+  ): Promise<AgentTargetActionResolution> {
+    await this.#health(session, signal)
+    return (await this.#refreshWindow(session, this.#scope(session), targetIdValue, binding, signal)).selected
+  }
+
+  async #transitionWindow(
+    session: RuntimeClientSession,
+    targetIdValue: string,
+    kind: "show" | "focus",
+    context: AgentMutationContext,
+  ): Promise<void> {
+    const scope = this.#scope(session)
+    const fresh = await this.#refreshWindow(session, scope, targetIdValue, context.binding, context.signal)
+    await this.#dispatch(session, "window_transition", {
+      inventoryId: fresh.selected.inventoryId,
+      inventoryRevision: fresh.selected.inventoryRevision,
+      clientRequestId: context.clientRequestId,
+      request: { kind, target: fresh.selected.target.ref },
+    }, context.signal)
+    await this.#refreshWindow(session, scope, targetIdValue, fresh.selected, context.signal)
   }
 
   async #observe(
     session: RuntimeClientSession,
     targetIdValue: string,
     mode: "ax" | "screenshot" | "both",
+    caption: string | undefined,
     signal: AbortSignal,
   ) {
     await this.#health(session, signal)
     const scope = this.#scope(session)
     const selected = scope.resolveAction(targetIdValue)
     if (selected.target.kind === "browser-target") {
-      return this.#observeBrowser(session, scope, targetIdValue, selected, mode, signal)
+      return this.#observeBrowser(session, scope, targetIdValue, selected, mode, caption, signal)
     }
     if (selected.target.kind !== "window") throw new Error("observe поддерживает window или browser target")
     const fresh = await this.#refreshWindow(session, scope, targetIdValue, selected, signal)
     const ax = mode === "screenshot" ? undefined : await this.#inspectWindow(session, scope, targetIdValue, fresh.selected, signal)
-    const screenshot = mode === "ax" ? undefined : await this.#captureWindow(session, targetIdValue, fresh, signal)
+    const screenshot = mode === "ax" ? undefined : await this.#captureWindow(session, targetIdValue, fresh, caption!, signal)
     if (mode === "screenshot") scope.invalidateElements(targetIdValue)
     return observedStateSchema.parse({
       targetId: targetIdValue,
@@ -361,6 +437,7 @@ export class RuntimeAgentMethods {
     targetIdValue: string,
     selected: AgentTargetActionResolution,
     mode: "ax" | "screenshot" | "both",
+    caption: string | undefined,
     signal: AbortSignal,
   ) {
     if (selected.target.kind !== "browser-target") throw new Error("Browser observe требует browser target")
@@ -393,7 +470,7 @@ export class RuntimeAgentMethods {
         target,
         capture: {
           source: "browser-viewport",
-          caption: `Agent observation exact browser target ${targetIdValue}`,
+          caption: caption!,
           target: { kind: "browser-target", ref: target },
           clip: { kind: "full-target" },
           fullPage: false,
@@ -497,6 +574,7 @@ export class RuntimeAgentMethods {
     session: RuntimeClientSession,
     targetIdValue: string,
     fresh: FreshWindow,
+    caption: string,
     signal: AbortSignal,
   ) {
     const { inventory, selected, window } = fresh
@@ -506,7 +584,7 @@ export class RuntimeAgentMethods {
     const response = await this.#dispatch(session, "capture_window", {
       clientRequestId: this.#ids("agent-window-capture"),
       inventoryId: inventory.inventoryId,
-      caption: `Agent observation exact window ${targetIdValue}`,
+      caption,
       clip: { kind: "full-target" },
       cursor: "exclude",
       readinessPolicy: { policyId: "agent-window-observe", requiredSteps: ["complete-frame", "permission", "target", "ownership"], disabledSteps: [] },

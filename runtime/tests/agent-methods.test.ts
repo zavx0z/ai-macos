@@ -18,12 +18,15 @@ import {
   operationRecordSchema,
   runtimeOperationIntentSchema,
   readinessPolicySchema,
+  type RuntimeResourceHandle,
   windowTransitionRequestSchema,
   windowTransitionResultSchema,
   windowRecordSchema,
   z,
   type BrowserInstanceRecord,
   type BrowserOperationRequest,
+  type NativeAdapter,
+  type NativeExecutionContext,
   type OperationTarget,
   type RuntimeClientSession,
   type RuntimeOperationIntent,
@@ -82,11 +85,64 @@ test("get_state выдаёт exact lineage handles, фильтрует PID/app �
   await expect(fixture.registry.dispatch(second.session, "observe", { targetId: id, mode: "ax" }, new AbortController().signal)).rejects.toThrow("client lineage")
 })
 
-test("show_window делает exact show/focus, refresh и возвращает snapshot-bound element IDs", async () => {
+test("get_state различает running без AX окон, отсутствующее приложение и AX-denied CG-only окно", async () => {
   const fixture = createFixture()
   const desktop = registerDesktop(fixture)
   registerBrowsers(fixture)
   registerAgentMethods(fixture.registry, fixture.core, fixture.targets, { ids: sequenceIds() })
+  const noWindowsRef = applicationRef("application:no-windows", 201)
+  const deniedRef = applicationRef("application:denied", 202)
+  const diagnostic = desktopInventorySnapshotSchema.parse({
+    ...desktop.inventory,
+    applications: [
+      { ref: noWindowsRef, name: "No Windows", bundleId: "com.meta.no-windows", hidden: "false",
+        axStatus: "no-windows", windowCount: 0 },
+      { ref: deniedRef, name: "Denied App", bundleId: "com.meta.denied", hidden: "unknown",
+        axStatus: "denied", axReason: "Accessibility permission denied", windowCount: 0 },
+    ],
+    windows: [{
+      kind: "cg-only",
+      ...generation,
+      nativeGeneration,
+      cgEntryRef: "cg-entry:denied",
+      ownerPid: deniedRef.pid,
+      cgWindowId: 88,
+      title: "Denied Window",
+      frame: { x: 10, y: 20, width: 300, height: 200 },
+      onScreen: "true",
+      actionability: "unavailable",
+      reason: "AX identity unavailable",
+    }],
+  })
+  desktop.inventory.applications = diagnostic.applications
+  desktop.inventory.windows = diagnostic.windows
+  const client = fixture.core.openClient("principal:diagnostics")
+
+  const noWindows = await fixture.registry.dispatch(client.session, "get_state", {
+    kind: "window", app: "No Windows",
+  }, new AbortController().signal)
+  const absent = await fixture.registry.dispatch(client.session, "get_state", {
+    kind: "window", app: "Missing App",
+  }, new AbortController().signal)
+  const denied = await fixture.registry.dispatch(client.session, "get_state", {
+    kind: "window", app: "Denied App",
+  }, new AbortController().signal)
+
+  expect(noWindows.data).toMatchObject({ complete: true, errors: [], windows: [], unavailableWindows: [],
+    applications: [{ name: "No Windows", pid: 201, axStatus: "no-windows", axWindowCount: 0 }] })
+  expect(absent.data).toMatchObject({ complete: true, applications: [], windows: [], unavailableWindows: [] })
+  expect(denied.data).toMatchObject({ complete: true, errors: [], windows: [],
+    applications: [{ name: "Denied App", pid: 202, axStatus: "denied",
+      axReason: "Accessibility permission denied", axWindowCount: 0 }],
+    unavailableWindows: [{ pid: 202, title: "Denied Window", visibility: "true", reason: "AX identity unavailable" }] })
+  expect(JSON.stringify(denied.data)).not.toContain("targetId")
+})
+
+test("show_window делает exact show/focus, refresh и возвращает snapshot-bound element IDs", async () => {
+  const fixture = createFixture()
+  const desktop = registerDesktop(fixture)
+  registerBrowsers(fixture)
+  const methods = registerAgentMethods(fixture.registry, fixture.core, fixture.targets, { ids: sequenceIds() })
   const client = fixture.core.openClient("principal:show")
   const state = await fixture.registry.dispatch(client.session, "get_state", { kind: "window" }, new AbortController().signal)
   const id = (state.data.windows as Array<{ targetId: string }>)[0]!.targetId
@@ -95,6 +151,9 @@ test("show_window делает exact show/focus, refresh и возвращает
   expect(shown.data).toMatchObject({ targetId: id, complete: true, elements: [{ role: "AXButton", title: "Save", actions: ["AXPress"] }] })
   expect(String(shown.data.state)).toContain("role=AXButton")
   expect(JSON.stringify(shown.data)).not.toContain("elementRef")
+  const status = await methods.operations.getTargetStatus(client.session, id)
+  expect(status.recent.map(operation => operation.action).sort()).toEqual(["show-window-focus", "show-window-show"])
+  expect(new Set(status.recent.map(operation => operation.operationId)).size).toBe(2)
 })
 
 test("closed exact window tombstones old handle и не выбирает replacement с тем же title", async () => {
@@ -120,20 +179,28 @@ test("observe both регистрирует elements, скрывает observati
   const client = fixture.core.openClient("principal:observe")
   const state = await fixture.registry.dispatch(client.session, "get_state", { kind: "window" }, new AbortController().signal)
   const id = (state.data.windows as Array<{ targetId: string }>)[0]!.targetId
-  const observed = await fixture.registry.dispatch(client.session, "observe", { targetId: id, mode: "both" }, new AbortController().signal)
+  await expect(fixture.registry.dispatch(client.session, "observe", {
+    targetId: id, mode: "screenshot",
+  }, new AbortController().signal)).rejects.toThrow("expectation caption")
+  const observed = await fixture.registry.dispatch(client.session, "observe", {
+    targetId: id, mode: "both", caption: "Ожидаю окно Chrome с кнопкой Save",
+  }, new AbortController().signal)
   expect(observed.frameRefs).toEqual(["frame:agent:1"])
   expect(observed.data).toMatchObject({ targetId: id, width: 320, height: 240, complete: true })
   expect(JSON.stringify(observed.data)).not.toContain("observationId")
   expect(JSON.stringify(observed.data)).not.toContain("frame:agent:1")
   expect(desktop.inventoryCalls()).toBe(2)
   expect(desktop.captureRequests[0]).toMatchObject({
+    caption: "Ожидаю окно Chrome с кнопкой Save",
     output: { format: "image/png", scale: 0.5 },
     target: { mappingEvidence: { state: "confirmed", proof: { kind: "cg-ax-correlation" } } },
   })
   const elementId = (observed.data.elements as Array<{ elementId: string }>)[0]!.elementId
   const scope = fixture.targets.forLineage(fixture.core.clients.lineage(client.session))
   expect(scope.resolveElement(id, elementId).elementId).toBe(elementId)
-  await fixture.registry.dispatch(client.session, "observe", { targetId: id, mode: "screenshot" }, new AbortController().signal)
+  await fixture.registry.dispatch(client.session, "observe", {
+    targetId: id, mode: "screenshot", caption: "Ожидаю то же окно после AX чтения",
+  }, new AbortController().signal)
   expect(() => scope.resolveElement(id, elementId)).toThrow("latest target snapshot")
 })
 
@@ -163,13 +230,16 @@ test("observe browser выполняет exact AX и capture через выбр
   const initialBrowserId = (state.data.browsers as Array<{ browserId: string }>)[0]!.browserId
   const tabs = await fixture.registry.dispatch(client.session, "get_tabs", { browserId: initialBrowserId }, new AbortController().signal)
   const tabId = (tabs.data.tabs as Array<{ targetId: string }>)[0]!.targetId
-  const observed = await fixture.registry.dispatch(client.session, "observe", { targetId: tabId, mode: "both" }, new AbortController().signal)
+  const observed = await fixture.registry.dispatch(client.session, "observe", {
+    targetId: tabId, mode: "both", caption: "Ожидаю страницу с кнопкой Save",
+  }, new AbortController().signal)
   expect(observed.data).toMatchObject({ targetId: tabId, complete: true, elements: [], width: 320, height: 240 })
   expect(String(observed.data.state)).toContain('role="button" title="Save" actions=["focus"]')
   expect(observed.frameRefs).toEqual(["frame:browser:1"])
   expect(browser.operationKinds).toEqual(["connect-instance", "read-accessibility", "capture-target"])
   expect(browser.captureResources).toEqual([[]])
   expect(browser.captureRequests[0]).toMatchObject({ capture: {
+    caption: "Ожидаю страницу с кнопкой Save",
     readinessPolicy: {
       requiredSteps: ["target", "document-ready", "complete-frame"],
       disabledSteps: ["fonts", "network-idle", "images", "reflow-stable", "animations", "final-commit", "permission", "ownership"],
@@ -181,7 +251,19 @@ test("observe browser выполняет exact AX и capture через выбр
 })
 
 function createFixture() {
-  const core = new RuntimeCore({ generation, runtimeBuildId: "build:agent", nativeGeneration })
+  const native = {
+    lastStatus: undefined as ReturnType<typeof nativeStatus> | undefined,
+    async status(request: { requestId: string }) {
+      if (this.lastStatus === undefined) throw new Error("Fixture native status отсутствует")
+      return { ...this.lastStatus, requestId: request.requestId }
+    },
+  }
+  const core = new RuntimeCore({
+    generation,
+    runtimeBuildId: "build:agent",
+    nativeGeneration,
+    native: native as unknown as NativeAdapter,
+  })
   core.updateCapabilities(capabilitySetSchema.parse({
     schemaVersion: "1",
     scope: "runtime",
@@ -190,6 +272,7 @@ function createFixture() {
   }))
   return {
     core,
+    native,
     registry: new MethodRegistry(core),
     targets: new AgentTargetRegistry({ generation }),
   }
@@ -213,6 +296,14 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
   const transitions: Array<{ request: z.infer<typeof windowTransitionRequestSchema> }> = []
   const captureRequests: Array<z.infer<typeof captureWindowMethodInputSchema>> = []
   let inventoryCalls = 0
+  fixture.core.targets.register(
+    { kind: "window", ref: windowRef },
+    inventory.inventoryId,
+    inventory.revision,
+    "resolution:agent-window",
+    "proof:agent-window",
+    inventory.displayLayoutRevision,
+  )
   fixture.registry.register("system_health", method(async () => ({ machine: { matchesExpected: true }, runtime: { draining: false, admissionSealed: false } })))
   fixture.registry.register("list_windows", method(async () => {
     inventoryCalls++
@@ -224,19 +315,32 @@ function registerDesktop(fixture: ReturnType<typeof createFixture>) {
   fixture.registry.register("window_transition", method(async (context, input) => {
     transitions.push(input)
     const actual = windowRecord(input.request.target)
-    const value = windowTransitionResultSchema.parse({
-      target: input.request.target,
-      requested: input.request,
-      actual,
-      changed: true,
-      partial: false,
-      errors: [],
+    const target = { kind: "window" as const, ref: input.request.target }
+    const intent = runtimeOperationIntentSchema.parse({
+      intent: "mutation",
+      clientRequestId: input.clientRequestId,
+      precondition: { target, inventoryId: input.inventoryId, inventoryRevision: input.inventoryRevision },
+      deadlineAt: new Date(Date.now() + 5_000).toISOString(),
+      requestedResources: [{ kind: "desktop-input", resourceRef: "desktop" }],
     })
-    return {
-      operation: completedOperation(context.session, input.clientRequestId, input.inventoryId,
-        input.inventoryRevision, { kind: "window", ref: input.request.target }, "native"),
-      result: { ok: true as const, value, outcome: successfulOutcome() },
-    }
+    return fixture.core.runOperation(context.session, intent, input.request, async operation => {
+      if (operation.wire.kind !== "native") throw new Error("Fixture требует native operation")
+      const status = nativeStatus(operation.wire)
+      fixture.native.lastStatus = status
+      return {
+        ok: true,
+        value: windowTransitionResultSchema.parse({
+        target: input.request.target,
+        requested: input.request,
+        actual,
+        changed: true,
+        partial: false,
+        errors: [],
+        }),
+        outcome: successfulOutcome(operation.resources),
+        nativeStatus: status,
+      }
+    }, context.signal)
   }, z.strictObject({
     inventoryId: z.string(),
     inventoryRevision: z.number().int(),
@@ -434,16 +538,70 @@ function windowRecord(ref = windowRef): WindowRecord {
   })
 }
 
-function successfulOutcome() {
+function applicationRef(applicationRef: string, pid: number) {
+  return {
+    ...generation,
+    nativeGeneration,
+    applicationRef,
+    pid,
+    launchedAt: "2026-09-15T10:00:00.000Z",
+    registrationNonce: `registration:${pid}`,
+  }
+}
+
+function successfulOutcome(resources: readonly RuntimeResourceHandle[] = []) {
   return {
     dispatch: "finished" as const,
     targetVerified: "verified" as const,
     userInterference: "none-observed" as const,
     observation: "available" as const,
     effect: { state: "verified" as const, proofRefs: ["proof:effect"] },
-    cleanup: { scope: "none" as const, state: "complete" as const, resources: [] as [] },
+    cleanup: resources.length === 0
+      ? { scope: "none" as const, state: "complete" as const, resources: [] as [] }
+      : { scope: "owned" as const, state: "complete" as const,
+          resources: resources.map(handle => ({ handle, outcome: "released" as const })) },
     restoration: "kept-target" as const,
     dispatchAttempts: 1,
+  }
+}
+
+function nativeStatus(wire: NativeExecutionContext) {
+  const now = new Date().toISOString()
+  return {
+    requestId: `native-status:${wire.operationId}`,
+    ...generation,
+    nativeGeneration,
+    highWaterFence: wire.fence,
+    acceptedFence: wire.fence,
+    operationId: wire.operationId,
+    execution: "finished" as const,
+    dispatch: "finished" as const,
+    cleanup: "complete" as const,
+    targetVerified: "verified" as const,
+    cancellationRequested: false,
+    userInterference: "unknown" as const,
+    restorationAllowed: false,
+    quarantined: false,
+    heldCount: 0,
+    lastCheckpoint: "fixture-finished",
+    dispatchAttempts: 1,
+    ledgerRevision: 1,
+    observer: {
+      state: "unavailable" as const,
+      ...generation,
+      nativeGeneration,
+      coverageStartCursor: "cursor:fixture",
+      cursor: "cursor:fixture",
+      nextSequence: 1,
+      startedAt: now,
+      coveredFrom: now,
+      coveredThrough: now,
+      heartbeatAt: now,
+      coveredKinds: [],
+      droppedEvents: 0,
+      gapDetected: false,
+      reason: "Fixture observer отключён",
+    },
   }
 }
 
