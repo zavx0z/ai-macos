@@ -86,6 +86,18 @@ typedef struct {
   bool can_resize;
 } MetaAXWindowInput;
 
+typedef enum {
+  META_AX_OWNER_UNCHANGED,
+  META_AX_OWNER_BOUND,
+  META_AX_OWNER_CONFLICT,
+} MetaAXOwnerBindStatus;
+
+// Exact AXSheets membership связывает surface с owner по стабильным AX tokens.
+// Конфликт помечается необратимо и не разрешает публикацию произвольного owner.
+MetaAXOwnerBindStatus meta_ax_window_bind_owner(
+    MetaAXWindowInput *window,
+    uint64_t owner_ax_token);
+
 typedef struct {
   uint32_t window_id;
   int32_t pid;

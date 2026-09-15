@@ -30,9 +30,9 @@ int main(void) {
        .launch_time_micros = 1000000,
        .ax_token = 2,
        .owner_ax_token = 1,
-       .title = "Sheet",
+       .title = "",
        .role = "AXSheet",
-       .frame = {.x = 20, .y = 20, .width = 200, .height = 100},
+       .frame = {.x = 0, .y = 0, .width = 500, .height = 400},
        .surface_kind = META_SURFACE_SHEET,
        .can_close = true},
   };
@@ -80,6 +80,10 @@ int main(void) {
   NSDictionary *unresolved = json[@"windows"][1];
   assert([window[@"kind"] isEqualToString:@"ax-window"]);
   assert([window[@"surfaces"] count] == 1);
+  assert([window[@"surfaces"][0][@"ownerWindowRef"]
+      isEqual:window[@"windowRef"]]);
+  assert([window[@"surfaces"][0][@"title"] isEqual:@""]);
+  assert([window[@"surfaces"][0][@"role"] isEqual:@"AXSheet"]);
   assert([unresolved[@"kind"] isEqualToString:@"cg-only"]);
   assert(unresolved[@"windowRef"] == nil);
   assert([json[@"displayLayoutRevision"] unsignedLongLongValue] == 1);

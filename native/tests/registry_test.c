@@ -33,6 +33,99 @@ static void failing_release(void *context, void *pointer) {
   free(pointer);
 }
 
+static void test_ax_sheet_owner_binding_is_monotonic(void) {
+  MetaAXWindowInput discovered = {
+      .pid = 42,
+      .launch_time_micros = 100,
+      .ax_token = 2,
+      .surface_kind = META_SURFACE_WINDOW,
+  };
+  assert(meta_ax_window_bind_owner(&discovered, 0) ==
+         META_AX_OWNER_UNCHANGED);
+  assert(discovered.owner_ax_token == 0);
+  assert(meta_ax_window_bind_owner(&discovered, 1) == META_AX_OWNER_BOUND);
+  assert(discovered.owner_ax_token == 1);
+  assert(discovered.surface_kind == META_SURFACE_SHEET);
+  assert(meta_ax_window_bind_owner(&discovered, 1) ==
+         META_AX_OWNER_UNCHANGED);
+  assert(meta_ax_window_bind_owner(&discovered, 3) ==
+         META_AX_OWNER_CONFLICT);
+  assert(meta_ax_window_bind_owner(&discovered, 1) ==
+         META_AX_OWNER_CONFLICT);
+
+  MetaAXWindowInput self_owned = {
+      .pid = 42,
+      .launch_time_micros = 100,
+      .ax_token = 4,
+      .surface_kind = META_SURFACE_SHEET,
+  };
+  assert(meta_ax_window_bind_owner(&self_owned, 4) ==
+         META_AX_OWNER_CONFLICT);
+  assert(self_owned.surface_kind == META_SURFACE_SHEET);
+}
+
+static void test_unowned_or_conflicting_sheet_is_not_published(void) {
+  MetaRegistry *registry = meta_registry_create("native-sheet-guard");
+  assert(registry != NULL);
+  MetaApplicationInput application = {
+      .pid = 42,
+      .launch_time_micros = 100,
+      .name = "Fixture",
+      .hidden = META_FALSE,
+      .ax_status = META_AX_READY,
+  };
+  MetaAXWindowInput windows[] = {
+      {.pid = 42,
+       .launch_time_micros = 100,
+       .ax_token = 1,
+       .title = "Window",
+       .role = "AXWindow",
+       .surface_kind = META_SURFACE_WINDOW},
+      {.pid = 42,
+       .launch_time_micros = 100,
+       .ax_token = 2,
+       .title = "",
+       .role = "AXSheet",
+       .surface_kind = META_SURFACE_SHEET},
+  };
+  MetaInventoryInput input = {
+      .applications = &application,
+      .application_count = 1,
+      .ax_windows = windows,
+      .ax_window_count = 2,
+      .source_complete = true,
+      .display_topology_epoch = 1,
+  };
+  assert(meta_registry_refresh(registry, &input));
+  const MetaInventorySnapshot *snapshot = meta_registry_snapshot(registry);
+  assert(!snapshot->complete);
+  assert(snapshot->window_count == 1);
+  assert(snapshot->windows[0].surface_kind == META_SURFACE_WINDOW);
+
+  assert(meta_ax_window_bind_owner(&windows[1], 1) == META_AX_OWNER_BOUND);
+  assert(meta_ax_window_bind_owner(&windows[1], 3) ==
+         META_AX_OWNER_CONFLICT);
+  assert(meta_registry_refresh(registry, &input));
+  snapshot = meta_registry_snapshot(registry);
+  assert(!snapshot->complete);
+  assert(snapshot->window_count == 1);
+
+  windows[1] = (MetaAXWindowInput){
+      .pid = 42,
+      .launch_time_micros = 100,
+      .ax_token = 2,
+      .owner_ax_token = 1,
+      .role = "AXWindow",
+      .surface_kind = META_SURFACE_WINDOW,
+  };
+  assert(meta_registry_refresh(registry, &input));
+  snapshot = meta_registry_snapshot(registry);
+  assert(!snapshot->complete);
+  assert(snapshot->window_count == 1);
+  assert(snapshot->windows[0].surface_kind == META_SURFACE_WINDOW);
+  meta_registry_destroy(registry);
+}
+
 static void test_stable_refs_and_reincarnation(void) {
   MetaRegistry *registry = meta_registry_create("native-a");
   assert(registry != NULL);
@@ -252,9 +345,9 @@ static void test_sheet_owner_ax_only_and_displays(void) {
        .launch_time_micros = 1,
        .ax_token = 11,
        .owner_ax_token = 10,
-       .title = "Сохранить",
+       .title = "",
        .role = "AXSheet",
-       .frame = {.x = -800, .y = 200, .width = 500, .height = 300},
+       .frame = {.x = -1000, .y = 100, .width = 900, .height = 700},
        .surface_kind = META_SURFACE_SHEET,
        .can_close = true},
   };
@@ -289,6 +382,7 @@ static void test_sheet_owner_ax_only_and_displays(void) {
   assert(snapshot->windows[0].actionability == META_ACTIONABILITY_AX);
   assert(strcmp(snapshot->windows[1].owner_window_ref,
                 snapshot->windows[0].window_ref) == 0);
+  assert(snapshot->windows[1].mapping == META_MAPPING_UNAVAILABLE);
   assert(snapshot->display_count == 2);
   assert(snapshot->display_layout_revision == 1);
   char layout_ref[META_NATIVE_REF_CAPACITY];
@@ -422,6 +516,8 @@ int main(void) {
   memset(long_generation, 'g', 65);
   long_generation[65] = '\0';
   assert(meta_registry_create(long_generation) == NULL);
+  test_ax_sheet_owner_binding_is_monotonic();
+  test_unowned_or_conflicting_sheet_is_not_published();
   test_stable_refs_and_reincarnation();
   test_ambiguous_mapping_and_incomplete_apps();
   test_sheet_owner_ax_only_and_displays();

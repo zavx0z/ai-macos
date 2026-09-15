@@ -219,9 +219,8 @@ static bool attribute_settable(AXUIElementRef element,
 }
 
 static MetaSurfaceKind surface_kind(const char *role, const char *subrole) {
-  if (strcmp(role, "AXSheet") == 0 || strcmp(subrole, "AXDialog") == 0) {
-    return META_SURFACE_SHEET;
-  }
+  (void)subrole;
+  if (strcmp(role, "AXSheet") == 0) return META_SURFACE_SHEET;
   if (strcmp(role, "AXMenu") == 0 || strcmp(role, "AXMenuItem") == 0) {
     return META_SURFACE_MENU;
   }
@@ -313,14 +312,16 @@ static void prune_handles(MetaMacOSBackend *backend,
   backend->handle_count = output;
 }
 
-static bool window_input_exists(const MetaAXWindowInput *windows, size_t count,
-                                int32_t pid, uint64_t ax_token) {
+static MetaAXWindowInput *find_window_input(MetaAXWindowInput *windows,
+                                            size_t count,
+                                            int32_t pid,
+                                            uint64_t ax_token) {
   for (size_t index = 0; index < count; index += 1) {
     if (windows[index].pid == pid && windows[index].ax_token == ax_token) {
-      return true;
+      return &windows[index];
     }
   }
-  return false;
+  return NULL;
 }
 
 static bool append_ax_window(MetaMacOSBackend *backend,
@@ -339,7 +340,12 @@ static bool append_ax_window(MetaMacOSBackend *backend,
   const uint64_t token = token_for_element(backend, pid, launch_time_micros,
                                            element);
   if (token == 0) return false;
-  if (window_input_exists(*windows, *count, pid, token)) return true;
+  MetaAXWindowInput *existing =
+      find_window_input(*windows, *count, pid, token);
+  if (existing != NULL) {
+    return meta_ax_window_bind_owner(existing, owner_token) !=
+           META_AX_OWNER_CONFLICT;
+  }
   const size_t next_count = *count + 1;
   MetaAXWindowInput *next = realloc(*windows, next_count * sizeof(*next));
   if (next == NULL) return false;
@@ -360,7 +366,6 @@ static bool append_ax_window(MetaMacOSBackend *backend,
       .pid = pid,
       .launch_time_micros = launch_time_micros,
       .ax_token = token,
-      .owner_ax_token = owner_token,
       .title = title,
       .role = role,
       .subrole = subrole,
@@ -370,6 +375,10 @@ static bool append_ax_window(MetaMacOSBackend *backend,
       .focused = META_UNKNOWN,
       .main = META_UNKNOWN,
   };
+  if (meta_ax_window_bind_owner(&collected, owner_token) ==
+      META_AX_OWNER_CONFLICT) {
+    goto collected_owner_conflict;
+  }
   collected.minimized = copy_bool_attribute(element, kAXMinimizedAttribute);
   if (monotonic_millis() >= deadline_millis) goto collected_deadline_reached;
   collected.fullscreen = copy_bool_attribute(element, CFSTR("AXFullScreen"));
@@ -411,6 +420,12 @@ static bool append_ax_window(MetaMacOSBackend *backend,
   }
   *count = next_count;
   return true;
+
+collected_owner_conflict:
+  free((void *)collected.title);
+  free((void *)collected.role);
+  free((void *)collected.subrole);
+  return false;
 
 collected_deadline_reached:
   free((void *)collected.title);

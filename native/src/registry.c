@@ -5,6 +5,37 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define META_AX_OWNER_AMBIGUOUS_TOKEN UINT64_MAX
+
+MetaAXOwnerBindStatus meta_ax_window_bind_owner(
+    MetaAXWindowInput *window,
+    uint64_t owner_ax_token) {
+  if (window == NULL || window->ax_token == 0) {
+    return META_AX_OWNER_CONFLICT;
+  }
+  if (window->owner_ax_token == META_AX_OWNER_AMBIGUOUS_TOKEN) {
+    window->surface_kind = META_SURFACE_SHEET;
+    return META_AX_OWNER_CONFLICT;
+  }
+  if (owner_ax_token == 0) return META_AX_OWNER_UNCHANGED;
+  if (owner_ax_token == window->ax_token) {
+    window->owner_ax_token = META_AX_OWNER_AMBIGUOUS_TOKEN;
+    window->surface_kind = META_SURFACE_SHEET;
+    return META_AX_OWNER_CONFLICT;
+  }
+  if (window->owner_ax_token == 0) {
+    window->owner_ax_token = owner_ax_token;
+    window->surface_kind = META_SURFACE_SHEET;
+    return META_AX_OWNER_BOUND;
+  }
+  if (window->owner_ax_token == owner_ax_token) {
+    window->surface_kind = META_SURFACE_SHEET;
+    return META_AX_OWNER_UNCHANGED;
+  }
+  window->owner_ax_token = META_AX_OWNER_AMBIGUOUS_TOKEN;
+  return META_AX_OWNER_CONFLICT;
+}
+
 typedef struct {
   int32_t pid;
   uint64_t launch_time_micros;
@@ -256,6 +287,28 @@ static MetaMappingStatus correlate_window(
   return META_MAPPING_UNAVAILABLE;
 }
 
+static bool exact_sheet_owner(const MetaAXWindowInput *windows,
+                              size_t count,
+                              const MetaAXWindowInput *sheet) {
+  if (sheet->owner_ax_token == 0 ||
+      sheet->owner_ax_token == META_AX_OWNER_AMBIGUOUS_TOKEN ||
+      sheet->owner_ax_token == sheet->ax_token) {
+    return false;
+  }
+  const MetaAXWindowInput *owner = NULL;
+  for (size_t index = 0; index < count; index += 1) {
+    const MetaAXWindowInput *candidate = &windows[index];
+    if (candidate->pid == sheet->pid &&
+        candidate->launch_time_micros == sheet->launch_time_micros &&
+        candidate->ax_token == sheet->owner_ax_token &&
+        candidate->surface_kind == META_SURFACE_WINDOW) {
+      if (owner != NULL) return false;
+      owner = candidate;
+    }
+  }
+  return owner != NULL;
+}
+
 MetaRegistry *meta_registry_create(const char *native_generation) {
   MetaRegistryAllocator allocator = {
       .allocate_zeroed = default_allocate_zeroed,
@@ -394,9 +447,12 @@ bool meta_registry_refresh(MetaRegistry *registry,
   working.application_count = input->application_count;
 
   for (size_t index = 0; index < input->ax_window_count; index += 1) {
-    ax_mappings[index] = correlate_window(
-        &input->ax_windows[index], input->cg_windows, input->cg_window_count,
-        &ax_candidate_indices[index]);
+    ax_mappings[index] = input->ax_windows[index].surface_kind ==
+                                 META_SURFACE_WINDOW
+        ? correlate_window(&input->ax_windows[index], input->cg_windows,
+                           input->cg_window_count,
+                           &ax_candidate_indices[index])
+        : META_MAPPING_UNAVAILABLE;
   }
   for (size_t index = 0; index < input->ax_window_count; index += 1) {
     if (ax_mappings[index] != META_MAPPING_CORROBORATED) continue;
@@ -419,6 +475,17 @@ bool meta_registry_refresh(MetaRegistry *registry,
   size_t output_window_count = 0;
   for (size_t index = 0; index < input->ax_window_count; index += 1) {
     const MetaAXWindowInput *source = &input->ax_windows[index];
+    const bool contradictory_window_owner =
+        source->surface_kind == META_SURFACE_WINDOW &&
+        source->owner_ax_token != 0;
+    if (source->owner_ax_token == META_AX_OWNER_AMBIGUOUS_TOKEN ||
+        contradictory_window_owner ||
+        (source->surface_kind == META_SURFACE_SHEET &&
+         !exact_sheet_owner(input->ax_windows, input->ax_window_count,
+                            source))) {
+      complete = false;
+      continue;
+    }
     MetaApplicationRecord *application = find_application_record(
         applications, input->application_count, source->pid,
         source->launch_time_micros);
