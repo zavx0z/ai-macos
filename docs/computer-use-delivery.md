@@ -36,10 +36,10 @@
 - миграция Codex/external callers, retirement REST listeners и удаление старых
   CLI/bootstrap paths;
 - A02/A31/A43 и обязательная live/visual/native/device matrix.
-- внешний Computer Use compatibility facade: пользователь принял цель
-  совместимости, но точные методы/schemas/errors/cancellation/media semantics
-  ещё исследуются по actual bundled Codex/ChatGPT API и официальной
-  документации. До фиксации evidence-backed contract реализацию не угадывать.
+- оценка внешнего API: пользователь попросил сначала сравнить целесообразность
+  полной и частичной совместимости; переход приостановлен. Проверенный bundled
+  Codex/ChatGPT API и источники описаны в `docs/computer-use-api.md`.
+  Полная совместимость не является принятым условием выпуска.
 
 Точный proposal удаления source хранится в
 `scripts/legacy-source-removal-plan.json`. Он не является разрешением удалять
@@ -228,10 +228,9 @@ capability объявляется после проверки именно на 
   caller migration, successful installed doctor и exact retirement собственных
   legacy listeners. Сначала удаляются start/bypass paths, затем временный
   retirement coordinator.
-- После завершения root research зафиксировать внешний compatibility facade и
-  проверить его contract tests против actual Computer Use API. Внутренний MCP
-  catalog может быть богаче, но поддерживаемая внешняя поверхность не должна
-  расходиться по обязательным request/result/cancel/image semantics.
+- После сравнения вариантов зафиксировать выбранный внешний API и проверить
+  его сквозными сценариями. Если выбрана совместимость, отдельно проверять
+  request/result/cancel/image semantics заявленного набора методов.
 
 **Выход:** нет второго неуправляемого пути ввода, неизвестных работающих
 собственных старых сервисов и объявленных без доказательств возможностей.

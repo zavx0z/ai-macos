@@ -40,12 +40,12 @@ artifact, фактические macOS permissions, visual result или пол�
   реальной задачи Codex.
 - Полная live матрица окон, ввода, capture, Chrome и Android не выполнена.
 - Механическая сборка AppKit fixture не является visual/AX/input acceptance.
-- Пользователь принял дополнительную финальную цель: внешний агентский API
-  должен быть совместим с Computer Use API, доступным Codex/ChatGPT. Точный
+- Пользователь запросил сравнить наш внешний API с Computer Use API
+  Codex/ChatGPT и сначала оценить целесообразность перехода. Точный
   интерфейс найден в bundled `@oai/cua` 0.2.4 приложения
   `/Applications/ChatGPT.app` и зафиксирован в `docs/computer-use-api.md`.
-  Реализация JS facade, постоянной REPL и полного набора AX-действий начата;
-  совместимость ещё не принята.
+  Начатые черновики JS facade/REPL приостановлены. Решение о полной либо
+  частичной совместимости не принято; необходимые исправления core продолжаются.
 
 ## Граница готовности
 
@@ -61,8 +61,8 @@ artifact, фактические macOS permissions, visual result или пол�
 5. Удаления legacy entrypoints/CLI/bootstrap по
    `scripts/legacy-source-removal-plan.json`.
 6. Повторного source/full acceptance и обязательной live-проверки root.
-7. Фиксации и проверки внешнего compatibility facade после завершения API
-   research; внутренний runtime contract сам по себе этот gate не закрывает.
+7. Решения о внешнем API после сравнения вариантов и проверки выбранного
+   интерфейса на сквозных сценариях.
 
 ## Эксплуатационные ограничения
 

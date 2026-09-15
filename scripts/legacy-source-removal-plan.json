@@ -1,7 +1,7 @@
 {
   "format": "meta-ai-macos-legacy-source-removal-plan-v1",
   "generatedFromCommit": "8eabedf",
-  "state": "proposal-blocked-until-root-integration-and-api-contract",
+  "state": "proposal-blocked-until-root-integration-and-api-decision",
   "scope": "repository-source-only",
   "preconditions": [
     "Полный production RuntimeHost catalog и native binding проходят root integration без legacy REST.",
@@ -11,11 +11,11 @@
     "LegacyServiceRetirementCoordinator подтвердил exact ownership и завершение собственных listeners 7878-7882.",
     "Chrome CDP LaunchAgent инвентаризирован и остановлен только при подтвержденном ownership.",
     "Root подтвердил, что удаление source-controlled helper не удаляет installer-managed stable TCC pathname.",
-    "Завершено исследование actual bundled и official Computer Use API; внешний compatibility facade зафиксирован tests и не использует legacy REST/CLI как реализацию."
+    "Принято решение о внешнем API после сравнения вариантов; выбранный интерфейс проверен и не использует legacy REST/CLI как реализацию."
   ],
   "externalApiCompatibility": {
-    "goal": "Совместимая внешняя agent-facing поверхность с Computer Use API Codex/ChatGPT",
-    "contractStatus": "under-research",
+    "goal": "Оценить пользу и стоимость полной либо частичной совместимости с Computer Use API Codex/ChatGPT",
+    "contractStatus": "source-verified-adoption-paused-pending-decision",
     "researchSources": [
       "/Applications/ChatGPT.app bundled API inspected by root",
       "https://learn.chatgpt.com/docs/computer-use"
