@@ -42,6 +42,8 @@ import {
   NATIVE_CLIPBOARD_WIRE_BYTES,
   type NativeClipboardRequest, type NativeClipboardResponse,
 } from "./clipboard-protocol.ts"
+import { nativePermissionsRequestSchema, nativePermissionsResponseSchema, nativePermissionsResponseMatches,
+  type NativePermissionsRequest, type NativePermissionsResponse } from "./permissions-protocol.ts"
 
 export interface NativeTransport {
   send(frame: NativeTransportRequestFrame): Promise<void>
@@ -229,6 +231,19 @@ export class NativeBrokerAdapter implements NativeAdapter {
       throw new Error("Native heartbeat ACK не коррелирует с request")
     }
     return response.payload
+  }
+
+  async permissions(request: NativePermissionsRequest, control: AdapterControl): Promise<NativePermissionsResponse> {
+    control.signal.throwIfAborted()
+    const parsed = parseWireValue(nativePermissionsRequestSchema, request)
+    this.#assertGeneration(parsed)
+    await control.checkpoint("native-before-passive-permissions")
+    const response = await this.#exchange("permissions", { channel: "permissions", payload: parsed }, parsed.requestId, control.signal, parsed.deadlineAt)
+    if (response.channel !== "permissions") throw new Error("Native permissions response channel mismatch")
+    const value = parseWireValue(nativePermissionsResponseSchema, response.payload)
+    if (!nativePermissionsResponseMatches(parsed, value, this.loadedBuildId)) throw new Error("Native permissions response identity mismatch")
+    await control.checkpoint("native-after-passive-permissions")
+    return value
   }
 
   async clipboard(request: NativeClipboardRequest, control: AdapterControl): Promise<NativeClipboardResponse> {

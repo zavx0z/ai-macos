@@ -4,6 +4,7 @@ import { tmpdir, hostname } from "node:os"
 import { join } from "node:path"
 import type { NativeTransport } from "@meta/native/adapter"
 import type { NativeTransportPacket, NativeTransportRequestFrame } from "@meta/native/protocol"
+import type { NativePermissionsResponse } from "@meta/native/protocol"
 import { createRuntimeHost } from "../src/host.ts"
 
 test("host derives audit login identity and rejects different live helper session", async () => {
@@ -39,12 +40,24 @@ test("host derives audit login identity and rejects different live helper sessio
 
 class AuditTransport implements NativeTransport {
   closed = false
-  readonly #packet: Promise<NativeTransportPacket>
+  permissions: Partial<NativePermissionsResponse> = {}
+  permissionCalls = 0
+  #packet: Promise<NativeTransportPacket>
   #resolve!: (packet: NativeTransportPacket) => void
   constructor(readonly session: { verified: true, source: "darwin-audit", uid: number, effectiveUid: number, auditUserId: number, auditSessionId: number }) {
     this.#packet = new Promise(resolve => { this.#resolve = resolve })
   }
   async send(frame: NativeTransportRequestFrame) {
+    if (frame.channel === "permissions") {
+      this.permissionCalls++
+      const { deadlineAt: _, ...identity } = frame.payload
+      this.#resolve({ kind: "message", frame: { channel: "permissions", payload: {
+        ...identity, kind: "permissions-response", nativeBuildId: "build:native-audit",
+        accessibility: true, postEvents: true, screenRecording: false,
+        codeIdentity: { helperPath: "/tmp/signed-self-helper", cdhash: "a".repeat(40) }, ...this.permissions,
+      } } })
+      return
+    }
     if (frame.channel !== "handshake") throw new Error("handshake fixture only")
     this.#resolve({ kind: "message", frame: { channel: "handshake", payload: {
       kind: "handshake-response", protocolVersion: "1", requestId: frame.payload.requestId,
@@ -58,11 +71,41 @@ class AuditTransport implements NativeTransport {
     } } })
   }
   async *packets(signal: AbortSignal) {
-    yield await this.#packet
-    await new Promise<void>(resolve => {
-      if (signal.aborted) resolve()
-      else signal.addEventListener("abort", () => resolve(), { once: true })
-    })
+    let onAbort!: () => void
+    const aborted = new Promise<undefined>(resolve => { onAbort = () => resolve(undefined); signal.addEventListener("abort", onAbort, { once: true }) })
+    try {
+      while (!signal.aborted) {
+        const packet = await Promise.race([this.#packet, aborted])
+        if (packet === undefined) return
+        this.#packet = new Promise(resolve => { this.#resolve = resolve })
+        yield packet
+      }
+    } finally { signal.removeEventListener("abort", onAbort) }
   }
   async close() { this.closed = true }
 }
+
+test("host health использует fresh passive grants и signed loaded identity", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "host-permissions-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 125 }
+  const transport = new AuditTransport(session)
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:host-permissions", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+  try {
+    const client = await host.core.openClientDurable("principal:permissions")
+    const read = async () => (await host.catalog.dispatch(client.session, "system_health", {}, new AbortController().signal)).data
+    expect((await read()).permissions).toEqual({
+      accessibility: { granted: true, helperPath: "/tmp/signed-self-helper", cdhash: "a".repeat(40) },
+      screenRecording: { granted: false, ownerPath: "/tmp/signed-self-helper", cdhash: "a".repeat(40) },
+      postEvents: { granted: true, helperPath: "/tmp/signed-self-helper", cdhash: "a".repeat(40) },
+    })
+    transport.permissions = { accessibility: false }
+    expect((await read()).permissions).toMatchObject({ accessibility: { granted: false } })
+    transport.permissions = { nativeBuildId: "build:wrong" }
+    expect((await read()).permissionsUnavailable).toContain("identity mismatch")
+    transport.permissions = { nativeGeneration: "native:wrong" }
+    expect((await read()).permissions).toBeUndefined()
+    expect(transport.permissionCalls).toBe(4)
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+})

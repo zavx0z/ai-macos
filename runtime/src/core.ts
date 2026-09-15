@@ -52,6 +52,7 @@ import { ResourceRegistry } from "./resources.ts"
 import { NativeContinuationRegistry } from "./continuations.ts"
 import { BrowserLifetimeCoordinator, type CoordinatedLifecycle } from "./reservations.ts"
 import type { PersistentOperationJournal, StoredOperationEvidence } from "./storage/index.ts"
+import type { StoredClientSession } from "./client-sessions.ts"
 
 type JournalEntry = {
   digest: string
@@ -97,6 +98,8 @@ export type RuntimeCoreOptions = {
   reservationTtlMs?: number
   operationJournal?: PersistentOperationJournal
   durableTimeoutMs?: number
+  hmacKeyGeneration?: string
+  clientPersistence?: { sessions: readonly StoredClientSession[], persist(sessions: readonly StoredClientSession[]): Promise<void> }
 }
 
 export type ReserveCapturePublicationRequest = Pick<ObservationPublication,
@@ -142,6 +145,9 @@ export class RuntimeCore implements RuntimeAdapter {
   readonly #completionVerifier?: BackendCompletionVerifier
   readonly #operationJournal?: PersistentOperationJournal
   readonly #durableTimeoutMs: number
+  readonly #clientPersistence?: RuntimeCoreOptions["clientPersistence"]
+  #credentialTail: Promise<void> = Promise.resolve()
+  readonly #persistedSessions = new Set<string>()
   #storagePoisoned = false
   #storageInitialized: boolean
   #recoveryEvidence: StoredOperationEvidence[] = []
@@ -156,15 +162,20 @@ export class RuntimeCore implements RuntimeAdapter {
     this.#clock = options.clock ?? systemClock
     this.#ids = options.ids ?? randomIdSource
     this.#secret = options.secret ?? crypto.getRandomValues(new Uint8Array(32))
-    this.#hmacKeyGeneration = this.#ids.next("hmac-key")
+    this.#hmacKeyGeneration = options.hmacKeyGeneration ?? this.#ids.next("hmac-key")
     this.#cancelGraceMs = options.cancelGraceMs ?? 1_000
     this.#completionVerifier = options.completionVerifier
     this.#operationJournal = options.operationJournal
+    this.#clientPersistence = options.clientPersistence
     this.#durableTimeoutMs = options.durableTimeoutMs ?? 1000
     if (!Number.isSafeInteger(this.#durableTimeoutMs) || this.#durableTimeoutMs < 1 || this.#durableTimeoutMs > 10_000) throw new Error("Durable timeout вне bounds")
     this.#storageInitialized = options.operationJournal === undefined
     this.#capabilities = unavailableRuntimeCapabilities(this.#ids.next("runtime-capabilities"))
     this.clients = new ClientSessionRegistry(this.generation, { clock: this.#clock, ids: this.#ids })
+    if (options.clientPersistence !== undefined) {
+      this.clients.restore(options.clientPersistence.sessions)
+      for (const stored of options.clientPersistence.sessions) this.#persistedSessions.add(stored.session.clientSessionId)
+    }
     this.resources = new ResourceRegistry(this.generation, this.#secret, { clock: this.#clock, ids: this.#ids })
     this.browserLifetime = new BrowserLifetimeCoordinator({
       generation: this.generation,
@@ -225,7 +236,31 @@ export class RuntimeCore implements RuntimeAdapter {
   }
 
   openClient(principalId: string, ttlMs?: number): RuntimeClientCredential {
+    if (this.#clientPersistence !== undefined) throw new Error("Durable host требует openClientDurable")
     return this.clients.open(principalId, ttlMs)
+  }
+
+  async openClientDurable(principalId: string, ttlMs?: number): Promise<RuntimeClientCredential> {
+    return this.#persistCredential(() => this.clients.open(principalId, ttlMs))
+  }
+
+  async resumeClientDurable(resumptionToken: string, ttlMs?: number): Promise<RuntimeClientCredential> {
+    return this.#persistCredential(() => this.clients.resume(resumptionToken, ttlMs))
+  }
+
+  async #persistCredential(create: () => RuntimeClientCredential): Promise<RuntimeClientCredential> {
+    if (this.#clientPersistence === undefined) return create()
+    const persist = async () => {
+      if (this.#storagePoisoned) throw new Error("Durable storage poisoned")
+      const credential = create()
+      try { await this.#awaitDurable(this.#clientPersistence!.persist(this.clients.snapshot())) }
+      catch (error) { this.#storagePoisoned = true; this.quarantineStartup("Client credential persistence не подтверждена"); throw error }
+      this.#persistedSessions.add(credential.session.clientSessionId)
+      return credential
+    }
+    const pending = this.#credentialTail.then(persist, persist)
+    this.#credentialTail = pending.then(() => undefined, () => undefined)
+    return pending
   }
 
   async reserveCapturePublication(session: RuntimeClientSession, request: ReserveCapturePublicationRequest): Promise<ObservationPublication> {
@@ -317,6 +352,20 @@ export class RuntimeCore implements RuntimeAdapter {
     if (this.#storageInitialized) return structuredClone(this.#recoveryEvidence)
     this.sealAdmission()
     this.#recoveryEvidence = await this.#operationJournal.loadRecoveryEvidence()
+    if (this.#clientPersistence !== undefined && this.#operationJournal.loadAll !== undefined) {
+      for (const { record, revision } of await this.#operationJournal.loadAll()) {
+        const lineageId = this.clients.historicalLineage(record.clientSessionId, record.principalId)
+        if (lineageId === undefined || record.context.loginSessionId !== this.generation.loginSessionId) continue
+        const dedupKey = canonicalJson([this.generation.runtimeEpoch, lineageId, record.context.clientRequestId])
+        const previous = this.#dedup.get(dedupKey)
+        if (previous !== undefined && previous !== record.context.operationId) throw new Error("Historical journal содержит duplicate lineage/request")
+        this.#journal.set(record.context.operationId, {
+          record, digest: record.payloadReceipt.hmacSha256, lineageId, durableRevision: revision,
+          durableTail: Promise.resolve(), controller: new AbortController(), settled: true, adapterStarted: record.outcome.dispatch !== "none",
+        })
+        this.#dedup.set(dedupKey, record.context.operationId)
+      }
+    }
     this.#storageInitialized = true
     if (this.#recoveryEvidence.length === 0) this.unsealAdmission()
     return structuredClone(this.#recoveryEvidence)
@@ -377,6 +426,7 @@ export class RuntimeCore implements RuntimeAdapter {
   ): Promise<RuntimeExecution<TResult>> {
     const now = this.#clock.now()
     await this.clients.assertActive(session, now)
+    if (this.#clientPersistence !== undefined && !this.#persistedSessions.has(session.clientSessionId)) throw new Error("Client session не подтверждена durable storage")
     const intent = runtimeOperationIntentSchema.parse(intentValue)
     const domain = intent.precondition.target.kind
     if (lifecycle === undefined && [
@@ -415,7 +465,9 @@ export class RuntimeCore implements RuntimeAdapter {
       }
       if (previous.result !== undefined) return previous.result as RuntimeExecution<TResult>
       if (previous.promise !== undefined) return previous.promise as Promise<RuntimeExecution<TResult>>
-      throw new Error("Operation зарегистрирована без execution promise")
+      throw new RuntimeContractError("receipt-expired", "Сохранён только operation receipt; действие не повторяется", "runtime-dedup", {
+        recoveryAction: "get-operation", context: { operationId: previousOperationId },
+      })
     }
 
     this.#assertIntentAuthority(session, intent, now)
@@ -500,6 +552,7 @@ export class RuntimeCore implements RuntimeAdapter {
     const entry = this.#journal.get(operationId)
     if (entry === undefined) throw new Error("Operation не найдена")
     this.#assertJournalAuthority(session, entry.record)
+    if (entry.record.context.runtimeEpoch !== this.generation.runtimeEpoch) return entry.record
     if (isTerminal(entry.record)) return entry.record
     entry.record = operationRecordSchema.parse({
       ...entry.record,
@@ -609,7 +662,7 @@ export class RuntimeCore implements RuntimeAdapter {
   }
 
   activeOperationCount(): number {
-    return [...this.#journal.values()].filter(entry => !isTerminal(entry.record)).length
+    return [...this.#journal.values()].filter(entry => !entry.settled).length
   }
 
   async #stageLifetimeRecovery(operationIds: readonly string[]): Promise<() => void> {
@@ -960,6 +1013,10 @@ export class RuntimeCore implements RuntimeAdapter {
     }
     const pending = entry.durableTail.then(write, write)
     entry.durableTail = pending.catch(() => undefined)
+    await this.#awaitDurable(pending)
+  }
+
+  async #awaitDurable(pending: Promise<unknown>): Promise<void> {
     let timer: ReturnType<typeof setTimeout> | undefined
     try {
       await Promise.race([pending, new Promise<never>((_, reject) => {

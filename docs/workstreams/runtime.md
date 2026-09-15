@@ -10,6 +10,35 @@ production cutover ещё впереди. Recovery и Android composition при
 
 ## Checkpoint durable core и host integration
 
+Restart credentials и пассивная идентичность helper:
+
+- Private client state хранит HMAC key generation, ключ, hashes bearer/resumption
+  credentials и exact lineage/session metadata. Checksum, private mode, UID,
+  запрет symlink и размер проверяются при чтении; запись использует atomic fsync.
+- Host подтверждает запись credential до ответа open/resume. Зависшая запись
+  ограничена durable deadline и закрывает admission. Обычный sync open запрещён
+  в durable host; operation требует подтверждённую durable session.
+- После restart старый bearer не действует. Resumption token подтверждает прежнюю
+  lineage в той же login session и выдаёт новый bearer/current epoch. Token
+  сохраняется при resume, чтобы потерянный resume reply можно было безопасно
+  повторить без создания новой lineage.
+- Terminal и unresolved journal metadata загружаются без action replay. Старая
+  lineage читает прежний receipt; fresh principal с тем же именем доступа не
+  получает. Response payload не сохраняется: повтор возвращает receipt-expired
+  со ссылкой на operation, не запускает adapter заново.
+- Native permissions control channel проверяет request/runtime/login/native
+  generation и loaded build. Health возвращает свежие passive grants с
+  SecCode self identity, когда helper её предоставил. При отсутствии подписи
+  или mismatch явно возвращается permissionsUnavailable.
+- Metadata subprocess cleanup теперь TERM → bounded wait → KILL → подтверждение
+  exit; не подтверждённый exit является ошибкой, а не успешным завершением probe.
+- Focused restart/reservations/host/persistence: **17 pass / 114 assertions**.
+  Полный предыдущий runtime run: 96 pass и один устаревший message assertion,
+  после исправления wording соответствующий тест повторно прошёл. Root tsc
+  остановился только на незавершённых installer helpers в параллельной работе.
+- Остаётся: подтверждённое восстановление старого held-input ledger новым
+  helper, bounded retention/session cleanup и live native generation rotation.
+
 Следующий транспортный срез:
 
 - Отдельный adminToken из private credential разрешает только administrative

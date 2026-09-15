@@ -196,13 +196,13 @@ export class RuntimeUdsServer {
       if (request.method === "POST" && url.pathname === "/v1/session/open") {
         this.#assertBootstrap(request)
         const body = await readJson(request, sessionOpenSchema)
-        const credential = this.#core.openClient(this.#principalId)
+        const credential = await this.#core.openClientDurable(this.#principalId)
         return json({ ...credential, clientName: body.clientName })
       }
       if (request.method === "POST" && url.pathname === "/v1/session/resume") {
         this.#assertBootstrap(request)
         const body = await readJson(request, sessionResumeSchema)
-        return json(this.#core.clients.resume(body.resumptionToken))
+        return json(await this.#core.resumeClientDurable(body.resumptionToken))
       }
 
       const session = this.#authenticate(request)
@@ -297,14 +297,16 @@ export class RuntimeUdsServer {
 
 export class RuntimeUdsClient {
   readonly #socketPath: string
-  readonly #bootstrapToken: string
-  readonly #adminToken?: string
+  #bootstrapToken: string
+  #adminToken?: string
+  readonly #credentialPath: string
   #bearerToken: string | undefined
   #resumptionToken: string | undefined
   readonly #timeoutMs: number
 
-  private constructor(socketPath: string, bootstrapToken: string, timeoutMs: number, adminToken?: string) {
+  private constructor(socketPath: string, credentialPath: string, bootstrapToken: string, timeoutMs: number, adminToken?: string) {
     this.#socketPath = socketPath
+    this.#credentialPath = credentialPath
     this.#bootstrapToken = bootstrapToken
     this.#adminToken = adminToken
     this.#timeoutMs = timeoutMs
@@ -318,7 +320,7 @@ export class RuntimeUdsClient {
     const credential = parseWireJson(bootstrapCredentialSchema, await readFile(credentialPath, "utf8"))
     const timeoutMs = options.timeoutMs ?? RUNTIME_TRANSPORT_TIMEOUT_MS
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error("Runtime client timeout должен быть 1..30000 ms")
-    return new RuntimeUdsClient(socketPath, credential.bootstrapToken, timeoutMs, credential.adminToken)
+    return new RuntimeUdsClient(socketPath, credentialPath, credential.bootstrapToken, timeoutMs, credential.adminToken)
   }
 
   async open(clientName: string): Promise<void> {
@@ -334,6 +336,9 @@ export class RuntimeUdsClient {
 
   async resume(): Promise<void> {
     if (this.#resumptionToken === undefined) throw new Error("Нет resumption credential")
+    const bootstrap = parseWireJson(bootstrapCredentialSchema, await readFile(this.#credentialPath, "utf8"))
+    this.#bootstrapToken = bootstrap.bootstrapToken
+    this.#adminToken = bootstrap.adminToken
     const response = await this.#request("/v1/session/resume", {
       method: "POST",
       bootstrap: true,

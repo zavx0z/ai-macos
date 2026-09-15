@@ -91,7 +91,7 @@ test("host singleton защищает запуск helper и drain закрыв�
     expect(host.catalog.descriptors().tools.some(tool => tool.name === "system_health")).toBe(true)
     expect(host.catalog.descriptors().revision).toBeGreaterThan(beforeRevision)
     expect(changes).toBe(1)
-    const session = host.core.openClient("principal:drain").session
+    const session = (await host.core.openClientDurable("principal:drain")).session
     await expect(host.catalog.dispatch(session, "mutation", {}, new AbortController().signal)).rejects.toThrow("sealed")
     expect(host.core.admissionSealed).toBe(true)
     host.core.unsealAdmission()

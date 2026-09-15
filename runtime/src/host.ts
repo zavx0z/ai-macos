@@ -1,5 +1,6 @@
 import { hostname } from "node:os"
 import { dirname, join } from "node:path"
+import { realpath } from "node:fs/promises"
 import {
   capabilitySetSchema, freezeAdapterHostContext,
   nativeHandshakeCompatibility, nativeHandshakeRequestSchema, operationRecordSchema, opaqueIdSchema, z,
@@ -19,6 +20,8 @@ import { acquireHostLock } from "./host-lock.ts"
 import { composeHostCapabilities } from "./host-capabilities.ts"
 import { FileHeldInputLedger, FileOperationJournal } from "./storage/index.ts"
 import { registerWindowMethods } from "./window-methods.ts"
+import { FileClientState } from "./client-state.ts"
+import { sha256 } from "./primitives.ts"
 
 export type RuntimeHostOptions = {
   socketPath: string
@@ -52,6 +55,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   const loginSessionId = session?.verified ? `audit:${session.uid}:${session.auditSessionId}` : options.loginSessionId
   if (loginSessionId === undefined) throw new Error("Native audit login identity unavailable")
   const generation = { runtimeEpoch: `runtime:${crypto.randomUUID()}`, loginSessionId }
+  const clientState = new FileClientState(join(stateDirectory, `clients-${sha256(loginSessionId)}.json`))
+  const clientIdentity = await clientState.initialize(loginSessionId)
   const adapterInstanceRef = `adapter:${crypto.randomUUID()}`
   let runtime: RuntimeCore | undefined
   let native: NativeBrokerAdapter | undefined
@@ -116,6 +121,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   runtime = new RuntimeCore({
     generation, runtimeBuildId: options.runtimeBuildId,
     operationJournal: journal,
+    secret: Buffer.from(clientIdentity.secretHex, "hex"), hmacKeyGeneration: clientIdentity.keyGeneration,
+    clientPersistence: { sessions: clientIdentity.sessions, persist: sessions => clientState.persist(sessions) },
     completionVerifier: { async verify(context, result) {
       if (clipboard === undefined) throw new Error("Clipboard completion verifier не подключён")
       await clipboard.verify(context, result)
@@ -158,11 +165,33 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       z.strictObject({ state: z.literal("compatible"), buildId: z.string(), generation: z.string() }),
     ]),
     capabilities: capabilitySetSchema, activeOperations: z.number().int().min(0), quarantinedResources: z.number().int().min(0),
+    permissions: z.strictObject({
+      accessibility: z.strictObject({ granted: z.boolean(), helperPath: z.string(), cdhash: z.string() }),
+      screenRecording: z.strictObject({ granted: z.boolean(), ownerPath: z.string(), cdhash: z.string() }),
+      postEvents: z.strictObject({ granted: z.boolean(), helperPath: z.string(), cdhash: z.string() }),
+    }).optional(),
+    permissionsUnavailable: z.string().optional(),
   })
   catalog.register("system_health", {
     title: "Состояние runtime", description: "Пассивная проверка машины, загруженных builds и доступности runtime.",
     input: z.strictObject({}), output: doctorSchema, readOnly: true, availableDuringDrain: true,
-    requiredCapabilities: ["runtime.health"], async execute() { return doctor() },
+    requiredCapabilities: ["runtime.health"], async execute(context) {
+      if (native === undefined || handshake === undefined) return { ...doctor(), permissionsUnavailable: "Native helper unavailable" }
+      try {
+        const signal = AbortSignal.any([context.signal, AbortSignal.timeout(1000)])
+        const response = await native.permissions({ kind: "permissions", protocolVersion: "1", requestId: `permissions:${crypto.randomUUID()}`,
+          ...generation, nativeGeneration: handshake.nativeGeneration, deadlineAt: new Date(Date.now() + 1000).toISOString(),
+        }, { signal, checkpoint() { signal.throwIfAborted() } })
+        if (response.codeIdentity === undefined) throw new Error("Native signed self identity unavailable")
+        const { helperPath, cdhash } = response.codeIdentity
+        if (options.helperPath !== undefined && await realpath(options.helperPath) !== await realpath(helperPath)) throw new Error("Loaded helper path не совпадает с configured artifact")
+        return { ...doctor(), permissions: {
+          accessibility: { granted: response.accessibility, helperPath, cdhash },
+          screenRecording: { granted: response.screenRecording, ownerPath: helperPath, cdhash },
+          postEvents: { granted: response.postEvents, helperPath, cdhash },
+        } }
+      } catch (error) { return { ...doctor(), permissionsUnavailable: error instanceof Error ? error.message : "Native permissions unavailable" } }
+    },
   })
   catalog.register("get_operation", {
     title: "Состояние операции", description: "Чтение operation receipt текущей client lineage без повтора действия.",
@@ -261,6 +290,19 @@ async function readNativeMetadata(helperPath: string): Promise<unknown> {
     ])
   } finally {
     if (timer !== undefined) clearTimeout(timer)
-    if (child.exitCode === null) child.kill()
+    if (child.exitCode === null) {
+      child.kill("SIGTERM")
+      if (!await waitForMetadataExit(child.exited, 100)) {
+        child.kill("SIGKILL")
+        if (!await waitForMetadataExit(child.exited, 1000)) throw new Error("Native metadata child cleanup не подтверждён после SIGKILL")
+      }
+    }
   }
+}
+
+async function waitForMetadataExit(exited: Promise<number>, timeoutMs: number): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([exited.then(() => true), new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), timeoutMs) })])
+  } finally { if (timer !== undefined) clearTimeout(timer) }
 }
