@@ -53,6 +53,8 @@ mkdir -p "$(dirname -- "$CANDIDATE_OUTPUT")"
   native/src/readiness-command/meta_readiness_command.m \
   native/src/readiness-command/meta_readiness_system.m \
   native/src/observer/meta_observer.m \
+  native/src/observer-index/meta_observer_snapshot_gate.c \
+  native/src/observer-index/meta_observer_index_builder.m \
   native/src/observer-index/meta_observer_target_index.m \
   native/src/observer-command/meta_observer_command.m \
   native/src/input-observer/meta_input_observer_binding.m \

@@ -19,6 +19,7 @@
 #include "capture-command/meta_capture_command.h"
 #include "hit-test/meta_hit_test_binder.h"
 #include "observer-command/meta_observer_command.h"
+#include "observer-index/meta_observer_index_builder.h"
 #include "recovery-probe/meta_recovery_probe.h"
 #include "readiness-command/meta_readiness_system.h"
 #include "input-observer/meta_input_observer_binding.h"
@@ -66,11 +67,56 @@
 @implementation MetaObserverBorrowContext
 @end
 
+@interface MetaObserverIndexBuildContext : NSObject
+@property(nonatomic) MetaMacOSBackend *windows;
+@property(nonatomic, strong) NSDictionary *generation;
+@end
+@implementation MetaObserverIndexBuildContext
+@end
+
 static bool observer_borrowed(void *context, const MetaAXTargetBorrow *borrow) {
   MetaObserverBorrowContext *binding = (__bridge MetaObserverBorrowContext *)context;
   binding.record = meta_observer_target_record_create(borrow, binding.generation[@"runtimeEpoch"],
       binding.generation[@"loginSessionId"], binding.generation[@"nativeGeneration"]);
   return binding.record != nil;
+}
+
+static uint64_t observer_index_now(void *context) {
+  (void)context;
+  return (uint64_t)(NSProcessInfo.processInfo.systemUptime * 1000.0);
+}
+
+static bool observer_index_refresh(void *context, uint64_t budget) {
+  MetaObserverIndexBuildContext *binding =
+      (__bridge MetaObserverIndexBuildContext *)context;
+  return meta_macos_refresh_inventory(binding.windows, budget);
+}
+
+static const MetaInventorySnapshot *observer_index_snapshot(void *context) {
+  MetaObserverIndexBuildContext *binding =
+      (__bridge MetaObserverIndexBuildContext *)context;
+  return meta_macos_backend_snapshot(binding.windows);
+}
+
+static bool observer_index_snapshot_ready(
+    void *context, const MetaInventorySnapshot *snapshot) {
+  MetaObserverIndexBuildContext *binding =
+      (__bridge MetaObserverIndexBuildContext *)context;
+  return meta_macos_observer_snapshot_ready(binding.windows, snapshot);
+}
+
+static MetaObserverTargetRecord *observer_index_record(
+    void *context, const MetaWindowRecord *window,
+    const MetaInventorySnapshot *snapshot, NSDictionary *generation) {
+  MetaObserverIndexBuildContext *builder =
+      (__bridge MetaObserverIndexBuildContext *)context;
+  MetaObserverBorrowContext *binding = [[MetaObserverBorrowContext alloc] init];
+  binding.generation = generation;
+  MetaAXBorrowStatus status = meta_macos_with_ax_target(
+      builder.windows, window->target_ref, snapshot->inventory_id,
+      snapshot->revision, snapshot->native_generation, observer_borrowed,
+      (__bridge void *)binding);
+  return status == META_AX_BORROW_OK ? binding.record : nil;
 }
 
 static bool inspect_borrowed(void *context, const MetaAXTargetBorrow *borrow) {
@@ -447,29 +493,24 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
     MetaMacOSBackend *windows = _windows;
     __weak MetaSystemCommandBackend *weakSelf = self;
     __block uint64_t indexRevision = 0;
+    MetaObserverIndexBuildContext *indexContext =
+        [[MetaObserverIndexBuildContext alloc] init];
+    indexContext.windows = windows;
+    indexContext.generation = generation;
+    MetaObserverIndexBuilderBackend indexBackend = {
+        .context = (__bridge void *)indexContext,
+        .monotonic_millis = observer_index_now,
+        .refresh_inventory = observer_index_refresh,
+        .snapshot = observer_index_snapshot,
+        .snapshot_ready = observer_index_snapshot_ready,
+        .record_for_window = observer_index_record,
+    };
+    MetaObserverIndexBuildContext *retainedIndexContext = indexContext;
     MetaObserverCommandBinder *binder = [[MetaObserverCommandBinder alloc] initWithGeneration:generation nativeBuildId:@META_NATIVE_BUILD_ID
       indexBuilder:^MetaObserverPreparedIndex * {
-        NSTimeInterval deadline = NSProcessInfo.processInfo.systemUptime + 5;
-        if (!meta_macos_refresh_inventory(windows, 5000)) return nil;
-        const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(windows);
-        if (snapshot == NULL || !snapshot->complete) return nil;
-        NSMutableArray *records = [NSMutableArray array];
-        for (size_t index = 0; index < snapshot->window_count; index += 1) {
-          if (NSProcessInfo.processInfo.systemUptime >= deadline) return nil;
-          const MetaWindowRecord *window = &snapshot->windows[index];
-          if (window->surface_kind != META_SURFACE_WINDOW && window->surface_kind != META_SURFACE_SHEET) continue;
-          if (window->actionability != META_ACTIONABILITY_AX || window->target_ref[0] == '\0') continue;
-          if (records.count >= META_OBSERVER_TARGET_INDEX_MAX_RECORDS) return nil;
-          MetaObserverBorrowContext *binding = [[MetaObserverBorrowContext alloc] init];
-          binding.generation = generation;
-          if (meta_macos_with_ax_target(windows, window->target_ref, snapshot->inventory_id, snapshot->revision,
-              snapshot->native_generation, observer_borrowed, (__bridge void *)binding) != META_AX_BORROW_OK) return nil;
-          [records addObject:binding.record];
-        }
-        if (NSProcessInfo.processInfo.systemUptime >= deadline) return nil;
-        MetaObserverTargetIndex *index = [[MetaObserverTargetIndex alloc] init];
-        if (![index replaceRecords:records]) return nil;
-        return meta_observer_prepared_index_create(index, @(snapshot->inventory_id), snapshot->revision, ++indexRevision);
+        (void)retainedIndexContext;
+        return meta_observer_build_current_index(
+            indexBackend, generation, ++indexRevision);
       }
       mainExecutor:^BOOL(BOOL (^work)(void)) {
         if (NSThread.isMainThread) return work();
@@ -501,6 +542,12 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
       }
       readinessProvider:^NSDictionary * { return meta_current_session_readiness(generation[@"loginSessionId"]); }
       instanceIdProvider:^NSString * { return [@"observer-" stringByAppendingString:NSUUID.UUID.UUIDString]; }];
+    [binder setPreparedValidator:^BOOL(MetaObserverPreparedIndex *prepared) {
+      const MetaInventorySnapshot *snapshot = meta_macos_backend_snapshot(windows);
+      return snapshot != NULL && snapshot->revision == prepared.inventoryRevision &&
+          [prepared.inventoryId isEqual:@(snapshot->inventory_id)] &&
+          meta_macos_observer_snapshot_ready(windows, snapshot);
+    }];
     [_asyncLock lock];
     _observerCommands = binder;
     [_asyncLock unlock];

@@ -32,6 +32,17 @@ trap 'rm -rf -- "$CHECK_DIR"' EXIT HUP INT TERM
   -Wextra \
   -Werror \
   -Inative/include \
+  -Inative/src/observer-index \
+  native/src/observer-index/meta_observer_snapshot_gate.c \
+  native/src/observer-index/meta_observer_snapshot_gate_test.c \
+  -o "$CHECK_DIR/observer-snapshot-gate-test"
+
+/usr/bin/clang \
+  -std=c17 \
+  -Wall \
+  -Wextra \
+  -Werror \
+  -Inative/include \
   -c native/src/ledger.c \
   -o "$CHECK_DIR/ledger.o"
 
@@ -204,6 +215,7 @@ fi
   -o "$CHECK_DIR/permissions-request-test"
 
 "$CHECK_DIR/registry-test"
+"$CHECK_DIR/observer-snapshot-gate-test"
 "$CHECK_DIR/executor-test"
 "$CHECK_DIR/ledger-test"
 "$CHECK_DIR/input-bridge-test"
@@ -228,3 +240,5 @@ fi
   -o "$CHECK_DIR/rotation-horizon-test"
 
 "$CHECK_DIR/rotation-horizon-test"
+
+sh native/scripts/check-observer.sh

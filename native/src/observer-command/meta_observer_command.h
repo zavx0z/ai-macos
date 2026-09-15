@@ -29,6 +29,7 @@ typedef MetaNativeObserver *_Nullable (^MetaObserverFactory)(
     NSDictionary *generation, MetaObserverTargetIndex *index);
 typedef NSDictionary *_Nullable (^MetaObserverReadinessProvider)(void);
 typedef NSString *_Nullable (^MetaObserverInstanceIdProvider)(void);
+typedef BOOL (^MetaObserverPreparedValidator)(MetaObserverPreparedIndex *prepared);
 
 @interface MetaObserverCommandBinder : NSObject
 - (nullable instancetype)initWithGeneration:(NSDictionary *)generation
@@ -38,6 +39,9 @@ typedef NSString *_Nullable (^MetaObserverInstanceIdProvider)(void);
                                      factory:(MetaObserverFactory)factory
                            readinessProvider:(MetaObserverReadinessProvider)readinessProvider
                           instanceIdProvider:(MetaObserverInstanceIdProvider)instanceIdProvider;
+// Не выполняет refresh: повторно связывает prepared index с exact current
+// foreground receipt непосредственно вокруг main-thread observer start.
+- (void)setPreparedValidator:(nullable MetaObserverPreparedValidator)validator;
 - (NSDictionary *)handleRequest:(NSDictionary *)request;
 // Вызывается command loop только после успешной отправки prepare ACK.
 - (BOOL)activatePushForObserverInstance:(NSString *)observerInstanceRef;

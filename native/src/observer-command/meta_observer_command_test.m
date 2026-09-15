@@ -37,6 +37,8 @@ typedef struct {
   __unsafe_unretained NSMutableArray *deferredMain;
   __unsafe_unretained NSMutableArray *retainedObservers;
   useconds_t indexDelayMicros;
+  size_t validatorCalls;
+  size_t invalidateValidatorCall;
 } Fixture;
 
 static NSDictionary *generation(void) {
@@ -332,6 +334,29 @@ static void test_expired_prepare_stops_before_main_start(void) {
   assert(fixture.factoryCalls == 0);
 }
 
+static void test_foreground_receipt_change_stops_started_candidate(void) {
+  Fixture fixture = {
+    .mainSucceeds = YES,
+    .invalidateValidatorCall = 5,
+  };
+  NSMutableArray *retainedObservers = [NSMutableArray array];
+  fixture.retainedObservers = retainedObservers;
+  MetaObserverCommandBinder *value = binder(&fixture);
+  Fixture *binding = &fixture;
+  [value setPreparedValidator:^BOOL(__unused MetaObserverPreparedIndex *prepared) {
+    binding->validatorCalls += 1;
+    return binding->validatorCalls != binding->invalidateValidatorCall;
+  }];
+  NSDictionary *failed =
+      [value handleRequest:request(@"prepare", nil, nil, nil)];
+  assert([failed[@"ok"] isEqual:@NO]);
+  assert(fixture.validatorCalls == 5);
+  assert(fixture.factoryCalls == 1);
+  FixtureObserver *candidate = retainedObservers.lastObject;
+  assert(candidate != nil && candidate.stopped);
+  assert(![value activatePushForObserverInstance:@"observer-1"]);
+}
+
 static void test_readiness_scan_is_exact_and_nondestructive(void) {
   Fixture fixture = {.mainSucceeds = YES};
   MetaObserverCommandBinder *value = binder(&fixture);
@@ -412,6 +437,7 @@ int main(void) {
     test_late_prepare_cannot_create_or_replace_observer();
     test_started_candidate_is_stopped_after_failed_handoff();
     test_expired_prepare_stops_before_main_start();
+    test_foreground_receipt_change_stops_started_candidate();
     test_readiness_scan_is_exact_and_nondestructive();
   }
   puts("observer command tests passed");

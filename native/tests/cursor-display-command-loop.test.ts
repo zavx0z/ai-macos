@@ -23,6 +23,7 @@ beforeAll(async () => {
     "input_job.m",
     "registry.c",
     "macos_backend.m",
+    "observer-index/meta_observer_snapshot_gate.c",
     "window-actions/meta_window_readback.c",
     "input-target/meta_geometry_probe.m",
     "cursor-display/meta_cursor_display.m",

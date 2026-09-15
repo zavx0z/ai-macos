@@ -24,6 +24,7 @@ mkdir -p "$OUTPUT_DIRECTORY"
   native/src/input_bridge.c \
   native/src/broker_core.c \
   native/src/macos_backend.m \
+  native/src/observer-index/meta_observer_snapshot_gate.c \
   native/src/window-actions/meta_window_readback.c \
   native/src/macos_input.m \
   native/src/serialization.m \

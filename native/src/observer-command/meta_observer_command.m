@@ -104,6 +104,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
 @property(nonatomic, copy) MetaObserverFactory factory;
 @property(nonatomic, copy) MetaObserverReadinessProvider readinessProvider;
 @property(nonatomic, copy) MetaObserverInstanceIdProvider instanceIdProvider;
+@property(nonatomic, copy, nullable) MetaObserverPreparedValidator preparedValidator;
 - (BOOL)prepareTokenIsCurrent:(NSObject *)token;
 - (void)clearPendingObserver:(MetaNativeObserver *)observer
                        token:(NSObject *)token;
@@ -198,6 +199,19 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
                         reason:@"Unknown observer command"];
 }
 
+- (void)setPreparedValidator:(MetaObserverPreparedValidator)validator {
+  [_lock lock];
+  _preparedValidator = [validator copy];
+  [_lock unlock];
+}
+
+- (BOOL)preparedStillValid:(MetaObserverPreparedIndex *)prepared {
+  [_lock lock];
+  MetaObserverPreparedValidator validator = _preparedValidator;
+  [_lock unlock];
+  return validator == nil || validator(prepared);
+}
+
 - (NSDictionary *)prepare:(NSDictionary *)request {
   NSString *previous = request[@"previousObserverInstanceRef"];
   [_lock lock];
@@ -220,7 +234,8 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   MetaObserverPreparedIndex *prepared = self.indexBuilder();
   NSString *instance = self.instanceIdProvider();
   NSDictionary *readiness = self.readinessProvider();
-  if (prepared == nil || !identifier(instance, 127) ||
+  if (prepared == nil || ![self preparedStillValid:prepared] ||
+      !identifier(instance, 127) ||
       !dictionary(readiness) || !request_before_deadline(request)) {
     return [self failureResponse:request
                          command:@"prepare"
@@ -256,6 +271,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   BOOL executed = self.mainExecutor(^BOOL {
     MetaObserverCommandBinder *binder = weakSelf;
     if (binder == nil || !request_before_deadline(request) ||
+        ![binder preparedStillValid:prepared] ||
         ![binder prepareTokenIsCurrent:prepareToken]) {
       return NO;
     }
@@ -275,6 +291,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
       [binder->_lock unlock];
     }
     if (!request_before_deadline(request) ||
+        ![binder preparedStillValid:prepared] ||
         ![binder prepareTokenIsCurrent:prepareToken]) return NO;
     created = binder.factory(binder.generation, prepared.index);
     if (created == nil) return NO;
@@ -285,8 +302,14 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
     if (!accepted) return NO;
     [created recordCurrentSessionReadiness:readiness];
     if (!request_before_deadline(request) ||
+        ![binder preparedStillValid:prepared] ||
         ![binder prepareTokenIsCurrent:prepareToken]) return NO;
     if (![created start]) {
+      [created stop];
+      [binder clearPendingObserver:created token:prepareToken];
+      return NO;
+    }
+    if (![binder preparedStillValid:prepared]) {
       [created stop];
       [binder clearPendingObserver:created token:prepareToken];
       return NO;
@@ -303,6 +326,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
       [weakSelf acceptEvent:event observerInstanceRef:instance];
     }];
     if (!request_before_deadline(request) ||
+        ![binder preparedStillValid:prepared] ||
         ![binder prepareTokenIsCurrent:prepareToken]) {
       [created setEventSink:nil];
       [created stop];
@@ -311,8 +335,9 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
     }
     return YES;
   });
+  BOOL finalPreparedValid = executed && [self preparedStillValid:prepared];
   [_lock lock];
-  BOOL accepted = executed && created != nil &&
+  BOOL accepted = executed && created != nil && finalPreparedValid &&
                   identifier(baselineCursor, 127) &&
                   request_before_deadline(request) &&
                   _prepareToken == prepareToken &&

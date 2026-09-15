@@ -194,6 +194,32 @@ static uint64_t application_serial_from_ref(const char *application_ref) {
   return strtoull(separator + 1, NULL, 10);
 }
 
+static void retain_uncertain_window_identities(
+    MetaRegistry *working,
+    const MetaRegistry *previous,
+    const MetaInventoryInput *input,
+    const MetaApplicationRecord *applications,
+    size_t application_count) {
+  for (size_t index = 0; index < working->window_identity_count; index += 1) {
+    WindowIdentity *identity = &working->window_identities[index];
+    if (identity->last_seen_revision != previous->revision) continue;
+    const MetaApplicationRecord *application = NULL;
+    for (size_t app_index = 0; app_index < application_count; app_index += 1) {
+      const MetaApplicationRecord *candidate = &applications[app_index];
+      if (application_serial_from_ref(candidate->application_ref) ==
+          identity->application_serial) {
+        application = candidate;
+        break;
+      }
+    }
+    const bool uncertain = application == NULL
+        ? !input->source_complete
+        : application->ax_status != META_AX_READY &&
+          application->ax_status != META_AX_NO_WINDOWS;
+    if (uncertain) identity->last_seen_revision = working->revision;
+  }
+}
+
 static MetaMappingStatus correlate_window(
     const MetaAXWindowInput *window, const MetaCGWindowInput *cg_windows,
     size_t cg_window_count, size_t *matched_index) {
@@ -478,6 +504,12 @@ bool meta_registry_refresh(MetaRegistry *registry,
       }
     }
   }
+
+  // Partial enumeration не возвращает старое окно в fresh snapshot, но и не
+  // превращает временно неизвестный live AX handle в новый identity после
+  // восстановления. Known READY/NO_WINDOWS absence остаётся tombstone.
+  retain_uncertain_window_identities(
+      &working, registry, input, applications, input->application_count);
 
   for (size_t index = 0; index < input->cg_window_count; index += 1) {
     if (matched_cg[index]) continue;

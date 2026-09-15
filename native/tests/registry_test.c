@@ -108,6 +108,27 @@ static void test_stable_refs_and_reincarnation(void) {
   input.ax_window_count = 0;
   input.cg_windows = NULL;
   input.cg_window_count = 0;
+  input.source_complete = false;
+  application.ax_status = META_AX_TIMED_OUT;
+  assert(meta_registry_refresh(registry, &input));
+  snapshot = meta_registry_snapshot(registry);
+  assert(!snapshot->complete && snapshot->window_count == 0);
+  assert(meta_registry_resolve_window(registry, first_window_ref) == NULL);
+
+  input.ax_windows = &ax_window;
+  input.ax_window_count = 1;
+  input.cg_windows = &cg_window;
+  input.cg_window_count = 1;
+  input.source_complete = true;
+  application.ax_status = META_AX_READY;
+  assert(meta_registry_refresh(registry, &input));
+  snapshot = meta_registry_snapshot(registry);
+  assert(strcmp(first_window_ref, snapshot->windows[0].window_ref) == 0);
+
+  input.ax_windows = NULL;
+  input.ax_window_count = 0;
+  input.cg_windows = NULL;
+  input.cg_window_count = 0;
   application.ax_status = META_AX_NO_WINDOWS;
   assert(meta_registry_refresh(registry, &input));
   assert(meta_registry_resolve_window(registry, first_window_ref) == NULL);

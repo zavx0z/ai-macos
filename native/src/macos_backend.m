@@ -11,6 +11,7 @@
 #include <time.h>
 
 #include "meta_macos.h"
+#include "observer-index/meta_observer_snapshot_gate.h"
 #include "window-actions/meta_window_readback.h"
 
 typedef struct {
@@ -20,6 +21,8 @@ typedef struct {
   AXUIElementRef element;
   uint64_t last_seen_refresh;
 } AXHandle;
+
+#define META_MACOS_MAX_AX_HANDLES 4096
 
 struct MetaMacOSBackend {
   MetaRegistry *registry;
@@ -33,6 +36,7 @@ struct MetaMacOSBackend {
   atomic_size_t topology_callbacks_in_flight;
   bool topology_observer_ready;
   bool topology_stopping;
+  MetaObserverSnapshotReceipt observer_snapshot_receipt;
 };
 
 static void display_topology_changed(
@@ -84,6 +88,19 @@ static uint64_t monotonic_millis(void) {
 
 static uint64_t unix_micros(void) {
   return (uint64_t)(NSDate.date.timeIntervalSince1970 * 1000000.0);
+}
+
+static bool set_ax_timeout_before_deadline(AXUIElementRef element,
+                                           uint64_t deadline_millis,
+                                           uint64_t maximum_millis) {
+  const uint64_t now = monotonic_millis();
+  if (element == NULL || now == 0 || now >= deadline_millis ||
+      maximum_millis == 0) return false;
+  const uint64_t remaining = deadline_millis - now;
+  const uint64_t timeout = remaining < maximum_millis ? remaining
+                                                       : maximum_millis;
+  return AXUIElementSetMessagingTimeout(
+      element, (float)((double)timeout / 1000.0)) == kAXErrorSuccess;
 }
 
 static uint64_t process_start_micros(pid_t pid) {
@@ -226,6 +243,21 @@ static uint64_t token_for_element(MetaMacOSBackend *backend, int32_t pid,
       return handle->token;
     }
   }
+  if (backend->handle_count >= META_MACOS_MAX_AX_HANDLES) {
+    size_t output = 0;
+    for (size_t index = 0; index < backend->handle_count; index += 1) {
+      AXHandle handle = backend->handles[index];
+      const uint64_t current_launch = process_start_micros(handle.pid);
+      if (current_launch != 0 &&
+          current_launch != handle.launch_time_micros) {
+        CFRelease(handle.element);
+        continue;
+      }
+      backend->handles[output++] = handle;
+    }
+    backend->handle_count = output;
+    if (backend->handle_count >= META_MACOS_MAX_AX_HANDLES) return 0;
+  }
   const size_t next_count = backend->handle_count + 1;
   AXHandle *next = realloc(backend->handles, next_count * sizeof(*next));
   if (next == NULL) return 0;
@@ -249,13 +281,31 @@ static AXHandle *find_handle(MetaMacOSBackend *backend, uint64_t token) {
   return NULL;
 }
 
-static void prune_handles(MetaMacOSBackend *backend) {
+static void prune_handles(MetaMacOSBackend *backend,
+                          const MetaApplicationInput *applications,
+                          size_t application_count) {
   size_t output = 0;
   for (size_t index = 0; index < backend->handle_count; index += 1) {
     AXHandle handle = backend->handles[index];
     if (handle.last_seen_refresh != backend->refresh_number) {
-      CFRelease(handle.element);
-      continue;
+      const uint64_t current_launch = process_start_micros(handle.pid);
+      const MetaApplicationInput *application = NULL;
+      for (size_t app_index = 0; app_index < application_count; app_index += 1) {
+        const MetaApplicationInput *candidate = &applications[app_index];
+        if (candidate->pid == handle.pid &&
+            candidate->launch_time_micros == handle.launch_time_micros) {
+          application = candidate;
+          break;
+        }
+      }
+      if (!meta_observer_retain_unseen_ax_handle(
+              handle.launch_time_micros, current_launch,
+              application != NULL,
+              application == NULL ? META_AX_UNAVAILABLE
+                                  : application->ax_status)) {
+        CFRelease(handle.element);
+        continue;
+      }
     }
     backend->handles[output++] = handle;
   }
@@ -281,7 +331,10 @@ static bool append_ax_window(MetaMacOSBackend *backend,
     *timed_out = true;
     return false;
   }
-  AXUIElementSetMessagingTimeout(element, 0.1f);
+  if (!set_ax_timeout_before_deadline(element, deadline_millis, 100)) {
+    *timed_out = true;
+    return false;
+  }
   const uint64_t token = token_for_element(backend, pid, launch_time_micros,
                                            element);
   if (token == 0) return false;
@@ -601,11 +654,33 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
                                   uint64_t total_budget_millis) {
   if (backend == NULL || total_budget_millis == 0) return false;
   @autoreleasepool {
+    backend->observer_snapshot_receipt = (MetaObserverSnapshotReceipt){0};
     backend->refresh_number += 1;
     const uint64_t started = monotonic_millis();
-    const uint64_t inventory_deadline = started + total_budget_millis;
-    NSArray<NSRunningApplication *> *running =
-        NSWorkspace.sharedWorkspace.runningApplications;
+    MetaObserverRefreshBudget budget = {0};
+    if (!meta_observer_refresh_budget(started, total_budget_millis, &budget))
+      return false;
+    const uint64_t inventory_deadline = budget.inventory_deadline_millis;
+    const uint64_t ax_deadline = budget.ax_deadline_millis;
+    NSRunningApplication *foreground_before =
+        NSWorkspace.sharedWorkspace.frontmostApplication;
+    const pid_t foreground_pid = foreground_before.processIdentifier;
+    const uint64_t foreground_launch_time =
+        process_start_micros(foreground_pid);
+    NSMutableArray<NSRunningApplication *> *running =
+        [NSWorkspace.sharedWorkspace.runningApplications mutableCopy];
+    NSUInteger foreground_index = NSNotFound;
+    for (NSUInteger index = 0; index < running.count; index += 1) {
+      if (running[index].processIdentifier == foreground_pid) {
+        foreground_index = index;
+        break;
+      }
+    }
+    if (foreground_index != NSNotFound && foreground_index != 0) {
+      NSRunningApplication *foreground = running[foreground_index];
+      [running removeObjectAtIndex:foreground_index];
+      [running insertObject:foreground atIndex:0];
+    }
     const size_t application_count = running.count;
     MetaApplicationInput *applications =
         calloc(application_count, sizeof(*applications));
@@ -616,6 +691,8 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
     MetaDisplayInput *displays = NULL;
     size_t display_count = 0;
     bool complete = applications != NULL || application_count == 0;
+    bool foreground_found = false;
+    bool foreground_slice_complete = false;
 
     if (!complete) return false;
     const bool accessibility = AXIsProcessTrusted();
@@ -623,6 +700,10 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
       NSRunningApplication *running_application = running[index];
       const pid_t pid = running_application.processIdentifier;
       const uint64_t launch_time_micros = process_start_micros(pid);
+      const bool is_foreground = pid == foreground_pid &&
+          launch_time_micros != 0 &&
+          launch_time_micros == foreground_launch_time;
+      foreground_found = foreground_found || is_foreground;
       MetaApplicationInput *application = &applications[index];
       *application = (MetaApplicationInput){
           .pid = pid,
@@ -642,7 +723,7 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
         complete = false;
         continue;
       }
-      if (monotonic_millis() - started >= total_budget_millis) {
+      if (monotonic_millis() >= ax_deadline) {
         application->ax_status = META_AX_TIMED_OUT;
         complete = false;
         continue;
@@ -654,7 +735,12 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
         complete = false;
         continue;
       }
-      AXUIElementSetMessagingTimeout(ax_application, 0.5f);
+      if (!set_ax_timeout_before_deadline(ax_application, ax_deadline, 500)) {
+        application->ax_status = META_AX_TIMED_OUT;
+        complete = false;
+        CFRelease(ax_application);
+        continue;
+      }
       CFTypeRef windows_value = NULL;
       const AXError windows_error = AXUIElementCopyAttributeValue(
           ax_application, kAXWindowsAttribute, &windows_value);
@@ -668,26 +754,33 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
       }
 
       CFArrayRef top_windows = (CFArrayRef)windows_value;
+      const size_t application_ax_start = ax_window_count;
       application->ax_status = CFArrayGetCount(top_windows) == 0
                                    ? META_AX_NO_WINDOWS
                                    : META_AX_READY;
       bool application_timed_out = false;
+      bool application_failed = false;
       for (CFIndex window_index = 0;
            window_index < CFArrayGetCount(top_windows); window_index += 1) {
         AXUIElementRef window =
             (AXUIElementRef)CFArrayGetValueAtIndex(top_windows, window_index);
         if (!append_ax_window(backend, &ax_windows, &ax_window_count, pid,
                               launch_time_micros, window, 0,
-                              inventory_deadline, &application_timed_out)) {
+                              ax_deadline, &application_timed_out)) {
           complete = false;
+          application_failed = !application_timed_out;
           if (application_timed_out) break;
           continue;
         }
         const uint64_t owner_token =
             token_for_element(backend, pid, launch_time_micros, window);
         CFTypeRef sheets_value = NULL;
-        const AXError sheets_error = AXUIElementCopyAttributeValue(
-            window, CFSTR("AXSheets"), &sheets_value);
+        const bool sheets_within_budget = set_ax_timeout_before_deadline(
+            window, ax_deadline, 100);
+        const AXError sheets_error = sheets_within_budget
+            ? AXUIElementCopyAttributeValue(window, CFSTR("AXSheets"),
+                                            &sheets_value)
+            : kAXErrorCannotComplete;
         if (sheets_error == kAXErrorSuccess && sheets_value != NULL &&
             CFGetTypeID(sheets_value) == CFArrayGetTypeID()) {
           CFArrayRef sheets = (CFArrayRef)sheets_value;
@@ -697,43 +790,86 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
                 (AXUIElementRef)CFArrayGetValueAtIndex(sheets, sheet_index);
             if (!append_ax_window(backend, &ax_windows, &ax_window_count, pid,
                                   launch_time_micros, sheet, owner_token,
-                                  inventory_deadline,
+                                  ax_deadline,
                                   &application_timed_out)) {
               complete = false;
+              application_failed = !application_timed_out;
               if (application_timed_out) break;
             }
           }
+        } else if (sheets_error == kAXErrorSuccess) {
+          application_failed = true;
+          complete = false;
+        } else if (sheets_error == kAXErrorCannotComplete) {
+          application_timed_out = true;
+          complete = false;
+        } else if (sheets_error != kAXErrorNoValue &&
+                   sheets_error != kAXErrorAttributeUnsupported) {
+          application_failed = true;
+          complete = false;
         }
         if (sheets_value != NULL) CFRelease(sheets_value);
         if (application_timed_out) break;
       }
 
       CFTypeRef focused_value = NULL;
-      if (!application_timed_out &&
-          AXUIElementCopyAttributeValue(ax_application,
-                                        kAXFocusedWindowAttribute,
-                                        &focused_value) == kAXErrorSuccess &&
-          focused_value != NULL &&
-          CFGetTypeID(focused_value) == AXUIElementGetTypeID()) {
-        append_ax_window(backend, &ax_windows, &ax_window_count, pid,
-                         launch_time_micros,
-                         (AXUIElementRef)focused_value, 0,
-                         inventory_deadline, &application_timed_out);
+      if (!application_timed_out && !application_failed) {
+        const bool focused_within_budget = set_ax_timeout_before_deadline(
+            ax_application, ax_deadline, 500);
+        const AXError focused_error = focused_within_budget
+            ? AXUIElementCopyAttributeValue(ax_application,
+                                            kAXFocusedWindowAttribute,
+                                            &focused_value)
+            : kAXErrorCannotComplete;
+        if (focused_error == kAXErrorSuccess && focused_value != NULL &&
+            CFGetTypeID(focused_value) == AXUIElementGetTypeID()) {
+          if (!append_ax_window(backend, &ax_windows, &ax_window_count, pid,
+                                launch_time_micros,
+                                (AXUIElementRef)focused_value, 0,
+                                ax_deadline, &application_timed_out)) {
+            application_failed = !application_timed_out;
+            complete = false;
+          }
+        } else if (focused_error == kAXErrorSuccess) {
+          application_failed = true;
+          complete = false;
+        } else if (focused_error == kAXErrorCannotComplete) {
+          application_timed_out = true;
+          complete = false;
+        } else if (focused_error != kAXErrorNoValue &&
+                   focused_error != kAXErrorAttributeUnsupported) {
+          application_failed = true;
+          complete = false;
+        }
       }
       if (application_timed_out) {
         application->ax_status = META_AX_TIMED_OUT;
         complete = false;
+      } else if (application_failed) {
+        application->ax_status = META_AX_FAILED;
+        complete = false;
+      } else if (ax_window_count > application_ax_start) {
+        application->ax_status = META_AX_READY;
+      }
+      if (is_foreground) {
+        foreground_slice_complete =
+            application->ax_status == META_AX_READY ||
+            application->ax_status == META_AX_NO_WINDOWS;
       }
       if (focused_value != NULL) CFRelease(focused_value);
       CFRelease(top_windows);
       CFRelease(ax_application);
     }
 
-    CFArrayRef cg_values = CGWindowListCopyWindowInfo(
-        kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
-        kCGNullWindowID);
+    bool within_budget = monotonic_millis() < inventory_deadline;
+    CFArrayRef cg_values = within_budget
+        ? CGWindowListCopyWindowInfo(
+              kCGWindowListOptionAll | kCGWindowListExcludeDesktopElements,
+              kCGNullWindowID)
+        : NULL;
     if (cg_values == NULL) {
       complete = false;
+      if (monotonic_millis() >= inventory_deadline) within_budget = false;
     } else {
       for (CFIndex index = 0; index < CFArrayGetCount(cg_values); index += 1) {
         CFDictionaryRef info =
@@ -747,16 +883,19 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
         }
       }
       CFRelease(cg_values);
+      if (monotonic_millis() >= inventory_deadline) within_budget = false;
     }
     uint64_t topology_epoch_before = 0;
     uint64_t topology_epoch_after = 0;
-    const bool topology_epoch_ready = meta_macos_display_topology_epoch(
+    const bool topology_epoch_ready = within_budget &&
+        meta_macos_display_topology_epoch(
         backend, &topology_epoch_before);
     if (!topology_epoch_ready ||
         !collect_displays(&displays, &display_count)) complete = false;
     const bool topology_stable = topology_epoch_ready &&
         meta_macos_display_topology_epoch(backend, &topology_epoch_after) &&
-        topology_epoch_before == topology_epoch_after;
+        topology_epoch_before == topology_epoch_after &&
+        monotonic_millis() < inventory_deadline;
 
     MetaInventoryInput input = {
         .applications = applications,
@@ -773,13 +912,53 @@ bool meta_macos_refresh_inventory(MetaMacOSBackend *backend,
     };
     const bool refreshed = topology_stable &&
         meta_registry_refresh(backend->registry, &input);
-    if (refreshed) prune_handles(backend);
+    if (refreshed) {
+      prune_handles(backend, applications, application_count);
+      NSRunningApplication *foreground_after =
+          NSWorkspace.sharedWorkspace.frontmostApplication;
+      const pid_t foreground_after_pid = foreground_after.processIdentifier;
+      const uint64_t foreground_after_launch =
+          process_start_micros(foreground_after_pid);
+      const MetaInventorySnapshot *snapshot =
+          meta_registry_snapshot(backend->registry);
+      MetaObserverSnapshotReceipt receipt = {
+          .foreground_slice_complete = foreground_found &&
+              foreground_slice_complete &&
+              foreground_after_pid == foreground_pid &&
+              foreground_after_launch == foreground_launch_time &&
+              foreground_after_launch > 0,
+          .foreground_pid = foreground_pid,
+          .foreground_launch_time_micros = foreground_launch_time,
+          .snapshot_revision = snapshot == NULL ? 0 : snapshot->revision,
+      };
+      if (snapshot != NULL) {
+        snprintf(receipt.inventory_id, sizeof(receipt.inventory_id), "%s",
+                 snapshot->inventory_id);
+        snprintf(receipt.native_generation,
+                 sizeof(receipt.native_generation), "%s",
+                 snapshot->native_generation);
+      }
+      backend->observer_snapshot_receipt = receipt;
+    }
     free_application_inputs(applications, application_count);
     free_ax_window_inputs(ax_windows, ax_window_count);
     free_cg_window_inputs(cg_windows, cg_window_count);
     free(displays);
     return refreshed;
   }
+}
+
+bool meta_macos_observer_snapshot_ready(
+    MetaMacOSBackend *backend,
+    const MetaInventorySnapshot *snapshot) {
+  if (backend == NULL || snapshot == NULL ||
+      snapshot != meta_registry_snapshot(backend->registry)) return false;
+  NSRunningApplication *foreground =
+      NSWorkspace.sharedWorkspace.frontmostApplication;
+  const pid_t pid = foreground.processIdentifier;
+  return meta_observer_snapshot_receipt_matches(
+      snapshot, &backend->observer_snapshot_receipt, pid,
+      process_start_micros(pid));
 }
 
 static bool process_matches(const MetaWindowRecord *record, AXHandle *handle) {
