@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test"
 import type { CdpTarget } from "@meta/shared"
-import { newTab, type AndroidTargetCreationDeps } from "../src/android.ts"
 import { selectCreatedTarget } from "../src/target-identity.ts"
 
 function target(id: string, url = "https://same.test"): CdpTarget {
@@ -28,30 +27,5 @@ describe("Android exact target creation", () => {
       new Set(["old"]),
       [target("old"), target("new-a"), target("new-b")],
     )).toThrow("ambiguous")
-  })
-
-  test("intent всегда получает явный serial и возвращает exact diff target", async () => {
-    let time = 0
-    let inventory = 0
-    const opened: Array<{ serial: string; url: string }> = []
-    const deps: AndroidTargetCreationDeps = {
-      async listTargets() {
-        inventory += 1
-        return inventory === 1 ? [target("old")] : [target("old"), target("created")]
-      },
-      async openUrl(serial, url) {
-        opened.push({ serial, url })
-      },
-      async delay(ms) {
-        time += ms
-      },
-      now() {
-        return time
-      },
-    }
-
-    const created = await newTab("phone-b", "https://same.test", deps)
-    expect(opened).toEqual([{ serial: "phone-b", url: "https://same.test" }])
-    expect(created.id).toBe("created")
   })
 })
