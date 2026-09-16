@@ -20,8 +20,10 @@ test("readonly-вход возвращает контракт изменяюще
     const tools = (await client.listTools()).tools
     expect(tools.map(tool => tool.name)).toEqual(["zavx0z"])
     expect(tools[0]?.annotations).toMatchObject({ readOnlyHint: true, destructiveHint: false, idempotentHint: true })
-    expect(tools[0]?.inputSchema.required ?? []).toEqual([])
-    expect((await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent).toMatchObject({ node: "root", children: [{ node: "computer" }] })
+    expect(tools[0]?.inputSchema).toEqual({ type: "object", properties: {} })
+    expect(tools[0]?.description).toBe("")
+    expect(client.getInstructions()).toBeUndefined()
+    expect((await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent).toMatchObject({ node: "root", children: [{ node: "computer" }], contract: { inputSchema: { properties: { node: { type: "string" }, action: { type: "string" }, input: { type: "object" } } } }, next: { node: "computer" } })
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer" } })).structuredContent).toMatchObject({ node: "computer", children: [{ action: "click" }] })
     for (const args of [
       { node: "computer/click" },

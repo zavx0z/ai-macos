@@ -20,8 +20,8 @@ export async function startChatProxy(options: { catalogPath: string }) {
   return createCatalogServer({
     listTools: () => [{
       name: "zavx0z", title: "Завхоз",
-      description: "Readonly-точка входа. {} показывает разделы; node возвращает справку. Необязательный action выбирает контракт действия, input содержит необязательные параметры. Ни один запрос не выполняет описываемые операции и не изменяет состояние компьютера.",
-      inputSchema: z.toJSONSchema(entryInput) as { type: "object" },
+      description: "",
+      inputSchema: { type: "object", properties: {} },
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     }],
     subscribeCatalogChanged: () => () => {},
@@ -33,7 +33,9 @@ export async function startChatProxy(options: { catalogPath: string }) {
         if (node === "root" && request.action === undefined) {
           return result({ name: "zavx0z", runtimeBuildId: snapshot.runtimeBuildId, catalogHash: snapshot.catalogHash,
             node, description: "Справка по доступным разделам. Контракты взяты из snapshot и не подтверждают текущую готовность Runtime.",
-            children: [{ node: "computer", description: "Справка и контракты ai-macos" }] })
+            children: [{ node: "computer", description: "Справка и контракты ai-macos" }],
+            contract: { inputSchema: z.toJSONSchema(entryInput) },
+            next: { node: "computer" } })
         }
         if (node === "computer" && request.action === undefined) {
           return result({ node, description: "Справка по операциям Mac. Для контракта укажите action или путь операции.",
@@ -54,7 +56,7 @@ export async function startChatProxy(options: { catalogPath: string }) {
           ? `${error.code}: ${error.message}` : "Некорректный запрос справки." }] }
       }
     },
-  }, { name: "zavx0z", version: "0.1.0", instructions: "Readonly-точка входа. node возвращает справку; action и input необязательны. Все ответы информационные: выполнение операций и подключение к Runtime отсутствуют. Контракты snapshot не подтверждают текущую готовность и не регистрируют новые инструменты." })
+  }, { name: "zavx0z", version: "0.1.0" })
 }
 
 if (import.meta.main) {
