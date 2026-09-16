@@ -1,9 +1,11 @@
-export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot-v5.html"
+export const SCREENSHOT_UI_URI = "ui://widget/ai-macos-screenshot-v6.html"
 
 export const SCREENSHOT_UI_DOMAIN =
   "https://ai-macos-local.zavx0z.app"
 
-export const screenshotUiHtml = String.raw`<!doctype html>
+/** Один просмотрщик для legacy MCP и текущего прокси; транспорт задаётся явно. */
+export function createScreenshotUiHtml(options: { legacyLatestCapture: boolean }) {
+  return String.raw`<!doctype html>
 <html lang="en">
   <head>
     <meta charset="utf-8" />
@@ -39,123 +41,139 @@ export const screenshotUiHtml = String.raw`<!doctype html>
     <div id="empty" role="status">Waiting for screenshot…</div>
 
     <script>
-      const viewer = document.getElementById("viewer");
-      const image = document.getElementById("image");
-      const caption = document.getElementById("caption");
-      const details = document.getElementById("details");
-      const expand = document.getElementById("expand");
-      const empty = document.getElementById("empty");
-      let lastReportedHeight = 0;
-      let lastVersion = 0;
-      let heightFrame;
-      let pipRequested = false;
-      let refreshInFlight = false;
+      const viewer = document.getElementById("viewer")
+      const image = document.getElementById("image")
+      const caption = document.getElementById("caption")
+      const details = document.getElementById("details")
+      const expand = document.getElementById("expand")
+      const empty = document.getElementById("empty")
+      let lastReportedHeight = 0
+      let lastVersion = 0
+      let currentStream
+      const retiredStreams = new Set()
+      const legacyLatestCapture = ${JSON.stringify(options.legacyLatestCapture)}
+      let heightFrame
+      let pipRequested = false
+      let refreshInFlight = false
 
       function notifyHeight() {
-        cancelAnimationFrame(heightFrame);
+        cancelAnimationFrame(heightFrame)
         heightFrame = requestAnimationFrame(() => {
           const height = Math.ceil(Math.max(
             document.body.scrollHeight,
             document.documentElement.scrollHeight,
-          ));
-          if (!height || height === lastReportedHeight) return;
-          lastReportedHeight = height;
+          ))
+          if (!height || height === lastReportedHeight) return
+          lastReportedHeight = height
 
           try {
-            window.openai?.notifyIntrinsicHeight?.(height);
+            window.openai?.notifyIntrinsicHeight?.(height)
           } catch {}
 
           window.parent.postMessage({
             jsonrpc: "2.0",
             method: "ui/notifications/size-changed",
             params: { height },
-          }, "*");
-        });
+          }, "*")
+        })
       }
 
       async function expandImage() {
         if (typeof window.openai?.requestDisplayMode === "function") {
-          await window.openai.requestDisplayMode({ mode: "fullscreen" });
-          return;
+          await window.openai.requestDisplayMode({ mode: "fullscreen" })
+          return
         }
         if (typeof window.openai?.requestModal === "function") {
-          await window.openai.requestModal({});
+          await window.openai.requestModal({})
         }
       }
 
       async function enterPip() {
-        if (pipRequested || typeof window.openai?.requestDisplayMode !== "function") return;
+        if (pipRequested || viewer.hidden || typeof window.openai?.requestDisplayMode !== "function") return
+        pipRequested = true
         try {
-          await window.openai.requestDisplayMode({ mode: "pip" });
-          pipRequested = true;
-        } catch {}
+          await window.openai.requestDisplayMode({ mode: "pip" })
+        } catch { pipRequested = false }
       }
 
       function render(toolResult) {
-        const result = toolResult?.mcp_tool_result ?? toolResult?.call_tool_result ?? toolResult?.result ?? toolResult ?? {};
-        const content = Array.isArray(result.content) ? result.content : [];
-        const imageBlock = content.find((item) => item?.type === "image" && typeof item?.data === "string");
-        const privateImage = result._meta?.screenshot;
-        const metadata = result.structuredContent ?? {};
-        // Поздний ответ initial/manual fetch не заменяет более новый кадр.
+        const result = toolResult?.mcp_tool_result ?? toolResult?.call_tool_result ?? toolResult?.result ?? toolResult ?? {}
+        const content = Array.isArray(result.content) ? result.content : []
+        const imageBlock = content.find((item) => item?.type === "image" && typeof item?.data === "string")
+        const privateImage = result._meta?.screenshot
+        const metadata = { ...result.structuredContent, ...privateImage }
+        const imageData = privateImage?.data ?? imageBlock?.data
+        if (typeof imageData !== "string") return
+        const stream = metadata.streamId
+        if (typeof stream === "string" && stream !== currentStream) {
+          if (retiredStreams.has(stream)) return
+          if (currentStream !== undefined) retiredStreams.add(currentStream)
+          currentStream = stream
+          lastVersion = 0
+        }
+        // Поздний ответ не заменяет новый кадр; metadata без изображения не двигает версию.
         if (typeof metadata.version === "number" && metadata.version < lastVersion) return
-        if (typeof metadata.version === "number") lastVersion = metadata.version;
-        const imageData = imageBlock?.data ?? privateImage?.data;
-        if (typeof imageData !== "string") return;
+        if (typeof metadata.version === "number") lastVersion = metadata.version
 
-        const mimeType = imageBlock?.mimeType || privateImage?.mimeType || "image/png";
-        image.src = "data:" + mimeType + ";base64," + imageData;
-        image.alt = metadata.caption || "macOS screenshot";
-        caption.textContent = metadata.caption || metadata.target || "macOS screenshot";
-        const windowTitle = metadata.window?.title;
-        details.textContent = windowTitle || metadata.target || "";
-        empty.hidden = true;
-        viewer.hidden = false;
-        notifyHeight();
+        const mimeType = imageBlock?.mimeType || privateImage?.mimeType || "image/png"
+        image.src = "data:" + mimeType + ";base64," + imageData
+        image.alt = metadata.caption || "macOS screenshot"
+        caption.textContent = metadata.caption || metadata.target || "macOS screenshot"
+        const windowTitle = metadata.window?.title
+        details.textContent = windowTitle || metadata.target || ""
+        empty.hidden = true
+        viewer.hidden = false
+        void enterPip()
+        notifyHeight()
       }
 
       async function refreshLatest() {
-        if (refreshInFlight || typeof window.openai?.callTool !== "function") return;
-        refreshInFlight = true;
+        if (!legacyLatestCapture || refreshInFlight || typeof window.openai?.callTool !== "function") return
+        refreshInFlight = true
         try {
-          const result = await window.openai.callTool("latest_capture", { after: lastVersion });
-          render(result);
+          const result = await window.openai.callTool("latest_capture", { after: lastVersion })
+          render(result)
         } catch {} finally {
-          refreshInFlight = false;
+          refreshInFlight = false
         }
       }
 
+      document.getElementById("refresh").hidden = !legacyLatestCapture
       document.getElementById("refresh").addEventListener("click", refreshLatest)
-      image.addEventListener("load", notifyHeight, { passive: true });
-      image.addEventListener("click", expandImage);
-      expand.addEventListener("click", expandImage);
+      image.addEventListener("load", notifyHeight, { passive: true })
+      image.addEventListener("click", expandImage)
+      expand.addEventListener("click", expandImage)
 
       if (typeof ResizeObserver === "function") {
-        const observer = new ResizeObserver(notifyHeight);
-        observer.observe(document.documentElement);
-        observer.observe(document.body);
+        const observer = new ResizeObserver(notifyHeight)
+        observer.observe(document.documentElement)
+        observer.observe(document.body)
       }
 
       window.addEventListener("message", (event) => {
-        if (event.source !== window.parent) return;
-        const message = event.data;
-        if (!message || message.jsonrpc !== "2.0") return;
-        if (message.method === "ui/notifications/tool-result") render(message.params);
-      }, { passive: true });
+        if (event.source !== window.parent) return
+        const message = event.data
+        if (!message || message.jsonrpc !== "2.0") return
+        if (message.method === "ui/notifications/tool-result") render(message.params)
+      }, { passive: true })
 
       window.addEventListener("openai:set_globals", (event) => {
-        const globals = event.detail?.globals;
-        render(globals?.toolResponseMetadata);
-        void enterPip();
-        void refreshLatest();
-      }, { passive: true });
+        const globals = event.detail?.globals
+        render(globals?.toolResponseMetadata)
+        render(globals?.toolOutput)
+      }, { passive: true })
 
-      render(window.openai?.toolResponseMetadata);
-      render(window.openai?.toolOutput);
-      void enterPip();
-      void refreshLatest();
+      empty.hidden = !legacyLatestCapture
+      render(window.openai?.toolResponseMetadata)
+      render(window.openai?.toolOutput)
+      void refreshLatest()
       // Последующие кадры приходят через tool-result/globals; idle polling отсутствует.
-      notifyHeight();
+      notifyHeight()
     </script>
   </body>
 </html>`
+
+}
+
+export const screenshotUiHtml = createScreenshotUiHtml({ legacyLatestCapture: true })
+export const chatScreenshotUiHtml = createScreenshotUiHtml({ legacyLatestCapture: false })

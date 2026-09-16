@@ -7,6 +7,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { createRuntimeHost } from "@meta/runtime"
 import { z } from "@meta/shared/contracts"
 import { startChatProxy } from "../src/chat-proxy.ts"
+import { SCREENSHOT_UI_URI, chatScreenshotUiHtml } from "../src/screenshot-ui.ts"
 
 test("справка раскрывается без Runtime, выполнение требует исполнителя", async () => {
   const directory = await mkdtemp(join(tmpdir(), "chat-proxy-"))
@@ -17,6 +18,17 @@ test("справка раскрывается без Runtime, выполнени
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)])
     const tools = (await client.listTools()).tools
     expect(tools.map(tool => tool.name)).toEqual(["zavx0z"])
+    expect(tools[0]?._meta?.["openai/outputTemplate"]).toBe(SCREENSHOT_UI_URI)
+    const resources = (await client.listResources()).resources
+    expect(resources.map(resource => resource.uri)).toEqual([SCREENSHOT_UI_URI])
+    const resource = await client.readResource({ uri: SCREENSHOT_UI_URI })
+    const firstContent = resource.contents[0]
+    const html = firstContent && "text" in firstContent ? firstContent.text : ""
+    expect(html).toBe(chatScreenshotUiHtml)
+    const emptyCapture = await client.callTool({ name: "zavx0z", arguments: {
+      node: "ui/latest_capture", input: { clientId: "test-widget" },
+    } })
+    expect(emptyCapture.isError).toBe(true)
     expect(tools[0]?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: false })
     expect(tools[0]?.inputSchema).toMatchObject({ type: "object", additionalProperties: false,
       properties: { node: { type: "string" }, action: { type: "string" }, input: { type: "object" } } })
@@ -58,7 +70,7 @@ test("action выполняется через UDS ровно один раз, i
     },
   })
   const server = await startChatProxy({ runtime: { socketPath, credentialPath, expectedHostname: hostname(),
-    allowedActions: ["system_health", "test_write", "get_operation", "late_method"] } })
+    allowedActions: ["system_health", "test_write", "get_operation", "late_method", "fixture_frame"] } })
   const client = new Client({ name: "chat-executor-test", version: "1" })
   const [ct, st] = InMemoryTransport.createLinkedPair()
   const call = (args: Record<string, unknown>) => client.callTool({ name: "zavx0z", arguments: args })
@@ -68,6 +80,42 @@ test("action выполняется через UDS ровно один раз, i
     expect((await call({ node: "computer", action: "system_health" })).isError).toBe(true)
     await host.start()
     expect((await call({ node: "computer", action: "system_health" })).structuredContent).toMatchObject({ machine: { matchesExpected: true } })
+    const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64")
+    host.catalog.register("fixture_frame", {
+      title: "Снимок", description: "Изолированный кадр без доступа к экрану", readOnly: true,
+      input: z.strictObject({}), output: z.strictObject({ frameRef: z.string() }),
+      async execute(context) {
+        const target = { kind: "browser-target" as const, ref: {
+          ...host.core.generation, browserInstanceRef: "browser:fixture", transportGeneration: "cdp:fixture",
+          targetId: "target:fixture", resourceRef: "target-resource:fixture",
+        } }
+        const frameRef = `frame:${crypto.randomUUID()}`
+        const observationId = `observation:${crypto.randomUUID()}`
+        host.core.frames.registerPublication({
+          observationId, frameRef, ...host.core.generation, source: "browser-viewport", captureTarget: target,
+          capturePolicySha256: "a".repeat(64), expiresAt: new Date(Date.now() + 5000).toISOString(),
+          inventoryId: "inventory:fixture", inventoryRevision: 1, displayLayoutRevision: 0,
+          cacheScopeRef: host.core.clients.lineage(context.session),
+        })
+        await host.core.frames.publish({
+          observationId, frameRef, ...host.core.generation, source: "browser-viewport", target,
+          capturedAt: new Date().toISOString(), widthPx: 1, heightPx: 1, mime: "image/png",
+          expectedByteLength: png.byteLength, expectedSha256: new Bun.CryptoHasher("sha256").update(png).digest("hex"), bytes: png,
+        })
+        return { frameRef }
+      },
+      frames: output => [output.frameRef],
+    })
+    const firstFrame = await call({ node: "computer", action: "fixture_frame" })
+    const secondFrame = await call({ node: "computer", action: "fixture_frame" })
+    const firstScreenshot = firstFrame._meta?.screenshot as { version: number, streamId: string }
+    const secondScreenshot = secondFrame._meta?.screenshot as { version: number, streamId: string }
+    expect(firstFrame.content).toContainEqual({ type: "image", data: png.toString("base64"), mimeType: "image/png" })
+    expect(firstFrame._meta?.screenshot).toMatchObject({ data: png.toString("base64"), mimeType: "image/png" })
+    expect(secondScreenshot.version).toBeGreaterThan(firstScreenshot.version)
+    expect(secondScreenshot.streamId).toBe(firstScreenshot.streamId)
+    expect((await call({}))._meta?.screenshot).toBeUndefined()
+    expect((await call({ node: "ui/latest_capture", input: { clientId: "foreign-widget" } })).isError).toBe(true)
     expect((await call({ node: "computer/test_write", input: { value: 7 } })).structuredContent).toMatchObject({ executed: false })
     expect(calls).toBe(0)
     expect((await call({ node: "computer/late_method" })).isError).toBe(true)

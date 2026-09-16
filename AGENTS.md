@@ -2,7 +2,8 @@
 
 ## Действующая архитектура
 
-Основной агентский интерфейс — direct MCP `ai-macos` поверх одного Runtime
+Интерфейс ChatGPT — единый `zavx0z` через proxy и Secure MCP Tunnel.
+Direct MCP `ai-macos` остаётся отдельным клиентом того же Runtime
 и одного долгоживущего Native broker. Установленное приложение —
 подписанный `computer-use.app`; transport — private authenticated Unix socket.
 
@@ -26,6 +27,11 @@ Root `bun run dev` ещё относится к legacy сервисам, а не
 Документы содержат датированные результаты; текущую готовность проверять live.
 
 ## Управление компьютером
+
+Для объявленного `zavx0z` сначала получить `{}` и следовать текущему
+контракту по [протоколу](mcp/protocol.md). Правила ниже о direct MCP относятся
+к задачам с объявленными `mcp__ai_macos__*`; отсутствие одного подключения
+не разрешает создавать второе или запускать legacy REST.
 
 1. Прочитать [навык ai-macos](skills/ai-macos/SKILL.md). Использовать только
    объявленные в текущей задаче `mcp__ai_macos__*`.
@@ -112,6 +118,11 @@ Legacy `input/bin/meta-input-helper` не является helper нового b
 Installed MCP launcher — `mcp/src/installed-launcher.ts`: проверяет release и
 стабильный app, запускает `--mcp` без source/REST fallback.
 Изменение config не заменяет старое открытое соединение.
+
+Для отдельного ChatGPT proxy владелец обновления — `scripts/chat-proxy-install.ts`.
+Он управляет всей tunnel session `ai-macos-chat`; отдельно завершать дочерний
+`zavx0z-mcp` запрещено. Изменение Runtime не устанавливается перезапуском proxy.
+Подробности и граница визуальной приёмки — в [MCP README](mcp/README.md).
 
 Проверять затронутые Bun suites/TypeScript; Native —
 `sh native/scripts/check.sh` и `sh native/scripts/check-observer.sh`.

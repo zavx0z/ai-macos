@@ -1,6 +1,6 @@
 import { expect, test } from "bun:test"
 import { runInNewContext } from "node:vm"
-import { screenshotUiHtml } from "../src/screenshot-ui.ts"
+import { screenshotUiHtml, chatScreenshotUiHtml } from "../src/screenshot-ui.ts"
 
 type UiEvent = {
   source?: unknown
@@ -8,7 +8,7 @@ type UiEvent = {
   detail?: { globals: { toolResponseMetadata: unknown } }
 }
 
-function viewer() {
+function viewer(html = screenshotUiHtml) {
   const elements = new Map<string, {
     src?: string
     textContent?: string
@@ -19,7 +19,7 @@ function viewer() {
   }>()
   for (const id of ["viewer", "image", "caption", "details", "expand", "empty", "refresh"]) {
     const events = new Map<string, () => void>()
-    elements.set(id, { scrollHeight: 100, events, addEventListener(name, listener) { events.set(name, listener) } })
+    elements.set(id, { hidden: id === "viewer", scrollHeight: 100, events, addEventListener(name, listener) { events.set(name, listener) } })
   }
   const listeners = new Map<string, (event: UiEvent) => void>()
   const calls: Array<{ name: string, after: number }> = []
@@ -29,6 +29,7 @@ function viewer() {
   const parent = { postMessage() {} }
   const window = {
     parent,
+    setInterval() { throw new Error("Периодический polling в PiP запрещён") },
     addEventListener(name: string, listener: (event: UiEvent) => void) { listeners.set(name, listener) },
     openai: {
       callTool(name: string, input: { after: number }) {
@@ -39,7 +40,7 @@ function viewer() {
       notifyIntrinsicHeight() {},
     },
   }
-  const script = screenshotUiHtml.match(/<script>([\s\S]*?)<\/script>/)?.[1]
+  const script = html.match(/<script>([\s\S]*?)<\/script>/)?.[1]
   if (script === undefined) throw new Error("Виджет не содержит script")
   runInNewContext(script, {
     window,
@@ -109,5 +110,41 @@ test("PiP принимает globals, но игнорирует сообщени
   ui.globals(frame(2, "second"))
   await flush()
   expect(ui.elements.get("image")?.src).toBe("data:image/png;base64,second")
+  expect(ui.modes).toEqual(["pip"])
+})
+
+test("PiP прокси ждёт свой кадр, обновляет один image и не запрашивает общий latest", async () => {
+  const ui = viewer(chatScreenshotUiHtml)
+  await flush()
+  expect(ui.modes).toEqual([])
+  expect(ui.elements.get("viewer")?.hidden).toBe(true)
+  const image = ui.elements.get("image")
+  ui.result(frame(2, "new"))
+  ui.result(frame(1, "old"))
+  ui.result(frame(99, "foreign"), false)
+  await flush()
+  expect(image?.src).toBe("data:image/png;base64,new")
+  ui.globals(frame(3, "latest"))
+  await flush()
+  expect(ui.elements.get("image")).toBe(image)
+  expect(image?.src).toBe("data:image/png;base64,latest")
+  expect(ui.modes).toEqual(["pip"])
+  expect(ui.calls).toEqual([])
+  expect(ui.elements.get("refresh")?.hidden).toBe(true)
+})
+
+test("PiP принимает новый stream и не возвращается к кадрам до перезапуска", async () => {
+  const ui = viewer(chatScreenshotUiHtml)
+  const streamed = (streamId: string, version: number, data: string) => {
+    const result = frame(version, data)
+    return { ...result, _meta: { screenshot: { ...result._meta.screenshot, streamId, version } } }
+  }
+  ui.result(streamed("old-stream", 90, "old"))
+  ui.result(streamed("new-stream", 1, "new"))
+  ui.result(streamed("old-stream", 91, "late"))
+  ui.result({ structuredContent: { version: 1000 } })
+  ui.result(streamed("new-stream", 2, "latest"))
+  await flush()
+  expect(ui.elements.get("image")?.src).toBe("data:image/png;base64,latest")
   expect(ui.modes).toEqual(["pip"])
 })

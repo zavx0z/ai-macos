@@ -1,71 +1,87 @@
-# ai-macos MCP
+# MCP и подключение ChatGPT
 
-This direct MCP server supersedes the deprecated `ai-macos-local` connector,
-which must not be used and remains an external archival gate.
-Agent workflows use the direct `ai-macos` server configured in Codex and do
-not fall back to the connector or call the REST services themselves.
+Рабочий путь ChatGPT:
 
-The STDIO entrypoint is `src/launcher.ts`. Set
-`AI_MACOS_EXPECTED_HOSTNAME` to the exact physical Mac hostname before use.
-The server rejects all tools except passive `system_health` when the actual
-hostname differs or no expected hostname is configured.
+`ChatGPT → Secure MCP Tunnel → zavx0z-mcp → runtime.sock → computer-use.app → Native helper`
 
-The launcher checks the local desktop REST services before starting the MCP
-server:
+Локальный alias/profile туннеля — `ai-macos-chat`. Его удалённое отображаемое
+имя может быть `ai-macos-local`; это не имя запускаемого legacy MCP.
+Прокси — отдельный исполняемый файл, Runtime и Native — согласованный
+подписанный bundle. Перезапуск туннеля не устанавливает изменения Runtime.
 
-- `@meta/window` on `127.0.0.1:7878`
-- `@meta/screen` on `127.0.0.1:7879`
-- `@meta/chrome` on `127.0.0.1:7880`
-- `@meta/input` on `127.0.0.1:7882`
+`src/chat-proxy.ts` публикует единственный инструмент `zavx0z`.
+[Протокол](protocol.md) описывает `node`, `action`, `input` и динамическую справку.
+`src/installed-launcher.ts` остаётся отдельным direct MCP launcher установленного
+Runtime. `src/index.ts` — legacy путь: его правка не обновляет `zavx0z`.
+Старые REST-сервисы для этого подключения не запускаются.
 
-All missing desktop services are started concurrently when the MCP connects.
-Existing compatible listeners are reused.
-Existing incompatible listeners are preserved and surfaced as degraded state
-through `system_health`; they are never replaced or treated as permission to
-start a duplicate listener. Started services are detached from the MCP process
-so a Codex MCP reconnect does not stop them. Service output is appended to
-`logs/mcp-services/`.
+## Снимки и PiP
 
-Android remains opt-in and is not started by the desktop MCP launcher.
+`src/screenshot-ui.ts` содержит один просмотрщик. Его текущая конфигурация
+`chatScreenshotUiHtml` использует кадр из конкретного tool result, без общего
+latest-frame между беседами, аренды владельца и периодического опроса.
+Последовательные доставленные кадры меняют один `img`; запоздавшие кадры
+предыдущей версии или предыдущего stream не заменяют новые.
 
-Window discovery and targeting use the same signed native helper as input.
-`list_windows` returns exact process IDs, and every window-targeted MCP tool
-accepts optional `pid` in addition to the existing `app`/`index`/`title`
-selectors. Existing calls remain compatible; same-name processes fail closed
-until the caller selects an exact visible target.
+Прокси сохраняет `ImageContent` для зрения модели и добавляет снимок в `_meta`
+для UI. Удалять модельный кадр ради сокрытия изображения в интерфейсе нельзя:
+агент потеряет наблюдение. Агент не должен дополнительно вставлять этот снимок
+Markdown-картинкой в ответ. Отображением tool result управляет ChatGPT.
 
-Typing requests are accepted only when their estimated duration is at most 30
-seconds. This is not a hard native-helper deadline. An accepted typing dispatch
-has no client-side REST timeout: MCP keeps the verified target focused and holds
-the mutation guard until the helper responds. Cancellation is not yet propagated
-into the helper, so callers must not retry or deliberately change focus until
-its completion state is known.
+После первого кадра просмотрщик запрашивает PiP, если хост предоставляет этот
+API. Успешный capture не подтверждает открытия виджета. Обновление одного
+смонтированного viewer проверяется тестом; сохранение одного PiP между вызовами
+и отсутствие дополнительных карточек требуют проверки именно в ChatGPT.
+Если хост создаёт новый iframe на каждый вызов единственного tool, локальный
+таймер или глобальная аренда не исправляют этот контракт.
 
-Run manually with:
+Основание: [официальная документация UI](https://developers.openai.com/plugins/build/chatgpt-ui)
+и [метаданные результатов](https://developers.openai.com/plugins/reference).
+Документация предупреждает о повторном создании iframe при шаблоне на каждом tool.
+
+## Обновление и восстановление
+
+Внешний оператор запускает из canonical checkout:
 
 ```sh
-bun run --cwd mcp start
+bun scripts/chat-proxy-install.ts
+bun scripts/chat-proxy-install.ts --execute --credential-service dev.knowledge-base.tunnel
 ```
 
-Set `AI_MACOS_REST_STARTUP_TIMEOUT_MS` to override the default 15-second REST
-startup deadline.
+Первая команда только печатает план. Вторая требует чистое дерево, собирает
+кандидат, проверяет initialize/tools/list/resources и корневую справку,
+останавливает **всю** управляемую tunnel session, атомарно меняет бинарник,
+поднимает тот же alias/profile/tunnel и проверяет health/ready. При ошибке —
+один rollback прежнего бинарника. Регистрация плагина и Runtime не меняются.
 
-## Stable windows (0.3.0)
+Credential берётся из существующей ссылки профиля. Если переменная окружения
+не задана, `--credential-service` указывает существующую запись Keychain;
+ключ не выводится и не сохраняется в исходниках или отчёте установки.
+В `Application Support/ai-macos/chat-proxy/update.json` записываются commit,
+SHA256 кандидата/предыдущей сборки и итоговая фаза. `update.lock` защищает от
+параллельных обновлений. После аварийного прерывания сначала исследовать журнал
+и процессы; не удалять lock автоматически.
 
-Use `app`, `pid` and `windowId` returned by `list_windows`. Every targeted input
-and capture tool accepts the CGWindowID; stale title/index/frame hints never
-retarget an explicit ID. Closed IDs fail without replaying input. Native sheets
-expose `ownerWindowId`; post-input restoration targets their owner even when
-Save/Open was deliberately closed. Legacy app/index/title calls remain accepted.
+Для восстановления без пересборки используется `tunnel-client runtimes connect`
+с существующим alias `ai-macos-chat`, tunnel ID и командой из профиля. Точные
+аргументы и credential reference берутся из установленной конфигурации;
+`tunnel-client runtimes status ai-macos-chat --json` проверяет результат.
 
-`system_health.mcp` identifies the connected protocol version and process.
-Already-connected MCP clients keep their old schemas until reconnected; updating
-REST listeners alone does not refresh the client tool catalog.
+**Не выполнять `kill` дочернего `zavx0z-mcp`.** Его выход завершает туннель.
+Не обновлять управляющий канал через Terminal, которым управляет этот же канал.
+Восстановление выполняет внешний Codex/shell либо оператор.
 
-Regression suite: `bun test shared/src/window-identity.test.ts window/tests screen/tests input/tests/window-selector.test.ts mcp/tests`.
-The explicit `mcp/tests/live-window-id.ts` integration test requires
-`AI_MACOS_LIVE_TEST=1`, a configured expected hostname, and
-`tmp/live-window-target.json` populated from a verified inventory. Inspect the
-window before each `capture`, `cancel` or `open` phase; saved screenshots/proofs
-are under `tmp/stable-window-*`. This is an opt-in implementation test, not an
-alternate application-automation interface. It never submits a publication.
+Runtime устанавливается отдельно через `scripts/runtime-install.ts` с прежней
+подписью и выбранным readiness profile. Правки retention в исходниках вступают
+в силу только после этой установки.
+
+## Проверки
+
+```sh
+bun test mcp/tests/catalog-server.test.ts mcp/tests/chat-proxy.test.ts mcp/tests/runtime-mcp.test.ts mcp/tests/screenshot-ui.test.ts scripts/chat-proxy-install.test.ts
+bunx tsc --noEmit -p mcp/tsconfig.json
+```
+
+Это проверки протокола, UI-логики и процедуры установки без реального ввода.
+Живая приёмка: ChatGPT вызывает `{}`, `system_health`, наблюдает выбранную цель
+и подтверждает открытие и обновление PiP. Установщик этого не имитирует.
