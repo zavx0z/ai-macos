@@ -310,7 +310,7 @@ export class LocalCommandRunner implements CommandRunner {
       const failure = error as Error & { stdout?: string, stderr?: string, code?: number | string }
       return {
         stdout: failure.stdout ?? "",
-        stderr: failure.stderr ?? failure.message,
+        stderr: failure.stderr?.trim() ? failure.stderr : failure.message,
         exitCode: typeof failure.code === "number" ? failure.code : 1,
       }
     }
@@ -751,7 +751,7 @@ async function ensureRelease(plan: RuntimeInstallPlan, options: RuntimeInstallOp
       HELPER_SIGNING_IDENTIFIER, plan.signing)
     const architectures = await checked(options.runner, "/usr/bin/lipo", ["-archs", nativeHelperPath])
     if (!architectures.stdout.split(/\s+/).includes("x86_64")) throw new Error("Native candidate не содержит x86_64")
-    const metadataResult = await checked(options.runner, nativeHelperPath, ["--metadata"], undefined, 5_000)
+    const metadataResult = await checked(options.runner, nativeHelperPath, ["--metadata"], undefined, 15_000)
     const metadata = parseNativeMetadata(metadataResult.stdout)
     if (metadata.nativeBuildId !== plan.release.nativeBuildId) throw new Error("Native metadata содержит другой build ID")
     if (metadata.installRoot !== plan.paths.repositoryRoot) throw new Error("Native metadata содержит другой canonical install root")
@@ -871,7 +871,7 @@ async function verifyReleaseArtifacts(
     assertEmbeddedCertificateRequirement(signature.designatedRequirement,
       HELPER_SIGNING_IDENTIFIER, manifest.signing.certificateSha1)
   }
-  const metadata = parseNativeMetadata((await checked(runner, helperPath, ["--metadata"], undefined, 5_000)).stdout)
+  const metadata = parseNativeMetadata((await checked(runner, helperPath, ["--metadata"], undefined, 15_000)).stdout)
   if (metadata.nativeBuildId !== manifest.builds.nativeBuildId || metadata.installRoot !== plan.paths.repositoryRoot
     || !freshAuditUser(metadata.session)) {
     throw new Error("Immutable release native metadata/build/audit не совпадает с manifest")
@@ -1277,7 +1277,7 @@ async function verifyApplicationCopy(
     assertEmbeddedCertificateRequirement(helperSignature.designatedRequirement,
       HELPER_SIGNING_IDENTIFIER, manifest.signing.certificateSha1)
   }
-  const metadata = parseNativeMetadata((await checked(runner, helperPath, ["--metadata"], undefined, 5_000)).stdout)
+  const metadata = parseNativeMetadata((await checked(runner, helperPath, ["--metadata"], undefined, 15_000)).stdout)
   if (metadata.nativeBuildId !== manifest.builds.nativeBuildId || metadata.installRoot !== plan.paths.repositoryRoot
     || !freshAuditUser(metadata.session)) throw new Error("Stable helper metadata identity mismatch")
 }
@@ -1477,7 +1477,7 @@ async function runDoctor(
         : readinessDeadlineAt
     if (Date.now() >= deadlineAt) break
     const result = await runner.run(executable, ["--doctor"], {
-      timeoutMs: Math.max(1, Math.min(2_000, deadlineAt - Date.now())),
+      timeoutMs: Math.max(1, Math.min(10_000, deadlineAt - Date.now())),
       env: {
         META_RUNTIME_SOCKET: join(plan.paths.runRoot, "runtime.sock"),
         META_RUNTIME_CREDENTIAL: join(plan.paths.runRoot, "credential.json"),
@@ -1719,7 +1719,7 @@ function parseStartupPermissions(value: unknown): StartupPermissionsHealth | und
 }
 
 function doctorTimeout(options: RuntimeInstallOptions): number {
-  const timeout = options.doctorTimeoutMs ?? 10_000
+  const timeout = options.doctorTimeoutMs ?? 30_000
   if (!Number.isSafeInteger(timeout) || timeout < 100 || timeout > 30_000) throw new Error("Doctor timeout должен быть 100..30000 ms")
   return timeout
 }

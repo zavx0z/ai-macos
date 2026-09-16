@@ -6,6 +6,7 @@ import { join } from "node:path"
 import { CAPABILITY_IDS } from "../shared/src/contracts/index.ts"
 import { runInstalledLauncher, type InstalledRunner } from "../mcp/src/installed-launcher.ts"
 import {
+  LocalCommandRunner,
   HELPER_SIGNING_IDENTIFIER,
   RUNTIME_SERVICE_LABEL,
   RUNTIME_SIGNING_IDENTIFIER,
@@ -2092,3 +2093,32 @@ async function signatureContentKey(path: string): Promise<string> {
   await visit(path, "")
   return sha256(values.join("\n"))
 }
+
+
+test("doctor с запуском дольше двух секунд получает budget внутри общего deadline", async () => {
+  const fixture = await createFixture()
+  const budgets: number[] = []
+  const runner: CommandRunner = {
+    async run(file, args, options) {
+      if (args.includes("--doctor")) {
+        budgets.push(options?.timeoutMs ?? 0)
+        if ((options?.timeoutMs ?? 0) < 2500) {
+          return { stdout: "", stderr: "cold doctor process timed out", exitCode: 1 }
+        }
+      }
+      return fixture.runner.run(file, args)
+    },
+  }
+  const options = { ...fixture.options, runner, doctorTimeoutMs: 5000 }
+  const result = await applyRuntimeInstall(await planRuntimeInstall(options), options)
+  expect(result.state).toBe("installed")
+  expect(budgets).toHaveLength(1)
+  expect(budgets[0]).toBeGreaterThanOrEqual(2500)
+  expect(budgets[0]).toBeLessThanOrEqual(5000)
+})
+
+test("пустой stderr не скрывает причину ошибки запуска процесса", async () => {
+  const result = await new LocalCommandRunner().run("/usr/bin/false", [])
+  expect(result.exitCode).not.toBe(0)
+  expect(result.stderr).toContain("false")
+})
