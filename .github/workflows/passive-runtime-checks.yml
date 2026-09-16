@@ -23,6 +23,13 @@ jobs:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
         with:
           persist-credentials: false
+      - name: Archive exact source snapshot
+        run: git archive --format=tar.gz HEAD > "$RUNNER_TEMP/source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-${{ github.sha }}
+          path: ${{ runner.temp }}/source.tar.gz
+          retention-days: 1
       - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
         with:
           bun-version: '1.4.2'
