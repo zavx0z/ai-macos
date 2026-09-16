@@ -1607,11 +1607,18 @@ test("owner lock и late service appearance блокируют concurrent cutove
   const plan = await planRuntimeInstall(fixture.options)
   let unlock!: () => void
   const gate = new Promise<void>(resolve => { unlock = resolve })
+  let acquired!: () => void
+  const lockAcquired = new Promise<void>(resolve => { acquired = resolve })
   const running = applyRuntimeInstall(plan, {
     ...fixture.options,
-    async failpoint(stage) { if (stage === "after-installer-lock") await gate },
+    async failpoint(stage) {
+      if (stage === "after-installer-lock") {
+        acquired()
+        await gate
+      }
+    },
   })
-  await Bun.sleep(10)
+  await lockAcquired
   await expect(applyRuntimeInstall(plan, fixture.options)).rejects.toThrow("lock уже удерживается")
   unlock()
   await running
@@ -2120,5 +2127,21 @@ test("doctor с запуском дольше двух секунд получа
 test("пустой stderr не скрывает причину ошибки запуска процесса", async () => {
   const result = await new LocalCommandRunner().run("/usr/bin/false", [])
   expect(result.exitCode).not.toBe(0)
-  expect(result.stderr).toContain("false")
+  expect(result.stderr).toBe("")
+  expect(result.completed).toBe(true)
+  expect(result.errorMessage).toContain("false")
+})
+
+
+test("проверка отсутствующего PID сохраняет штатные exit 1 и пустой stderr", async () => {
+  const child = Bun.spawn(["/usr/bin/true"], { stdout: "ignore", stderr: "ignore" })
+  await child.exited
+  const result = await new LocalCommandRunner().run("/bin/ps", ["-ww", "-p", String(child.pid), "-o", "pid="])
+  expect(result).toMatchObject({ exitCode: 1, completed: true, stdout: "", stderr: "" })
+})
+
+test("таймаут процесса отличается от нормального exit 1", async () => {
+  const result = await new LocalCommandRunner().run("/bin/sleep", ["1"], { timeoutMs: 10 })
+  expect(result.completed).toBe(false)
+  expect(result.errorMessage).toBeString()
 })

@@ -76,6 +76,8 @@ export type CommandResult = {
   stdout: string
   stderr: string
   exitCode: number
+  completed?: boolean
+  errorMessage?: string
 }
 
 export interface CommandRunner {
@@ -307,10 +309,12 @@ export class LocalCommandRunner implements CommandRunner {
       })
       return { stdout: result.stdout, stderr: result.stderr, exitCode: 0 }
     } catch (error) {
-      const failure = error as Error & { stdout?: string, stderr?: string, code?: number | string }
+      const failure = error as Error & { stdout?: string, stderr?: string, code?: number | string, killed?: boolean, signal?: string | null }
       return {
         stdout: failure.stdout ?? "",
-        stderr: failure.stderr?.trim() ? failure.stderr : failure.message,
+        stderr: failure.stderr ?? "",
+        completed: typeof failure.code === "number" && !failure.killed && !failure.signal,
+        errorMessage: failure.message,
         exitCode: typeof failure.code === "number" ? failure.code : 1,
       }
     }
@@ -1484,7 +1488,7 @@ async function runDoctor(
       },
     })
     if (result.exitCode !== 0) {
-      lastFailure = result.stderr.trim() || `doctor exit ${result.exitCode}`
+      lastFailure = result.stderr.trim() || result.errorMessage || `doctor exit ${result.exitCode}`
       await boundedDelay(Math.min(50, Math.max(1, deadlineAt - Date.now())))
       continue
     }
@@ -2497,8 +2501,8 @@ async function readProcessIncarnation(runner: CommandRunner, pid: number): Promi
     env: { LC_ALL: "C", LANG: "C" },
   })
   if (result.exitCode !== 0) {
-    if (result.stdout.trim() === "" && result.stderr.trim() === "") return undefined
-    throw new Error(`ps process probe failed (${result.exitCode}): ${result.stderr.trim()}`)
+    if (result.exitCode === 1 && result.completed !== false && result.stdout.trim() === "" && result.stderr.trim() === "") return undefined
+    throw new Error(`ps process probe failed (${result.exitCode}): ${result.stderr.trim() || result.errorMessage || "no stderr"}`)
   }
   const lines = result.stdout.split("\n").filter(line => line.trim().length > 0)
   if (lines.length !== 1) throw new Error("ps process probe вернул неоднозначный record")
@@ -2606,7 +2610,7 @@ async function checked(
   env?: Readonly<Record<string, string>>,
 ): Promise<CommandResult> {
   const result = await runner.run(file, args, { cwd, timeoutMs, env })
-  if (result.exitCode !== 0) throw new Error(`${basename(file)} failed (${result.exitCode}): ${result.stderr.trim()}`)
+  if (result.exitCode !== 0) throw new Error(`${basename(file)} failed (${result.exitCode}): ${result.stderr.trim() || result.errorMessage || "no stderr"}`)
   return result
 }
 
