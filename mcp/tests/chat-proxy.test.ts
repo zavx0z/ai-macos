@@ -18,9 +18,15 @@ test("справка раскрывается без Runtime, выполнени
     const tools = (await client.listTools()).tools
     expect(tools.map(tool => tool.name)).toEqual(["zavx0z"])
     expect(tools[0]?.annotations).toMatchObject({ readOnlyHint: false, destructiveHint: true, idempotentHint: false })
-    expect(tools[0]?.inputSchema).toEqual({ type: "object", properties: {} })
-    expect(tools[0]?.description).toBe("")
-    expect(client.getInstructions()).toBeUndefined()
+    expect(tools[0]?.inputSchema).toMatchObject({ type: "object", additionalProperties: false,
+      properties: { node: { type: "string" }, action: { type: "string" }, input: { type: "object" } } })
+    expect(Object.keys(tools[0]!.inputSchema.properties!)).toEqual(["node", "action", "input"])
+    expect(tools[0]?.inputSchema.required ?? []).toEqual([])
+    expect(tools[0]?.description).toContain("контракт без выполнения")
+    expect(client.getInstructions()).toBe(tools[0]?.description)
+    const root = (await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent as Record<string, unknown>
+    expect((root.contract as { inputSchema: unknown }).inputSchema).toEqual(tools[0]?.inputSchema)
+    expect(root.examples).toMatchObject({ execute: { node: "computer", action: "system_health", input: {} } })
     expect((await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent).toMatchObject({ node: "root", children: [{ node: "computer" }], contract: { inputSchema: { properties: { node: { type: "string" }, action: { type: "string" }, input: { type: "object" } } } }, next: { node: "computer" } })
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer" } })).isError).toBe(true)
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer", action: "not_published" } })).isError).toBe(true)

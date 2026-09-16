@@ -1,14 +1,16 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
-import { ToolSchema } from "@modelcontextprotocol/sdk/types.js"
+import { ToolSchema, type Tool } from "@modelcontextprotocol/sdk/types.js"
 import { parseWireValue, z } from "@meta/shared/contracts"
 import { ChatProxyError, createChatExecutor, type ChatRuntimeOptions } from "./chat-executor.ts"
 import { createCatalogServer } from "./catalog-server.ts"
 
 const entryInput = z.strictObject({
-  node: z.string().min(1).max(160).optional(),
-  action: z.string().min(1).max(127).optional(),
-  input: z.record(z.string(), z.json()).optional(),
+  node: z.string().min(1).max(160).optional().describe("Раздел справки: root, computer или computer/<операция>. По умолчанию root."),
+  action: z.string().min(1).max(127).optional().describe("Выполнить операцию из каталога выбранного раздела. Без action возвращается только справка."),
+  input: z.record(z.string(), z.json()).optional().describe("Аргументы операции по её динамическому inputSchema. По умолчанию {}. Само наличие input не запускает действие."),
 })
+const entryInputSchema = z.toJSONSchema(entryInput) as Tool["inputSchema"]
+const entryProtocol = "Один вход для справки и выполнения. {} возвращает корневую справку; {node:'computer'} — каталог; {node:'computer/<операция>'} — контракт без выполнения; {node:'computer',action:'<операция>',input:{...}} — выполнение. Сначала выполните system_health и проверьте machine.matchesExpected=true. Параметры остальных операций берите из их текущих контрактов. Для ввода нужны check_input и свежее observe. После timeout/unknown не повторяйте действие: запросите get_operation/list_recent_operations."
 
 /** Пустой запрос раскрывает протокол; только явный action запускает исполнитель. */
 export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
@@ -19,8 +21,8 @@ export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
   const server = createCatalogServer({
     listTools: () => [{
       name: "zavx0z", title: "Завхоз",
-      description: "",
-      inputSchema: { type: "object", properties: {} },
+      description: entryProtocol,
+      inputSchema: entryInputSchema,
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false },
     }],
     subscribeCatalogChanged: () => () => {},
@@ -33,8 +35,13 @@ export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
           return result({ name: "zavx0z",
             node, description: "Справка по доступным разделам. Контракты запрашиваются у Runtime при обращении к разделу.",
             children: [{ node: "computer", description: "Справка и контракты ai-macos" }],
-            contract: { inputSchema: z.toJSONSchema(entryInput) },
-            protocol: "Без action — справка. С action — выполнение; input необязателен и по умолчанию {}. Сначала вызовите system_health и проверьте machine.matchesExpected. Для ввода нужны check_input и свежий observe. После timeout/unknown не повторяйте действие: получите статус через get_operation/list_recent_operations.",
+            contract: { inputSchema: entryInputSchema },
+            protocol: entryProtocol,
+            examples: {
+              catalog: { node: "computer" },
+              contract: { node: "computer/system_health" },
+              execute: { node: "computer", action: "system_health", input: {} },
+            },
             next: { node: "computer" } })
         }
         if (node === "computer" && request.action === undefined) {
@@ -62,7 +69,7 @@ export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
           ? `${error.code}: ${error.message}` : "Запрос некорректен или Runtime недоступен. Автоматического повтора нет. Если исход действия неизвестен, запросите get_operation/list_recent_operations." }] }
       }
     },
-  }, { name: "zavx0z", version: "unversioned" })
+  }, { name: "zavx0z", version: "unversioned", instructions: entryProtocol })
   const previousOnClose = server.onclose
   server.onclose = () => {
     previousOnClose?.()
