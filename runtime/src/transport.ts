@@ -21,6 +21,11 @@ import { ClientRenewalCoordinator } from "./client-renewal.ts"
 const MAX_RUNTIME_REQUEST_BYTES = 1024 * 1024
 const MAX_RUNTIME_RESPONSE_BYTES = 8 * 1024 * 1024
 const RUNTIME_TRANSPORT_TIMEOUT_MS = 5_000
+type CachedRuntimeCatalog = {
+  value: z.infer<typeof catalogResponseSchema>
+  fingerprint: string
+  etag?: string
+}
 
 export class RuntimeUnknownDeliveryError extends Error {
   constructor(
@@ -227,7 +232,11 @@ export class RuntimeUdsServer {
       }
       if (request.method === "GET" && url.pathname === "/v1/catalog") {
         if (this.#catalog === undefined) return json({ error: "catalog-unavailable" }, 503)
-        return json(this.#catalog.descriptors())
+        const catalog = this.#catalog.serializedCatalog()
+        const headers = { "content-type": "application/json", "cache-control": "private, no-cache", etag: catalog.etag }
+        return request.headers.get("if-none-match") === catalog.etag
+          ? new Response(null, { status: 304, headers })
+          : new Response(catalog.body, { headers })
       }
       const methodMatch = /^\/v1\/tools\/([^/]+)$/.exec(url.pathname)
       if (request.method === "POST" && methodMatch !== null) {
@@ -324,6 +333,7 @@ export class RuntimeUdsClient {
   readonly #timeoutMs: number
   readonly #renewal: ClientRenewalCoordinator
   readonly #catalogSubscriptions = new Set<() => void>()
+  #catalogCache?: CachedRuntimeCatalog
   #closing?: Promise<void>
 
   private constructor(socketPath: string, credentialPath: string, bootstrapToken: string, timeoutMs: number, adminToken?: string, now?: () => number) {
@@ -410,14 +420,14 @@ export class RuntimeUdsClient {
   }
 
   async listTools(): Promise<RuntimeToolDescriptor[]> {
-    const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog"))
-    return catalog.tools as RuntimeToolDescriptor[]
+    const catalog = await this.#readCatalog()
+    return structuredClone(catalog.value.tools) as RuntimeToolDescriptor[]
   }
 
   async callTool(name: string, args: Record<string, unknown>, signal: AbortSignal): Promise<RuntimeToolResult> {
     try {
-      const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog", { signal }))
-      const descriptor = catalog.tools.find(tool => tool.name === name)
+      const catalog = await this.#readCatalog(signal)
+      const descriptor = catalog.value.tools.find(tool => tool.name === name)
       if (descriptor === undefined) throw new Error("Method отсутствует в текущем runtime catalogue")
       const timeoutMs = Math.max(this.#timeoutMs, (descriptor._meta?.timeoutMs ?? 5000) + 1000)
       const result = methodResponseSchema.parse(await this.#request(`/v1/tools/${encodeURIComponent(name)}`, {
@@ -460,8 +470,8 @@ export class RuntimeUdsClient {
     let timer: ReturnType<typeof setTimeout> | undefined
     const poll = async () => {
       try {
-        const catalog = catalogResponseSchema.parse(await this.#request("/v1/catalog", { signal: controller.signal }))
-        const nextFingerprint = canonicalJson(catalog)
+        const catalog = await this.#readCatalog(controller.signal)
+        const nextFingerprint = catalog.fingerprint
         const changed = fingerprint !== undefined && nextFingerprint !== fingerprint
         fingerprint = nextFingerprint
         if (changed) listener()
@@ -472,6 +482,43 @@ export class RuntimeUdsClient {
     const unsubscribe = () => { controller.abort(); if (timer !== undefined) clearTimeout(timer); this.#catalogSubscriptions.delete(unsubscribe) }
     this.#catalogSubscriptions.add(unsubscribe)
     return unsubscribe
+  }
+
+  /** Проверяет актуальность через ETag; старый server без ETag сохраняет полный путь проверки. */
+  async #readCatalog(signal?: AbortSignal, renewed = false): Promise<CachedRuntimeCatalog> {
+    const lease = await this.#renewal.enter(this.#timeoutMs * 2, signal)
+    try {
+      const previous = this.#catalogCache
+      const response = await this.#raw("/v1/catalog", {
+        signal: lease.signal,
+        ...(previous?.etag === undefined ? {} : { headers: { "if-none-match": previous.etag } }),
+      })
+      if (response.status === 304) {
+        if (previous?.etag === undefined || response.headers.get("etag") !== previous.etag) {
+          throw new Error("Runtime catalog 304 не подтверждает сохранённый ETag")
+        }
+        return previous
+      }
+      const body = await readResponseJson(response, this.#timeoutMs)
+      if (!response.ok) {
+        if (response.status === 401 && !renewed) {
+          lease.release()
+          await this.#renewal.renewNow(signal)
+          return this.#readCatalog(signal, true)
+        }
+        throw new RuntimeUdsHttpError(response.status, body)
+      }
+      const value = catalogResponseSchema.parse(body)
+      const etag = response.headers.get("etag")
+      const next = {
+        value,
+        fingerprint: canonicalJson(value),
+        ...(etag === null || etag.length > 256 ? {} : { etag }),
+      }
+      // Поздний ответ не вытесняет уже сохранённый результат другого запроса.
+      if (this.#catalogCache === previous) this.#catalogCache = next
+      return next
+    } finally { lease.release() }
   }
 
   async invoke<Result>(method: string, intent: RuntimeOperationIntent, payload: unknown): Promise<RuntimeExecution<Result>> {
@@ -542,7 +589,7 @@ export class RuntimeUdsClient {
 
   #raw(
     path: string,
-    options: { method?: string, body?: unknown, bootstrap?: boolean, admin?: boolean, signal?: AbortSignal, timeoutMs?: number } = {},
+    options: { method?: string, body?: unknown, bootstrap?: boolean, admin?: boolean, signal?: AbortSignal, timeoutMs?: number, headers?: Record<string, string> } = {},
   ): Promise<Response> {
     const token = options.admin ? this.#adminToken : options.bootstrap ? this.#bootstrapToken : this.#bearerToken
     const timeoutMs = options.timeoutMs ?? this.#timeoutMs
@@ -551,6 +598,7 @@ export class RuntimeUdsClient {
       unix: this.#socketPath,
       method: options.method ?? "GET",
       headers: {
+        ...options.headers,
         authorization: `Bearer ${token}`,
         ...(options.body === undefined ? {} : { "content-type": "application/json" }),
       },

@@ -9,6 +9,16 @@ import { composeHostCapabilities } from "../src/host-capabilities.ts"
 import { createRuntimeHost } from "../src/host.ts"
 import { RuntimeUdsClient } from "../src/transport.ts"
 
+test("serialized catalog меняет ETag после restart даже при совпавших revision и schemas", () => {
+  const create = (runtimeEpoch: string) => new MethodRegistry(new RuntimeCore({
+    generation: { runtimeEpoch, loginSessionId: "login:catalog-cache" }, runtimeBuildId: "build:catalog-cache",
+  }))
+  const first = create("runtime:catalog-before")
+  const second = create("runtime:catalog-after")
+  expect(first.serializedCatalog().body).toBe(second.serializedCatalog().body)
+  expect(first.serializedCatalog().etag).not.toBe(second.serializedCatalog().etag)
+})
+
 test("MethodRegistry validates schemas and active session before execution", async () => {
   const runtime = new RuntimeCore({ generation: { runtimeEpoch: "runtime:registry", loginSessionId: "login:registry" }, runtimeBuildId: "build:registry" })
   const registry = new MethodRegistry(runtime)

@@ -149,6 +149,91 @@ test("catalog subscription сравнивает parsed descriptors при сов
   }
 }, 8_000)
 
+test("UDS catalog возвращает пустой 304 только authenticated caller и меняет ETag при закрытии admission", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "runtime-catalog-etag-"))
+  const socketPath = join(directory, "runtime.sock")
+  const credentialPath = join(directory, "credential.json")
+  const core = new RuntimeCore({ generation, runtimeBuildId: "build:catalog-etag" })
+  const catalog = new MethodRegistry(core)
+  catalog.register("read_state", {
+    title: "Состояние", description: "Проверка актуальности каталога", readOnly: true,
+    input: z.strictObject({}), output: z.strictObject({ ready: z.boolean() }),
+    async execute() { return { ready: true } },
+  })
+  const server = new RuntimeUdsServer({ socketPath, credentialPath, core, catalog })
+  try {
+    await server.start()
+    const credential = core.openClient("catalog-etag")
+    const headers = { authorization: `Bearer ${credential.bearerToken}` }
+    const first = await fetch("http://localhost/v1/catalog", { unix: socketPath, headers })
+    const etag = first.headers.get("etag")!
+    expect(((await first.json()) as { tools: Array<{ name: string }> }).tools.map(tool => tool.name)).toEqual(["read_state"])
+    const cached = catalog.serializedCatalog()
+    const unchanged = await fetch("http://localhost/v1/catalog", {
+      unix: socketPath, headers: { ...headers, "if-none-match": etag },
+    })
+    expect(unchanged.status).toBe(304)
+    expect(await unchanged.text()).toBe("")
+    expect(catalog.serializedCatalog()).toBe(cached)
+    const foreign = await fetch("http://localhost/v1/catalog", {
+      unix: socketPath, headers: { authorization: "Bearer forged", "if-none-match": etag },
+    })
+    expect(foreign.status).toBe(401)
+    await foreign.text()
+    core.sealAdmission()
+    const changed = await fetch("http://localhost/v1/catalog", {
+      unix: socketPath, headers: { ...headers, "if-none-match": etag },
+    })
+    expect(changed.status).toBe(200)
+    expect(changed.headers.get("etag")).not.toBe(etag)
+    expect(((await changed.json()) as { tools: unknown[] }).tools).toEqual([])
+  } finally { await server.stop(); await rm(directory, { recursive: true, force: true }) }
+})
+
+test("client использует подтверждённый 304, не отдаёт mutable cache и замечает новый ETag", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "runtime-client-etag-"))
+  const socketPath = join(directory, "runtime.sock")
+  const credentialPath = join(directory, "credential.json")
+  const core = new RuntimeCore({ generation, runtimeBuildId: "build:client-etag" })
+  const credential = core.openClient("client-etag")
+  await writeFile(credentialPath, JSON.stringify({ protocolVersion: "1", ...generation,
+    principalId: "client-etag", bootstrapToken: "bootstrap:client-etag" }), { mode: 0o600 })
+  let etag = '"first"'
+  let malformed304 = false
+  const statuses: number[] = []
+  const server = Bun.serve({ unix: socketPath, fetch(request) {
+    const path = new URL(request.url).pathname
+    if (path === "/v1/session/open") return fixtureJson(credential)
+    if (path === "/v1/session/close") return fixtureJson({ closed: true })
+    if (path !== "/v1/catalog") return fixtureJson({ error: "not-found" }, 404)
+    if (request.headers.get("if-none-match") === etag) {
+      statuses.push(304)
+      return new Response(null, { status: 304, headers: { etag: malformed304 ? '"foreign"' : etag } })
+    }
+    statuses.push(200)
+    return Response.json({ revision: 7, tools: [{ name: "read_state", title: etag, description: "Состояние",
+      inputSchema: { type: "object" }, outputSchema: { type: "object" },
+      annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false } }] }, { headers: { etag } })
+  } })
+  let client: RuntimeUdsClient | undefined
+  try {
+    client = await RuntimeUdsClient.fromCredentialFile(socketPath, credentialPath)
+    await client.open("client-etag")
+    const first = await client.listTools()
+    first[0]!.title = "Изменено вызывающим кодом"
+    expect((await client.listTools())[0]!.title).toBe('"first"')
+    etag = '"second"'
+    expect((await client.listTools())[0]!.title).toBe('"second"')
+    expect(statuses).toEqual([200, 304, 200])
+    malformed304 = true
+    await expect(client.listTools()).rejects.toThrow("не подтверждает сохранённый ETag")
+  } finally {
+    await client?.close().catch(() => undefined)
+    server.stop(true)
+    await rm(directory, { recursive: true, force: true })
+  }
+})
+
 test("UDS автоматически renews после fake idle/outage дольше bearer TTL и close прекращает calls", async () => {
   const directory = await mkdtemp(join(tmpdir(), "runtime-renewal-"))
   const socketPath = join(directory, "runtime.sock")

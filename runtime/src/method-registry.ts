@@ -1,6 +1,7 @@
 import { capabilityIsReady, contractJsonSchema, parseWireValue, utf8ByteLength, z, type CapabilityId, type RuntimeClientSession } from "@meta/shared/contracts"
 import type { RuntimeCore } from "./core.ts"
 import { RuntimeContractError } from "./errors.ts"
+import { sha256 } from "./primitives.ts"
 
 export type RuntimeToolDescriptor = {
   name: string
@@ -63,6 +64,7 @@ export class MethodRegistry {
   readonly internal: InternalMethodRegistry
   #revision = 0
   #internalRevision = 0
+  #serializedCatalog?: Readonly<{ body: string, etag: string }>
 
   constructor(runtime: RuntimeCore) {
     this.#runtime = runtime
@@ -146,6 +148,18 @@ export class MethodRegistry {
     return this.#descriptors("public")
   }
 
+  /** Неизменившийся каталог не копируется и не сериализуется на каждом poll. */
+  serializedCatalog(): Readonly<{ body: string, etag: string }> {
+    if (this.#serializedCatalog === undefined) {
+      const body = JSON.stringify(this.descriptors())
+      this.#serializedCatalog = Object.freeze({
+        body,
+        etag: `"${sha256(`${this.#runtime.generation.runtimeEpoch}\n${body}`)}"`,
+      })
+    }
+    return this.#serializedCatalog
+  }
+
   #descriptors(visibility: RuntimeMethodVisibility): { revision: number, tools: RuntimeToolDescriptor[] } {
     const catalog = { revision: visibility === "public" ? this.#revision : this.#internalRevision,
       tools: [...this.#methods.values()]
@@ -188,6 +202,7 @@ export class MethodRegistry {
     this.#internalRevision++
     if (visibility === "internal") return
     this.#revision++
+    this.#serializedCatalog = undefined
     for (const listener of this.#listeners) listener()
   }
 }
