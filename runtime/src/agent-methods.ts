@@ -1,3 +1,4 @@
+import { agentCaptureOutput } from "./agent-capture-output.ts"
 import { operationDeadline } from "./deadline.ts"
 import {
   browserOperationResources,
@@ -821,8 +822,8 @@ export class RuntimeAgentMethods {
       clip: { kind: "full-target" },
       cursor: "exclude",
       readinessPolicy: { policyId: "agent-window-observe", requiredSteps: ["complete-frame", "permission", "target"], disabledSteps: ["ownership"] },
-      output: { format: "image/png", scale: 0.5, maxWidthPx: 16_384, maxHeightPx: 16_384,
-        maxPixels: 8_000_000, maxEncodedBytes: 8 * 1024 * 1024 },
+      output: agentCaptureOutput(window.frame.width, window.frame.height,
+        Math.max(1, ...inventory.displays.map(display => display.scale))),
       target: { kind: "window", target: selected.target, cgWindowId: window.cgWindowId,
         ownerPid: window.ownerPid, mappingEvidence: {
           state: "confirmed", claim: "cg-ax-correlation", source: "desktop-inventory",
@@ -874,6 +875,13 @@ export class RuntimeAgentMethods {
     if (!["display", "desktop-layout"].includes(selected.target.kind) || captureTarget === undefined) {
       throw new Error("Desktop capture требует exact display/layout target")
     }
+    const displays = fresh.display ? [fresh.display] : inventory.displays
+    const left = Math.min(...displays.map(display => display.bounds.x))
+    const top = Math.min(...displays.map(display => display.bounds.y))
+    const right = Math.max(...displays.map(display => display.bounds.x + display.bounds.width))
+    const bottom = Math.max(...displays.map(display => display.bounds.y + display.bounds.height))
+    const output = agentCaptureOutput(right - left, bottom - top,
+      Math.max(1, ...displays.map(display => display.scale)))
     const response = await this.#dispatch(session, "capture_desktop", {
       clientRequestId: this.#ids("agent-desktop-capture"),
       inventoryId: inventory.inventoryId,
@@ -882,8 +890,7 @@ export class RuntimeAgentMethods {
       cursor: "exclude",
       readinessPolicy: { policyId: "agent-display-observe",
         requiredSteps: ["complete-frame", "permission", "target"], disabledSteps: ["ownership"] },
-      output: { format: "image/png", scale: 0.5, maxWidthPx: 16_384, maxHeightPx: 16_384,
-        maxPixels: 8_000_000, maxEncodedBytes: 8 * 1024 * 1024 },
+      output,
       target: captureTarget,
     }, signal)
     const capture = response.data as { result: AdapterResult<ScreenCaptureResult>, frameAvailable: boolean }

@@ -1,4 +1,4 @@
-export const VIEWER_UI_URI = "ui://zavx0z/codex-app-v1.html"
+export const VIEWER_UI_URI = "ui://zavx0z/codex-app-v2.html"
 
 /** Прототип общего приложения: один mount, ожидающие MCP-запросы, fullscreen и PiP. */
 export const viewerUiHtml = `<!doctype html>
@@ -8,31 +8,34 @@ export const viewerUiHtml = `<!doctype html>
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
     :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-    body { margin: 0; padding: 16px; color: CanvasText; background: Canvas; }
-    header { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
-    h1 { font-size: 18px; margin: 0; }
-    button { padding: 8px 14px; cursor: pointer; font: inherit; }
-    #status { opacity: .75; }
-    main { margin-top: 16px; min-height: 120px; }
-    figure { margin: 0; }
-    img { display: block; max-width: 100%; max-height: calc(100vh - 140px); object-fit: contain; }
-    figcaption { margin-top: 8px; font-size: 12px; opacity: .8; }
-    body[data-mode="pip"] { padding: 8px; }
-    body[data-mode="pip"] header { gap: 6px; }
-    body[data-mode="pip"] h1, body[data-mode="pip"] #status, body[data-mode="pip"] #source { display: none; }
-    body[data-mode="pip"] img { max-height: calc(100vh - 70px); }
-    body[data-mode="pip"] main { margin-top: 8px; }
-    pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 100%; overflow: hidden; }
+    body { color: CanvasText; background: Canvas; }
+    #app { width: 100%; margin: 0 auto; overflow: hidden; }
+    header { height: 44px; display: flex; gap: 6px; align-items: center; padding: 6px 8px; overflow: hidden; }
+    h1 { font-size: 13px; margin: 0 6px 0 0; white-space: nowrap; }
+    button { padding: 5px 9px; cursor: pointer; font: inherit; font-size: 12px; white-space: nowrap; flex-shrink: 0; }
+    #status { font-size: 11px; opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    main { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; background: #101114; color: #f4f4f5; }
+    figure { position: absolute; inset: 0; margin: 0; }
+    img { display: block; width: 100%; height: 100%; object-fit: contain; }
+    figcaption { position: absolute; bottom: 0; left: 0; right: 0; padding: 5px 8px; font-size: 11px; background: #000a; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    #source { position: absolute; top: 8px; left: 10px; margin: 0; font-size: 12px; opacity: .7; z-index: 1; }
+    pre { position: absolute; inset: 30px 10px 10px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; overflow: hidden; font: inherit; font-size: 14px; }
+    body[data-mode="fullscreen"] #app, body[data-mode="pip"] #app { max-width: calc((100dvh - 44px) * 16 / 9); }
+    body[data-mode="pip"] h1, body[data-mode="pip"] #status { display: none; }
+    @media (max-width: 480px) { h1, #status { display: none; } }
     [hidden] { display: none !important; }
   </style>
 </head>
 <body>
+  <div id="app">
   <header>
     <h1>Codex App</h1>
     <button id="fullscreen">На весь экран</button>
     <button id="pip">Поверх чата</button>
     <button id="inline">В чате</button>
-    <button id="resume" hidden>Возобновить обновления</button>
+    <button id="resume" title="Возобновить обновления" hidden>↻</button>
     <span id="status" role="status">Подключение…</span>
   </header>
   <main>
@@ -43,6 +46,7 @@ export const viewerUiHtml = `<!doctype html>
     </figure>
     <pre id="text">Ожидание данных сервисов</pre>
   </main>
+  </div>
   <script>
     const status = document.getElementById("status")
     const image = document.getElementById("image")
@@ -196,9 +200,24 @@ export const viewerUiHtml = `<!doctype html>
       }
     }
 
+    function reportSize() {
+      const app = document.getElementById("app")
+      if (!app?.getBoundingClientRect) return
+      const height = Math.ceil(app.getBoundingClientRect().height)
+      if (height > 0 && typeof window.openai?.notifyIntrinsicHeight === "function") {
+        window.openai.notifyIntrinsicHeight(height)
+      }
+    }
+    if (typeof ResizeObserver === "function") {
+      const observer = new ResizeObserver(reportSize)
+      observer.observe(document.getElementById("app"))
+      window.addEventListener("pagehide", () => observer.disconnect())
+    }
+
     function syncMode(mode) {
       displayMode = mode ?? displayMode
       document.body.dataset.mode = displayMode
+      reportSize()
     }
 
     for (const mode of ["fullscreen", "pip", "inline"]) {
