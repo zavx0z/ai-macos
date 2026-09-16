@@ -17,7 +17,7 @@ test("справка раскрывается без Runtime, выполнени
   try {
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)])
     const tools = (await client.listTools()).tools
-    expect(tools.map(tool => tool.name)).toEqual(["zavx0z", "zavx0z_viewer", "zavx0z_viewer_next"])
+    expect(tools.map(tool => tool.name)).toEqual(["zavx0z", "codex_app", "codex_app_next"])
     expect(tools[0]?._meta?.["openai/outputTemplate"]).toBeUndefined()
     expect(tools[1]?._meta?.["openai/outputTemplate"]).toBe(VIEWER_UI_URI)
     const resources = (await client.listResources()).resources
@@ -74,7 +74,7 @@ test("action выполняется через UDS ровно один раз, i
     allowedActions: ["system_health", "test_write", "get_operation", "late_method", "fixture_frame"] } })
   const client = new Client({ name: "chat-executor-test", version: "1" })
   const [ct, st] = InMemoryTransport.createLinkedPair()
-  const call = (args: Record<string, unknown>) => client.callTool({ name: "zavx0z", arguments: args })
+  const call = (args: Record<string, unknown>, _meta?: Record<string, unknown>) => client.callTool({ name: "zavx0z", arguments: args, ...(_meta ? { _meta } : {}) })
   try {
     await Promise.all([client.connect(ct), server.connect(st)])
     expect((await call({})).isError).not.toBe(true)
@@ -107,7 +107,13 @@ test("action выполняется через UDS ровно один раз, i
       },
       frames: output => [output.frameRef],
     })
-    const firstFrame = await call({ node: "computer", action: "fixture_frame" })
+    const meta = { "openai/session": "first-screenshot" }
+    const firstFrame = await call({ node: "computer", action: "fixture_frame" }, meta)
+    expect(firstFrame.content).toContainEqual(expect.objectContaining({ type: "text", text: expect.stringContaining("CODEX_APP_OPEN_REQUIRED") }))
+    const opened = await client.callTool({ name: "codex_app", arguments: {}, _meta: meta })
+    expect(opened._meta?.viewer).toMatchObject({ version: 1, content: { kind: "image", data: png.toString("base64") } })
+    const nextResponse = await call({}, meta)
+    expect(nextResponse.content).not.toContainEqual(expect.objectContaining({ type: "text", text: expect.stringMatching(/^CODEX_APP_OPEN_REQUIRED:/) }))
     const secondFrame = await call({ node: "computer", action: "fixture_frame" })
     const firstScreenshot = firstFrame._meta?.screenshot as { version: number, streamId: string }
     const secondScreenshot = secondFrame._meta?.screenshot as { version: number, streamId: string }

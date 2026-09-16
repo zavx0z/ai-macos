@@ -70,22 +70,39 @@ test("MCP передаёт метаданные беседы, два серви�
   const call = (name: string, args: Record<string, unknown>, _meta = meta) => client.callTool({ name, arguments: args, _meta })
   try {
     await Promise.all([client.connect(ct), server.connect(st)])
-    const opened = await call("zavx0z_viewer", {})
+    const opened = await call("codex_app", {})
     const view = opened._meta?.viewer as { viewerId: string, accessToken: string }
     expect(view.viewerId).toBeString()
     const wait = call("zavx0z", { node: "viewer", action: "wait", input: { after: 0, waitMs: 1000 } })
     await call("zavx0z", { node: "viewer", action: "publish_demo", input: { service: "demo-a", text: "A" } })
     expect((await wait).structuredContent).toMatchObject({ content: { service: "demo-a" }, version: 1 })
     await call("zavx0z", { node: "viewer", action: "publish_demo", input: { service: "demo-b", text: "B" } })
-    const frame = await call("zavx0z_viewer_next", { viewerId: view.viewerId, accessToken: view.accessToken, after: 1 })
+    const frame = await call("codex_app_next", { viewerId: view.viewerId, accessToken: view.accessToken, after: 1 })
     expect(frame._meta?.viewer).toMatchObject({ version: 2, content: { service: "demo-b" } })
     expect(frame.content).toMatchObject([{ type: "text" }])
     expect((await call("zavx0z", { node: "viewer", action: "status" }, { "openai/session": "conversation:b" })).structuredContent)
       .toMatchObject({ viewerId: null, version: 0 })
     const descriptors = (await client.listTools()).tools
-    expect(descriptors.filter(tool => tool._meta?.["openai/outputTemplate"]).map(tool => tool.name)).toEqual(["zavx0z_viewer"])
+    expect(descriptors.filter(tool => tool._meta?.["openai/outputTemplate"]).map(tool => tool.name)).toEqual(["codex_app"])
   } finally {
     await client.close()
     await server.close()
   }
+})
+
+
+test("предложение открытия однократное; явное открытие и закрытие не вызывают его повторно", async () => {
+  const views = new ViewerSessions()
+  expect(views.suggestOpen(undefined)).toBe(false)
+  expect(views.suggestOpen("a")).toBe(true)
+  expect(views.suggestOpen("a")).toBe(false)
+  const view = views.open("a")
+  const signal = new AbortController().signal
+  await views.next({ ...view, mountId: "mount", after: 0, waitMs: 0 }, signal)
+  await views.next({ ...view, mountId: "mount", after: 0, release: true }, signal)
+  expect(views.suggestOpen("a")).toBe(false)
+  views.open("b")
+  expect(views.suggestOpen("b")).toBe(false)
+  expect(views.suggestOpen("c")).toBe(true)
+  views.close()
 })

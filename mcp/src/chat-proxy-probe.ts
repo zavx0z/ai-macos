@@ -15,7 +15,7 @@ export async function probeChatProxy(command: string, env: Record<string, string
       throw new Error("Кандидат не публикует ожидаемый протокол zavx0z")
     }
     if (tool._meta?.["openai/outputTemplate"]) throw new Error("Командный инструмент не должен создавать UI")
-    const uri = tools.find(item => item.name === "zavx0z_viewer")?._meta?.["openai/outputTemplate"]
+    const uri = tools.find(item => item.name === "codex_app")?._meta?.["openai/outputTemplate"]
     if (typeof uri !== "string") throw new Error("Кандидат не публикует UI resource")
     const resource = await client.readResource({ uri }, { signal: deadline })
     const html = resource.contents.find(item => "text" in item)

@@ -26,6 +26,8 @@ type Session = {
   displayedVersion: number
   displayMode: string
   waits: number
+  autoOpenSuggested: boolean
+  openRequested: boolean
   pending?: { finish(): void, cancel(): void }
 }
 
@@ -47,14 +49,25 @@ export class ViewerSessions {
     }
     if (this.#sessions.size >= 8) throw new Error("VIEWER_CAPACITY: достигнут предел активных бесед")
     const value: Session = { scope, id: randomUUID(), token: randomUUID(), version: 0, order: 0,
-      touchedAt: Date.now(), deliveredVersion: 0, displayedVersion: 0, displayMode: "unknown", waits: 0 }
+      touchedAt: Date.now(), deliveredVersion: 0, displayedVersion: 0, displayMode: "unknown", waits: 0,
+      autoOpenSuggested: false, openRequested: false }
     this.#sessions.set(scope, value)
     return value
   }
 
-  open(scope: string | undefined) {
+  open(scope: string | undefined, requested = true) {
     const value = this.get(scope)
+    if (requested) value.openRequested = true
     return { viewerId: value.id, accessToken: value.token, ...this.#snapshot(value, -1) }
+  }
+
+  /** Подсказка модели выдаётся один раз; сама по себе не означает открытия iframe. */
+  suggestOpen(scope: string | undefined): boolean {
+    if (!scope) return false
+    const value = this.get(scope)
+    if (value.autoOpenSuggested || value.openRequested || value.mountId) return false
+    value.autoOpenSuggested = true
+    return true
   }
 
   publish(scope: string | undefined, content: ViewerContent, order?: number) {
@@ -72,6 +85,7 @@ export class ViewerSessions {
     const value = scope ? this.#sessions.get(scope) : undefined
     return { scopeAvailable: !!scope, viewerId: value?.id ?? null, version: value?.version ?? 0,
       mounted: !!value?.mountId, mountId: value?.mountId ?? null,
+      openRequested: value?.openRequested ?? false, autoOpenSuggested: value?.autoOpenSuggested ?? false,
       deliveredVersion: value?.deliveredVersion ?? 0, displayedVersion: value?.displayedVersion ?? 0,
       displayMode: value?.displayMode ?? "unknown", pending: !!value?.pending, waits: value?.waits ?? 0 }
   }

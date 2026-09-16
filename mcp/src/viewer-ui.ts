@@ -1,6 +1,6 @@
-export const VIEWER_UI_URI = "ui://zavx0z/viewer-v2.html"
+export const VIEWER_UI_URI = "ui://zavx0z/codex-app-v1.html"
 
-/** Прототип общего приложения: один mount, ожидающие MCP-запросы и явный fullscreen. */
+/** Прототип общего приложения: один mount, ожидающие MCP-запросы, fullscreen и PiP. */
 export const viewerUiHtml = `<!doctype html>
 <html lang="ru">
 <head>
@@ -14,26 +14,40 @@ export const viewerUiHtml = `<!doctype html>
     button { padding: 8px 14px; cursor: pointer; font: inherit; }
     #status { opacity: .75; }
     main { margin-top: 16px; min-height: 120px; }
-    img { max-width: 100%; max-height: 80vh; object-fit: contain; }
+    figure { margin: 0; }
+    img { display: block; max-width: 100%; max-height: calc(100vh - 140px); object-fit: contain; }
+    figcaption { margin-top: 8px; font-size: 12px; opacity: .8; }
+    body[data-mode="pip"] { padding: 8px; }
+    body[data-mode="pip"] header { gap: 6px; }
+    body[data-mode="pip"] h1, body[data-mode="pip"] #status, body[data-mode="pip"] #source { display: none; }
+    body[data-mode="pip"] img { max-height: calc(100vh - 70px); }
+    body[data-mode="pip"] main { margin-top: 8px; }
     pre { white-space: pre-wrap; overflow-wrap: anywhere; font: inherit; }
     [hidden] { display: none !important; }
   </style>
 </head>
 <body>
   <header>
-    <h1>Завхоз</h1>
-    <button id="fullscreen">Развернуть приложение</button>
+    <h1>Codex App</h1>
+    <button id="fullscreen">На весь экран</button>
+    <button id="pip">Поверх чата</button>
+    <button id="inline">В чате</button>
     <button id="resume" hidden>Возобновить обновления</button>
     <span id="status" role="status">Подключение…</span>
   </header>
   <main>
     <h2 id="source"></h2>
-    <img id="image" hidden alt="">
+    <figure id="figure" hidden>
+      <img id="image" alt="">
+      <figcaption id="caption"></figcaption>
+    </figure>
     <pre id="text">Ожидание данных сервисов</pre>
   </main>
   <script>
     const status = document.getElementById("status")
     const image = document.getElementById("image")
+    const figure = document.getElementById("figure")
+    const caption = document.getElementById("caption")
     const text = document.getElementById("text")
     const source = document.getElementById("source")
     const resume = document.getElementById("resume")
@@ -88,7 +102,7 @@ export const viewerUiHtml = `<!doctype html>
       return {}
     }
 
-    function render(snapshot) {
+    async function render(snapshot) {
       if (!snapshot || snapshot.version < version) return
       version = snapshot.version ?? version
       const content = snapshot.content
@@ -96,16 +110,24 @@ export const viewerUiHtml = `<!doctype html>
       source.textContent = content.service
       if (content.kind === "image") {
         const url = "data:" + content.mimeType + ";base64," + content.data
-        image.onload = () => { if (image.src === url) displayedVersion = snapshot.version }
-        image.onerror = () => { status.textContent = "Не удалось показать изображение" }
         image.alt = content.caption
+        caption.textContent = content.caption
         image.src = url
-        image.hidden = false
+        figure.hidden = false
         text.hidden = true
+        try {
+          if (typeof image.decode === "function") await image.decode()
+          else await new Promise((resolve, reject) => {
+            if (image.complete && image.naturalWidth > 0) return resolve()
+            image.onload = resolve
+            image.onerror = () => reject(new Error("Изображение не загружено"))
+          })
+          if (image.src === url && version === snapshot.version) displayedVersion = snapshot.version
+        } catch { throw new Error("Не удалось показать снимок. Нажмите Возобновить обновления.") }
       } else {
         text.textContent = content.text
         text.hidden = false
-        image.hidden = true
+        figure.hidden = true
         displayedVersion = snapshot.version
       }
     }
@@ -114,8 +136,8 @@ export const viewerUiHtml = `<!doctype html>
       const args = { viewerId: viewer.viewerId, accessToken: viewer.accessToken,
         after: version, mountId, displayedVersion, displayMode, waitMs: 20000 }
       const response = typeof window.openai?.callTool === "function"
-        ? await window.openai.callTool("zavx0z_viewer_next", args)
-        : await request("tools/call", { name: "zavx0z_viewer_next", arguments: args })
+        ? await window.openai.callTool("codex_app_next", args)
+        : await request("tools/call", { name: "codex_app_next", arguments: args })
       const result = unwrap(response)
       if (result.isError) throw new Error(result.content?.find(item => item.type === "text")?.text ?? "Ошибка обновления")
       const snapshot = result._meta?.viewer ?? result.structuredContent
@@ -133,8 +155,8 @@ export const viewerUiHtml = `<!doctype html>
       if (!viewer) return
       const args = { viewerId: viewer.viewerId, accessToken: viewer.accessToken, after: version, mountId, release: true, waitMs: 0 }
       const released = typeof window.openai?.callTool === "function"
-        ? window.openai.callTool("zavx0z_viewer_next", args)
-        : request("tools/call", { name: "zavx0z_viewer_next", arguments: args })
+        ? window.openai.callTool("codex_app_next", args)
+        : request("tools/call", { name: "codex_app_next", arguments: args })
       void released.catch(() => {})
     }
 
@@ -146,7 +168,7 @@ export const viewerUiHtml = `<!doctype html>
         while (!disposed) {
           const snapshot = await next()
           if (disposed) break
-          render(snapshot)
+          await render(snapshot)
           status.textContent = "Связь активна · ревизия " + version + " · " + displayMode
         }
       } catch (error) {
@@ -155,7 +177,7 @@ export const viewerUiHtml = `<!doctype html>
       } finally { running = false }
     }
 
-    function accept(value) {
+    async function accept(value) {
       const result = unwrap(value)
       if (result.isError) {
         status.textContent = result.content?.find(item => item.type === "text")?.text ?? "Не удалось открыть приложение"
@@ -165,23 +187,38 @@ export const viewerUiHtml = `<!doctype html>
       if (!incoming?.viewerId || !incoming.accessToken) return
       if (viewer && viewer.viewerId !== incoming.viewerId) return
       viewer = incoming
-      render(incoming)
-      void listen()
+      try {
+        await render(incoming)
+        void listen()
+      } catch (error) {
+        status.textContent = error.message
+        resume.hidden = false
+      }
     }
 
-    document.getElementById("fullscreen").addEventListener("click", async () => {
-      try {
-        if (!window.openai?.requestDisplayMode && !availableModes.includes("fullscreen")) {
-          throw new Error("Хост не объявил режим fullscreen")
-        }
-        const result = typeof window.openai?.requestDisplayMode === "function"
-          ? await window.openai.requestDisplayMode({ mode: "fullscreen" })
-          : await request("ui/request-display-mode", { mode: "fullscreen" })
-        displayMode = result?.mode ?? window.openai?.displayMode ?? "unknown"
-        status.textContent = displayMode === "fullscreen" ? "Приложение развёрнуто" : "Хост оставил режим: " + displayMode
-      } catch (error) { status.textContent = error.message }
+    function syncMode(mode) {
+      displayMode = mode ?? displayMode
+      document.body.dataset.mode = displayMode
+    }
+
+    for (const mode of ["fullscreen", "pip", "inline"]) {
+      document.getElementById(mode).addEventListener("click", async () => {
+        try {
+          if (availableModes.length > 0 && !availableModes.includes(mode)) {
+            throw new Error("Хост не объявил режим " + mode)
+          }
+          const result = typeof window.openai?.requestDisplayMode === "function"
+            ? await window.openai.requestDisplayMode({ mode })
+            : await request("ui/request-display-mode", { mode })
+          syncMode(result?.mode ?? window.openai?.displayMode ?? "unknown")
+          status.textContent = displayMode === mode ? "Режим: " + displayMode : "Хост оставил режим: " + displayMode
+        } catch (error) { status.textContent = error.message }
+      })
+    }
+    resume.addEventListener("click", () => {
+      version = displayedVersion
+      void listen()
     })
-    resume.addEventListener("click", () => { void listen() })
     window.addEventListener("message", event => {
       if (event.source !== window.parent || event.data?.jsonrpc !== "2.0") return
       const message = event.data
@@ -192,7 +229,7 @@ export const viewerUiHtml = `<!doctype html>
         }
         bridgeReady = true
         availableModes = message.result?.hostContext?.availableDisplayModes ?? []
-        displayMode = message.result?.hostContext?.displayMode ?? displayMode
+        syncMode(message.result?.hostContext?.displayMode)
         window.parent.postMessage({ jsonrpc: "2.0", method: "ui/notifications/initialized", params: {} }, "*")
         void listen()
         return
@@ -205,23 +242,26 @@ export const viewerUiHtml = `<!doctype html>
         else waiting.resolve(message.result)
         return
       }
-      if (message.method === "ui/notifications/tool-result") accept(message.params)
-      if (message.method === "ui/notifications/host-context-changed") displayMode = message.params?.displayMode ?? displayMode
+      if (message.method === "ui/notifications/tool-result") void accept(message.params)
+      if (message.method === "ui/notifications/host-context-changed") {
+        syncMode(message.params?.displayMode)
+        availableModes = message.params?.availableDisplayModes ?? availableModes
+      }
       if (message.method === "ui/resource-teardown") {
         dispose()
         window.parent.postMessage({ jsonrpc: "2.0", id: message.id, result: {} }, "*")
       }
     })
     window.addEventListener("openai:set_globals", event => {
-      displayMode = event.detail?.globals?.displayMode ?? displayMode
-      accept(event.detail?.globals?.toolResponseMetadata)
+      syncMode(event.detail?.globals?.displayMode)
+      void accept(event.detail?.globals?.toolResponseMetadata)
     })
     window.addEventListener("pagehide", dispose)
     window.parent.postMessage({ jsonrpc: "2.0", id: initializeId, method: "ui/initialize", params: {
-      protocolVersion: "2026-01-26", appInfo: { name: "Завхоз", version: "1" },
-      appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
+      protocolVersion: "2026-01-26", appInfo: { name: "Codex App", version: "1" },
+      appCapabilities: { availableDisplayModes: ["inline", "fullscreen", "pip"] },
     } }, "*")
-    accept(window.openai?.toolResponseMetadata)
+    void accept(window.openai?.toolResponseMetadata)
   </script>
 </body>
 </html>`

@@ -2,6 +2,7 @@ import {afterEach, beforeEach, describe, expect, test} from "bun:test"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 import { hostname } from "node:os"
+import { SCREENSHOT_UI_URI } from "../src/screenshot-ui.ts"
 
 let transport: StdioClientTransport | undefined
 let fakeClipboard = ""
@@ -354,21 +355,21 @@ describe("ai-macos MCP server", () => {
 
     const openPipTool = listed.tools.find((tool) => tool.name === "open_screenshot_pip")
     expect(openPipTool?._meta).toMatchObject({
-      ui: { resourceUri: "ui://widget/ai-macos-screenshot-v5.html" },
-      "openai/outputTemplate": "ui://widget/ai-macos-screenshot-v5.html",
+      ui: { resourceUri: SCREENSHOT_UI_URI },
+      "openai/outputTemplate": SCREENSHOT_UI_URI,
       "openai/widgetAccessible": true,
     })
 
     const resources = await client.listResources()
     expect(resources.resources).toContainEqual(expect.objectContaining({
-      uri: "ui://widget/ai-macos-screenshot-v5.html",
+      uri: SCREENSHOT_UI_URI,
       mimeType: "text/html;profile=mcp-app",
     }))
-    const resource = await client.readResource({ uri: "ui://widget/ai-macos-screenshot-v5.html" })
+    const resource = await client.readResource({ uri: SCREENSHOT_UI_URI })
     const screenshotResource = resource.contents[0]
     expect(screenshotResource).toBeDefined()
     expect(screenshotResource).toMatchObject({
-      uri: "ui://widget/ai-macos-screenshot-v5.html",
+      uri: SCREENSHOT_UI_URI,
       mimeType: "text/html;profile=mcp-app",
     })
     expect(screenshotResource?._meta).toMatchObject({
