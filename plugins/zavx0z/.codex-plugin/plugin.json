@@ -5,19 +5,20 @@
   "author": {
     "name": "zavx0z"
   },
-  "mcpServers": "./.mcp.json",
   "interface": {
     "displayName": "zavx0z",
     "shortDescription": "Завхоз - заведующий цифровым хозяйством",
-    "longDescription": "Единая точка входа к локальному Runtime. Начните с пустого запроса {}.",
+    "longDescription": "Навык завхоза и существующее аккаунтное MCP-подключение.",
     "developerName": "zavx0z",
     "category": "Productivity",
     "capabilities": [
       "Read",
       "Write"
     ],
-    "defaultPrompt": "Вызови zavx0z с {} и прочитай возвращённую справку.",
+    "defaultPrompt": "Используй $zavx0z и получи справку существующего подключения.",
     "composerIcon": "./assets/logo.png",
     "logo": "./assets/logo.png"
-  }
+  },
+  "apps": "./.app.json",
+  "skills": "./skills/"
 }

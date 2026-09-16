@@ -1,0 +1,4 @@
+interface:
+  display_name: "zavx0z"
+  short_description: "Единая точка входа к цифровому хозяйству"
+  default_prompt: "Используй $zavx0z: вызови существующий инструмент с {} и прочитай справку."
