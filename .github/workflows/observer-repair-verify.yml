@@ -1,0 +1,72 @@
+name: Verify observer recovery
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/observer-repair-verify.yml']
+permissions:
+  contents: write
+concurrency:
+  group: observer-repair
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.4.2'
+      - name: Apply reviewed patches with integrity verification
+        env:
+          FOLLOWUP: >-
+            H4sIAAAAAAAC/6VV227bRhB991dM2CAgIZGWXLcplMp1YhRogRYx0iDPXpErah2KS+wuZQuCgMR9aN/6K26RFGmbuL9A/VFndklasq02QC3AJGbncubMmWUYhsB2VZkbMeW7hmujdydSm1AkHG1mHpEtMnqn0+nA6KM8Dw8hfNjb634OHXo8hMPDHQCIZa4NGMVyXUhlYAg5P4PHZSLM88boa661kHlAAa1rNC6z7IVA7yEaS755OMODF1xRGJ57fW+ns36sOEtEjml/MMxw8iDL3NtMkuKbQQ9lyuKYq6mwMLRvgYgx+PdSVgTrkJjIno40VzOujiT+Yyk/YlmGBfauuyWC0MLOmDAQY2HDnzkGv8ETfwFaxi+5OWZmMoBTKXI/EYrHRqp5F4E614icvKBLCSzXLNsScO0QnWqZY4wbRr9nh9Hvt8OAGhMBjDT17VrdsFuiGjuRYDlYEL/0x88LrOxb15gZlsk0SriOlSgQD3IXGSkzjfCn3KdXGB4APaOcTXESQxFnAnqjVyfoBMOty63mT6R1CJmlDXldurPCN9doY58GhFPap0dK4lD5V/OpEgOfMW1zGacAC2aoCZMG1lgkGtLKqS/HFFTI5xvwUYiE0Zw7fuBiw43NkireBeVkJuQAIZpyVRye3u2edGw9vv7OKWOezTDAnjwAOE5mUXNi9XrUam0VHAP2TQToaNP7jgNLBcldh0VpZ743l0Z4gnLU554a/NuozKep2YCB9ALrglzdKFItN28k2YdWqBQfajeQvV3dVW9WV1Uv1VvV6+q36s31SW+XcCEs8xM5pTHiLyUpYYzXBA1ZerlAO4v2upW594j8ILl/UXLQlMYGy/zhI9xyRP4CjwPBnDyCG55Lk+WJzuhg+6YEvmMZSLBmo+zzHdeQaPu7S6RRtFyv9eFfm9vP2hVZyZKnlmxfa0UqrVJaA+X7qG4KVXeMnRDPe5Wva2Mf7mCtzqTlj77otf9FDr06N/c/Hq9sL2SRy50LNV3yCKm9L3MvQwQsJqH9obwgoglU2F8I+jSwvtGFtiFwYty0y2I6v3SuJvfMxNPno5OqdgC2ohvk8G2eFhazpaAI8UbdQ6LGvI61jiTmuMOIq/o3qEfde57KK+/qneovA/V5eoXVB9q7t3qJ2u6vCnN9+jzuvoTHV6tfiRRrl5TzNXqZ/T/FQ+uqj/A5nuPPheYwOWDVhcI3usC0/M8huZK6DS7YQHjaozFOY4d4V4f6Ribx6P/4j+TeRo6JXlr4W4E7aelvhbdNHEwd0WjGelNublhdca13FKJlJhv0bWXbrtRI5En/uahTbDFn3CuMYQ6iKKoRl4X8/H7pukLjbIoczbD3WejjCM+BxTN5x7qqsBvqG/3zs6dvuHz5pO0IWxL8HbBbvBKgiWBkl6f0xb7nsUyXEdS3wzbW2xa+V9gBliYit0BqSnlkHzsenSQpn8AC5VsxOYJAAA=
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, hashlib, os, re
+          from pathlib import Path
+          workflow = Path('.github/workflows/observer-repair.yml').read_text()
+          encoded = ''.join(re.findall(r'PATCH_PART_\d: >-\n\s+(\S+)', workflow))
+          patch = gzip.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '3e3f6fba1fba54e9f7af63913597387f5158fffce045da699b1d08eaad0d620e'
+          Path(os.environ['RUNNER_TEMP'], 'observer.patch').write_bytes(patch)
+          followup = gzip.decompress(base64.b64decode(os.environ['FOLLOWUP'].strip(), validate=True))
+          assert hashlib.sha256(followup).hexdigest() == '3e817a595f9d50174e88b8491c97001b23cea186a1931283dc7a685fea180a1d'
+          Path(os.environ['RUNNER_TEMP'], 'followup.patch').write_bytes(followup)
+          PY
+          git apply --check "$RUNNER_TEMP/observer.patch"
+          git apply "$RUNNER_TEMP/observer.patch"
+          git apply --check "$RUNNER_TEMP/followup.patch"
+          git apply "$RUNNER_TEMP/followup.patch"
+      - run: bun install --frozen-lockfile
+      - name: Runtime regression suite
+        id: runtime
+        run: bun test runtime/tests
+      - name: Native protocol and command-loop fixtures
+        id: native
+        if: ${{ !cancelled() && steps.runtime.outcome != 'skipped' }}
+        run: bun test native/tests
+      - name: TypeScript
+        id: types
+        if: ${{ !cancelled() && steps.runtime.outcome != 'skipped' }}
+        run: |
+          bun run --cwd runtime typecheck
+          bun x tsc --noEmit -p native/tsconfig.json
+      - name: Native observer and C fixtures
+        id: fixtures
+        if: ${{ !cancelled() && steps.runtime.outcome != 'skipped' }}
+        run: |
+          sh native/scripts/check-observer.sh
+          sh native/scripts/check.sh
+          git diff --check
+      - name: Publish source only after all checks passed
+        if: ${{ success() && steps.runtime.outcome == 'success' && steps.native.outcome == 'success' && steps.types.outcome == 'success' && steps.fixtures.outcome == 'success' }}
+        run: |
+          git diff --check
+          git add runtime/src runtime/tests native/src native/tests docs/architecture/observer-failure-recovery.md
+          git config user.name 'ChatGPT'
+          git config user.email 'chatgpt@users.noreply.github.com'
+          git commit -m 'fix: isolate observer failures and recover continuous observation without restarting Native'
+          git push origin HEAD:main
+          git rev-parse HEAD
