@@ -756,9 +756,31 @@ describe("RuntimeScreenAdapter", () => {
   test("bounded wait вызывает cancel и сохраняет unresolved task", async () => {
     const native = new FakeNativeDriver(new Promise<NativeCaptureCompletion>(() => {}))
     const runtime = services()
-    const deadline = new Date(Date.now() + 15).toISOString()
-    const result = await new RuntimeScreenAdapter(host, runtime, native, () => new Date(), 10)
-      .capture(context(captureTarget, deadline), request())
+    let clockMs = nowMs
+    const deadline = new Date(nowMs + 5_000).toISOString()
+    let confirmStarted!: () => void
+    let resumeWait!: () => void
+    const started = new Promise<void>(resolve => { confirmStarted = resolve })
+    const resume = new Promise<void>(resolve => { resumeWait = resolve })
+    const captureContext = context(captureTarget, deadline)
+    captureContext.control.checkpoint = async (stage) => {
+      if (stage !== "screen.capture-started") return
+      confirmStarted()
+      await resume
+    }
+    const pending = new RuntimeScreenAdapter(
+      host,
+      runtime,
+      native,
+      () => new Date(clockMs),
+      10,
+    ).capture(captureContext, request())
+    await started
+    expect(native.requests).toHaveLength(1)
+    expect(native.cancelled).toEqual([])
+    clockMs = Date.parse(deadline) - 15
+    resumeWait()
+    const result = await pending
     expect(result.ok).toBe(false)
     if (result.ok) throw new Error("expected failure")
     expect(result.error.code).toBe("operation-outcome-unknown")
