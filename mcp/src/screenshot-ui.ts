@@ -97,6 +97,8 @@ export const screenshotUiHtml = String.raw`<!doctype html>
         const imageBlock = content.find((item) => item?.type === "image" && typeof item?.data === "string");
         const privateImage = result._meta?.screenshot;
         const metadata = result.structuredContent ?? {};
+        // Поздний ответ initial/manual fetch не заменяет более новый кадр.
+        if (typeof metadata.version === "number" && metadata.version < lastVersion) return
         if (typeof metadata.version === "number") lastVersion = metadata.version;
         const imageData = imageBlock?.data ?? privateImage?.data;
         if (typeof imageData !== "string") return;
