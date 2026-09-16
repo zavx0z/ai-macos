@@ -963,11 +963,13 @@ type OwnedRuntimeProcesses = {
   helper: ProcessIncarnation
 }
 
+type CapturedProcessState = "alive" | "alive-orphan" | "alive-command-changed" | "alive-orphan-command-changed" | "gone"
+
 type BootoutConvergenceSample = {
   elapsedMs: number
   label: "running" | "removing" | "absent"
-  parent: "alive" | "alive-orphan" | "gone"
-  helper: "alive" | "alive-orphan" | "gone"
+  parent: CapturedProcessState
+  helper: CapturedProcessState
 }
 
 class BootoutConvergenceError extends Error {
@@ -2477,15 +2479,15 @@ async function captureOwnedRuntimeProcesses(
 async function capturedProcessState(
   runner: CommandRunner,
   captured: ProcessIncarnation,
-): Promise<"alive" | "alive-orphan" | "gone"> {
+): Promise<CapturedProcessState> {
   const current = await readProcessIncarnation(runner, captured.pid)
   if (current === undefined) return "gone"
   if (current.startedAt !== captured.startedAt) return "gone"
-  if (current.command !== captured.command) {
-    if (current.state?.startsWith("Z") !== true) {
-      throw new Error(`Process ${captured.pid} изменил command при том же PID/lstart вне zombie state`)
-    }
-  }
+  // После bootout смена command не доказывает завершение захваченного процесса.
+  // Ждём исчезновения именно PID + времени рождения, сохраняя строгий admission до bootout.
+  if (current.command !== captured.command) return current.parentPid === captured.parentPid
+    ? "alive-command-changed"
+    : "alive-orphan-command-changed"
   return current.parentPid === captured.parentPid ? "alive" : "alive-orphan"
 }
 

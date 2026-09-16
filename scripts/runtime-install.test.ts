@@ -1338,15 +1338,41 @@ test("exact removing label без PID остаётся pending до not-found", 
   expect(Date.now() - began).toBeGreaterThanOrEqual(100)
 })
 
-test("zombie command mismatch остаётся живым witness до исчезновения PID", async () => {
+test("чужой command родителя до bootout запрещает остановку и обновление", async () => {
+  const fixture = await createFixture()
+  const first = await planRuntimeInstall(fixture.options)
+  await applyRuntimeInstall(first, fixture.options)
+  fixture.runner.commit = "f".repeat(40)
+  fixture.runner.loaded = true
+  fixture.runner.parentCommandBeforeBootout = "/tmp/foreign-runtime"
+  const options = {
+    ...fixture.options,
+    runtimeAdmin: successfulAdmin({
+      running: true,
+      runtimeEpoch: "runtime:wrong-parent-command",
+      runtimeBuildId: first.release.runtimeBuildId,
+      nativeBuildId: first.release.nativeBuildId,
+      activeOperations: 0,
+      quarantinedResources: 0,
+    }),
+  }
+  const update = await planRuntimeInstall(options)
+
+  await expect(applyRuntimeInstall(update, options)).rejects.toThrow()
+  expect(fixture.runner.removing).toBe(false)
+  expect(fixture.runner.bootstrapCalls).toBe(1)
+  expect(await readlink(join(options.paths.installRoot, "current"))).toBe(first.release.releasePath)
+})
+
+test.each([false, true])("смена command (zombie=%s) ждёт исчезновения captured PID", async zombie => {
   const fixture = await createFixture()
   const first = await planRuntimeInstall(fixture.options)
   await applyRuntimeInstall(first, fixture.options)
   fixture.runner.commit = "9".repeat(40)
   fixture.runner.loaded = true
   fixture.runner.helperExitPolls = 3
-  fixture.runner.helperZombieAfterBootout = true
-  fixture.runner.helperCommandAfterBootout = "<defunct>"
+  fixture.runner.helperZombieAfterBootout = zombie
+  fixture.runner.helperCommandAfterBootout = zombie ? "<defunct>" : "(meta-input-helper)"
   const options = {
     ...fixture.options,
     shutdownConvergenceTimeoutMs: 500,
@@ -1390,7 +1416,13 @@ test("live command mismatch при том же PID/lstart остаётся failc
   }
   const update = await planRuntimeInstall(options)
 
-  await expect(applyRuntimeInstall(update, options)).rejects.toThrow("rollback incomplete")
+  let failure: unknown
+  try { await applyRuntimeInstall(update, options) }
+  catch (error) { failure = error }
+  expect(failure).toBeInstanceOf(AggregateError)
+  const convergence = (failure as AggregateError).errors[0] as Error & { lastSample?: unknown }
+  expect(convergence.lastSample).toEqual({ elapsedMs: 500, label: "absent",
+    parent: "gone", helper: "alive-orphan-command-changed" })
   expect(fixture.runner.bootstrapCalls).toBe(1)
 })
 
@@ -1721,6 +1753,7 @@ class FakeRunner implements CommandRunner {
   processStartedAt = "Mon Sep 15 21:43:56 2026"
   helperZombieAfterBootout = false
   helperCommandAfterBootout: string | undefined
+  parentCommandBeforeBootout: string | undefined
   bootstrapCalls = 0
   appearAtPrint: number | undefined
   printCalls = 0
@@ -1799,7 +1832,8 @@ class FakeRunner implements CommandRunner {
         }
         if (this.removing && !this.processIdsReused && pid === 4243 && this.helperExitPolls > 0) this.helperExitPolls--
         else if (this.removing && !this.processIdsReused && pid === 4243) this.helperPresent = false
-        if (pid === 4242 && this.parentPresent) return ok(this.processLine(4242, 1, this.launchProgram))
+        if (pid === 4242 && this.parentPresent) return ok(this.processLine(4242, 1,
+          this.removing ? this.launchProgram : this.parentCommandBeforeBootout ?? this.launchProgram))
         if (pid === 4243 && this.helperPresent) {
           return ok(this.processLine(4243, this.helperOrphaned ? 1 : 4242,
             this.removing ? this.helperCommandAfterBootout ?? this.helperPath() : this.helperPath(),
