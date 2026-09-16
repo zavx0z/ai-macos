@@ -37,6 +37,13 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Archive tested source (without credentials or working files)
+        run: git archive --format=tar.gz HEAD > "$RUNNER_TEMP/source.tar.gz"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: source-${{ github.sha }}
+          path: ${{ runner.temp }}/source.tar.gz
+          retention-days: 3
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
