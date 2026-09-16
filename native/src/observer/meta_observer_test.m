@@ -262,7 +262,7 @@ static void test_subscription_budget_is_bounded(void) {
       &budget, 100, META_OBSERVER_MAX_WINDOWS + 1));
 }
 
-static void test_subscribed_application_mapping_miss_is_global_event(void) {
+static void test_activation_is_event_without_idle_subscription(void) {
   MetaRunningApplicationFixture *applicationFixture =
       [[MetaRunningApplicationFixture alloc] init];
   applicationFixture.processIdentifier = getpid();
@@ -288,9 +288,8 @@ static void test_subscribed_application_mapping_miss_is_global_event(void) {
     return nil;
   }];
   [observer handleActivatedApplication:application];
-  assert(([observer.trace isEqual:@[
-    @"subscribe-application", @"resolve"
-  ]]));
+  // Смена focus не выполняет подписки или AX resolve в простое.
+  assert(observer.trace.count == 0);
   NSArray *events = [observer takeEvents];
   assert(events.count == 1);
   assert([events[0][@"kind"] isEqual:@"focus"]);
@@ -304,9 +303,10 @@ static void test_subscribed_application_mapping_miss_is_global_event(void) {
   failed.trace = [NSMutableArray array];
   mark_all_coverage_ready(failed);
   [failed handleActivatedApplication:application];
-  assert([failed.trace isEqual:@[@"subscribe-application"]]);
-  assert([failed.coverage[@"state"] isEqual:@"unavailable"]);
-  assert([failed.coverage[@"gapDetected"] boolValue]);
+  assert(failed.trace.count == 0);
+  assert([failed.coverage[@"state"] isEqual:@"ready"]);
+  assert(![failed.coverage[@"gapDetected"] boolValue]);
+  assert([failed takeEvents].count == 1);
 }
 
 static void test_new_window_subscribes_before_mapping(void) {
@@ -489,7 +489,7 @@ int main(void) {
     test_subscription_gap_and_target_generation();
     test_synthetic_identity_conflict_and_buffer_gap();
     test_subscription_budget_is_bounded();
-    test_subscribed_application_mapping_miss_is_global_event();
+    test_activation_is_event_without_idle_subscription();
     test_new_window_subscribes_before_mapping();
     test_termination_keeps_new_pid_incarnation();
   }

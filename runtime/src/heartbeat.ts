@@ -18,31 +18,38 @@ export function runtimeHeartbeatFailureReason(failure: RuntimeHeartbeatFailure):
   return `Native heartbeat ${failure.failureClass}; elapsedMs=${failure.elapsedMs}; timerLagMs=${failure.timerLagMs}`
 }
 
+/** Heartbeat обслуживает только незавершённую Native operation, не простой desktop. */
 export function startRuntimeHeartbeat(options: {
   native: Pick<NativeAdapter, "heartbeat">
   generation: NativeGeneration
   onFailure(error: RuntimeHeartbeatFailure): void
+  active?: boolean
   intervalMs?: number
   deadlineMs?: number
   monotonicNow?: () => number
-}): { stop(): Promise<void> } {
+}): { setActive(active: boolean): void, stop(): Promise<void> } {
   const intervalMs = options.intervalMs ?? 250
   const deadlineMs = options.deadlineMs ?? 500
   if (!Number.isSafeInteger(intervalMs) || intervalMs < 1 || intervalMs > 250
     || !Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 500) throw new Error("Heartbeat cadence выходит за watchdog budget")
   let stopped = false
+  let active = options.active ?? true
+  let epoch = 0
   let timer: ReturnType<typeof setTimeout> | undefined
   let control: AbortController | undefined
   let pending: Promise<void> | undefined
   const monotonicNow = options.monotonicNow ?? (() => performance.now())
 
+  const kick = () => {
+    if (!stopped && active && pending === undefined) pending = beat()
+  }
   const beat = async () => {
-    if (stopped) return
+    const ownEpoch = epoch
     const startedAt = monotonicNow()
     const request = { requestId: `heartbeat:${crypto.randomUUID()}`, ...options.generation,
       deadlineAt: new Date(Date.now() + deadlineMs).toISOString() }
-    control = new AbortController()
-    const controller = control
+    const controller = new AbortController()
+    control = controller
     const signal = controller.signal
     let deadline: ReturnType<typeof setTimeout> | undefined
     let onAbort!: () => void
@@ -60,30 +67,44 @@ export function startRuntimeHeartbeat(options: {
         throw new RuntimeHeartbeatFailure("invalid-ack", milliseconds(monotonicNow() - startedAt), 0)
       }
     } catch (cause) {
-      if (!stopped) {
+      // Поздняя ошибка уже завершённой operation не отравляет следующую/простой.
+      if (!stopped && active && epoch === ownEpoch) {
         stopped = true
         const elapsedMs = milliseconds(monotonicNow() - startedAt)
-        const failure = cause instanceof RuntimeHeartbeatFailure
-          ? cause
-          : new RuntimeHeartbeatFailure("adapter", elapsedMs, Math.max(0, elapsedMs - deadlineMs), cause)
-        options.onFailure(failure)
+        options.onFailure(cause instanceof RuntimeHeartbeatFailure ? cause
+          : new RuntimeHeartbeatFailure("adapter", elapsedMs, Math.max(0, elapsedMs - deadlineMs), cause))
       }
     } finally {
       if (deadline !== undefined) clearTimeout(deadline)
       signal.removeEventListener("abort", onAbort)
-      if (!stopped) {
-        timer = setTimeout(() => { pending = beat() }, intervalMs)
-        timer.unref?.()
+      control = undefined
+      pending = undefined
+      if (!stopped && active) {
+        if (epoch !== ownEpoch) queueMicrotask(kick)
+        else {
+          timer = setTimeout(() => { timer = undefined; kick() }, intervalMs)
+          timer.unref?.()
+        }
       }
     }
   }
-  pending = beat()
-  return { async stop() {
-    stopped = true
-    if (timer !== undefined) clearTimeout(timer)
-    control?.abort(new Error("Runtime heartbeat остановлен"))
-    await pending
-  } }
+  kick()
+  return {
+    setActive(next) {
+      if (stopped || active === next) return
+      active = next
+      epoch++
+      if (timer !== undefined) { clearTimeout(timer); timer = undefined }
+      if (!active) control?.abort(new Error("Native operation завершена"))
+      else kick()
+    },
+    async stop() {
+      stopped = true
+      if (timer !== undefined) clearTimeout(timer)
+      control?.abort(new Error("Runtime heartbeat остановлен"))
+      await pending
+    },
+  }
 }
 
 function milliseconds(value: number): number {

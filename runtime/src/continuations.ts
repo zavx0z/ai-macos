@@ -249,7 +249,12 @@ export class NativeContinuationRegistry implements NativeContinuationIssuer, Nat
     if (!Number.isFinite(requestedDeadline) || requestedDeadline <= now.getTime()) {
       throw new Error("Continuation requestedDeadlineAt уже истёк")
     }
-    const deadlineAt = new Date(Math.min(requestedDeadline, now.getTime() + 1_000)).toISOString()
+    // Единственный result-wait использует остаток capture operation и stop budget.
+    // Обычные status/cancel/release сохраняют короткий отдельный cleanup budget.
+    const maximumDeadline = request.purpose === "result" && handle.state === "active"
+      ? Math.max(now.getTime() + 1_000, Date.parse(operation.context.deadlineAt) + 1_000)
+      : now.getTime() + 1_000
+    const deadlineAt = new Date(Math.min(requestedDeadline, maximumDeadline)).toISOString()
     const idempotencyKey = continuationIdempotencyKey(request)
     let cleanupRequestId = this.#cleanupIds.get(idempotencyKey)
     if (cleanupRequestId === undefined) {

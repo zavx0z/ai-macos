@@ -1,3 +1,4 @@
+import { bindDeadline, signalDeadline } from "./deadline.ts"
 import { capabilityIsReady, contractJsonSchema, parseWireValue, utf8ByteLength, z, type CapabilityId, type RuntimeClientSession } from "@meta/shared/contracts"
 import type { RuntimeCore } from "./core.ts"
 import { RuntimeContractError } from "./errors.ts"
@@ -61,6 +62,7 @@ export class MethodRegistry {
   readonly #runtime: RuntimeCore
   readonly #methods = new Map<string, StoredMethod>()
   readonly #listeners = new Set<() => void>()
+  readonly #settledListeners = new Set<() => void>()
   readonly internal: InternalMethodRegistry
   #revision = 0
   #internalRevision = 0
@@ -111,7 +113,10 @@ export class MethodRegistry {
       availableDuringDrain: frozen.availableDuringDrain ?? false,
       invoke: async (context, raw) => {
         const input = parseWireValue(frozen.input, raw, { maxBytes: maxRequestBytes, maxDepth: 32 })
+        const inherited = signalDeadline(context.signal)
+        const deadlineAtMs = inherited ?? Date.now() + timeoutMs
         const controller = new AbortController()
+        bindDeadline(controller.signal, deadlineAtMs)
         const onAbort = () => controller.abort(context.signal.reason)
         context.signal.addEventListener("abort", onAbort, { once: true })
         if (context.signal.aborted) onAbort()
@@ -122,7 +127,7 @@ export class MethodRegistry {
             abortListener = () => reject(new RuntimeContractError("cancelled", "Method отменён", name))
             controller.signal.addEventListener("abort", abortListener, { once: true })
             if (controller.signal.aborted) abortListener()
-            timer = setTimeout(() => controller.abort("method deadline"), timeoutMs)
+            if (inherited === undefined) timer = setTimeout(() => controller.abort("method deadline"), Math.max(0, deadlineAtMs - Date.now()))
           })
           if (controller.signal.aborted) throw new RuntimeContractError("cancelled", "Method отменён", name)
           const output = await Promise.race([execute({ ...context, signal: controller.signal }, input), stop])
@@ -190,7 +195,17 @@ export class MethodRegistry {
     }
     if (this.#runtime.admissionSealed && !method.availableDuringDrain) throw new RuntimeContractError("capability-unavailable", "Runtime admission sealed", "method-registry")
     if (!method.requiredCapabilities.every(id => capabilityIsReady(this.#runtime.capabilities, id))) throw new RuntimeContractError("capability-unavailable", "Required capabilities unavailable", "method-registry")
-    return method.invoke({ session, signal }, input)
+    try { return await method.invoke({ session, signal }, input) }
+    finally {
+      for (const listener of this.#settledListeners) {
+        try { listener() } catch { /* Проверка lifecycle не меняет возвращаемый результат. */ }
+      }
+    }
+  }
+
+  subscribeCallSettled(listener: () => void): () => void {
+    this.#settledListeners.add(listener)
+    return () => { this.#settledListeners.delete(listener) }
   }
 
   subscribeCatalogChanged(listener: () => void): () => void {

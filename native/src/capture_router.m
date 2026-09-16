@@ -665,6 +665,24 @@ bool meta_capture_router_status(MetaCaptureRouter *router,
   return result;
 }
 
+void meta_capture_router_wait_result(MetaCaptureRouter *router,
+                                     const char *task_ref,
+                                     double deadline_unix_seconds) {
+  if (router == NULL || !valid_identifier(task_ref, 127)) return;
+  NSDate *deadline = [NSDate dateWithTimeIntervalSince1970:deadline_unix_seconds];
+  [router->lock lock];
+  CaptureEntry *entry = find_entry(router, task_ref);
+  if (entry == NULL || entry->releasing) { [router->lock unlock]; return; }
+  entry->in_flight += 1;
+  while (entry->result == NULL && !entry->released && !entry->releasing &&
+         (!entry->layout || !entry->layout_start_settled || entry->callback_pending)) {
+    if (![router->lock waitUntilDate:deadline]) break;
+  }
+  entry->in_flight -= 1;
+  [router->lock broadcast];
+  [router->lock unlock];
+}
+
 bool meta_capture_router_result(MetaCaptureRouter *router,
                                 const char *task_ref,
                                 MetaCaptureTaskStatus *status,

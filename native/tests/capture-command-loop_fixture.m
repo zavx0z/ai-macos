@@ -1,6 +1,7 @@
 #import <Foundation/Foundation.h>
 
 #include <unistd.h>
+#include <os/lock.h>
 
 #include "meta_broker_core.h"
 #include "meta_command_loop.h"
@@ -9,12 +10,11 @@
 #include "observer-command/meta_observer_command.h"
 
 typedef struct {
+  os_unfair_lock lock;
   MetaCaptureCompletion completion;
   dispatch_queue_t callback_queue;
   MetaCaptureTaskStatus status;
   MetaCaptureRequest accepted_request;
-  bool completion_scheduled;
-  size_t status_count;
   int task_storage;
 } FakeCaptureChild;
 
@@ -87,6 +87,7 @@ static MetaCaptureTaskRef fake_start(void *context,
   FakeCaptureBackend *fake = context;
   if (fake->start_count >= 8) return NULL;
   FakeCaptureChild *child = &fake->children[fake->start_count++];
+  child->lock = OS_UNFAIR_LOCK_INIT;
   child->accepted_request = *request;
   child->callback_queue = callback_queue;
   child->completion = [completion copy];
@@ -95,6 +96,24 @@ static MetaCaptureTaskRef fake_start(void *context,
       .startPending = true,
       .cleanup = MetaCaptureCleanupPending,
   };
+  // Как ScreenCaptureKit: завершение приходит само, а не после status polling.
+  dispatch_queue_t queue = callback_queue == NULL
+      ? dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0) : callback_queue;
+  dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC), queue, ^{
+    MetaCaptureResult *result = successful_result(&child->accepted_request);
+    if (result == NULL) return;
+    os_unfair_lock_lock(&child->lock);
+    child->status = (MetaCaptureTaskStatus){
+        .revision = child->status.revision + 1,
+        .completionDelivered = true,
+        .streamStarted = true,
+        .streamStopped = true,
+        .cleanup = MetaCaptureCleanupComplete,
+        .drained = true,
+    };
+    os_unfair_lock_unlock(&child->lock);
+    child->completion(result);
+  });
   return &child->task_storage;
 }
 
@@ -113,8 +132,10 @@ static void fake_cancel(void *context, MetaCaptureTaskRef task) {
   FakeCaptureChild *child = fake_child(fake, task);
   if (child == NULL) return;
   fake->cancel_count += 1;
+  os_unfair_lock_lock(&child->lock);
   child->status.revision += 1;
   child->status.stopRequested = true;
+  os_unfair_lock_unlock(&child->lock);
 }
 
 static bool fake_status(void *context, MetaCaptureTaskRef task,
@@ -122,28 +143,9 @@ static bool fake_status(void *context, MetaCaptureTaskRef task,
   FakeCaptureBackend *fake = context;
   FakeCaptureChild *child = fake_child(fake, task);
   if (child == NULL) return false;
-  child->status_count += 1;
+  os_unfair_lock_lock(&child->lock);
   *status = child->status;
-  if (child->status_count >= 2 && !child->completion_scheduled &&
-      child->completion != nil) {
-    child->completion_scheduled = true;
-    dispatch_queue_t queue = child->callback_queue == NULL
-                                 ? dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0)
-                                 : child->callback_queue;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_MSEC), queue, ^{
-      MetaCaptureResult *result = successful_result(&child->accepted_request);
-      if (result == NULL) return;
-      child->status = (MetaCaptureTaskStatus){
-          .revision = 2,
-          .completionDelivered = true,
-          .streamStarted = true,
-          .streamStopped = true,
-          .cleanup = MetaCaptureCleanupComplete,
-          .drained = true,
-      };
-      child->completion(result);
-    });
-  }
+  os_unfair_lock_unlock(&child->lock);
   return true;
 }
 
@@ -202,6 +204,7 @@ static bool fake_cleanup_up(void *context, MetaHeldEventKind kind,
   MetaBrokerCore *_core;
   MetaCaptureCommandBinder *_binder;
   MetaObserverCommandBinder *_observerBinder;
+  dispatch_block_t _pushNotifier;
   MetaDisplayRecord _displays[2];
   MetaInventorySnapshot _snapshot;
   NSLock *_lock;
@@ -326,8 +329,10 @@ static bool fake_cleanup_up(void *context, MetaHeldEventKind kind,
       }
       instanceIdProvider:^NSString * { return @"observer-fixture-1"; }];
   }
+  [_observerBinder setPushNotifier:_pushNotifier];
   return [_observerBinder handleRequest:request];
 }
+- (void)setObserverPushNotifier:(dispatch_block_t)notifier { _pushNotifier = [notifier copy]; [_observerBinder setPushNotifier:notifier]; }
 - (BOOL)activateObserverPush:(NSString *)instanceRef { return [_observerBinder activatePushForObserverInstance:instanceRef]; }
 - (NSDictionary *)takeObserverPush:(NSUInteger)maximum { return [_observerBinder takePushEnvelopes:maximum]; }
 - (NSDictionary *)clipboard:(NSDictionary *)command { (void)command; return nil; }

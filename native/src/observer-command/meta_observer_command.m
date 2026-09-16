@@ -133,6 +133,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   uint64_t _lastPushedSequence;
   BOOL _baselineAvailable;
   BOOL _pushActive;
+  dispatch_block_t _pushNotifier;
   NSString *_gapReason;
 }
 
@@ -188,6 +189,17 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
                           reason:@"Observer instance больше не является current"];
   }
   if ([command isEqual:@"coverage"]) {
+    // Main-runloop barrier: обработать предшествующие callbacks и проверить tap
+    // непосредственно для запроса, вместо heartbeat таймера 4 раза в секунду.
+    MetaNativeObserver *observer = _observer;
+    if (!self.mainExecutor(^BOOL {
+      if (!request_before_deadline(request)) return NO;
+      [observer recordHeartbeat];
+      return YES;
+    })) {
+      return [self failureResponse:request command:command code:@"capability-unavailable"
+                            reason:@"Observer main-runloop barrier не подтверждён"];
+    }
     return [self successResponse:request
                          command:command
                         snapshot:[self currentSnapshot]
@@ -443,6 +455,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
     }
     [created takeEvents];
     baselineCursor = created.coverage[@"cursor"];
+    [created setChangeSink:binder->_pushNotifier];
     [created setEventSink:^(NSDictionary *event) {
       [weakSelf acceptEvent:event observerInstanceRef:instance];
     }];
@@ -601,6 +614,13 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
                       snapshot:snapshot
                         events:nil
                     fromCursor:nil];
+}
+
+- (void)setPushNotifier:(dispatch_block_t)notifier {
+  [_lock lock];
+  _pushNotifier = [notifier copy];
+  [_observer setChangeSink:notifier];
+  [_lock unlock];
 }
 
 - (BOOL)activatePushForObserverInstance:(NSString *)observerInstanceRef {
@@ -988,6 +1008,10 @@ static NSString *event_target_relation(NSDictionary *expected,
   [_eventCondition lock];
   [_eventCondition broadcast];
   [_eventCondition unlock];
+  [_lock lock];
+  dispatch_block_t notify = _pushNotifier;
+  [_lock unlock];
+  if (notify != nil) notify();
 }
 
 - (NSDictionary *)currentSnapshot {

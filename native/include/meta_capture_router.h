@@ -57,6 +57,11 @@ bool meta_capture_router_start_layout(
 bool meta_capture_router_status(MetaCaptureRouter *router,
                                 const char *task_ref,
                                 MetaCaptureTaskStatus *status);
+// Ждёт callback результата/детей layout; NSCondition освобождает lock при ожидании.
+// Не запускает capture повторно и не опрашивает backend по таймеру.
+void meta_capture_router_wait_result(MetaCaptureRouter *router,
+                                     const char *task_ref,
+                                     double deadline_unix_seconds);
 bool meta_capture_router_result(MetaCaptureRouter *router,
                                 const char *task_ref,
                                 MetaCaptureTaskStatus *status,

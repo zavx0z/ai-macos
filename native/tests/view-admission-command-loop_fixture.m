@@ -284,6 +284,7 @@ static bool fixture_flags(void *context, uint64_t flags) {
   }
   return result;
 }
+- (void)setObserverPushNotifier:(dispatch_block_t)notifier { [_observerCommands setPushNotifier:notifier]; }
 - (BOOL)activateObserverPush:(NSString *)instanceRef {
   return [_observerCommands activatePushForObserverInstance:instanceRef];
 }

@@ -254,6 +254,7 @@ class FakeCaptureTransport implements NativeTransport {
   readonly #packets: NativeTransportPacket[] = []
   readonly #waiters: Array<(packet: NativeTransportPacket) => void> = []
   resultPolls = 0
+  pendingCompletion: (() => void) | undefined
   cancelled = false
   closed = false
   lateStart: Extract<NativeTransportPacket, { kind: "message" }>["frame"] | undefined
@@ -348,17 +349,13 @@ class FakeCaptureTransport implements NativeTransport {
       const control = frame.payload.control
       if (control.purpose === "result") {
         this.resultPolls += 1
-        if (this.resultPolls === 1 || (this.mode === "cancel" && !this.cancelled)) {
-          this.pushMessage({
-            channel: "cleanup",
-            payload: {
-              purpose: "result",
-              ack: cleanupAck(control, 1, false),
-              statusEvidence: captureStatusEvidence(1, false),
-              poll: { state: "pending", captureTaskRef: taskRef, status: captureStatus(1, false) },
-            },
+        const waitForCompletion = frame.payload.payload.waitForCompletion === true
+        if (waitForCompletion) {
+          // Сервер ожидает callback, канал cancel остаётся доступен.
+          await new Promise<void>(resolve => {
+            if (this.mode === "cancel" && !this.cancelled) this.pendingCompletion = resolve
+            else queueMicrotask(resolve)
           })
-          return
         }
         const completion = this.mode === "cancel"
           ? cancelledCompletion()
@@ -420,6 +417,8 @@ class FakeCaptureTransport implements NativeTransport {
     }
     if (frame.channel === "cancel") {
       this.cancelled = true
+      this.pendingCompletion?.()
+      this.pendingCompletion = undefined
       this.pushMessage({
         channel: "cancel",
         payload: {
@@ -691,7 +690,6 @@ test("ProtocolNativeCaptureDriver доверяет no-task только typed re
     })
     const driver = new ProtocolNativeCaptureDriver(
       new NativeCaptureClient(broker, new FakeContinuationAuthority()),
-      0,
     )
     const context = operationContext()
     broker.mutationDelivery.register(context.wire)
@@ -757,7 +755,6 @@ test("ProtocolNativeCaptureDriver проходит start/pending/result/binary/e
   const continuations = new FakeContinuationAuthority()
   const driver = new ProtocolNativeCaptureDriver(
     new NativeCaptureClient(broker, continuations),
-    0,
   )
   const task = await driver.start(operationContext(), {
     request: captureRequest(),
@@ -775,17 +772,14 @@ test("ProtocolNativeCaptureDriver проходит start/pending/result/binary/e
     "complete-frame": { state: "reached", durationMs: 2 },
   })
   expect(result.readinessFacts).not.toHaveProperty("ownership")
-  expect(transport.resultPolls).toBe(2)
+  expect(transport.resultPolls).toBe(1)
   expect(evidenceReports.map(report => report.factKind)).toEqual([
     "capture-task-start",
-    "capture-task-status",
     "capture-task-terminal",
     "frame",
   ])
-  expect(continuations.statusAdvances).toEqual([
-    { revision: 1, cleanup: "unknown", drained: false },
-  ])
-  expect(continuations.issuedPurposes).toEqual(["result", "result"])
+  expect(continuations.statusAdvances).toEqual([])
+  expect(continuations.issuedPurposes).toEqual(["result"])
 
   expect(await driver.release(task.taskRef, "release-key:protocol")).toEqual({
     taskRef,
@@ -796,7 +790,7 @@ test("ProtocolNativeCaptureDriver проходит start/pending/result/binary/e
     status: "already-released",
   })
   await expect(driver.release(task.taskRef, "release-key:conflict")).rejects.toThrow("конфликтует")
-  expect(continuations.issuedPurposes).toEqual(["result", "result", "release"])
+  expect(continuations.issuedPurposes).toEqual(["result", "release"])
   expect(transport.sent.some(frame => JSON.stringify(frame).includes("base64"))).toBe(false)
   await broker.close()
 })
@@ -834,7 +828,7 @@ test("ProtocolNativeCaptureDriver адресованно отменяет pendin
     capabilitySchemaVersion: "1",
   })
   const continuations = new FakeContinuationAuthority()
-  const driver = new ProtocolNativeCaptureDriver(new NativeCaptureClient(broker, continuations), 5)
+  const driver = new ProtocolNativeCaptureDriver(new NativeCaptureClient(broker, continuations))
   const task = await driver.start(operationContext(), {
     request: captureRequest(),
     nativeMapping: mapping,
@@ -850,12 +844,9 @@ test("ProtocolNativeCaptureDriver адресованно отменяет pendin
   expect(result.drained).toBe(true)
   expect(reports.map(report => report.factKind)).toEqual([
     "capture-task-start",
-    "capture-task-status",
     "capture-task-terminal",
   ])
-  expect(continuations.statusAdvances).toEqual([
-    { revision: 1, cleanup: "unknown", drained: false },
-  ])
+  expect(continuations.statusAdvances).toEqual([])
   expect(continuations.issuedPurposes).toContain("cancel")
   expect(await driver.release(task.taskRef, "release-key:cancel")).toEqual({
     taskRef,
@@ -889,7 +880,7 @@ test("ProtocolNativeCaptureDriver не регистрирует late start ACK �
     capabilitySchemaVersion: "1",
   })
   const continuations = new FakeContinuationAuthority()
-  const driver = new ProtocolNativeCaptureDriver(new NativeCaptureClient(broker, continuations), 0)
+  const driver = new ProtocolNativeCaptureDriver(new NativeCaptureClient(broker, continuations))
   const controller = new AbortController()
   const started = driver.start(operationContext(controller.signal), {
     request: captureRequest(),
@@ -940,7 +931,7 @@ test("ProtocolNativeCaptureDriver reconciles unknown completion через verif
     capabilitySchemaVersion: "1",
   })
   const continuations = new FakeContinuationAuthority()
-  const driver = new ProtocolNativeCaptureDriver(new NativeCaptureClient(broker, continuations), 0)
+  const driver = new ProtocolNativeCaptureDriver(new NativeCaptureClient(broker, continuations))
   const task = await driver.start(operationContext(), {
     request: captureRequest(),
     nativeMapping: mapping,
@@ -969,12 +960,10 @@ test("ProtocolNativeCaptureDriver reconciles unknown completion через verif
     drained: true,
   })
   expect(continuations.statusAdvances).toEqual([
-    { revision: 1, cleanup: "unknown", drained: false },
     { revision: 2, cleanup: "unknown", drained: false },
   ])
   expect(reports.map(report => report.factKind)).toEqual([
     "capture-task-start",
-    "capture-task-status",
     "capture-task-status",
     "frame",
     "capture-task-terminal",
@@ -1060,7 +1049,7 @@ test("NativeCaptureClient сам регистрирует task/status/terminal �
     expectedNativeBuildId: "native-build:protocol",
     capabilitySchemaVersion: "1",
   })
-  const driver = new ProtocolNativeCaptureDriver(new NativeCaptureClient(broker, continuations), 0)
+  const driver = new ProtocolNativeCaptureDriver(new NativeCaptureClient(broker, continuations))
   const task = await driver.start(context, {
     request: captureRequest(),
     nativeMapping: mapping,
@@ -1075,7 +1064,6 @@ test("NativeCaptureClient сам регистрирует task/status/terminal �
   })
   expect([...reports.values()].map(report => report.factKind)).toEqual([
     "capture-task-start",
-    "capture-task-status",
     "capture-task-terminal",
     "frame",
   ])

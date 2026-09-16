@@ -15,17 +15,14 @@ export function startRuntimeRotation(configuration: {
   prepareRecoveryRestart?(signal: AbortSignal): Promise<QuarantinedRestartReceipt>
   close(): Promise<void>
   exit(): void
-  intervalMs?: number
   deadlineMs?: number
   drainDeadlineMs?: number
 }) {
   const options = Object.freeze({ ...configuration })
-  const intervalMs = options.intervalMs ?? 1000
   const deadlineMs = options.deadlineMs ?? 15_000
   const drainDeadlineMs = options.drainDeadlineMs ?? (options.prepareRecoveryRestart === undefined
     ? deadlineMs : Math.max(1, Math.min(5000, Math.floor(deadlineMs / 3))))
-  if (!Number.isSafeInteger(intervalMs) || intervalMs < 1 || intervalMs > 5000
-    || !Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 60_000
+  if (!Number.isSafeInteger(deadlineMs) || deadlineMs < 1 || deadlineMs > 60_000
     || !Number.isSafeInteger(drainDeadlineMs) || drainDeadlineMs < 1 || drainDeadlineMs > deadlineMs
     || options.prepareRecoveryRestart !== undefined && drainDeadlineMs >= deadlineMs) throw new Error("Rotation bounds вне диапазона или без резерва для recovery")
   let status: RuntimeRotationStatus = { state: "running" }
@@ -73,13 +70,11 @@ export function startRuntimeRotation(configuration: {
       }
     })()
   }
-  const timer = setInterval(check, intervalMs)
-  timer.unref?.()
   return {
     status: () => ({ ...status }),
     check,
     retryAfterCleanup() { if (!stopped && status.state === "blocked") { status = { state: "running" }; check() } },
-    stop() { stopped = true; clearInterval(timer) },
+    stop() { stopped = true },
   }
 }
 

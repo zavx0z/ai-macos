@@ -1,3 +1,4 @@
+import { bindDeadline, signalDeadline } from "./deadline.ts"
 import {
   CAPABILITY_IDS,
   adapterResultSchema,
@@ -145,6 +146,8 @@ export type ReserveCapturePublicationRequest = Pick<ObservationPublication,
 export class RuntimeCore implements RuntimeAdapter {
   readonly generation: RuntimeGeneration
   #capabilities: CapabilitySet
+  readonly #lineageCleanupListeners = new Set<(lineageId: string) => void>()
+  readonly #activityListeners = new Set<() => void>()
   readonly #capabilityListeners = new Set<() => void>()
   readonly #admissionListeners = new Set<() => void>()
   #admissionSealed = false
@@ -249,6 +252,7 @@ export class RuntimeCore implements RuntimeAdapter {
           .map(entry => entry.promise?.catch(() => undefined)))
         await this.browserLifetime.shutdownLineage(lineageId, signal)
         this.#clientCleanupFailures.delete(lineageId)
+        for (const listener of this.#lineageCleanupListeners) listener(lineageId)
       },
       failed: lineageId => { this.#clientCleanupFailures.add(lineageId) },
     })
@@ -670,6 +674,10 @@ export class RuntimeCore implements RuntimeAdapter {
     await this.clients.assertActive(session, now)
     if (this.#clientPersistence !== undefined && !this.#persistedSessions.has(session.clientSessionId)) throw new Error("Client session не подтверждена durable storage")
     const intent = runtimeOperationIntentSchema.parse(intentValue)
+    const parentDeadline = signalDeadline(signal)
+    if (parentDeadline !== undefined && Date.parse(intent.deadlineAt) > parentDeadline) {
+      intent.deadlineAt = new Date(parentDeadline).toISOString()
+    }
     const domain = intent.precondition.target.kind
     if (lifecycle === undefined && [
       "browser-instance", "browser-target", "device", "device-browser-instance", "device-browser-target",
@@ -767,9 +775,13 @@ export class RuntimeCore implements RuntimeAdapter {
       durableTail: Promise.resolve(),
     }
     this.#journal.set(operationId, entry)
+    this.#notifyActivity()
     this.#dedup.set(dedupKey, operationId)
     const deadlineDelay = Math.max(0, Date.parse(intent.deadlineAt) - this.#clock.now().getTime())
-    entry.deadlineTimer = setTimeout(() => controller.abort("operation deadline exceeded"), deadlineDelay)
+    bindDeadline(controller.signal, Date.parse(intent.deadlineAt))
+    if (parentDeadline !== Date.parse(intent.deadlineAt)) {
+      entry.deadlineTimer = setTimeout(() => controller.abort("operation deadline exceeded"), deadlineDelay)
+    }
     const promise = this.#execute(entry, session, handles, request, execute, lifecycle)
     entry.promise = promise as Promise<RuntimeExecution<unknown>>
     try { return await promise }
@@ -933,6 +945,27 @@ export class RuntimeCore implements RuntimeAdapter {
 
   operationCount(): number {
     return this.#journal.size
+  }
+
+  /** События начала/завершения вместо таймера, опрашивающего весь journal. */
+  subscribeLineageCleanup(listener: (lineageId: string) => void): () => void {
+    this.#lineageCleanupListeners.add(listener)
+    return () => { this.#lineageCleanupListeners.delete(listener) }
+  }
+
+  subscribeActivity(listener: () => void): () => void {
+    this.#activityListeners.add(listener)
+    return () => { this.#activityListeners.delete(listener) }
+  }
+
+  activeNativeOperationCount(): number {
+    return [...this.#journal.values()].filter(entry => !entry.settled && entry.record.context.kind === "native").length
+  }
+
+  #notifyActivity(): void {
+    for (const listener of this.#activityListeners) {
+      try { listener() } catch { /* Диагностическая подписка не меняет исход operation. */ }
+    }
   }
 
   activeOperationCount(): number {
@@ -1298,6 +1331,7 @@ export class RuntimeCore implements RuntimeAdapter {
     if (entry.deadlineTimer !== undefined) clearTimeout(entry.deadlineTimer)
     entry.record = execution.operation
     entry.result = execution as RuntimeExecution<unknown>
+    this.#notifyActivity()
   }
 
   async #persist(entry: JournalEntry, record: OperationRecord, cleanupReceipt?: CleanupAuthorityReceipt): Promise<void> {

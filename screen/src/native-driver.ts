@@ -34,14 +34,8 @@ export class ProtocolNativeCaptureDriver implements NativeCaptureDriver {
   readonly #tasks = new Map<string, TrackedTask>()
   readonly #releaseKeys = new Map<string, string>()
   readonly #released = new Map<string, ReleasedTask>()
-  readonly #pollIntervalMs: number
-
-  constructor(client: NativeCaptureClient, pollIntervalMs = 10) {
-    if (!Number.isInteger(pollIntervalMs) || pollIntervalMs < 0 || pollIntervalMs > 1_000) {
-      throw new Error("Native capture poll interval должен быть в диапазоне 0..1000 ms")
-    }
+  constructor(client: NativeCaptureClient) {
     this.#client = client
-    this.#pollIntervalMs = pollIntervalMs
   }
 
   async start(
@@ -72,10 +66,10 @@ export class ProtocolNativeCaptureDriver implements NativeCaptureDriver {
     if (this.#tasks.has(protocol.taskRef) || this.#released.has(protocol.taskRef)) {
       throw new Error(`Native protocol повторно выдал captureTaskRef ${protocol.taskRef}`)
     }
-    const result = this.#pollUntilTerminal(
-      protocol,
-      Date.parse(context.wire.deadlineAt) + input.stopTimeoutMs,
-    )
+    const result = protocol.result(true).then(result => {
+      if (result.poll.state !== "completed") throw new Error("Native capture callback не получен в пределах operation deadline")
+      return mapCompletion(result)
+    })
     this.#tasks.set(protocol.taskRef, { protocol, result })
     return { taskRef: protocol.taskRef, result }
   }
@@ -110,18 +104,6 @@ export class ProtocolNativeCaptureDriver implements NativeCaptureDriver {
     this.#releaseKeys.delete(taskRef)
     this.#released.set(taskRef, { idempotencyKey })
     return { taskRef, status: "released" }
-  }
-
-  async #pollUntilTerminal(
-    task: ProtocolCaptureTask,
-    deadlineMs: number,
-  ): Promise<NativeCaptureCompletion> {
-    while (Date.now() < deadlineMs) {
-      const result = await task.result()
-      if (result.poll.state === "completed") return mapCompletion(result)
-      if (this.#pollIntervalMs > 0) await Bun.sleep(this.#pollIntervalMs)
-    }
-    throw new Error("Native capture result polling превысил operation + stop budget")
   }
 
   #task(taskRef: string): TrackedTask {

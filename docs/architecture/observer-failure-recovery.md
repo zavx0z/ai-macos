@@ -58,3 +58,5 @@ Regression fixtures проверяют snapshot/PUSH в обоих порядк�
 
 Это локальное исправление lifecycle, не замена всей архитектуры. TTL handles,
 таймеры ротации, heartbeat активного ввода и протокол capture здесь не удаляются.
+
+Последующее упрощение polling, TTL и deadline описано в [Runtime по запросу](runtime-demand-lifecycle.md).

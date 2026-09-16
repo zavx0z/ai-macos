@@ -202,10 +202,7 @@ describe("Runtime input readiness method", () => {
         target: value.target,
         inventoryId: "inventory:readiness-methods",
         inventoryRevision: 7,
-        deadlineAt: new Date(
-          value.now.getTime()
-          + INPUT_READINESS_BUDGETS.operationMs,
-        ).toISOString(),
+        deadlineAt: (first.data.operation as { context: { deadlineAt: string } }).context.deadlineAt,
       },
       payload: { expectedDisplayRef: value.target.ref },
     })

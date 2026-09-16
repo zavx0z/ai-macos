@@ -1,3 +1,4 @@
+import { operationDeadline } from "./deadline.ts"
 import {
   NATIVE_PROTOCOL_VERSION,
   adapterResultSchema,
@@ -68,9 +69,7 @@ export function registerReadinessMethods(
     maxRequestBytes: 1024 * 1024,
     maxResponseBytes: 2 * 1024 * 1024,
     async execute(context, request) {
-      const deadlineAt = new Date(
-        now().getTime() + INPUT_READINESS_BUDGETS.operationMs,
-      ).toISOString()
+      const deadlineAt = operationDeadline(context.signal, INPUT_READINESS_BUDGETS.operationMs, now().getTime())
       const intent = runtimeOperationIntentSchema.parse({
         intent: "mutation",
         clientRequestId: request.clientRequestId,

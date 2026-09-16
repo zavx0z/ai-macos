@@ -31,6 +31,7 @@ export const screenshotUiHtml = String.raw`<!doctype html>
         <span id="caption">macOS screenshot</span>
         <span id="actions">
           <span id="details"></span>
+          <button id="refresh" type="button">Refresh</button>
           <button id="expand" type="button" title="Open the screenshot at full size">Expand</button>
         </span>
       </figcaption>
@@ -122,6 +123,7 @@ export const screenshotUiHtml = String.raw`<!doctype html>
         }
       }
 
+      document.getElementById("refresh").addEventListener("click", refreshLatest)
       image.addEventListener("load", notifyHeight, { passive: true });
       image.addEventListener("click", expandImage);
       expand.addEventListener("click", expandImage);
@@ -150,7 +152,7 @@ export const screenshotUiHtml = String.raw`<!doctype html>
       render(window.openai?.toolOutput);
       void enterPip();
       void refreshLatest();
-      window.setInterval(refreshLatest, 1000);
+      // Последующие кадры приходят через tool-result/globals; idle polling отсутствует.
       notifyHeight();
     </script>
   </body>

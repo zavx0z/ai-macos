@@ -28,6 +28,7 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
   readonly #generation: RuntimeGeneration
   readonly #clock: RuntimeClock
   readonly #ids: RuntimeIdSource
+  readonly #listeners = new Set<() => void>()
   readonly #sessions = new Map<string, StoredSession>()
   readonly #bearerIndex = new Map<string, string>()
   readonly #resumptionIndex = new Map<string, string>()
@@ -39,6 +40,27 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
     this.#generation = generation
     this.#clock = options.clock ?? systemClock
     this.#ids = options.ids ?? randomIdSource
+  }
+
+  subscribeChanged(listener: () => void): () => void {
+    this.#listeners.add(listener)
+    return () => { this.#listeners.delete(listener) }
+  }
+
+  nextExpiryAt(): number | undefined {
+    let next: number | undefined
+    for (const stored of this.#sessions.values()) {
+      if (stored.disconnected || stored.revoked || stored.session.runtimeEpoch !== this.#generation.runtimeEpoch) continue
+      const at = Date.parse(stored.session.expiresAt)
+      next = next === undefined ? at : Math.min(next, at)
+    }
+    return next
+  }
+
+  #changed(): void {
+    for (const listener of this.#listeners) {
+      try { listener() } catch { /* Планирование expiry не меняет session registry. */ }
+    }
   }
 
   open(principalId: string, ttlMs = 5 * 60 * 1_000): RuntimeClientCredential {
@@ -71,6 +93,7 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
     this.#sessions.set(session.clientSessionId, stored)
     this.#bearerIndex.set(stored.bearerDigest, session.clientSessionId)
     this.#resumptionIndex.set(stored.resumptionDigest, session.clientSessionId)
+    this.#changed()
     return { session, bearerToken, resumptionToken }
   }
 
@@ -87,6 +110,7 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
     previous.disconnected = true
     previous.revoked = true
     this.#bearerIndex.delete(previous.bearerDigest)
+    this.#changed()
     return credential
   }
 
@@ -137,6 +161,7 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
     if (stored !== undefined) {
       stored.disconnected = true
       this.#bearerIndex.delete(stored.bearerDigest)
+      this.#changed()
     }
   }
 
@@ -147,6 +172,7 @@ export class ClientSessionRegistry implements ClientSessionAuthority {
       this.#bearerIndex.delete(stored.bearerDigest)
       this.#resumptionIndex.delete(stored.resumptionDigest)
     }
+    this.#changed()
   }
 
   async assertActive(session: RuntimeClientSession, now: Date): Promise<void> {

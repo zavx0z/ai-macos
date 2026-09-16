@@ -196,7 +196,7 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   MetaObserverEventSink _eventSink;
   CFMachPortRef _tap;
   CFRunLoopSourceRef _source;
-  NSTimer *_heartbeatTimer;
+  dispatch_block_t _changeSink;
   NSUInteger _bytes;
   uint64_t _sequence;
   uint64_t _dropped;
@@ -267,6 +267,24 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   [_lock lock];
   _eventSink = [sink copy];
   [_lock unlock];
+}
+
+- (void)setChangeSink:(dispatch_block_t)sink {
+  [_lock lock];
+  _changeSink = [sink copy];
+  [_lock unlock];
+}
+
+// Полные AX subscriptions подключаются по запросу наблюдения, не при каждом
+// переключении приложения человеком в простое. Предыдущий focus уже stale.
+- (BOOL)refreshForegroundSubscription {
+  if (![NSThread isMainThread]) return NO;
+  NSRunningApplication *frontmost = NSWorkspace.sharedWorkspace.frontmostApplication;
+  if (frontmost == nil) return NO;
+  for (NSNumber *pid in _runningApplications.allKeys) {
+    if (pid.intValue != frontmost.processIdentifier) [self removeApplicationPid:pid.intValue];
+  }
+  return [self subscribeApplication:frontmost];
 }
 
 - (BOOL)start {
@@ -436,19 +454,13 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
                                        }]];
   }
   [self recordCoverageKind:@"lifecycle" available:YES reason:nil];
-  _heartbeatTimer = [NSTimer
-      scheduledTimerWithTimeInterval:0.25
-                              repeats:YES
-                                block:^(__unused NSTimer *timer) {
-                                  [weakSelf recordHeartbeat];
-                                }];
+  [self recordHeartbeat];
   return [self.coverage[@"state"] isEqual:@"ready"];
 }
 
 - (void)stop {
   if (![NSThread isMainThread]) return;
-  [_heartbeatTimer invalidate];
-  _heartbeatTimer = nil;
+
   if (_tap != NULL) CFMachPortInvalidate(_tap);
   if (_source != NULL) {
     CFRunLoopRemoveSource(CFRunLoopGetMain(), _source, kCFRunLoopCommonModes);
@@ -744,24 +756,9 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   }
 }
 
-- (void)handleActivatedApplication:(NSRunningApplication *)application {
-  if (![self subscribeApplication:application]) {
-    [self recordUnresolvedFocus:
-              @"AX subscription нового foreground application не удалась"];
-    return;
-  }
-  AXUIElementRef element =
-      AXUIElementCreateApplication(application.processIdentifier);
-  if (element == NULL) {
-    [self markUnavailable:
-              @"AX element нового foreground application недоступен"];
-    return;
-  }
-  [self handleAXElement:element
-                    pid:application.processIdentifier
-           notification:@"application-activated"
-          sourceObserver:NULL];
-  CFRelease(element);
+- (void)handleActivatedApplication:(__unused NSRunningApplication *)application {
+  // Переключение пользователем обновляет состояние без AX RPC в простое.
+  [self recordGlobalFocus];
 }
 
 - (void)handleTerminatedApplication:(NSRunningApplication *)application {
@@ -1014,10 +1011,16 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   }
   _ready = nextReady;
   if (_ready) _reason = nil;
+  dispatch_block_t changed = !available ? _changeSink : nil;
   [_lock unlock];
+  if (changed != nil) changed();
 }
 
 - (void)recordHeartbeat {
+  if (_tap != NULL && [NSThread isMainThread] && ![self refreshForegroundSubscription]) {
+    [self markUnavailable:@"AX subscription выбранного foreground application недоступна"];
+    return;
+  }
   if (_tap != NULL &&
       (!CGPreflightListenEventAccess() || !AXIsProcessTrusted() ||
        !CGEventTapIsEnabled(_tap))) {
@@ -1078,7 +1081,9 @@ static void observe_ax(AXObserverRef observer, AXUIElementRef element,
   _ready = NO;
   _gap = YES;
   _reason = bounded_reason(reason);
+  dispatch_block_t changed = _changeSink;
   [_lock unlock];
+  if (changed != nil) changed();
 }
 
 - (NSDictionary *)coverage {

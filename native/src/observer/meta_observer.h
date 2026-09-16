@@ -36,6 +36,8 @@ NSTimeInterval meta_observer_subscription_timeout_seconds(
 - (nullable instancetype)initWithGeneration:(NSDictionary *)generation;
 - (void)setFocusResolver:(MetaObserverFocusResolver)resolver;
 - (void)setEventSink:(nullable MetaObserverEventSink)sink;
+- (void)setChangeSink:(nullable dispatch_block_t)sink;
+- (BOOL)refreshForegroundSubscription;
 // Resolver читает только immutable native registry snapshot и не синхронизирует
 // main runloop с action worker.
 // start/stop выполняются на main runloop helper и никогда не открывают TCC UI.

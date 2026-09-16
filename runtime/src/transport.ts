@@ -392,7 +392,7 @@ export class RuntimeUdsClient {
   close(): Promise<void> {
     return this.#closing ??= (async () => {
       this.#renewal.close()
-      for (const unsubscribe of [...this.#catalogSubscriptions]) unsubscribe()
+      this.#catalogSubscriptions.clear()
       if (this.#bearerToken === undefined) return
       try { await this.#request("/v1/session/close", { method: "POST", body: {}, skipRenewal: true }) }
       finally { this.#bearerToken = undefined }
@@ -464,24 +464,11 @@ export class RuntimeUdsClient {
     } finally { lease.release() }
   }
 
+  /** Подписка уведомляет об изменениях, обнаруженных явным запросом каталога.
+   * В простое не выполняет сеть и не создаёт собственный polling loop. */
   subscribeCatalogChanged(listener: () => void): () => void {
-    const controller = new AbortController()
-    let fingerprint: string | undefined
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const poll = async () => {
-      try {
-        const catalog = await this.#readCatalog(controller.signal)
-        const nextFingerprint = catalog.fingerprint
-        const changed = fingerprint !== undefined && nextFingerprint !== fingerprint
-        fingerprint = nextFingerprint
-        if (changed) listener()
-      } catch { /* Переподключение каталога повторится на следующем ограниченном запросе. */ }
-      if (!controller.signal.aborted) timer = setTimeout(() => void poll(), 1000)
-    }
-    void poll()
-    const unsubscribe = () => { controller.abort(); if (timer !== undefined) clearTimeout(timer); this.#catalogSubscriptions.delete(unsubscribe) }
-    this.#catalogSubscriptions.add(unsubscribe)
-    return unsubscribe
+    this.#catalogSubscriptions.add(listener)
+    return () => { this.#catalogSubscriptions.delete(listener) }
   }
 
   /** Проверяет актуальность через ETag; старый server без ETag сохраняет полный путь проверки. */
@@ -516,7 +503,14 @@ export class RuntimeUdsClient {
         ...(etag === null || etag.length > 256 ? {} : { etag }),
       }
       // Поздний ответ не вытесняет уже сохранённый результат другого запроса.
-      if (this.#catalogCache === previous) this.#catalogCache = next
+      if (this.#catalogCache === previous) {
+        this.#catalogCache = next
+        if (previous !== undefined && previous.fingerprint !== next.fingerprint) {
+          for (const listener of this.#catalogSubscriptions) {
+            try { listener() } catch { /* Уведомление не меняет результат чтения. */ }
+          }
+        }
+      }
       return next
     } finally { lease.release() }
   }

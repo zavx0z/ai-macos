@@ -49,6 +49,8 @@ static BOOL future_deadline(id value) {
   return date != nil && date.timeIntervalSinceNow > 0;
 }
 
+static void keep_alive_perform(__unused void *info) {}
+
 static NSDictionary *failure(NSString *code, NSString *message) {
   return @{@"code": code, @"message": message, @"stage": @"native-command", @"retryable": @NO,
            @"replayAllowed": @NO, @"recoveryAction": @"inspect-health"};
@@ -78,6 +80,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   NSString *_nonce;
   dispatch_queue_t _control;
   dispatch_queue_t _actions;
+  dispatch_queue_t _captureResults;
   NSMutableSet<NSString *> *_requestIds;
   NSMutableDictionary<NSString *, NSNumber *> *_heartbeatIds;
   BOOL _admitted;
@@ -108,6 +111,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     _generation = generation;
     _control = control;
     _actions = dispatch_queue_create("meta.native.actions", DISPATCH_QUEUE_SERIAL);
+    _captureResults = dispatch_queue_create("meta.native.capture-results", DISPATCH_QUEUE_SERIAL);
     _requestIds = [NSMutableSet set];
     _heartbeatIds = [NSMutableDictionary dictionary];
     _receipts = [[MetaOperationReceipts alloc] init];
@@ -118,6 +122,13 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     _requestedExit = -1;
   }
   return self;
+}
+
+- (void)publishExit:(int)code {
+  atomic_store(&_exitCode, code);
+  CFRunLoopRef loop = CFRunLoopGetMain();
+  CFRunLoopPerformBlock(loop, kCFRunLoopCommonModes, ^{ CFRunLoopStop(loop); });
+  CFRunLoopWakeUp(loop);
 }
 
 - (int)exitCode { return atomic_load(&_exitCode); }
@@ -136,6 +147,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     [self send:@"event" payload:event];
     if (_requestedExit >= 0) return;
   }
+  if (events.count == 64) dispatch_async(_control, ^{ [self pumpObserver]; });
 }
 
 // Неисправность observer не является неисправностью транспорта/процесса.
@@ -180,10 +192,10 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   _requestedExit = code;
   [_job channelDisconnected];
   if (!_busy && _maintenanceCount == 0) {
-    atomic_store(&_exitCode, code);
+    [self publishExit:code];
   } else {
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1000000000), _control, ^{
-      atomic_store(&self->_exitCode, self->_requestedExit);
+      [self publishExit:self->_requestedExit];
     });
   }
 }
@@ -207,6 +219,10 @@ static NSDictionary *failure(NSString *code, NSString *message) {
 }
 
 - (BOOL)maintenance:(NSDictionary *)payload work:(NSDictionary *(^)(void))work completed:(void (^)(NSDictionary *))completed {
+  return [self maintenance:payload queue:_actions work:work completed:completed];
+}
+
+- (BOOL)maintenance:(NSDictionary *)payload queue:(dispatch_queue_t)queue work:(NSDictionary *(^)(void))work completed:(void (^)(NSDictionary *))completed {
   NSUInteger bytes = [NSJSONSerialization dataWithJSONObject:payload options:0 error:NULL].length;
   if (_maintenanceCount >= 128 || bytes > 4 * 1024 * 1024 || _maintenanceBytes > 4 * 1024 * 1024 - bytes) {
     [self shutdown:75 stage:@"maintenance-capacity"];
@@ -214,14 +230,14 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   }
   _maintenanceCount += 1;
   _maintenanceBytes += bytes;
-  dispatch_async(_actions, ^{
+  dispatch_async(queue, ^{
     @autoreleasepool {
       NSDictionary *result = work();
       dispatch_async(self->_control, ^{
         self->_maintenanceCount -= 1;
         self->_maintenanceBytes -= bytes;
         if (self->_requestedExit >= 0) {
-          if (!self->_busy && self->_maintenanceCount == 0) atomic_store(&self->_exitCode, self->_requestedExit);
+          if (!self->_busy && self->_maintenanceCount == 0) [self publishExit:self->_requestedExit];
           return;
         }
         completed(result);
@@ -447,7 +463,9 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   }
   if ([channel isEqual:@"cleanup"]) {
     MetaBrokerTransport *transport = _transport;
-    [self maintenance:payload work:^NSDictionary * {
+    // Долгое ожидание callback не занимает очередь, которая выполняет cancel.
+    dispatch_queue_t queue = [payload[@"payload"][@"waitForCompletion"] isEqual:@YES] ? _captureResults : _actions;
+    [self maintenance:payload queue:queue work:^NSDictionary * {
       return [self->_backend cleanupCapture:payload emitBinary:^BOOL(NSDictionary *header, NSData *bytes) { return [transport enqueueBinaryFrame:header bytes:bytes]; }];
     } completed:^(NSDictionary *result) {
       if (result == nil) [self shutdown:65];
@@ -545,7 +563,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
         if ((input || readiness || axPress || window || capture || application) && [job heartbeatExpired]) self->_sealed = YES;
         self->_busy = NO;
         self->_activeOperation = nil;
-        if (self->_requestedExit >= 0) { atomic_store(&self->_exitCode, self->_requestedExit); return; }
+        if (self->_requestedExit >= 0) { [self publishExit:self->_requestedExit]; return; }
         response[@"ok"] = result != nil ? @YES : @NO;
         if ([result[@"nativeError"] isKindOfClass:NSDictionary.class]) {
           response[@"ok"] = @NO;
@@ -592,14 +610,22 @@ int meta_command_loop_run(id<MetaCommandBackend> backend, NSString *buildId,
   if (transport == nil) return 70;
   controller.transport = transport;
   [transport start];
-  dispatch_source_t observerTimer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, control);
-  dispatch_source_set_timer(observerTimer, dispatch_time(DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC), 20 * NSEC_PER_MSEC, 5 * NSEC_PER_MSEC);
-  dispatch_source_set_event_handler(observerTimer, ^{ [controller pumpObserver]; });
-  dispatch_resume(observerTimer);
-  while ([controller exitCode] < 0) {
-    [[NSRunLoop currentRunLoop] runUntilDate:[NSDate dateWithTimeIntervalSinceNow:0.02]];
+  // DATA_OR объединяет burst событий. В idle нет timer/poll и пустых batches.
+  dispatch_source_t observerWake = dispatch_source_create(DISPATCH_SOURCE_TYPE_DATA_OR, 0, 0, control);
+  dispatch_source_set_event_handler(observerWake, ^{ [controller pumpObserver]; });
+  dispatch_resume(observerWake);
+  if ([backend respondsToSelector:@selector(setObserverPushNotifier:)]) {
+    [backend setObserverPushNotifier:^{ dispatch_source_merge_data(observerWake, 1); }];
   }
-  dispatch_source_cancel(observerTimer);
+  CFRunLoopSourceContext keepAliveContext = {0};
+  keepAliveContext.perform = keep_alive_perform;
+  CFRunLoopSourceRef keepAlive = CFRunLoopSourceCreate(NULL, 0, &keepAliveContext);
+  CFRunLoopAddSource(CFRunLoopGetMain(), keepAlive, kCFRunLoopCommonModes);
+  while ([controller exitCode] < 0) CFRunLoopRun();
+  CFRunLoopRemoveSource(CFRunLoopGetMain(), keepAlive, kCFRunLoopCommonModes);
+  CFRelease(keepAlive);
+  if ([backend respondsToSelector:@selector(setObserverPushNotifier:)]) [backend setObserverPushNotifier:nil];
+  dispatch_source_cancel(observerWake);
   dispatch_sync(control, ^{});
   if ([backend respondsToSelector:@selector(stopObserver)]) [backend stopObserver];
   [transport close];

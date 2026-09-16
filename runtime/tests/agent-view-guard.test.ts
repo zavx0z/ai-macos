@@ -31,7 +31,7 @@ test("fresh observe выдаёт explicit Native admission proof и однора
     observedNextSequence: 1,
     admissionCursor: "observer:view:start",
     admissionNextSequence: 1,
-    expiresAt: "2026-09-15T10:00:30.000Z",
+    expiresAt: "2026-09-15T10:02:00.000Z",
   })
   await expect(scope.admit(ticket, "operation:replay")).rejects.toThrow("consumed")
   await scope.settleOperation(ticket, operation("operation:view", target, "completed"))
@@ -592,5 +592,17 @@ test("длинная причина coverage не маскируется оши�
     await expect(scope.admit(ticket, "operation:long-reason")).rejects.toThrow("state=unavailable")
     value.observer.coverage = original
     await expect(scope.admit(ticket, "operation:long-reason:stale")).rejects.toThrow("coverage")
+  } finally { await value.guard.close() }
+})
+
+test("default view не протухает по возрасту; admission ограничен сроком operation", async () => {
+  const value = fixture()
+  const ticket = await observe(value, "lineage:idle", "target:idle", target)
+  expect(ticket.expiresAt).toBeUndefined()
+  value.advance(600_000)
+  const deadline = "2026-09-15T10:10:05.000Z"
+  try {
+    const proof = await value.guard.forLineage("lineage:idle").admit(ticket, "operation:idle", deadline)
+    expect(proof.expiresAt).toBe(deadline)
   } finally { await value.guard.close() }
 })

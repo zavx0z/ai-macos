@@ -1,3 +1,4 @@
+import { operationDeadline } from "./deadline.ts"
 import {
   browserOperationResources,
   structurallyEqual,
@@ -67,7 +68,7 @@ const windowSchema = z.strictObject({
   minimized: z.enum(["true", "false", "unknown"]),
   visibility: z.enum(["current", "not-current", "unknown"]),
   focused: z.enum(["true", "false", "unknown"]),
-  actionExpiresAt: z.string(),
+  actionExpiresAt: z.string().optional(),
 })
 const surfaceSchema = z.strictObject({
   targetId,
@@ -77,7 +78,7 @@ const surfaceSchema = z.strictObject({
   title: z.string(),
   actionability: z.enum(["ax", "unavailable"]),
   unavailableReason: z.string().optional(),
-  actionExpiresAt: z.string(),
+  actionExpiresAt: z.string().optional(),
 })
 const displaySchema = z.strictObject({
   targetId,
@@ -88,20 +89,20 @@ const displaySchema = z.strictObject({
   scale: z.number().positive(),
   rotationDegrees: z.number().min(0).lt(360),
   main: z.boolean(),
-  actionExpiresAt: z.string(),
+  actionExpiresAt: z.string().optional(),
 })
 const desktopLayoutSchema = z.strictObject({
   targetId,
   kind: z.literal("desktop-layout"),
   displayTargetIds: z.array(targetId),
-  actionExpiresAt: z.string(),
+  actionExpiresAt: z.string().optional(),
 })
 const browserSchema = z.strictObject({
   browserId: targetId,
   kind: z.literal("browser"),
   profile: z.string().optional(),
   state: z.enum(["connected", "degraded", "disconnected"]),
-  actionExpiresAt: z.string(),
+  actionExpiresAt: z.string().optional(),
 })
 const applicationSchema = z.strictObject({
   name: z.string(),
@@ -139,7 +140,7 @@ const tabsOutputSchema = z.strictObject({
     profile: z.string().optional(),
     title: z.string(),
     url: z.string(),
-    actionExpiresAt: z.string(),
+    actionExpiresAt: z.string().optional(),
   })),
 })
 const agentObservedStateBaseSchema = z.strictObject({
@@ -347,7 +348,7 @@ export class RuntimeAgentMethods {
             minimized: window.minimized,
             visibility: window.spaceVisibility,
             focused: window.focused,
-            actionExpiresAt: handle.actionExpiresAt,
+            ...(handle.actionExpiresAt === undefined ? {} : { actionExpiresAt: handle.actionExpiresAt }),
           })
           for (const surface of window.surfaces) {
             if (!surfaceOwnedByWindow(surface, window)) {
@@ -365,7 +366,7 @@ export class RuntimeAgentMethods {
               title: surface.title,
               actionability: surface.actionability,
               ...(surface.unavailableReason === undefined ? {} : { unavailableReason: surface.unavailableReason }),
-              actionExpiresAt: surfaceHandle.actionExpiresAt,
+              ...(surfaceHandle.actionExpiresAt === undefined ? {} : { actionExpiresAt: surfaceHandle.actionExpiresAt }),
             })
           }
         }
@@ -386,7 +387,7 @@ export class RuntimeAgentMethods {
               scale: display.scale,
               rotationDegrees: display.rotationDegrees,
               main: display.main,
-              actionExpiresAt: handle.actionExpiresAt,
+              ...(handle.actionExpiresAt === undefined ? {} : { actionExpiresAt: handle.actionExpiresAt }),
             })
           }
           if (inventory.desktopLayout !== undefined) {
@@ -402,7 +403,7 @@ export class RuntimeAgentMethods {
                 if (displayTargetId === undefined) throw new Error("Desktop layout содержит неизвестный display")
                 return displayTargetId
               }),
-              actionExpiresAt: handle.actionExpiresAt,
+              ...(handle.actionExpiresAt === undefined ? {} : { actionExpiresAt: handle.actionExpiresAt }),
             }
           }
         }
@@ -428,7 +429,7 @@ export class RuntimeAgentMethods {
             kind: "browser",
             ...(instance.profileLabel === undefined ? {} : { profile: instance.profileLabel }),
             state: instance.state,
-            actionExpiresAt: handle.actionExpiresAt,
+            ...(handle.actionExpiresAt === undefined ? {} : { actionExpiresAt: handle.actionExpiresAt }),
           })
         }
       } catch (error) {
@@ -461,7 +462,7 @@ export class RuntimeAgentMethods {
           clientRequestId: this.#ids("agent-browser-connect"),
           precondition: { target: { kind: "browser-instance", ref: instance.ref },
             inventoryId: snapshot.inventoryId, inventoryRevision: snapshot.inventoryRevision },
-          deadlineAt: new Date(this.#now().getTime() + 20_000).toISOString(),
+          deadlineAt: operationDeadline(signal, 20_000, this.#now().getTime()),
           requestedResources: browserOperationResources(request),
         },
         request,
@@ -505,7 +506,7 @@ export class RuntimeAgentMethods {
         ...(current.profileLabel === undefined ? {} : { profile: current.profileLabel }),
         title: tab.title,
         url: tab.url,
-        actionExpiresAt: handle.actionExpiresAt,
+        ...(handle.actionExpiresAt === undefined ? {} : { actionExpiresAt: handle.actionExpiresAt }),
       }
     })
     return tabsOutputSchema.parse({ browserId: currentBrowserId, complete: targets.complete === true, errors, tabs })
@@ -766,7 +767,7 @@ export class RuntimeAgentMethods {
           inventoryId: selected.inventoryId,
           inventoryRevision: selected.inventoryRevision,
         },
-        deadlineAt: new Date(this.#now().getTime() + 20_000).toISOString(),
+        deadlineAt: operationDeadline(signal, 20_000, this.#now().getTime()),
         requestedResources,
       },
       request,

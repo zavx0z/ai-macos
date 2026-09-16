@@ -578,8 +578,12 @@ export const nativeCaptureReleaseResultSchema = z.strictObject({
 })
 
 export const nativeCaptureCleanupRequestSchema = createNativeCleanupRequestSchema(
-  nativeCaptureTaskPayloadSchema,
-)
+  nativeCaptureTaskPayloadSchema.extend({ waitForCompletion: z.boolean().optional() }),
+).superRefine((request, context) => {
+  if (request.payload.waitForCompletion && request.control.purpose !== "result") {
+    context.addIssue({ code: "custom", path: ["payload", "waitForCompletion"], message: "Ожидание допустимо только для capture result" })
+  }
+})
 
 export const nativeCaptureTerminalEvidenceSchema = z.strictObject({
   operationId: opaqueIdSchema,

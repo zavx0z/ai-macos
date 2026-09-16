@@ -38,6 +38,7 @@
 - (NSDictionary *)heldRecovery:(NSDictionary *)request owner:(NSDictionary *)owner;
 - (NSDictionary *)observer:(NSDictionary *)request;
 - (BOOL)activateObserverPush:(NSString *)instanceRef;
+- (void)setObserverPushNotifier:(dispatch_block_t)notifier;
 - (NSDictionary *)takeObserverPush:(NSUInteger)maximum;
 - (void)stopObserver;
 @end

@@ -68,3 +68,30 @@ test("adapter rejection публикует только controlled class/timing 
   expect(runtimeHeartbeatFailureReason(observed)).toBe("Native heartbeat adapter; elapsedMs=2; timerLagMs=0")
   expect(runtimeHeartbeatFailureReason(observed)).not.toContain("PRIVATE")
 })
+
+test("простой не создаёт heartbeat; завершение operation подавляет поздний отказ", async () => {
+  let calls = 0
+  const failures: unknown[] = []
+  const loop = startRuntimeHeartbeat({ generation, active: false, intervalMs: 1, deadlineMs: 5,
+    native: { async heartbeat() { calls++; return new Promise(() => {}) } },
+    onFailure: error => { failures.push(error) },
+  })
+  try {
+    await Bun.sleep(15)
+    expect(calls).toBe(0)
+    loop.setActive(true)
+    expect(calls).toBe(1)
+    loop.setActive(false)
+    await Bun.sleep(15)
+    expect(calls).toBe(1)
+    expect(failures).toEqual([])
+    loop.setActive(true)
+    loop.setActive(false)
+    loop.setActive(true)
+    await Bun.sleep(0)
+    expect(calls).toBe(3)
+    loop.setActive(false)
+    await Bun.sleep(10)
+    expect(failures).toEqual([])
+  } finally { await loop.stop() }
+})

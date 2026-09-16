@@ -162,6 +162,62 @@ static void fake_release_result(void *context, MetaCaptureResult *result) {
   fake->result_release_count += 1;
 }
 
+// Ожидание callback не удерживает lock, необходимый status и cancel.
+static void test_result_wait(void) {
+  FakeCapture fake = {0};
+  MetaCaptureRouterBackend backend = {
+      .context = &fake, .start = fake_start, .cancel = fake_cancel,
+      .status = fake_status, .release_task = fake_release_task,
+      .release_result = fake_release_result,
+  };
+  MetaCaptureRouter *router = meta_capture_router_create("native-wait", backend);
+  assert(router != NULL);
+  MetaCaptureRequest request = {
+      .abiVersion = META_CAPTURE_ABI_VERSION,
+      .source = MetaCaptureSourceDisplayComposite,
+  };
+  char task_ref[META_NATIVE_REF_CAPACITY] = {0};
+  MetaCaptureTaskStatus status = {0};
+  assert(meta_capture_router_start(router, "operation-wait", &request, task_ref, &status));
+  // Истёкший deadline не выдаёт отсутствующий результат за готовый.
+  meta_capture_router_wait_result(router, task_ref, NSDate.date.timeIntervalSince1970 - 1);
+  const MetaCaptureResult *empty = NULL;
+  assert(meta_capture_router_result(router, task_ref, &status, &empty));
+  assert(empty == NULL);
+  assert(meta_capture_router_result_done(router, task_ref, empty));
+  dispatch_semaphore_t entered = dispatch_semaphore_create(0);
+  dispatch_semaphore_t finished = dispatch_semaphore_create(0);
+  const char *ref = task_ref;
+  dispatch_async(dispatch_get_global_queue(QOS_CLASS_DEFAULT, 0), ^{
+    dispatch_semaphore_signal(entered);
+    meta_capture_router_wait_result(router, ref, NSDate.date.timeIntervalSince1970 + 5);
+    dispatch_semaphore_signal(finished);
+  });
+  assert(dispatch_semaphore_wait(entered, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0);
+  assert(meta_capture_router_status(router, task_ref, &status));
+  assert(meta_capture_router_cancel(router, task_ref));
+  assert(fake.cancel_count == 1);
+  MetaCaptureResult *completion = calloc(1, sizeof(*completion));
+  assert(completion != NULL);
+  completion->outcome = MetaCaptureOutcomeCancelled;
+  completion->cleanup = MetaCaptureCleanupComplete;
+  fake.status = (MetaCaptureTaskStatus){
+      .revision = 2, .completionDelivered = true, .streamStopped = true,
+      .cleanup = MetaCaptureCleanupComplete, .drained = true,
+  };
+  fake.completion(completion);
+  // Будит callback, не истечение пятисекундного deadline.
+  assert(dispatch_semaphore_wait(finished, dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC)) == 0);
+  const MetaCaptureResult *result = NULL;
+  assert(meta_capture_router_result(router, task_ref, &status, &result));
+  assert(result == completion);
+  assert(meta_capture_router_result_done(router, task_ref, result));
+  bool already_released = false;
+  assert(meta_capture_router_release(router, task_ref, false, &already_released));
+  assert(!already_released);
+  meta_capture_router_destroy(router);
+}
+
 int main(void) {
   @autoreleasepool {
     status_entered = dispatch_semaphore_create(0);
@@ -591,6 +647,7 @@ int main(void) {
     assert(race.release_task_count == 2);
     assert(race.release_result_count == 3);
     meta_capture_router_destroy(layout_router);
+    test_result_wait();
   }
   puts("capture router tests passed");
   return 0;

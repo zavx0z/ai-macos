@@ -30,7 +30,7 @@ export type AgentTargetAuthority = {
 export type AgentTargetHandle = {
   targetId: string
   kind: AgentTarget["kind"]
-  actionExpiresAt: string
+  actionExpiresAt?: string
 }
 
 export type AgentElementHandle = {
@@ -50,14 +50,14 @@ export type AgentElementHandle = {
 export type AgentTargetActionResolution = AgentTargetAuthority & {
   targetId: string
   target: AgentTarget
-  actionExpiresAt: string
+  actionExpiresAt?: string
 }
 
 export type AgentTargetControlResolution = AgentTargetAuthority & {
   targetId: string
   target: AgentTarget
   state: "active" | "closed" | "invalidated"
-  actionExpiresAt: string
+  actionExpiresAt?: string
   controlExpiresAt: string
   reason?: string
 }
@@ -68,7 +68,7 @@ export type AgentElementResolution = {
   snapshotId: string
   elementRef: ElementRef
   actions: string[]
-  expiresAt: string
+  expiresAt?: string
 }
 
 export interface AgentTargetScope {
@@ -91,7 +91,7 @@ type TargetEntry = {
   target: AgentTarget
   authority: AgentTargetAuthority
   state: "active" | "closed" | "invalidated"
-  actionExpiresAtMs: number
+  actionExpiresAtMs?: number
   controlExpiresAtMs: number
   reason?: string
   latestSnapshotId?: string
@@ -106,7 +106,7 @@ type ElementEntry = {
   snapshotId: string
   elementRef: ElementRef
   actions: string[]
-  expiresAtMs: number
+  expiresAtMs?: number
   bytes: number
 }
 
@@ -132,9 +132,9 @@ export class AgentTargetRegistry {
   readonly #generation: { runtimeEpoch: string, loginSessionId: string }
   readonly #clock: RuntimeClock
   readonly #ids: RuntimeIdSource
-  readonly #actionTtlMs: number
+  readonly #actionTtlMs: number | undefined
   readonly #controlRetentionMs: number
-  readonly #elementTtlMs: number
+  readonly #elementTtlMs: number | undefined
   readonly #maxTargets: number
   readonly #maxElements: number
   readonly #maxBytes: number
@@ -148,10 +148,10 @@ export class AgentTargetRegistry {
     this.#generation = Object.freeze({ ...options.generation })
     this.#clock = options.clock ?? systemClock
     this.#ids = options.ids ?? randomIdSource
-    this.#actionTtlMs = bounded(options.actionTtlMs ?? 60_000, 1, 120_000, "action TTL")
+    this.#actionTtlMs = options.actionTtlMs === undefined ? undefined : bounded(options.actionTtlMs, 1, 120_000, "action TTL")
     this.#controlRetentionMs = bounded(options.controlRetentionMs ?? 300_000, 1, 30 * 60_000, "control retention")
-    if (this.#controlRetentionMs < this.#actionTtlMs) throw new Error("Control retention не может быть короче action TTL")
-    this.#elementTtlMs = bounded(options.elementTtlMs ?? 60_000, 1, 120_000, "element TTL")
+    if (this.#actionTtlMs !== undefined && this.#controlRetentionMs < this.#actionTtlMs) throw new Error("Control retention не может быть короче action TTL")
+    this.#elementTtlMs = options.elementTtlMs === undefined ? undefined : bounded(options.elementTtlMs, 1, 120_000, "element TTL")
     this.#maxTargets = bounded(options.maxTargets ?? 4096, 1, 10_000, "target count")
     this.#maxElements = bounded(options.maxElements ?? 10_000, 1, 100_000, "element count")
     this.#maxBytes = bounded(options.maxBytes ?? 8 * 1024 * 1024, 1024, 64 * 1024 * 1024, "registry bytes")
@@ -180,15 +180,28 @@ export class AgentTargetRegistry {
   prune(): void {
     const now = this.#clock.now().getTime()
     for (const element of [...this.#elements.values()]) {
-      if (now >= element.expiresAtMs) this.#deleteElement(element)
+      if (element.expiresAtMs !== undefined && now >= element.expiresAtMs) this.#deleteElement(element)
     }
     for (const [lineageId, store] of this.#lineages) {
       for (const entry of [...store.targets.values()]) {
-        if (now < entry.controlExpiresAtMs || entry.controlOwners.size > 0) continue
+        if (entry.state === "active" && entry.actionExpiresAtMs === undefined
+          || now < entry.controlExpiresAtMs || entry.controlOwners.size > 0) continue
         this.#deleteTarget(store, entry)
       }
       if (store.targets.size === 0) this.#lineages.delete(lineageId)
     }
+  }
+
+  /** Срок авторизации клиента не является сроком жизни окна. После подтверждённого
+   * закрытия lineage удаляем handles, но не control evidence незавершённых операций. */
+  releaseLineage(lineageId: string): void {
+    const store = this.#lineages.get(lineageId)
+    if (store === undefined) return
+    for (const entry of [...store.targets.values()]) {
+      if (entry.controlOwners.size === 0) this.#deleteTarget(store, entry)
+      else if (entry.state === "active") this.#invalidateTarget(lineageId, entry.targetId, "invalidated", "Client lineage закрыта")
+    }
+    if (store.targets.size === 0) this.#lineages.delete(lineageId)
   }
 
   stats() {
@@ -215,7 +228,7 @@ export class AgentTargetRegistry {
       if (authority.inventoryRevision < existing.authority.inventoryRevision) {
         throw new Error("Agent target registration использует stale inventory revision")
       }
-      const nextActionExpiresAtMs = now + this.#actionTtlMs
+      const nextActionExpiresAtMs = this.#actionTtlMs === undefined ? undefined : now + this.#actionTtlMs
       const nextControlExpiresAtMs = Math.max(existing.controlExpiresAtMs, now + this.#controlRetentionMs)
       const nextBytes = targetBytes({
         ...existing,
@@ -240,7 +253,7 @@ export class AgentTargetRegistry {
       target,
       authority,
       state: "active",
-      actionExpiresAtMs: now + this.#actionTtlMs,
+      actionExpiresAtMs: this.#actionTtlMs === undefined ? undefined : now + this.#actionTtlMs,
       controlExpiresAtMs: now + this.#controlRetentionMs,
       elementIds: new Set(),
       controlOwners: new Set(),
@@ -261,14 +274,14 @@ export class AgentTargetRegistry {
     this.prune()
     const entry = this.#ownTarget(lineageId, targetId)
     if (entry.state !== "active") throw new Error(`Agent target ${entry.state}; получите fresh state`)
-    if (this.#clock.now().getTime() >= entry.actionExpiresAtMs) {
+    if (entry.actionExpiresAtMs !== undefined && this.#clock.now().getTime() >= entry.actionExpiresAtMs) {
       throw new Error("Agent target action TTL истёк; получите fresh state")
     }
     return Object.freeze({
       targetId: entry.targetId,
       target: structuredClone(entry.target),
       ...entry.authority,
-      actionExpiresAt: timestamp(entry.actionExpiresAtMs),
+      ...(entry.actionExpiresAtMs === undefined ? {} : { actionExpiresAt: timestamp(entry.actionExpiresAtMs) }),
     })
   }
 
@@ -276,7 +289,7 @@ export class AgentTargetRegistry {
     this.prune()
     const entry = this.#ownTarget(lineageId, targetId)
     const now = this.#clock.now().getTime()
-    if (now >= entry.controlExpiresAtMs && entry.controlOwners.size === 0) {
+    if ((entry.state !== "active" || entry.actionExpiresAtMs !== undefined) && now >= entry.controlExpiresAtMs && entry.controlOwners.size === 0) {
       throw new Error("Agent target control retention истёк")
     }
     return Object.freeze({
@@ -284,7 +297,7 @@ export class AgentTargetRegistry {
       target: structuredClone(entry.target),
       ...entry.authority,
       state: entry.state,
-      actionExpiresAt: timestamp(entry.actionExpiresAtMs),
+      ...(entry.actionExpiresAtMs === undefined ? {} : { actionExpiresAt: timestamp(entry.actionExpiresAtMs) }),
       controlExpiresAt: timestamp(entry.controlExpiresAtMs),
       ...(entry.reason === undefined ? {} : { reason: entry.reason }),
     })
@@ -302,7 +315,7 @@ export class AgentTargetRegistry {
       throw new Error("Agent target terminal state conflict")
     }
     const now = this.#clock.now().getTime()
-    const nextActionExpiresAtMs = Math.min(entry.actionExpiresAtMs, now)
+    const nextActionExpiresAtMs = Math.min(entry.actionExpiresAtMs ?? now, now)
     const nextControlExpiresAtMs = Math.max(entry.controlExpiresAtMs, now + this.#controlRetentionMs)
     const nextBytes = targetBytes({
       ...entry,
@@ -367,7 +380,8 @@ export class AgentTargetRegistry {
     }
     this.prune()
     const parent = this.#ownTarget(lineageId, targetId)
-    const expiresAtMs = Math.min(parent.actionExpiresAtMs, this.#clock.now().getTime() + this.#elementTtlMs)
+    const expiresAtMs = this.#elementTtlMs === undefined ? parent.actionExpiresAtMs
+      : Math.min(parent.actionExpiresAtMs ?? Infinity, this.#clock.now().getTime() + this.#elementTtlMs)
     const pendingIds = new Set<string>()
     const elementIdsByRef = new Map<string, string>()
     const pending = result.nodes.map(node => {
@@ -438,7 +452,7 @@ export class AgentTargetRegistry {
     if (entry === undefined || entry.targetId !== targetId || parent.latestSnapshotId !== entry.snapshotId) {
       throw new Error("AX element handle не принадлежит latest target snapshot")
     }
-    if (this.#clock.now().getTime() >= entry.expiresAtMs) {
+    if (entry.expiresAtMs !== undefined && this.#clock.now().getTime() >= entry.expiresAtMs) {
       this.#deleteElement(entry)
       throw new Error("AX element handle истёк")
     }
@@ -452,7 +466,7 @@ export class AgentTargetRegistry {
       snapshotId: entry.snapshotId,
       elementRef: structuredClone(entry.elementRef),
       actions: [...entry.actions],
-      expiresAt: timestamp(entry.expiresAtMs),
+      ...(entry.expiresAtMs === undefined ? {} : { expiresAt: timestamp(entry.expiresAtMs) }),
     })
   }
 
@@ -538,7 +552,7 @@ function publicTarget(entry: TargetEntry): AgentTargetHandle {
   return Object.freeze({
     targetId: entry.targetId,
     kind: entry.target.kind,
-    actionExpiresAt: timestamp(entry.actionExpiresAtMs),
+    ...(entry.actionExpiresAtMs === undefined ? {} : { actionExpiresAt: timestamp(entry.actionExpiresAtMs) }),
   })
 }
 

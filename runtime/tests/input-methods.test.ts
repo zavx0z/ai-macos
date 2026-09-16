@@ -331,7 +331,7 @@ describe("C3 runtime input method catalogue", () => {
     expect(value.calls()).toBe(0)
   })
 
-  test("near-max actions получают отдельные operation и method margins без ожидания", async () => {
+  test("near-max actions наследуют общий method deadline без нового operation budget", async () => {
     const startedAt = new Date()
     const value = fixture({ now: () => startedAt })
     value.core.updateCapabilities(readyCapabilities())
@@ -379,8 +379,10 @@ describe("C3 runtime input method catalogue", () => {
 
     const textOperation = text.data.operation as { context: { deadlineAt: string } }
     const dragOperation = drag.data.operation as { context: { deadlineAt: string } }
-    expect(Date.parse(textOperation.context.deadlineAt) - startedAt.getTime()).toBe(33_000)
-    expect(Date.parse(dragOperation.context.deadlineAt) - startedAt.getTime()).toBe(8_000)
+    expect(Date.parse(textOperation.context.deadlineAt) - startedAt.getTime()).toBeGreaterThanOrEqual(35_000)
+    expect(Date.parse(textOperation.context.deadlineAt)).toBeLessThanOrEqual(Date.now() + 35_000)
+    expect(Date.parse(dragOperation.context.deadlineAt) - startedAt.getTime()).toBeGreaterThanOrEqual(10_000)
+    expect(Date.parse(dragOperation.context.deadlineAt)).toBeLessThanOrEqual(Date.now() + 10_000)
     expect(INPUT_METHOD_BUDGETS.typing).toEqual({ actionMs: 30_000, operationMs: 33_000, methodMs: 35_000 })
     expect(INPUT_METHOD_BUDGETS.short).toEqual({ actionMs: 5_000, operationMs: 8_000, methodMs: 10_000 })
   })

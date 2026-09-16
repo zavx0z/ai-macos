@@ -113,8 +113,12 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   let draining = false
   let heartbeat: ReturnType<typeof startRuntimeHeartbeat> | undefined
   let rotation: ReturnType<typeof startRuntimeRotation> | undefined
-  const startedAt = Date.now()
-  let clientSweep: ReturnType<typeof setInterval> | undefined
+  let activityUnsubscribe: (() => void) | undefined
+  let callUnsubscribe: (() => void) | undefined
+  let capabilitiesUnsubscribe: (() => void) | undefined
+  let unsubscribeClientExpiries: (() => void) | undefined
+  let expiryScheduling = false
+  let clientSweep: ReturnType<typeof setTimeout> | undefined
   let browserHost: ReturnType<typeof createBrowserHostComposition> | undefined
   let observerBinding: NativeObserverBinding | undefined
   let viewGuard: AgentViewGuard | undefined
@@ -251,6 +255,11 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   browserHost = createBrowserHostComposition(core, options.browser ?? {})
   await core.browserLifetime.restorePersisted()
+  const unsubscribeLineageCleanup = core.subscribeLineageCleanup(lineageId => {
+    viewBindings?.releaseLineage(lineageId)
+    viewGuard?.releaseLineage(lineageId)
+    agentTargets.releaseLineage(lineageId)
+  })
   const refreshCapabilities = () => core.updateCapabilities(composeHostCapabilities("host:runtime",
     native === undefined || nativeError !== undefined ? undefined : nativeCapabilities,
     nativeError, browserHost?.capabilitySet, observerState === "ready", viewReady))
@@ -485,7 +494,9 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     await lifecycle?.record("drain-start").catch(() => undefined)
     core.sealAdmission()
     preparationAbort.abort("Runtime drain отменил preparation")
-    if (clientSweep !== undefined) clearInterval(clientSweep)
+    expiryScheduling = false
+    unsubscribeClientExpiries?.()
+    if (clientSweep !== undefined) clearTimeout(clientSweep)
     await heartbeat?.stop()
     await core.drainOperations()
     await core.drainClientGrace()
@@ -659,15 +670,21 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     closing ??= (async () => {
       await lifecycle?.record("close-start").catch(() => undefined)
       rotation?.stop()
+      activityUnsubscribe?.()
+      callUnsubscribe?.()
+      capabilitiesUnsubscribe?.()
       core.sealAdmission()
       preparationAbort.abort("Runtime close отменил preparation")
-      if (clientSweep !== undefined) clearInterval(clientSweep)
+      expiryScheduling = false
+      unsubscribeClientExpiries?.()
+      if (clientSweep !== undefined) clearTimeout(clientSweep)
       const errors: Error[] = []
       const attempt = async (stage: string, cleanup: () => Promise<unknown> | undefined) => {
         try { await cleanup() }
         catch (cause) { errors.push(new Error(`Runtime close: ${stage} не подтверждён`, { cause })) }
       }
       await attempt("client lifecycle", () => core.closeClientLifecycle())
+      unsubscribeLineageCleanup()
       await permissionPreparation?.catch(() => undefined)
       await attempt("backend preparation", () => backendPreparation)
       await attempt("view guard", () => viewGuard?.close())
@@ -697,7 +714,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       try {
         await lifecycle?.record("host-start").catch(() => undefined)
         if (permissionFlow !== undefined) core.sealAdmission()
-        if (native !== undefined && handshake !== undefined) heartbeat = startRuntimeHeartbeat({ native,
+        if (native !== undefined && handshake !== undefined) heartbeat = startRuntimeHeartbeat({ native, active: false,
           generation: { ...generation, nativeGeneration: handshake.nativeGeneration },
           onFailure(error) {
             const reason = runtimeHeartbeatFailureReason(error)
@@ -705,19 +722,38 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
             revokeNative(reason)
           },
         })
+        activityUnsubscribe = core.subscribeActivity(() => {
+          heartbeat?.setActive(core.activeNativeOperationCount() > 0)
+          queueMicrotask(() => rotation?.check())
+        })
+        callUnsubscribe = catalog.subscribeCallSettled(() => rotation?.check())
+        capabilitiesUnsubscribe = core.subscribeCapabilities(() => { queueMicrotask(() => rotation?.check()) })
         await uds.start()
         if (permissionFlow === undefined) void beginBackendPreparation()
         else permissionPreparation = permissionFlow.start(preparationAbort.signal)
-        clientSweep = setInterval(() => core.sweepClientExpiries(), 1000)
-        clientSweep.unref?.()
+        expiryScheduling = true
+        const scheduleExpiry = () => {
+          if (clientSweep !== undefined) clearTimeout(clientSweep)
+          clientSweep = undefined
+          if (!expiryScheduling) return
+          const next = core.clients.nextExpiryAt()
+          if (next === undefined) return
+          clientSweep = setTimeout(() => {
+            clientSweep = undefined
+            core.sweepClientExpiries()
+            scheduleExpiry()
+          }, Math.max(0, next - Date.now()))
+          clientSweep.unref?.()
+        }
+        unsubscribeClientExpiries = core.clients.subscribeChanged(scheduleExpiry)
+        scheduleExpiry()
         rotation = startRuntimeRotation({
           managed: options.managed === true,
           reason() {
             const reason = nativeError !== undefined && actorRecord !== undefined ? "Owned Native actor недоступен; требуется recovery restart"
               : actorRecord !== undefined && core.activeOperationCount() === 0 && core.resources.quarantinedCount() > 0 ? "Current operations quarantined; требуется новый recovery actor"
                 : native !== undefined && native.sessionState.requestsUsed >= 8500 ? "Native request budget требует нового процесса"
-                  : Date.now() - startedAt >= 23 * 60 * 60 * 1000 ? "Runtime достиг rotation horizon"
-                    : core.frames.stats().issuedRefs >= 9000 ? "Frame reference budget требует нового процесса" : undefined
+                  : core.frames.stats().issuedRefs >= 9000 ? "Frame reference budget требует нового процесса" : undefined
             if (reason !== undefined) void lifecycle?.record("rotation-trigger", reason).catch(() => undefined)
             return reason
           },
@@ -728,7 +764,19 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
           exit: options.exitAfterRotation ?? (() => process.exit(0)),
         })
       }
-      catch (error) { core.sealAdmission(); await heartbeat?.stop(); await closeNative(); await releaseLock(); throw error }
+      catch (error) {
+        expiryScheduling = false
+        unsubscribeClientExpiries?.()
+        if (clientSweep !== undefined) clearTimeout(clientSweep)
+        activityUnsubscribe?.()
+        callUnsubscribe?.()
+        capabilitiesUnsubscribe?.()
+        core.sealAdmission()
+        await heartbeat?.stop()
+        await closeNative()
+        await releaseLock()
+        throw error
+      }
     },
     drain,
     close,

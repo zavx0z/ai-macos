@@ -125,7 +125,7 @@ static uint64_t monotonic_millis(void) {
     dispatch_source_set_event_handler(self->_reader, ^{ [weakSelf readAvailable]; });
     dispatch_source_set_event_handler(self->_writer, ^{ [weakSelf writeAvailable]; });
     self->_watchdog = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, self->_io);
-    dispatch_source_set_timer(self->_watchdog, dispatch_time(DISPATCH_TIME_NOW, 100000000), 100000000, 10000000);
+    dispatch_source_set_timer(self->_watchdog, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
     dispatch_source_set_event_handler(self->_watchdog, ^{
       MetaBrokerTransport *transport = weakSelf;
       if (transport == nil || transport->_closed) return;
@@ -133,9 +133,10 @@ static uint64_t monotonic_millis(void) {
       if ((transport->_partialSince != 0 && now - transport->_partialSince >= 5000) ||
           (transport->_writes.count > 0 && now - transport->_lastWriteProgress >= 5000)) {
         [transport fail:@"Native framed transport deadline exceeded"];
-      }
+      } else [transport armDeadline];
     });
     dispatch_resume(self->_watchdog);
+    [self armDeadline];
     dispatch_resume(self->_reader);
     self->_writerSuspended = YES;
     if (self->_writes.count > 0) {
@@ -145,7 +146,24 @@ static uint64_t monotonic_millis(void) {
   });
 }
 
+// Вызывается только на _io после изменения неполного frame или очереди записи.
+- (void)armDeadline {
+  if (_watchdog == nil || _closed) return;
+  uint64_t due = UINT64_MAX;
+  if (_partialSince != 0) due = _partialSince + 5000;
+  if (_writes.count > 0) due = MIN(due, _lastWriteProgress + 5000);
+  if (due == UINT64_MAX) {
+    dispatch_source_set_timer(_watchdog, DISPATCH_TIME_FOREVER, DISPATCH_TIME_FOREVER, 0);
+  } else {
+    uint64_t now = monotonic_millis();
+    dispatch_source_set_timer(_watchdog,
+      dispatch_time(DISPATCH_TIME_NOW, (int64_t)(due > now ? due - now : 0) * NSEC_PER_MSEC),
+      DISPATCH_TIME_FOREVER, 0);
+  }
+}
+
 - (void)readAvailable {
+  @try {
   NSUInteger readBudget = 256 * 1024;
   while (!_closed && readBudget > 0) {
     void *destination = _payload == nil ? _header + _headerLength : (uint8_t *)_payload.mutableBytes + _payloadLength;
@@ -203,6 +221,8 @@ static uint64_t monotonic_millis(void) {
       });
     }
   }
+
+  } @finally { [self armDeadline]; }
 }
 
 - (BOOL)enqueueFrame:(NSDictionary *)frame {
@@ -231,6 +251,7 @@ static uint64_t monotonic_millis(void) {
     self->_queuedBytes += length;
     if (clipboard) self->_queuedClipboardBytes += length;
     accepted = YES;
+    [self armDeadline];
     if (self->_started && self->_writerSuspended) {
       self->_writerSuspended = NO;
       dispatch_resume(self->_writer);
@@ -270,6 +291,7 @@ static uint64_t monotonic_millis(void) {
     self->_queuedBinaryBytes += length;
     self->_queuedBinaries += 1;
     accepted = YES;
+    [self armDeadline];
     if (self->_started && self->_writerSuspended) {
       self->_writerSuspended = NO;
       dispatch_resume(self->_writer);
@@ -279,6 +301,7 @@ static uint64_t monotonic_millis(void) {
 }
 
 - (void)writeAvailable {
+  @try {
   NSUInteger writeBudget = 256 * 1024;
   while (!_closed && _writes.count > 0 && writeBudget > 0) {
     NSData *data = _writes[0];
@@ -305,6 +328,8 @@ static uint64_t monotonic_millis(void) {
     dispatch_suspend(_writer);
     _writerSuspended = YES;
   }
+
+  } @finally { [self armDeadline]; }
 }
 
 - (void)close { dispatch_async(_io, ^{ [self closeOnQueue]; }); }

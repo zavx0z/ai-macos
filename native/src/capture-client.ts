@@ -192,12 +192,12 @@ export class NativeCaptureTask {
     return response.status
   }
 
-  async result(): Promise<NativeCapturePoll> {
+  async result(waitForCompletion = false): Promise<NativeCapturePoll> {
     this.#assertOpen()
-    const continuation = await this.#continuation("result")
+    const continuation = await this.#continuation("result", waitForCompletion)
     const response = await this.#native.cleanup(
       nativeCaptureCleanupRequestSchema,
-      { control: continuation.cleanupControl, payload: { captureTaskRef: this.taskRef } },
+      { control: continuation.cleanupControl, payload: { captureTaskRef: this.taskRef, ...(waitForCompletion ? { waitForCompletion: true } : {}) } },
       nativeCaptureCleanupResponseSchema,
       continuation.control,
     )
@@ -301,11 +301,12 @@ export class NativeCaptureTask {
     this.#released = true
   }
 
-  async #continuation(purpose: "result" | "status" | "cancel" | "release") {
+  async #continuation(purpose: "result" | "status" | "cancel" | "release", waitForCompletion = false) {
     return await this.#continuations.issue({
       operationId: this.#context.wire.operationId,
       taskRef: this.taskRef,
       purpose,
+      ...(waitForCompletion ? { requestedDeadlineAt: new Date(Math.max(Date.now() + 1_000, Date.parse(this.#context.wire.deadlineAt) + 1_000)).toISOString() } : {}),
       expectedRevision: this.#statusRevision,
     })
   }

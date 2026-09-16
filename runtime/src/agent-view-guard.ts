@@ -29,7 +29,7 @@ export type AgentObservationDraft = Readonly<{
 export type AgentViewTicket = Readonly<{
   targetId: string
   observedAt: string
-  expiresAt: string
+  expiresAt?: string
 }>
 
 export type AgentViewAdmissionProof = Readonly<{
@@ -54,6 +54,7 @@ export interface AgentViewScope {
   admit(
     ticket: AgentViewTicket,
     operationId: string,
+    deadlineAt?: string,
   ): Promise<AgentViewAdmissionProof>
   settleOperation(ticket: AgentViewTicket, operation: OperationRecord): Promise<void>
   invalidateView(ticket: AgentViewTicket, reason: string): void
@@ -67,7 +68,7 @@ type ViewRecord = {
   state: "draft" | "fresh" | "stale"
   startedAtMs: number
   observedAtMs?: number
-  expiresAtMs: number
+  expiresAtMs?: number
   retainUntilMs: number
   baselineCursor: string
   baselineNextSequence: number
@@ -77,6 +78,7 @@ type ViewRecord = {
 }
 
 type BoundOperation = {
+  deadlineAtMs: number
   operationId: string
   record: ViewRecord
 }
@@ -102,10 +104,10 @@ export class AgentViewGuard {
   readonly #resolveTarget: AgentViewGuardOptions["resolveTarget"]
   readonly #clock: RuntimeClock
   readonly #ids: RuntimeIdSource
-  readonly #ticketTtlMs: number
+  readonly #ticketTtlMs: number | undefined
   readonly #retentionMs: number
   readonly #syncTimeoutMs: number
-  readonly #maxCoverageLagMs: number
+  readonly #maxCoverageLagMs: number | undefined
   readonly #maxRecords: number
   readonly #maxBytes: number
   readonly #records = new Map<string, ViewRecord>()
@@ -131,10 +133,10 @@ export class AgentViewGuard {
     this.#resolveTarget = options.resolveTarget
     this.#clock = options.clock ?? systemClock
     this.#ids = options.ids ?? randomIdSource
-    this.#ticketTtlMs = limit(options.ticketTtlMs ?? 30_000, 1, 120_000, "view ticket TTL")
-    this.#retentionMs = limit(options.retentionMs ?? 300_000, this.#ticketTtlMs, 30 * 60_000, "view retention")
+    this.#ticketTtlMs = options.ticketTtlMs === undefined ? undefined : limit(options.ticketTtlMs, 1, 120_000, "view ticket TTL")
+    this.#retentionMs = limit(options.retentionMs ?? 300_000, this.#ticketTtlMs ?? 1, 30 * 60_000, "view retention")
     this.#syncTimeoutMs = limit(options.syncTimeoutMs ?? 1000, 1, 5000, "observer sync timeout")
-    this.#maxCoverageLagMs = limit(options.maxCoverageLagMs ?? 1000, 1, 5000, "observer coverage lag")
+    this.#maxCoverageLagMs = options.maxCoverageLagMs === undefined ? undefined : limit(options.maxCoverageLagMs, 1, 5000, "observer coverage lag")
     this.#maxRecords = limit(options.maxRecords ?? 4096, 1, 10_000, "view record count")
     this.#maxBytes = limit(options.maxBytes ?? 4 * 1024 * 1024, 1024, 64 * 1024 * 1024, "view record bytes")
     for (const value of Object.values(this.#generation)) opaqueIdSchema.parse(value)
@@ -171,11 +173,18 @@ export class AgentViewGuard {
       beginObservation: (targetId, target) => this.#beginObservation(lineageId, targetId, target),
       commitObservation: draft => this.#commitObservation(lineageId, draft),
       cancelObservation: draft => this.#cancelObservation(lineageId, draft),
-      admit: (ticket, operationId) => this.#admit(lineageId, ticket, operationId),
+      admit: (ticket, operationId, deadlineAt) => this.#admit(lineageId, ticket, operationId, deadlineAt),
       settleOperation: (ticket, operation) => this.#settleOperation(lineageId, ticket, operation),
       invalidateView: (ticket, reason) => this.#invalidateView(lineageId, ticket, reason),
     }
     return Object.freeze(scope)
+  }
+
+  releaseLineage(lineageId: string): void {
+    for (const record of this.#records.values()) {
+      if (record.lineageId === lineageId) this.#invalidate(record, "Client lineage закрыта")
+    }
+    this.#prune()
   }
 
   stats() {
@@ -208,7 +217,7 @@ export class AgentViewGuard {
       target,
       state: "draft",
       startedAtMs: now,
-      expiresAtMs: now + this.#ticketTtlMs,
+      expiresAtMs: this.#ticketTtlMs === undefined ? undefined : now + this.#ticketTtlMs,
       retainUntilMs: now + this.#retentionMs,
       baselineCursor: coverage.cursor,
       baselineNextSequence: coverage.nextSequence,
@@ -243,7 +252,7 @@ export class AgentViewGuard {
     record.observedAtMs = now
     record.observedCursor = coverage.cursor
     record.observedNextSequence = coverage.nextSequence
-    record.expiresAtMs = now + this.#ticketTtlMs
+    record.expiresAtMs = this.#ticketTtlMs === undefined ? undefined : now + this.#ticketTtlMs
     record.retainUntilMs = now + this.#retentionMs
     this.#current.set(currentKey, record.viewNonce)
     try { this.#assertByteBudget() }
@@ -251,7 +260,7 @@ export class AgentViewGuard {
       this.#invalidate(record, "Observation metadata превысила byte budget")
       throw error
     }
-    const ticket = Object.freeze({ targetId: record.targetId, observedAt: timestamp(now), expiresAt: timestamp(record.expiresAtMs) })
+    const ticket = Object.freeze({ targetId: record.targetId, observedAt: timestamp(now), ...(record.expiresAtMs === undefined ? {} : { expiresAt: timestamp(record.expiresAtMs) }) })
     this.#ticketKeys.set(ticket, record.viewNonce)
     return ticket
   }
@@ -265,13 +274,18 @@ export class AgentViewGuard {
     lineageId: string,
     ticket: AgentViewTicket,
     rawOperationId: string,
+    deadlineAt?: string,
   ): Promise<AgentViewAdmissionProof> {
     const record = this.#freshTicket(lineageId, ticket)
     const operationId = opaqueIdSchema.parse(rawOperationId)
     if (this.#operations.has(operationId)) throw new Error("Agent view operation уже admitted")
     const coverage = await this.#synchronize()
     this.#assertFresh(record)
+    const now = this.#clock.now().getTime()
+    const deadlineAtMs = deadlineAt === undefined ? now + 120_000 : Date.parse(deadlineAt)
+    if (!Number.isFinite(deadlineAtMs) || deadlineAtMs <= now) throw new Error("View admission operation deadline")
     const binding: BoundOperation = {
+      deadlineAtMs,
       operationId,
       record,
     }
@@ -363,8 +377,8 @@ export class AgentViewGuard {
 
   async #synchronize(): Promise<ObserverCoverage> {
     await this.#ensureStarted()
-    const coverage = await this.#healthyCoverage()
     const deadline = this.#clock.now().getTime() + this.#syncTimeoutMs
+    const coverage = await this.#healthyCoverage()
     while (
       this.#nextSequence === undefined
       || this.#nextSequence < coverage.nextSequence
@@ -407,7 +421,7 @@ export class AgentViewGuard {
     const missing = requiredKinds.filter(kind => !coverage.coveredKinds.includes(kind))
     if (missing.length > 0) failures.push(`missingKinds=${missing.join(",")}`)
     const lag = now - Date.parse(coverage.coveredThrough)
-    if (!Number.isFinite(lag) || lag > this.#maxCoverageLagMs) failures.push(`coverageLagMs=${lag}`)
+    if (!Number.isFinite(lag) || this.#maxCoverageLagMs !== undefined && lag > this.#maxCoverageLagMs) failures.push(`coverageLagMs=${lag}`)
     const heartbeat = Date.parse(coverage.heartbeatAt)
     if (!Number.isFinite(heartbeat) || heartbeat > now + 1000) failures.push("heartbeat timestamp invalid")
     if (this.#coverageStartCursor !== undefined
@@ -465,7 +479,8 @@ export class AgentViewGuard {
       observedNextSequence: record.observedNextSequence,
       admissionCursor: coverage.cursor,
       admissionNextSequence: coverage.nextSequence,
-      expiresAt: timestamp(record.expiresAtMs),
+      // Это срок доставки одноразового допуска, не возраст исходного снимка.
+      expiresAt: timestamp(Math.min(record.expiresAtMs ?? Infinity, binding.deadlineAtMs)),
     })
   }
 
@@ -477,7 +492,7 @@ export class AgentViewGuard {
 
   #assertFresh(record: ViewRecord): void {
     if (record.state !== "fresh") throw new Error(record.reason ?? "Agent view stale")
-    if (this.#clock.now().getTime() >= record.expiresAtMs) {
+    if (record.expiresAtMs !== undefined && this.#clock.now().getTime() >= record.expiresAtMs) {
       this.#invalidate(record, "Agent view ticket истёк")
       throw new Error(record.reason)
     }
@@ -533,7 +548,7 @@ export class AgentViewGuard {
   #prune(): void {
     const now = this.#clock.now().getTime()
     for (const record of this.#records.values()) {
-      if (record.state !== "stale" && now >= record.expiresAtMs) this.#invalidate(record, "Agent view ticket истёк")
+      if (record.state !== "stale" && record.expiresAtMs !== undefined && now >= record.expiresAtMs) this.#invalidate(record, "Agent view ticket истёк")
     }
     const retainedRecords = new Set([...this.#operations.values()].map(operation => operation.record))
     for (const [id, record] of this.#records) {

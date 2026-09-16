@@ -217,10 +217,9 @@ export class NativeBrokerAdapter implements NativeAdapter {
   #transportClosing: Promise<void> | undefined
   #rotationSealed = false
   #ledgerWrites = 0
-  readonly #startedAt = Date.now()
 
   get sessionState() {
-    const rotationRequired = this.#seenRequestIds.size >= 9_000 || Date.now() - this.#startedAt >= 24 * 60 * 60 * 1000
+    const rotationRequired = this.#seenRequestIds.size >= 9_000
     return {
       state: this.#poisoned !== undefined ? "poisoned" as const : this.#closed ? "closed" as const : this.#rotationSealed ? "draining" as const : rotationRequired ? "rotation-required" as const : "ready" as const,
       requestsUsed: this.#seenRequestIds.size,

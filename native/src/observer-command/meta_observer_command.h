@@ -51,6 +51,7 @@ typedef NSDictionary *_Nullable (^MetaObserverIndexFailureProvider)(void);
 - (NSDictionary *)handleRequest:(NSDictionary *)request;
 // Вызывается command loop только после успешной отправки prepare ACK.
 - (BOOL)activatePushForObserverInstance:(NSString *)observerInstanceRef;
+- (void)setPushNotifier:(nullable dispatch_block_t)notifier;
 // Возвращает primary PUSH envelopes и terminal gapReason, если он появился.
 - (NSDictionary *)takePushEnvelopes:(NSUInteger)maximum;
 - (nullable NSDictionary *)currentCoverageForObserverInstance:

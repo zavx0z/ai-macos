@@ -1,3 +1,4 @@
+import { bindDeadline, signalDeadline } from "./deadline.ts"
 import {
   TERMINAL_OPERATION_STATES,
   opaqueIdSchema,
@@ -164,6 +165,8 @@ export class AgentOperations {
     const clientRequestId = this.#ids.next("agent-request")
     scope.retainControl(targetId, ownerKey)
     const controller = new AbortController()
+    const deadlineAt = signalDeadline(signal)
+    if (deadlineAt !== undefined) bindDeadline(controller.signal, deadlineAt)
     const record: TrackedRecord = {
       trackingId,
       ownerKey,
@@ -407,7 +410,8 @@ function assertActionBinding(
 ): void {
   if (binding.targetId !== targetId || !Number.isSafeInteger(binding.inventoryRevision)
     || binding.inventoryRevision < 0 || binding.inventoryId.length < 1
-    || Date.parse(binding.actionExpiresAt) <= now.getTime()) {
+    || binding.actionExpiresAt !== undefined && (!Number.isFinite(Date.parse(binding.actionExpiresAt))
+      || Date.parse(binding.actionExpiresAt) <= now.getTime())) {
     throw new Error("Agent action target binding invalid или expired")
   }
 }

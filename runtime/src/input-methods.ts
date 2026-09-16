@@ -1,3 +1,4 @@
+import { operationDeadline } from "./deadline.ts"
 import {
   adapterResultSchema,
   desktopLayoutRefSchema,
@@ -244,7 +245,7 @@ function registerAction(
     maxRequestBytes: 1024 * 1024,
     maxResponseBytes: 2 * 1024 * 1024,
     async execute(context, request) {
-      const deadlineAt = new Date(definition.now().getTime() + definition.operationMs).toISOString()
+      const deadlineAt = operationDeadline(context.signal, definition.operationMs, definition.now().getTime())
       const intent = runtimeOperationIntentSchema.parse({
         intent: "mutation",
         clientRequestId: request.clientRequestId,

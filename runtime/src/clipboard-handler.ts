@@ -1,3 +1,4 @@
+import { operationDeadline } from "./deadline.ts"
 import {
   freezeAdapterHostContext, operationOutcomeSchema, runtimeOperationIntentSchema, structurallyEqual,
   type AdapterResult, type ClipboardExecutionContext, type RuntimeClientSession,
@@ -46,7 +47,7 @@ export class RuntimeClipboardHandler implements BackendCompletionVerifier {
     const intent = runtimeOperationIntentSchema.parse({
       intent: request.kind === "read" ? "read" : "mutation", clientRequestId,
       precondition: { target, inventoryId: "inventory:clipboard", inventoryRevision: 0 },
-      deadlineAt: new Date(Date.now() + 5000).toISOString(),
+      deadlineAt: operationDeadline(signal, 5000),
       requestedResources: [{ kind: "clipboard", resourceRef: "system" }],
     })
     return this.#core.runOperation(session, intent, request, async (context, value) => {

@@ -27,7 +27,7 @@ function fixture() {
       admitted++
       return { operationId, targetId: value.targetId, viewNonce: "nonce:binding", observerInstanceRef: "observer:binding",
         expectedCoverageStartCursor: "cursor:start", baselineCursor: "cursor:start", baselineNextSequence: 1,
-        observedCursor: "cursor:start", observedNextSequence: 1, admissionCursor: "cursor:start", admissionNextSequence: 1, expiresAt: value.expiresAt }
+        observedCursor: "cursor:start", observedNextSequence: 1, admissionCursor: "cursor:start", admissionNextSequence: 1, expiresAt: value.expiresAt! }
     },
     async settleOperation() {},
     invalidateView(value) { retired++; invalidated.add(value) },

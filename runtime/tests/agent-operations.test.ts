@@ -1,3 +1,4 @@
+import { bindDeadline, signalDeadline } from "../src/deadline.ts"
 import { describe, expect, test } from "bun:test"
 import {
   operationRecordSchema,
@@ -561,8 +562,28 @@ describe("agent operation control", () => {
     expect(() => scope.resolveControl(handle.targetId)).toThrow()
   })
 
+  test("обёртка tracked action сохраняет общий deadline и caller cancellation", async () => {
+    const { runtime, first, operations, firstScope } = fixture()
+    const caller = new AbortController()
+    const deadlineAt = Date.parse("2026-09-15T10:00:30.000Z")
+    bindDeadline(caller.signal, deadlineAt)
+    const cancelled = new Error("caller остановил action")
+    await expect(operations.runTrackedMutation(first, "target:window", "press-key", async context => {
+      expect(context.signal).not.toBe(caller.signal)
+      expect(signalDeadline(context.signal)).toBe(deadlineAt)
+      caller.abort(cancelled)
+      expect(context.signal.aborted).toBe(true)
+      runtime.records.set(context.clientRequestId, operation(first, context.clientRequestId,
+        "operation:deadline", "cancelled"))
+      context.signal.throwIfAborted()
+    }, caller.signal)).rejects.toThrow(cancelled.message)
+    expect(firstScope.retained.size).toBe(0)
+  })
+
   test("real RuntimeCore остаётся authority при cancel pending handler", async () => {
+    const clock = { now: () => new Date("2026-09-15T10:00:00.000Z") }
     const runtime = new RuntimeCore({
+      clock,
       generation,
       runtimeBuildId: "runtime-build:agent",
       nativeGeneration: "native:agent",
@@ -585,6 +606,7 @@ describe("agent operation control", () => {
     targets.scopes.set(lineage, new FakeTargetScope("target:window", target))
     let counter = 0
     const operations = new AgentOperations({
+      clock,
       runtime,
       targets,
       ids: { next(prefix) { counter += 1; return `${prefix}:${counter}` } },
@@ -605,7 +627,7 @@ describe("agent operation control", () => {
             inventoryId: context.binding.inventoryId,
             inventoryRevision: context.binding.inventoryRevision,
           },
-          deadlineAt: new Date(Date.now() + 30_000).toISOString(),
+          deadlineAt: new Date(clock.now().getTime() + 30_000).toISOString(),
           requestedResources: [],
         }),
         { text: "fixture" },

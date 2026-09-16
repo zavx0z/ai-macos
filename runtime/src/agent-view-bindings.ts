@@ -66,7 +66,7 @@ export class AgentViewBindings {
     if ((binding.mode === "keyboard") !== keyboard) throw new Error("Native method/action не совпадает с view request mode")
     binding.admissionPending ??= (async () => {
       const scope = this.guard.forLineage(binding.lineageId)
-      return scope.admit(binding.view.ticket, context.wire.operationId)
+      return scope.admit(binding.view.ticket, context.wire.operationId, context.wire.deadlineAt)
     })()
     const proof = await binding.admissionPending
     binding.admitted = proof
@@ -87,6 +87,13 @@ export class AgentViewBindings {
     })
   }
 
+  releaseLineage(lineageId: string): void {
+    for (const key of this.#views.keys()) {
+      if ((JSON.parse(key) as [string, string])[0] === lineageId) this.#retire(key, "Client lineage закрыта")
+    }
+
+  }
+
   #retire(key: string, reason: string, expected?: CurrentView): void {
     const view = expected ?? this.#views.get(key)
     if (view === undefined) return
@@ -97,6 +104,6 @@ export class AgentViewBindings {
     if (this.#views.get(key) === view) this.#views.delete(key)
   }
   #prune(): void {
-    for (const [key, view] of this.#views) if (Date.now() >= Date.parse(view.ticket.expiresAt)) this.#retire(key, "Agent view истёк", view)
+    for (const [key, view] of this.#views) if (view.ticket.expiresAt !== undefined && Date.now() >= Date.parse(view.ticket.expiresAt)) this.#retire(key, "Agent view истёк", view)
   }
 }

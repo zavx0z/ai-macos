@@ -1,3 +1,4 @@
+import { operationDeadline } from "./deadline.ts"
 import {
   adapterResultSchema,
   captureClipSchema,
@@ -190,7 +191,7 @@ export class RuntimeCaptureMethods {
       target: input.target,
       ...policy,
     })
-    const deadlineAt = new Date(Date.now() + 12_000).toISOString()
+    const deadlineAt = operationDeadline(signal, 12_000)
     const intent = runtimeOperationIntentSchema.parse({
       intent: "read",
       clientRequestId: input.clientRequestId,

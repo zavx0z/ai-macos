@@ -307,6 +307,7 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
   MetaBrokerCore *_core;
   MetaCaptureCommandBinder *_captureCommands;
   MetaObserverCommandBinder *_observerCommands;
+  dispatch_block_t _observerPushNotifier;
   MetaViewAdmissionController *_viewAdmissions;
   MetaPermissionsRequestController *_permissionRequests;
   NSDictionary *_observerRequest;
@@ -714,6 +715,7 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
                @"transient" : retainedIndexContext.failureTransient ? @YES : @NO};
     }];
     [_asyncLock lock];
+    [binder setPushNotifier:_observerPushNotifier];
     _observerCommands = binder;
     [_asyncLock unlock];
     _viewAdmissions = [[MetaViewAdmissionController alloc] initWithObserver:binder now:^NSDate * { return NSDate.date; }
@@ -725,6 +727,13 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
     _observerInstance = [result[@"command"] isEqual:@"stop"] ? nil : result[@"snapshot"][@"observerInstanceRef"];
   }
   return result;
+}
+
+- (void)setObserverPushNotifier:(dispatch_block_t)notifier {
+  [_asyncLock lock];
+  _observerPushNotifier = [notifier copy];
+  [_observerCommands setPushNotifier:notifier];
+  [_asyncLock unlock];
 }
 
 - (BOOL)activateObserverPush:(NSString *)instanceRef {

@@ -824,10 +824,13 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
                    record:(MetaCaptureCommandRecord *)record {
   if (terminal == nil) return;
   [self.lock lock];
-  record.terminalEvidenceEmitted = YES;
-  record.terminalStatusRevision = status.revision;
-  record.terminalDrainedEvidenceRef = terminal[@"drainedEvidenceRef"];
-  record.terminalReceiptRef = terminal[@"terminalReceiptRef"];
+  // result и status могут завершиться в разном порядке на разных очередях.
+  if (!record.terminalEvidenceEmitted || status.revision >= record.terminalStatusRevision) {
+    record.terminalEvidenceEmitted = YES;
+    record.terminalStatusRevision = status.revision;
+    record.terminalDrainedEvidenceRef = terminal[@"drainedEvidenceRef"];
+    record.terminalReceiptRef = terminal[@"terminalReceiptRef"];
+  }
   [self.lock unlock];
 }
 
@@ -1159,6 +1162,12 @@ static NSString *response_ref(NSString *task_ref, NSString *request_id,
   const MetaCaptureResult *result = NULL;
   BOOL result_held = NO;
   if ([purpose isEqual:@"result"]) {
+    if ([request[@"payload"][@"waitForCompletion"] isEqual:@YES]) {
+      NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+      formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
+      NSDate *deadline = [formatter dateFromString:control[@"deadlineAt"]];
+      if (deadline != nil) meta_capture_router_wait_result(self.router, task_ref.UTF8String, deadline.timeIntervalSince1970);
+    }
     if (!meta_capture_router_result(self.router, task_ref.UTF8String, &status,
                                     &result)) {
       fail(error, MetaCaptureCommandRouterFailure,

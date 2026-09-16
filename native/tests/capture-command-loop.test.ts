@@ -315,33 +315,6 @@ const control = () => ({
   checkpoint: () => undefined,
 })
 
-type CaptureResultReply = Extract<ReturnType<typeof nativeCaptureCleanupResponseSchema.parse>, { purpose: "result" }>
-
-// Ожидаем фактический callback fake capture, а не предполагаем завершение за 30 мс.
-// Повторяется только чтение результата; capture.start никогда не повторяется.
-async function finishCapture(
-  adapter: NativeBrokerAdapter,
-  captureTaskRef: string,
-  initial: CaptureResultReply,
-  requestPrefix: string,
-  operationId = "operation-1",
-): Promise<CaptureResultReply> {
-  const signal = AbortSignal.timeout(3_000)
-  let result = initial
-  for (let attempt = 1; result.poll.state === "pending"; attempt++) {
-    signal.throwIfAborted()
-    await Bun.sleep(5)
-    const next = await adapter.cleanup(nativeCaptureCleanupRequestSchema, {
-      control: cleanupControl("result", result.poll.status.revision,
-        result.statusEvidence.statusEvidenceRef, `${requestPrefix}:${attempt}`, operationId),
-      payload: { captureTaskRef },
-    }, nativeCaptureCleanupResponseSchema, { signal, checkpoint() { signal.throwIfAborted() } })
-    if (next.purpose !== "result") throw new Error("Ожидался capture result")
-    result = next
-  }
-  return result
-}
-
 test("production command loop проводит observer ACK перед PUSH и capture lifecycle", async () => {
   const registeredSources: Array<{ ref: string, bytes: Uint8Array }> = []
   const immutableSources = new Map<string, string>()
@@ -531,7 +504,7 @@ test("production command loop проводит observer ACK перед PUSH и c
     )
     expect(started.ok).toBe(true)
     if (!started.ok) throw new Error(started.error.message)
-    expect(started.result.status.startPending).toBe(true)
+    expect(started.result.status.revision).toBeGreaterThanOrEqual(1)
     expect(started.result.operationId).toBe("operation-1")
 
     const heartbeatRequest = nativeHeartbeatRequestSchema.parse({
@@ -549,7 +522,7 @@ test("production command loop проводит observer ACK перед PUSH и c
         started.result.statusEvidenceRef,
         "capture-result-pending-1",
       ),
-      payload: { captureTaskRef: started.result.captureTaskRef },
+      payload: { captureTaskRef: started.result.captureTaskRef, waitForCompletion: true },
     })
     const pending = await adapter.cleanup(
       nativeCaptureCleanupRequestSchema,
@@ -559,8 +532,7 @@ test("production command loop проводит observer ACK перед PUSH и c
     )
     expect(pending.purpose).toBe("result")
     if (pending.purpose !== "result") throw new Error("Ожидался result cleanup")
-    const completed = await finishCapture(adapter, started.result.captureTaskRef,
-      pending, "capture-result-complete")
+    const completed = pending
     expect(completed.purpose).toBe("result")
     if (completed.purpose !== "result" || completed.poll.state !== "completed") {
       throw new Error("Capture completion не доставлена")
@@ -711,7 +683,7 @@ test("production command loop проводит observer ACK перед PUSH и c
     )
     if (!layoutStarted.ok) throw new Error(JSON.stringify(layoutStarted.error))
     expect(layoutStarted.ok).toBe(true)
-    expect(layoutStarted.result.status.startPending).toBe(true)
+    expect(layoutStarted.result.status.revision).toBeGreaterThanOrEqual(1)
 
     const layoutPendingRequest = nativeCaptureCleanupRequestSchema.parse({
       control: cleanupControl(
@@ -722,7 +694,7 @@ test("production command loop проводит observer ACK перед PUSH и c
         "operation-layout-1",
         1,
       ),
-      payload: { captureTaskRef: layoutStarted.result.captureTaskRef },
+      payload: { captureTaskRef: layoutStarted.result.captureTaskRef, waitForCompletion: true },
     })
     const layoutPending = await layoutAdapter.cleanup(
       nativeCaptureCleanupRequestSchema,
@@ -732,8 +704,7 @@ test("production command loop проводит observer ACK перед PUSH и c
     )
     expect(layoutPending.purpose).toBe("result")
     if (layoutPending.purpose !== "result") throw new Error("Ожидался layout result cleanup")
-    const layoutCompleted = await finishCapture(layoutAdapter, layoutStarted.result.captureTaskRef,
-      layoutPending, "capture-layout-complete", "operation-layout-1")
+    const layoutCompleted = layoutPending
     expect(layoutCompleted.purpose).toBe("result")
     if (layoutCompleted.purpose !== "result" || layoutCompleted.poll.state !== "completed") {
       throw new Error("Layout completion не доставлена")

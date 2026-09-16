@@ -297,3 +297,23 @@ function inspection(
     errors: [],
   }
 }
+
+test("default handles не истекают в простое; закрытие lineage не удаляет удерживаемый control", () => {
+  const value = fixture()
+  const scope = value.registry.forLineage("lineage:lifetime")
+  const handle = scope.registerTarget(windowTarget("window:lifetime"), authority(1))
+  const [element] = scope.registerElements(handle.targetId, inspection("window:lifetime", "snapshot:lifetime", "element:lifetime"))
+  expect(handle.actionExpiresAt).toBeUndefined()
+  value.advance(86_400_000)
+  value.registry.prune()
+  expect(scope.resolveAction(handle.targetId).targetId).toBe(handle.targetId)
+  expect(scope.resolveElement(handle.targetId, element!.elementId).expiresAt).toBeUndefined()
+  scope.retainControl(handle.targetId, "operation:held")
+  value.registry.releaseLineage("lineage:lifetime")
+  expect(() => scope.resolveAction(handle.targetId)).toThrow("invalidated")
+  expect(scope.resolveControl(handle.targetId).targetId).toBe(handle.targetId)
+  scope.releaseControl(handle.targetId, "operation:held")
+  value.advance(300_001)
+  value.registry.prune()
+  expect(value.registry.stats().targets).toBe(0)
+})

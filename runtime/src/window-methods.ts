@@ -1,3 +1,4 @@
+import { operationDeadline } from "./deadline.ts"
 import {
   adapterResultSchema, axInspectionRequestSchema, axInspectionResultSchema, axInspectionTargetSchema, axPressRequestSchema, axPressResultSchema,
   desktopInventorySnapshotSchema, opaqueIdSchema, operationRecordSchema,
@@ -104,7 +105,7 @@ export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCor
         intent: "mutation", clientRequestId: input.clientRequestId,
         precondition: { target: { kind: "window", ref: input.request.target },
           inventoryId: input.inventoryId, inventoryRevision: input.inventoryRevision },
-        deadlineAt: new Date(Date.now() + 6000).toISOString(),
+        deadlineAt: operationDeadline(context.signal, 6000),
         requestedResources: [{ kind: "desktop-input", resourceRef: "desktop" }],
       })
       return core.runOperation(context.session, intent, input.request, (operation, request) => {
@@ -128,7 +129,7 @@ export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCor
       await core.targets.resolve({
         target: input.request.target, inventoryId: input.inventoryId, inventoryRevision: input.inventoryRevision,
         ...core.generation, nativeGeneration: input.request.target.ref.nativeGeneration,
-        deadlineAt: new Date(Date.now() + 5000).toISOString(),
+        deadlineAt: operationDeadline(context.signal, 5000),
       })
       const result = await windows.inspect(input.request, control(context.signal))
       return axInspectionResultSchema.parse(result)
@@ -152,7 +153,7 @@ export function registerWindowMethods(registry: MethodRegistry, core: RuntimeCor
         intent: "mutation",
         clientRequestId: input.clientRequestId,
         precondition: input.precondition,
-        deadlineAt: new Date(Date.now() + 8_000).toISOString(),
+        deadlineAt: operationDeadline(context.signal, 8_000),
         requestedResources: [{ kind: "desktop-input", resourceRef: "desktop" }],
       })
       return core.runOperation(context.session, intent, input.request, (operation, request) => {

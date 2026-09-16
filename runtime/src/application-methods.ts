@@ -1,3 +1,4 @@
+import { operationDeadline } from "./deadline.ts"
 import {
   adapterResultSchema,
   applicationBundleResolutionSchema,
@@ -73,7 +74,7 @@ export function registerApplicationMethods(
           inventoryId: input.inventoryId,
           inventoryRevision: input.inventoryRevision,
         },
-        deadlineAt: new Date(Date.now() + 6000).toISOString(),
+        deadlineAt: operationDeadline(context.signal, 6000),
         requestedResources: [{ kind: "desktop-input", resourceRef: "desktop" }],
       })
       return core.runOperation(context.session, intent, input.request, (operation, request) => {
@@ -105,7 +106,7 @@ export function registerApplicationMethods(
           inventoryId: input.inventoryId,
           inventoryRevision: input.inventoryRevision,
         },
-        deadlineAt: new Date(Date.now() + 6000).toISOString(),
+        deadlineAt: operationDeadline(context.signal, 6000),
         requestedResources: [{ kind: "desktop-input", resourceRef: "desktop" }],
       })
       return core.runOperation(context.session, intent, input.request, (operation, request) => {
