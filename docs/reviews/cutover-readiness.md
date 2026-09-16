@@ -5,9 +5,11 @@
 
 ## Установленная версия
 
-Последний подтверждённый installed checkpoint — source `0b16219`, release
-`release-11596d6e61b1f971e17b4261`, runtime/native build suffix
-`a00b566aa427a8b769229a42`. Последующие коммиты требуют новой установки.
+Последний подтверждённый installed checkpoint — source `61d1e9d`, release
+`release-a1308ceda1755e5b96464c6a`, runtime/native build suffix
+`47a1c96c07f1223d1fbf6e13`. Doctor подтвердил четыре grants, ready observer,
+ноль active operations и quarantined resources. Последующие коммиты требуют
+новой установки.
 
 - Стабильный подписанный bundle: `Application Support/ai-macos/runtime/computer-use.app`.
 - Executable: `Contents/MacOS/computer-use`; Native: `Contents/Helpers/meta-input-helper`.
@@ -27,8 +29,9 @@
 
 Используется собственная AppKit fixture из
 `tests/computer-use/fixtures/app/main.m`; её stdin hook только читает состояние.
-Все desktop-действия выполняет direct ai-macos MCP в задаче
-«Computer use: финальная проверка установленной версии».
+Все desktop-действия выполняет direct ai-macos MCP. Первые проверки выполнены
+в задаче «Computer use: финальная проверка установленной версии», numeric input
+продолжает задача «Computer use: ввод и финальный прогон».
 
 | Проверка | Наблюдаемый результат |
 | --- | --- |
@@ -60,12 +63,14 @@ applicationRef. `70eec77` дополнительно обнаруживает di
 по роли, PID и exact AXParent, когда AXSheets не дал owner. Это подтвердили
 полная AX hierarchy fixture, отдельный surface и реальное закрытие диалога.
 
-Первый numeric pointer click в новой задаче выявил следующий blocker:
+Первый numeric pointer click выявил исправленный в `ecc12c8` blocker:
 `input_executor.m` требует равенства observation.inventoryRevision и current
 operation.inventoryRevision. Реальный допустимый путь имел capture revision 10
 и свежий target revision 11. Настоящий TS producer → C command loop с fake sink
-воспроизводит отказ до begin и отсутствие физических posts. Исправление должно
-сохранить независимые проверки capture proof, текущей цели, layout и геометрии.
+воспроизводит отказ до begin и отсутствие физических posts. Исправление
+сохраняет независимые проверки capture proof, текущей цели, layout и геометрии.
+Valid outer context с rejected plan теперь получает реальный terminal receipt
+без posts, а unknown status не завершает Native actor.
 
 Live operation `operation:485a50d3-003b-44ce-97fa-8f48f840bd5a` осталась failed
 с dispatch/effect unknown; после запроса статуса Native завершился code 65.
@@ -73,7 +78,28 @@ Managed restart сохранил evidence и закрыл admission. Один ш
 `recover_startup_input` подтвердил ALL-UP: resolved=1, unresolved=0,
 remainingOperations=0, admissionSealed=false, cleanup=complete/resources released.
 Это не меняет исторический unknown dispatch и не разрешает слепой replay.
-Следующая попытка требует исправленной сборки и нового observation.
+Следующая попытка была выполнена только после установки и нового observation.
+
+На installed `ecc12c8` operation
+`operation:d41644b0-34af-4e53-9fbd-525758875fb6` завершилась failed с тремя
+post attempts, partial dispatch и `userInterference: observed`. Cleanup complete,
+ресурсы освобождены, Native не перезапускался. Пользователь подтвердил отсутствие
+физического ввода; повтор не выполнялся. Последующий read-only снимок показал
+неизменённое поле, но сам по себе не доказывает отсутствие эффекта клика.
+
+`b8c160a` разделяет physical input, UI invalidation и lifecycle changes. Только
+собственный single click после mouse-down может принять focus exact target или
+подтверждённого owner/surface; физическое вмешательство остаётся причиной отмены.
+Добавлена ограниченная диагностика первого решения observer без содержимого окон.
+`b45b548` сохраняет typed error и настоящий operation ID в коротком API.
+Оба исправления установлены в `61d1e9d`. Новая операция
+`operation:9df26cbb-0ed0-48d2-b4de-50522a4cdf85` честно сообщает cancelled,
+partial dispatch, `userInterference: none-observed`, cleanup complete, resources
+released. Observer diagnostic: `ui-invalidation`, `eventKind: focus`,
+`targetRelation: missing`, own input armed, phase 3. Физическое вмешательство
+больше не заявляется, но потеря exact target у focus пока блокирует приёмку.
+Повтора не было; read-only oracle подтвердил неизменённое поле, закрытый sheet,
+оба окна visible. Следующее исправление не должно разрешать targetless focus.
 
 Проверочная задача с новым каталогом:
 «Computer use: ввод и финальный прогон». Предыдущая задача сохранила старое
@@ -93,9 +119,12 @@ Pointer input отдельно требует image-ready и свежий Native
 
 ## Проверки исходников
 
-Последний общий safe прогон: 874 pass, 1 skip, 0 fail; 3708 assertions,
-144 files. System clipboard live test отключён. Последующие изменения требуют
-собственных targeted checks и проверки новой установленной сборки.
+Последний общий safe прогон на `61d1e9d`: 879 pass, 1 skip, 1 fail;
+3728 assertions, 145 files. System clipboard live test отключён. Единственное
+падение: `screen/tests/adapter.test.ts`, bounded wait — 15 ms deadline истёк
+до admission под нагрузкой, получен `deadline-exceeded` вместо ожидаемого
+post-admission `operation-outcome-unknown`. Требуется детерминированная проверка
+этой границы; весь прогон не считается зелёным.
 
 ## Что исправлено по результатам live
 
@@ -113,7 +142,11 @@ Pointer input отдельно требует image-ready и свежий Native
   истекло. Повтор через durable recovery успешно завершил установку. Source
   `73cdebb` увеличивает bounded evidence polling до 60 секунд и сохраняет
   последний label/parent/helper state в ошибке; bootstrap до ухода старых
-  процессов по-прежнему запрещён.
+  процессов по-прежнему запрещён. `61d1e9d` допускает смену command в процессе
+  завершения, считая прежний PID + birth по-прежнему живым. До bootout exact
+  command ownership остаётся обязательным. 66 installer/admin tests подтвердили
+  transient exit, timeout, PID reuse и совместимость durable witness; реальная
+  установка `61d1e9d` успешно прошла эту границу.
 
 История подписи и разрешений:
 [`startup-permissions-and-identity.md`](./startup-permissions-and-identity.md).
