@@ -3,25 +3,9 @@ name: Passive Runtime checks
 on:
   push:
     branches: [main]
-    paths:
-      - 'runtime/**'
-      - 'native/**'
-      - 'shared/**'
-      - 'input/**'
-      - 'screen/**'
-      - 'mcp/**'
-      - 'bun.lock'
-      - '.github/workflows/passive-runtime-checks.yml'
+    paths: ['runtime/**', 'native/**', 'shared/**', 'input/**', 'screen/**', 'mcp/**', 'bun.lock', '.github/workflows/passive-runtime-checks.yml']
   pull_request:
-    paths:
-      - 'runtime/**'
-      - 'native/**'
-      - 'shared/**'
-      - 'input/**'
-      - 'screen/**'
-      - 'mcp/**'
-      - 'bun.lock'
-      - '.github/workflows/passive-runtime-checks.yml'
+    paths: ['runtime/**', 'native/**', 'shared/**', 'input/**', 'screen/**', 'mcp/**', 'bun.lock', '.github/workflows/passive-runtime-checks.yml']
   workflow_dispatch:
 
 permissions:
@@ -49,16 +33,27 @@ jobs:
           bun-version: latest
       - name: Install locked dependencies
         run: bun install --frozen-lockfile
-      - name: Observer and Runtime regression tests
-        run: >-
-          bun test
-          runtime/tests/observer-hub.test.ts
-          runtime/tests/agent-view-guard.test.ts
-          runtime/tests/host.test.ts
-          runtime/tests/heartbeat.test.ts
-          runtime/tests/transport.test.ts
-          runtime/tests/method-registry.test.ts
+      - name: Runtime regression tests
+        run: bun test runtime/tests
       - name: Runtime TypeScript
         run: bun run --cwd runtime typecheck
       - name: Native observer fixtures (no live input)
         run: sh native/scripts/check-observer.sh
+  test-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+      - run: bun install --frozen-lockfile
+      - name: Archive isolated test runtime
+        run: |
+          cp "$(command -v bun)" "$RUNNER_TEMP/bun"
+          tar -czf "$RUNNER_TEMP/test-runtime.tar.gz" node_modules -C "$RUNNER_TEMP" bun
+      - uses: actions/upload-artifact@v4
+        with:
+          name: test-runtime-${{ github.sha }}
+          path: ${{ runner.temp }}/test-runtime.tar.gz
+          retention-days: 1
