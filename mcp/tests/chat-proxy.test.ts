@@ -7,7 +7,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { createRuntimeHost } from "@meta/runtime"
 import { z } from "@meta/shared/contracts"
 import { startChatProxy } from "../src/chat-proxy.ts"
-import { SCREENSHOT_UI_URI, chatScreenshotUiHtml } from "../src/screenshot-ui.ts"
+import { VIEWER_UI_URI, viewerUiHtml } from "../src/viewer-ui.ts"
 
 test("справка раскрывается без Runtime, выполнение требует исполнителя", async () => {
   const directory = await mkdtemp(join(tmpdir(), "chat-proxy-"))
@@ -17,14 +17,15 @@ test("справка раскрывается без Runtime, выполнени
   try {
     await Promise.all([client.connect(clientTransport), server.connect(serverTransport)])
     const tools = (await client.listTools()).tools
-    expect(tools.map(tool => tool.name)).toEqual(["zavx0z"])
-    expect(tools[0]?._meta?.["openai/outputTemplate"]).toBe(SCREENSHOT_UI_URI)
+    expect(tools.map(tool => tool.name)).toEqual(["zavx0z", "zavx0z_viewer", "zavx0z_viewer_next"])
+    expect(tools[0]?._meta?.["openai/outputTemplate"]).toBeUndefined()
+    expect(tools[1]?._meta?.["openai/outputTemplate"]).toBe(VIEWER_UI_URI)
     const resources = (await client.listResources()).resources
-    expect(resources.map(resource => resource.uri)).toEqual([SCREENSHOT_UI_URI])
-    const resource = await client.readResource({ uri: SCREENSHOT_UI_URI })
+    expect(resources.map(resource => resource.uri)).toEqual([VIEWER_UI_URI])
+    const resource = await client.readResource({ uri: VIEWER_UI_URI })
     const firstContent = resource.contents[0]
     const html = firstContent && "text" in firstContent ? firstContent.text : ""
-    expect(html).toBe(chatScreenshotUiHtml)
+    expect(html).toBe(viewerUiHtml)
     const emptyCapture = await client.callTool({ name: "zavx0z", arguments: {
       node: "ui/latest_capture", input: { clientId: "test-widget" },
     } })
@@ -39,7 +40,7 @@ test("справка раскрывается без Runtime, выполнени
     const root = (await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent as Record<string, unknown>
     expect((root.contract as { inputSchema: unknown }).inputSchema).toEqual(tools[0]?.inputSchema)
     expect(root.examples).toMatchObject({ execute: { node: "computer", action: "system_health", input: {} } })
-    expect((await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent).toMatchObject({ node: "root", children: [{ node: "computer" }], contract: { inputSchema: { properties: { node: { type: "string" }, action: { type: "string" }, input: { type: "object" } } } }, next: { node: "computer" } })
+    expect((await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent).toMatchObject({ node: "root", children: [{ node: "computer" }, { node: "viewer" }], contract: { inputSchema: { properties: { node: { type: "string" }, action: { type: "string" }, input: { type: "object" } } } }, next: { node: "computer" } })
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer" } })).isError).toBe(true)
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer", action: "not_published" } })).isError).toBe(true)
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer/click", action: "different" } })).isError).toBe(true)

@@ -35,7 +35,7 @@ jobs:
       - name: Screen and Input regression suites
         run: bun test screen/tests input/tests
       - name: MCP catalog, proxy and PiP regression tests
-        run: bun test mcp/tests/catalog-server.test.ts mcp/tests/chat-proxy.test.ts mcp/tests/runtime-mcp.test.ts mcp/tests/screenshot-ui.test.ts scripts/chat-proxy-install.test.ts
+        run: bun test mcp/tests/catalog-server.test.ts mcp/tests/chat-proxy.test.ts mcp/tests/runtime-mcp.test.ts mcp/tests/screenshot-ui.test.ts mcp/tests/viewer-session.test.ts mcp/tests/viewer-ui.test.ts scripts/chat-proxy-install.test.ts
       - name: Runtime, Native, Screen, Input and MCP TypeScript
         run: |
           bun run --cwd runtime typecheck

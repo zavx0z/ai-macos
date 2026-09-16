@@ -16,6 +16,7 @@ export interface RuntimeCatalogBackend {
     name: string,
     args: Record<string, unknown>,
     signal: AbortSignal,
+    meta?: Record<string, unknown>,
   ): Promise<CallToolResult>
   subscribeCatalogChanged(listener: () => void): (() => void) | void
   listResources?(): Promise<Resource[]> | Resource[]
@@ -51,6 +52,7 @@ export function createCatalogServer(
       request.params.name,
       request.params.arguments ?? {},
       extra.signal,
+      request.params._meta,
     )
   })
 

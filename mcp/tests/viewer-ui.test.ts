@@ -1,0 +1,85 @@
+import { expect, test } from "bun:test"
+import { runInNewContext } from "node:vm"
+import { viewerUiHtml } from "../src/viewer-ui.ts"
+
+test("один интерфейс принимает два сервиса; fullscreen только по кнопке и подтверждению хоста", async () => {
+  const elements = new Map<string, any>()
+  for (const id of ["status", "source", "text", "image", "fullscreen", "resume"]) {
+    elements.set(id, { textContent: "", hidden: false, events: new Map(),
+      addEventListener(name: string, handler: () => void) { this.events.set(name, handler) } })
+  }
+  const events = new Map<string, (event?: any) => void>()
+  const requests: Array<{ args: any, resolve(value: unknown): void, reject(error: Error): void }> = []
+  const modes: string[] = []
+  let granted = "inline"
+  const window = { parent: { postMessage() {} },
+    addEventListener(name: string, handler: (event: unknown) => void) { events.set(name, handler) },
+    openai: {
+      toolResponseMetadata: { mcp_tool_result: { _meta: { viewer: { viewerId: "viewer", accessToken: "token", version: 0 } } } },
+      callTool(_name: string, args: unknown) {
+        return new Promise((resolve, reject) => requests.push({ args, resolve, reject }))
+      },
+      async requestDisplayMode(input: { mode: string }) { modes.push(input.mode)
+        return { mode: granted } },
+    },
+  }
+  const script = viewerUiHtml.match(/<script>([\s\S]*?)<\/script>/)![1]!
+  runInNewContext(script, { window, document: { getElementById: (id: string) => elements.get(id) },
+    crypto: { randomUUID: () => "same-mount" }, setTimeout, clearTimeout,
+    setInterval() { throw new Error("Секундный polling запрещён") } })
+  const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve() }
+  expect(requests).toHaveLength(1)
+  expect(modes).toEqual([])
+  const text = elements.get("text")
+  requests[0]!.resolve({ _meta: { viewer: { version: 1, content: { kind: "text", service: "demo-a", text: "A" } } } })
+  await flush()
+  expect(text.textContent).toBe("A")
+  expect(requests[1]!.args).toMatchObject({ after: 1, mountId: "same-mount", displayedVersion: 1 })
+  requests[1]!.resolve({ _meta: { viewer: { version: 2, content: { kind: "text", service: "demo-b", text: "B" } } } })
+  await flush()
+  expect(elements.get("text")).toBe(text)
+  expect(text.textContent).toBe("B")
+  expect(elements.get("source").textContent).toBe("demo-b")
+  await elements.get("fullscreen").events.get("click")()
+  expect(elements.get("status").textContent).toContain("inline")
+  granted = "fullscreen"
+  await elements.get("fullscreen").events.get("click")()
+  expect(elements.get("status").textContent).toBe("Приложение развёрнуто")
+  expect(modes).toEqual(["fullscreen", "fullscreen"])
+  requests[2]!.reject(new Error("Связь прервана"))
+  await flush()
+  expect(requests).toHaveLength(3)
+  expect(elements.get("resume").hidden).toBe(false)
+  expect(elements.get("status").textContent).toBe("Связь прервана")
+  elements.get("resume").events.get("click")()
+  requests[3]!.resolve({ structuredContent: { version: 3, changed: true } })
+  await flush()
+  expect(requests).toHaveLength(4)
+  expect(elements.get("status").textContent).toContain("не передал содержимое")
+})
+
+test("стандартный UI bridge инициализируется без window.openai и освобождает mount", async () => {
+  const elements = new Map<string, any>()
+  for (const id of ["status", "source", "text", "image", "fullscreen", "resume"]) {
+    elements.set(id, { textContent: "", hidden: false, addEventListener() {} })
+  }
+  const events = new Map<string, (event: any) => void>()
+  const messages: any[] = []
+  const parent = { postMessage(message: unknown) { messages.push(message) } }
+  const window = { parent, addEventListener(name: string, handler: (event: any) => void) { events.set(name, handler) } }
+  const script = viewerUiHtml.match(/<script>([\s\S]*?)<\/script>/)![1]!
+  runInNewContext(script, { window, document: { getElementById: (id: string) => elements.get(id) },
+    crypto: { randomUUID: () => "mount" }, setTimeout: () => 1, clearTimeout() {} })
+  const send = (data: unknown) => events.get("message")!({ source: parent, data: { jsonrpc: "2.0", ...data as object } })
+  expect(messages[0]).toMatchObject({ method: "ui/initialize", params: { appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] } } })
+  send({ id: "viewer-initialize", result: { hostContext: { availableDisplayModes: ["inline", "fullscreen"] } } })
+  send({ method: "ui/notifications/tool-result", params: { _meta: { viewer: { viewerId: "view", accessToken: "token", version: 0 } } } })
+  const call = messages.find(message => message.method === "tools/call")
+  expect(call.params.name).toBe("zavx0z_viewer_next")
+  send({ id: call.id, result: { _meta: { viewer: { version: 1, content: { kind: "text", service: "demo-b", text: "Данные" } } } } })
+  for (let i = 0; i < 10; i++) await Promise.resolve()
+  expect(elements.get("text").textContent).toBe("Данные")
+  send({ id: "teardown", method: "ui/resource-teardown" })
+  expect(messages.find(message => message.params?.arguments?.release)).toMatchObject({ params: { arguments: { mountId: "mount", release: true } } })
+  expect(messages.at(-1)).toMatchObject({ id: "teardown", result: {} })
+})

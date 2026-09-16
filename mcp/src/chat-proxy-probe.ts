@@ -9,12 +9,13 @@ export async function probeChatProxy(command: string, env: Record<string, string
   try {
     await client.connect(transport, { signal: deadline })
     const { tools } = await client.listTools({}, { signal: deadline })
-    const tool = tools[0]
-    if (tools.length !== 1 || tool?.name !== "zavx0z"
+    const tool = tools.find(item => item.name === "zavx0z")
+    if (tools.length !== 3 || tool?.name !== "zavx0z"
       || !["node", "action", "input"].every(key => key in (tool.inputSchema.properties ?? {}))) {
       throw new Error("Кандидат не публикует ожидаемый протокол zavx0z")
     }
-    const uri = tool._meta?.["openai/outputTemplate"]
+    if (tool._meta?.["openai/outputTemplate"]) throw new Error("Командный инструмент не должен создавать UI")
+    const uri = tools.find(item => item.name === "zavx0z_viewer")?._meta?.["openai/outputTemplate"]
     if (typeof uri !== "string") throw new Error("Кандидат не публикует UI resource")
     const resource = await client.readResource({ uri }, { signal: deadline })
     const html = resource.contents.find(item => "text" in item)
