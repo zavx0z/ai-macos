@@ -2772,7 +2772,7 @@ async function cli(): Promise<void> {
     signing: signingFromArguments(process.argv),
   }
   let plan = await planRuntimeInstall(options)
-  if (execute && plan.service.loaded && !plan.release.alreadyInstalled) {
+  if (execute) {
     const { createRuntimeAdmin } = await import("./runtime-admin.ts")
     options = { ...options, runtimeAdmin: createRuntimeAdmin({ runRoot: options.paths.runRoot }) }
     plan = await planRuntimeInstall(options)
