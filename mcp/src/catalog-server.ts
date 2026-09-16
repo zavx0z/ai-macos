@@ -16,10 +16,10 @@ export interface RuntimeCatalogBackend {
   subscribeCatalogChanged(listener: () => void): (() => void) | void
 }
 
-export function createCatalogServer(backend: RuntimeCatalogBackend): Server {
+export function createCatalogServer(backend: RuntimeCatalogBackend, identity?: { name: string, version: string, instructions?: string }): Server {
   const server = new Server(
-    { name: "ai-macos-runtime-catalog", version: "0.4.0" },
-    { capabilities: { tools: { listChanged: true } } },
+    { name: identity?.name ?? "ai-macos-runtime-catalog", version: identity?.version ?? "0.4.0" },
+    { capabilities: { tools: { listChanged: true } }, ...(identity?.instructions === undefined ? {} : { instructions: identity.instructions }) },
   )
 
   server.setRequestHandler(ListToolsRequestSchema, async () => ({
