@@ -1,0 +1,75 @@
+name: Review demand-driven Computer Use
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/demand-review.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  review:
+    runs-on: macos-14
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.4.2'
+      - name: Restore retained patches and fix the deterministic test clock
+        run: |
+          python3 - <<'PY'
+          import base64, gzip, hashlib, lzma, os, re, subprocess
+          from pathlib import Path
+          for file, pattern, decompress, digest in [
+              ('demand-verify.yml', r'PATCH_\d: >-\n\s+(\S+)', lzma.decompress, '4683fb788393f9c26ae515b6202b29daec23573708ef1401f6ed1c0da114c4ba'),
+              ('demand-final-verify.yml', r'FOLLOWUP: >-\n\s+(\S+)', gzip.decompress, 'c45bcaf7ee5076e5fca9e56957ba8fcf2fe53e6c2b0bfdba0da0fba5735e7217'),
+          ]:
+              text = Path('.github/workflows', file).read_text()
+              patch = decompress(base64.b64decode(''.join(re.findall(pattern, text)), validate=True))
+              assert hashlib.sha256(patch).hexdigest() == digest
+              subprocess.run(['git', 'apply', '--check', '-'], input=patch, check=True)
+              subprocess.run(['git', 'apply', '-'], input=patch, check=True)
+          p = Path('runtime/tests/agent-operations.test.ts')
+          text = p.read_text()
+          marker = '  test("real RuntimeCore остаётся authority при cancel pending handler", async () => {'
+          assert text.count(marker) == 1
+          before, case = text.split(marker)
+          case = '\n    const clock = { now: () => new Date("2026-09-15T10:00:00.000Z") }' + case
+          case = case.replace('    const runtime = new RuntimeCore({\n', '    const runtime = new RuntimeCore({\n      clock,', 1)
+          case = case.replace('    const operations = new AgentOperations({\n', '    const operations = new AgentOperations({\n      clock,', 1)
+          assert case.count('new Date(Date.now() + 30_000)') == 1
+          case = case.replace('new Date(Date.now() + 30_000)', 'new Date(clock.now().getTime() + 30_000)')
+          p.write_text(before + marker + case)
+          subprocess.run(['git', 'add', 'runtime', 'native', 'screen', 'input', 'mcp', 'docs'], check=True)
+          subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
+          tree = subprocess.check_output(['git', 'write-tree'], text=True).strip()
+          subprocess.run(['git', 'archive', '--format=tar.gz', '-o', os.environ['RUNNER_TEMP'] + '/review-source.tar.gz', tree], check=True)
+          Path(os.environ['RUNNER_TEMP'], 'review.patch').write_bytes(subprocess.check_output(['git', 'diff', '--cached', '--binary']))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: demand-review-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/review-source.tar.gz
+            ${{ runner.temp }}/review.patch
+          retention-days: 3
+      - run: bun install --frozen-lockfile
+        id: install
+      - name: Runtime tests
+        run: bun test runtime/tests
+      - name: Native tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bun test native/tests
+      - name: Screen, Input and MCP tests
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bun test screen/tests input/tests mcp/tests/catalog-server.test.ts mcp/tests/chat-proxy.test.ts mcp/tests/runtime-mcp.test.ts
+      - name: TypeScript and native fixtures
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          bun run --cwd runtime typecheck
+          bun x tsc --noEmit -p native/tsconfig.json
+          bun x tsc --noEmit -p screen/tsconfig.json
+          bun x tsc --noEmit -p input/tsconfig.json
+          sh native/scripts/check.sh
