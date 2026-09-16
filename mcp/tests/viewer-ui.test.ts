@@ -2,6 +2,15 @@ import { expect, test } from "bun:test"
 import { runInNewContext } from "node:vm"
 import { viewerUiHtml } from "../src/viewer-ui.ts"
 
+test("сборка сохраняет русские подписи HTML без буквальных Unicode escape", async () => {
+  const bundle = await Bun.build({ entrypoints: [new URL("../src/viewer-ui.ts", import.meta.url).pathname], target: "bun" })
+  expect(bundle.success).toBe(true)
+  const module = await import(`data:text/javascript;base64,${Buffer.from(await bundle.outputs[0]!.text()).toString("base64")}`)
+  expect(module.viewerUiHtml).toContain("<h1>Завхоз</h1>")
+  expect(module.viewerUiHtml).toContain("Развернуть приложение")
+  expect(module.viewerUiHtml).not.toContain(String.raw`\u0417`)
+})
+
 test("один интерфейс принимает два сервиса; fullscreen только по кнопке и подтверждению хоста", async () => {
   const elements = new Map<string, any>()
   for (const id of ["status", "source", "text", "image", "fullscreen", "resume"]) {
@@ -31,11 +40,13 @@ test("один интерфейс принимает два сервиса; full
   expect(requests).toHaveLength(1)
   expect(modes).toEqual([])
   const text = elements.get("text")
-  requests[0]!.resolve({ _meta: { viewer: { version: 1, content: { kind: "text", service: "demo-a", text: "A" } } } })
+  requests[0]!.resolve({ result: '{"version":1,"changed":true}', structuredContent: { version: 1, changed: true },
+    _meta: { viewer: { version: 1, changed: true, content: { kind: "text", service: "demo-a", text: "A" } } } })
   await flush()
   expect(text.textContent).toBe("A")
   expect(requests[1]!.args).toMatchObject({ after: 1, mountId: "same-mount", displayedVersion: 1 })
-  requests[1]!.resolve({ _meta: { viewer: { version: 2, content: { kind: "text", service: "demo-b", text: "B" } } } })
+  requests[1]!.resolve({ result: '{"version":2,"changed":true}', structuredContent: { version: 2, changed: true },
+    meta: { viewer: { version: 2, changed: true, content: { kind: "text", service: "demo-b", text: "B" } } } })
   await flush()
   expect(elements.get("text")).toBe(text)
   expect(text.textContent).toBe("B")

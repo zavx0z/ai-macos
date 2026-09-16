@@ -1,7 +1,7 @@
-export const VIEWER_UI_URI = "ui://zavx0z/viewer-v1.html"
+export const VIEWER_UI_URI = "ui://zavx0z/viewer-v2.html"
 
 /** Прототип общего приложения: один mount, ожидающие MCP-запросы и явный fullscreen. */
-export const viewerUiHtml = String.raw`<!doctype html>
+export const viewerUiHtml = `<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8">
@@ -64,7 +64,28 @@ export const viewerUiHtml = String.raw`<!doctype html>
     }
 
     function unwrap(value) {
-      return value?.mcp_tool_result ?? value?.call_tool_result ?? value?.result ?? value ?? {}
+      for (let depth = 0; depth < 5; depth++) {
+        if (typeof value === "string") {
+          try { value = JSON.parse(value) } catch { return {} }
+        }
+        if (!value || typeof value !== "object") return {}
+        if (value.mcp_tool_result) {
+          value = value.mcp_tool_result
+          continue
+        }
+        if (value.call_tool_result) {
+          value = value.call_tool_result
+          continue
+        }
+        // callTool возвращает полный envelope и legacy result-строку рядом.
+        // Строка не должна скрывать structuredContent и приватную metadata.
+        if (value._meta || value.meta || value.structuredContent || Array.isArray(value.content)) {
+          return { ...value, _meta: value._meta ?? value.meta }
+        }
+        if (value.result === undefined) return value
+        value = value.result
+      }
+      return {}
     }
 
     function render(snapshot) {
@@ -98,6 +119,9 @@ export const viewerUiHtml = String.raw`<!doctype html>
       const result = unwrap(response)
       if (result.isError) throw new Error(result.content?.find(item => item.type === "text")?.text ?? "Ошибка обновления")
       const snapshot = result._meta?.viewer ?? result.structuredContent
+      if (!snapshot || typeof snapshot.version !== "number") {
+        throw new Error("Хост вернул неизвестный формат обновления приложения")
+      }
       if (snapshot?.changed && snapshot.version > version && !snapshot.content) {
         throw new Error("Хост не передал содержимое новой ревизии приложения")
       }

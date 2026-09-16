@@ -98,10 +98,10 @@ export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
       mimeType: "text/html;profile=mcp-app",
     }],
     readResource: (uri) => {
-      if (uri !== VIEWER_UI_URI) throw new Error("Неизвестный UI resource")
+      if (uri !== VIEWER_UI_URI && uri !== "ui://zavx0z/viewer-v1.html") throw new Error("Неизвестный UI resource")
       return {
         contents: [{
-          uri: VIEWER_UI_URI,
+          uri,
           mimeType: "text/html;profile=mcp-app",
           text: viewerUiHtml,
           _meta: {
