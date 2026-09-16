@@ -15,6 +15,7 @@ export const viewerUiHtml = `<!doctype html>
     header { height: 44px; display: flex; gap: 6px; align-items: center; padding: 6px 8px; overflow: hidden; }
     h1 { font-size: 13px; margin: 0 6px 0 0; white-space: nowrap; }
     button { padding: 5px 9px; cursor: pointer; font: inherit; font-size: 12px; white-space: nowrap; flex-shrink: 0; }
+    .mode-icon { display: none; }
     #status { font-size: 11px; opacity: .75; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     main { position: relative; width: 100%; aspect-ratio: 16 / 9; overflow: hidden; background: #101114; color: #f4f4f5; }
     figure { position: absolute; inset: 0; margin: 0; }
@@ -23,8 +24,9 @@ export const viewerUiHtml = `<!doctype html>
     #source { position: absolute; top: 8px; left: 10px; margin: 0; font-size: 12px; opacity: .7; z-index: 1; }
     pre { position: absolute; inset: 30px 10px 10px; margin: 0; white-space: pre-wrap; overflow-wrap: anywhere; overflow: hidden; font: inherit; font-size: 14px; }
     body[data-mode="fullscreen"] #app, body[data-mode="pip"] #app { max-width: calc((100dvh - 44px) * 16 / 9); }
-    body[data-mode="pip"] h1, body[data-mode="pip"] #status { display: none; }
-    @media (max-width: 480px) { h1, #status { display: none; } }
+    body[data-mode="pip"] h1, body[data-mode="pip"] #status, body[data-mode="pip"] .mode-label { display: none; }
+    body[data-mode="pip"] .mode-icon { display: inline; }
+    @media (max-width: 480px) { h1, #status, .mode-label { display: none; } .mode-icon { display: inline; } }
     [hidden] { display: none !important; }
   </style>
 </head>
@@ -32,9 +34,9 @@ export const viewerUiHtml = `<!doctype html>
   <div id="app">
   <header>
     <h1>Codex App</h1>
-    <button id="fullscreen">На весь экран</button>
-    <button id="pip">Поверх чата</button>
-    <button id="inline">В чате</button>
+    <button id="fullscreen" aria-label="На весь экран" title="На весь экран"><span class="mode-icon" aria-hidden="true">⛶</span><span class="mode-label">На весь экран</span></button>
+    <button id="pip" aria-label="Поверх чата" title="Поверх чата"><span class="mode-icon" aria-hidden="true">▣</span><span class="mode-label">Поверх чата</span></button>
+    <button id="inline" aria-label="В чате" title="В чате"><span class="mode-icon" aria-hidden="true">↙</span><span class="mode-label">В чате</span></button>
     <button id="resume" title="Возобновить обновления" hidden>↻</button>
     <span id="status" role="status">Подключение…</span>
   </header>
