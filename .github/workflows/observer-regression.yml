@@ -1,0 +1,53 @@
+name: Observer regression
+
+on:
+  push:
+    branches: [fix/observer-lifecycle-20260916]
+  pull_request:
+    paths:
+      - 'runtime/**'
+      - 'native/**'
+      - 'shared/**'
+      - 'input/**'
+      - 'screen/**'
+      - 'bun.lock'
+      - '.github/workflows/observer-regression.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Сохранить проверяемый исходный снимок
+        run: git archive --format=tar HEAD > "$RUNNER_TEMP/source.tar"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: observer-source-${{ github.sha }}
+          path: ${{ runner.temp }}/source.tar
+          retention-days: 3
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: Регрессии наблюдения и отмены
+        run: bun test runtime/tests/observer-hub.test.ts runtime/tests/agent-view-guard.test.ts runtime/tests/heartbeat.test.ts
+      - name: Проверка типов Runtime
+        run: bunx tsc --noEmit -p runtime/tsconfig.json
+
+  native:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@v2
+      - run: bun install --frozen-lockfile
+      - name: Native fixtures без реального ввода
+        run: sh native/scripts/check.sh
+      - name: Observer fixtures без реального ввода
+        run: sh native/scripts/check-observer.sh
