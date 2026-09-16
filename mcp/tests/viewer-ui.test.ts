@@ -68,8 +68,9 @@ test("один интерфейс принимает два сервиса; full
   await flush()
   expect(requests).toHaveLength(3)
   expect(elements.get("resume").hidden).toBe(false)
-  expect(elements.get("status").textContent).toBe("Связь прервана")
+  expect(elements.get("status").textContent).toBe("Переподключение: Связь прервана")
   elements.get("resume").events.get("click")()
+  await flush()
   requests[3]!.resolve({ structuredContent: { version: 3, changed: true } })
   await flush()
   expect(requests).toHaveLength(4)
@@ -145,4 +146,43 @@ test("снимок подтверждается после декодирова�
   await flush()
   expect(calls[2]).toMatchObject({ name: "codex_app_next", args: { after: 2, displayedVersion: 2, mountId: "mount" } })
   expect(elements.get("caption").textContent).toBe("Второй")
+})
+
+test("сетевой timeout автоматически повторяет только чтение с прежним mount и ревизией", async () => {
+  const elements = new Map<string, any>()
+  for (const id of ["status", "source", "text", "image", "figure", "caption", "fullscreen", "pip", "inline", "resume"]) {
+    elements.set(id, { textContent: "", hidden: false, addEventListener() {} })
+  }
+  const calls: Array<{ name: string, args: any, resolve(value: unknown): void, reject(error: Error): void }> = []
+  const timers: Array<{ run(): void, delay: number }> = []
+  const window = { parent: { postMessage() {} }, addEventListener() {}, openai: {
+    toolResponseMetadata: { _meta: { viewer: { viewerId: "view", accessToken: "token", version: 1,
+      content: { kind: "text", service: "test", text: "Первый кадр" } } } },
+    callTool(name: string, args: unknown) {
+      return new Promise((resolve, reject) => calls.push({ name, args, resolve, reject }))
+    },
+  } }
+  runInNewContext(viewerUiHtml.match(/<script>([\s\S]*?)<\/script>/)![1]!, {
+    window, document: { body: { dataset: {} }, getElementById: (id: string) => elements.get(id) },
+    crypto: { randomUUID: () => "same-mount" },
+    setTimeout(run: () => void, delay: number) { timers.push({ run, delay }); return timers.length },
+    clearTimeout() {},
+  })
+  const flush = async () => { for (let i = 0; i < 10; i++) await Promise.resolve() }
+  await flush()
+  calls[0]!.reject(new Error("Request timeout"))
+  await flush()
+  expect(elements.get("text").textContent).toBe("Первый кадр")
+  expect(timers[0]!.delay).toBe(2000)
+  timers[0]!.run()
+  await flush()
+  expect(calls[1]).toMatchObject({ name: "codex_app_next", args: { after: 1, mountId: "same-mount", displayedVersion: 1, waitMs: 10000 } })
+  calls[1]!.resolve({ _meta: { viewer: { version: 2, changed: true, content: { kind: "text", service: "test", text: "Второй кадр" } } } })
+  await flush()
+  expect(elements.get("text").textContent).toBe("Второй кадр")
+  expect(calls.map(call => call.name)).toEqual(["codex_app_next", "codex_app_next", "codex_app_next"])
+  calls[2]!.reject(new Error("VIEWER_SESSION_UNAVAILABLE"))
+  await flush()
+  expect(timers).toHaveLength(1)
+  expect(elements.get("resume").hidden).toBe(false)
 })

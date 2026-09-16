@@ -204,6 +204,7 @@ test("get_state выдаёт exact surface/display/layout handles с явным 
   } })
   expect(desktop.desktopCaptureRequests[0]).toMatchObject({
     caption: "Ожидаю левый display",
+    cursor: "include",
     readinessPolicy: {
       requiredSteps: ["complete-frame", "permission", "target"],
       disabledSteps: ["ownership"],
@@ -433,6 +434,7 @@ test("observe both регистрирует elements, скрывает observati
   expect(desktop.inventoryCalls()).toBe(2)
   expect(desktop.captureRequests[0]).toMatchObject({
     caption: "Ожидаю окно Chrome с кнопкой Save",
+    cursor: "include",
     readinessPolicy: {
       requiredSteps: ["complete-frame", "permission", "target"],
       disabledSteps: ["ownership"],
@@ -1191,7 +1193,7 @@ function captureResult(input: z.infer<typeof captureWindowMethodInputSchema>, re
     source: publication.source,
     image: { frameRef: frame.frameRef, widthPx: frame.widthPx, heightPx: frame.heightPx,
       mime: frame.mime, byteLength: frame.byteLength, sha256: frame.sha256 },
-    cursor: "excluded" as const,
+    cursor: input.cursor === "include" ? "included" as const : "excluded" as const,
     clip: { x: 0, y: 0, width: 320, height: 240 },
     captureEvidence: { state: "confirmed" as const, claim: "frame-freshness", source: "fixture", proof: {
       proofRef: "proof:frame", authorityRef: "authority:frame", kind: "frame-freshness" as const,
@@ -1218,7 +1220,7 @@ function captureResult(input: z.infer<typeof captureWindowMethodInputSchema>, re
     effective: {
       clip: input.clip,
       fullPage: false,
-      cursor: "excluded" as const,
+      cursor: input.cursor === "include" ? "included" as const : "excluded" as const,
       scale: input.output.scale,
       widthPx: 320,
       heightPx: 240,
@@ -1284,7 +1286,7 @@ function desktopCaptureResult(input: z.infer<typeof captureDesktopMethodInputSch
     source: publication.source,
     image: { frameRef: frame.frameRef, widthPx: frame.widthPx, heightPx: frame.heightPx,
       mime: frame.mime, byteLength: frame.byteLength, sha256: frame.sha256 },
-    cursor: "excluded" as const,
+    cursor: input.cursor === "include" ? "included" as const : "excluded" as const,
     clip: { x: 0, y: 0, width: 320, height: 240 },
     captureEvidence: { state: "confirmed" as const, claim: "frame-freshness", source: "fixture", proof: {
       proofRef: "proof:display-frame", authorityRef: "authority:display-frame", kind: "frame-freshness" as const,
@@ -1308,7 +1310,7 @@ function desktopCaptureResult(input: z.infer<typeof captureDesktopMethodInputSch
     publication,
     observation,
     frame,
-    effective: { clip: input.clip, fullPage: false, cursor: "excluded" as const,
+    effective: { clip: input.clip, fullPage: false, cursor: input.cursor === "include" ? "included" as const : "excluded" as const,
       scale: input.output.scale, widthPx: 320, heightPx: 240, pixelCount: 320 * 240,
       encodedBytes: frame.byteLength, readinessPolicy: input.readinessPolicy },
     cleanup: { scope: "none" as const, state: "complete" as const, resources: [] as [] },

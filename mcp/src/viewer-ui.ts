@@ -1,4 +1,4 @@
-export const VIEWER_UI_URI = "ui://zavx0z/codex-app-v2.html"
+export const VIEWER_UI_URI = "ui://zavx0z/codex-app-v3.html"
 
 /** Прототип общего приложения: один mount, ожидающие MCP-запросы, fullscreen и PiP. */
 export const viewerUiHtml = `<!doctype html>
@@ -67,6 +67,8 @@ export const viewerUiHtml = `<!doctype html>
     let bridgeReady = false
     let availableModes = []
     let requestId = 0
+    let reconnectTimer
+    let reconnectResolve
     const pending = new Map()
     const initializeId = "viewer-initialize"
 
@@ -140,7 +142,7 @@ export const viewerUiHtml = `<!doctype html>
 
     async function next() {
       const args = { viewerId: viewer.viewerId, accessToken: viewer.accessToken,
-        after: version, mountId, displayedVersion, displayMode, waitMs: 20000 }
+        after: version, mountId, displayedVersion, displayMode, waitMs: 10000 }
       const response = typeof window.openai?.callTool === "function"
         ? await window.openai.callTool("codex_app_next", args)
         : await request("tools/call", { name: "codex_app_next", arguments: args })
@@ -158,6 +160,8 @@ export const viewerUiHtml = `<!doctype html>
 
     function dispose() {
       disposed = true
+      clearTimeout(reconnectTimer)
+      reconnectResolve?.()
       if (!viewer) return
       const args = { viewerId: viewer.viewerId, accessToken: viewer.accessToken, after: version, mountId, release: true, waitMs: 0 }
       const released = typeof window.openai?.callTool === "function"
@@ -170,12 +174,30 @@ export const viewerUiHtml = `<!doctype html>
       if (running || disposed || !viewer || !(bridgeReady || window.openai?.callTool)) return
       running = true
       resume.hidden = true
+      let failures = 0
       try {
         while (!disposed) {
-          const snapshot = await next()
-          if (disposed) break
-          await render(snapshot)
-          status.textContent = "Связь активна · ревизия " + version + " · " + displayMode
+          try {
+            resume.hidden = true
+            const snapshot = await next()
+            if (disposed) break
+            await render(snapshot)
+            failures = 0
+            status.textContent = "Связь активна · ревизия " + version + " · " + displayMode
+          } catch (error) {
+            if (disposed) break
+            if (!/timeout|timed out|network|fetch|connection|связ|соединен|VIEWER_WAIT_EXISTS/i.test(error.message)) throw error
+            status.textContent = "Переподключение: " + error.message
+            resume.hidden = false
+            // Повторяется только приватное чтение ревизии; capture здесь недоступен.
+            const delay = Math.min(30000, 2000 * 2 ** Math.min(failures++, 4))
+            await new Promise(resolve => {
+              reconnectResolve = resolve
+              reconnectTimer = setTimeout(resolve, delay)
+            })
+            clearTimeout(reconnectTimer)
+            reconnectResolve = undefined
+          }
         }
       } catch (error) {
         status.textContent = error.message
@@ -237,6 +259,10 @@ export const viewerUiHtml = `<!doctype html>
       })
     }
     resume.addEventListener("click", () => {
+      if (reconnectResolve) {
+        reconnectResolve()
+        return
+      }
       version = displayedVersion
       void listen()
     })
