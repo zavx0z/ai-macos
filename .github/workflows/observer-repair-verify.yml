@@ -31,7 +31,7 @@ jobs:
           PY
           git apply --check "$RUNNER_TEMP/observer.patch"
           git apply "$RUNNER_TEMP/observer.patch"
-      - name: Complete recovery fixture and bound retained diagnostics
+      - name: Apply reviewed fixture corrections and gap diagnostics
         run: |
           python3 - <<'PY'
           from pathlib import Path
@@ -63,6 +63,40 @@ jobs:
               value.observer.coverage = original
               await expect(scope.admit(ticket, "operation:long-reason:stale")).rejects.toThrow("coverage")
             } finally { await value.guard.close() }
+          })
+          ''')
+          replace('native/tests/command-loop.test.ts', '''    const version = await adapter.clipboard(nativeClipboardRequestSchema.parse({ kind: "clipboard", protocolVersion: "1",
+                requestId: "after-gap-read", ...generation, deadlineAt, command: { method: "clipboard.version", payload: {} } }), control)''', '''    const version = await adapter.clipboard(nativeClipboardRequestSchema.parse({
+                kind: "request", protocolVersion: "1", requestId: "after-gap-read", ...generation, deadlineAt,
+                operation: {
+                  kind: "clipboard", operationId: "after-gap-operation", clientRequestId: "after-gap-client-request",
+                  clientSessionId: "client", principalId: "principal", runtimeEpoch: generation.runtimeEpoch,
+                  loginSessionId: generation.loginSessionId, inventoryId: "inventory", inventoryRevision: 0, deadlineAt,
+                  target: { kind: "clipboard", ref: { runtimeEpoch: generation.runtimeEpoch, loginSessionId: generation.loginSessionId, clipboardRef: "system" } },
+                },
+                command: { method: "clipboard.version", payload: {} },
+              }), control)''')
+          replace('native/src/capture-command/meta_capture_command_test.m', '''    assert(strcmp([pending[@"ack"][@"quarantined"] objCType],
+                            @encode(BOOL)) == 0);''', '''    // NSNumber's Objective-C encoding is not a portable JSON boolean test.
+              assert(CFGetTypeID((__bridge CFTypeRef)pending[@"ack"][@"quarantined"]) ==
+                     CFBooleanGetTypeID());''')
+          replace('runtime/src/observer-hub.ts',
+              '      gapDetected: gap || this.#coverage.gapDetected,',
+              '      gapDetected: gap || this.#gap !== undefined || this.#coverage.gapDetected,')
+          p = Path('runtime/tests/observer-hub.test.ts')
+          p.write_text(p.read_text() + '''
+
+          test("настоящий gap во время ожидания доставки сохраняется в текущем coverage", async () => {
+            const value = fixture()
+            value.hub.start()
+            value.setSnapshot(watermark(3))
+            const pending = value.hub.coverage()
+            await Bun.sleep(0)
+            value.queue.push(event(2))
+            try {
+              await expect(pending).resolves.toMatchObject({ state: "unavailable", gapDetected: true })
+              expect(value.gaps).toHaveLength(1)
+            } finally { await value.hub.close() }
           })
           ''')
           PY
