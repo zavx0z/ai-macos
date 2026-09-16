@@ -25,10 +25,13 @@
 Владимир поручил восстановить исполнитель после проверки readonly-варианта.
 Справка не имеет побочных эффектов, однако единственный внешний tool также
 умеет выполнять изменяющие операции: `readOnlyHint:false`,
-`destructiveHint:true`, `idempotentHint:false`. Пустая схема сохраняется.
+`destructiveHint:true`, `idempotentHint:false`. Пустая схема сохраняется. Обязательное для MCP SDK поле serverInfo.version
+имеет служебное значение `unversioned` и не используется для совместимости.
 
-Исполнитель лениво подключается к существующему Runtime, проверяет машину,
-build и полный контракт вызываемой операции. Действие не повторяется.
+Исполнитель лениво подключается к существующему Runtime и проверяет машину.
+Контракты берутся из текущего каталога по запросу. Привязки к сборке, хешу
+каталога и snapshot удалены. Runtime проверяет текущую схему аргументов.
+Действие не повторяется.
 Runtime сохраняет проверку admission, capabilities и наблюдений. Пассивный
 `system_health` доступен для диагностики несовпадений; status/cancel не зависят
 от готовности остальных операций. Clipboard и shell/workspace API не добавлены.
@@ -41,7 +44,7 @@ Runtime сохраняет проверку admission, capabilities и набл�
 - Профиль: `~/Library/Application Support/ai-macos/tunnel/profiles/ai-macos-chat.yaml`.
 - Предыдущий профиль: рядом, `ai-macos-chat.before-zavx0z.yaml`.
 - Новый backend: `~/Library/Application Support/ai-macos/chat-proxy/zavx0z-mcp`.
-- Snapshot: там же, `catalog-v1.json`.
+- Snapshot и переменная `AI_MACOS_CHAT_CATALOG` больше не используются.
 - Двоичный файл tunnel-client уже установлен в
   `~/Library/Application Support/knowledge-base/tunnel/bin/tunnel-client`.
   Он использован без переустановки или изменения Knowledge Base.
@@ -59,12 +62,13 @@ Runtime сохраняет проверку admission, capabilities и набл�
 
 - `mcp/src/chat-proxy.ts` — пустой публичный вход и раскрытие протокола.
 - `mcp/src/chat-executor.ts` — выполнение через private Runtime UDS без polling.
-- `mcp/src/catalog-snapshot.ts` — модуль ChatGPT для проверки целостности snapshot
-  и совместимости каталога; snapshot содержит 14 существующих операций.
-- 51 тест snapshot/proxy/catalog и TypeScript MCP прошли. MCP SDK + тестовый
+- Версионный snapshot-модуль и его тесты удалены. Сохранён список 14 разрешённых
+  операций; справка показывает пересечение этого списка с живым каталогом.
+- 6 тестов proxy/catalog и TypeScript MCP прошли. MCP SDK + тестовый
   RuntimeHost/UDS проверяют справку без подключения, поздний старт Runtime,
   выполнение ровно один раз, необязательный input, сохранение отказа Runtime,
-  allowlist и get_operation при закрытом admission. Настоящий ввод не запускался.
+  allowlist, get_operation при закрытом admission и появление новой операции
+  без пересборки прокси. Настоящий ввод не запускался.
 - Исполняемый файл пересобран; backend прежнего туннеля обновлён, status ready.
 
 Незакоммиченный ETag/304-черновик в `runtime/src/{method-registry,transport}.ts`
@@ -89,14 +93,29 @@ Runtime сохраняет проверку admission, capabilities и набл�
 Runtime/Native build 47a1c96c07f1223d1fbf6e13, observer ready на момент ответа.
 Следующий get_state остановлен проверкой текущего каталога: INVALID_CATALOG,
 Missing or invalid selected tool: get_state. Операция не повторялась. Полная
-передача управления пока не подтверждена: статический контракт имеется, но
-в текущем каталоге Runtime операция отсутствовала при проверке.
+передача управления пока не подтверждена. После этого по поручению Владимира
+статический snapshot удалён: справка теперь отражает текущий каталог Runtime.
 
-Диагностика процессов: три installed-launcher/--mcp относятся к Codex desktop
-app-server, ещё один — к Codex ACP в WebStorm. Это отдельные MCP-клиенты.
-На момент проверки Runtime-процесс без --mcp был один. Новый zavx0z-mcp
-не использует polling; старые установленные MCP-клиенты его продолжают.
+## Локальный плагин Codex
+
+`zavx0z@personal` установлен и включён штатным `codex plugin add`.
+Исходник: `plugins/zavx0z`; personal marketplace связывается с ним через
+`~/plugins/zavx0z`. Плагин содержит только MCP и логотип пользователя.
+Manifest version `0.0.0` — обязательное поле формата установки; проверки версий
+Runtime, каталогов и snapshot в прокси отсутствуют.
+
+Установленная копия проверена реальным MCP SDK: один tool, пустые description
+и properties, root без catalogHash, system_health с matchesExpected:true,
+activeOperations:0, quarantinedResources:0. Legacy `mcp_servers.ai-macos`
+в пользовательском Codex config выключен. Четырём проверенным старым
+installed-launcher отправлен SIGTERM; после завершения остались один Runtime
+и один прокси туннеля. Настоящий ввод не выполнялся.
+
+Новые задачи Codex подхватывают установленный плагин. Уже открытая задача
+может сохранять старый набор tools: установка не доказывает его обновление.
+Stdio по-прежнему допускает отдельный лёгкий proxy на клиентское соединение,
+но он не запускает Runtime/Native и не опрашивает каталог в фоне.
 
 Логотип пользователя сохранён в `mcp/assets/zavx0z-logo.jpg` и `.png`.
-PNG — 2460 bytes; рисунок не менялся. Замена значка существующего app через
-доступный UI не найдена, его загрузка в ChatGPT не заявляется выполненной.
+PNG — 2460 bytes; рисунок не менялся. В локальном плагине Codex логотип
+подключён; загрузка в ChatGPT app по-прежнему не заявляется выполненной.

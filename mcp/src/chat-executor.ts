@@ -1,20 +1,34 @@
 import { hostname } from "node:os"
 import { RuntimeUdsClient } from "@meta/runtime"
-import { assertRuntimeCompatible, assertToolAllowed, createCatalogSnapshot, type CatalogSnapshot } from "./catalog-snapshot.ts"
+
+export const computerActions = [
+  "system_health", "get_state", "observe", "show_window", "check_input", "click",
+  "type_text", "press_key", "press_shortcut", "scroll", "get_target_status",
+  "cancel_target", "get_operation", "list_recent_operations",
+] as const
+
+export class ChatProxyError extends Error {
+  constructor(readonly code: string, message: string) {
+    super(message)
+  }
+}
 
 export interface ChatRuntimeOptions {
   expectedHostname: string
   socketPath: string
   credentialPath: string
+  allowedActions?: readonly string[]
 }
 
-/** Ленивый исполнитель: проверяет машину и контракт, не повторяет операции. */
-export function createChatExecutor(snapshot: CatalogSnapshot, options: ChatRuntimeOptions) {
+/** Ленивый исполнитель: проверяет машину, использует текущий API Runtime, не повторяет операции. */
+export function createChatExecutor(options: ChatRuntimeOptions) {
   let client: RuntimeUdsClient | undefined
   let connecting: Promise<RuntimeUdsClient> | undefined
   let closed = false
-  const contracts = new Map(snapshot.tools.map(tool => [tool.name,
-    createCatalogSnapshot(snapshot.runtimeBuildId, snapshot.tools, [tool.name])]))
+  const allowed = new Set<string>(options.allowedActions ?? computerActions)
+  const assertAllowed = (action: string) => {
+    if (!allowed.has(action)) throw new ChatProxyError("TOOL_NOT_ALLOWED", "Операция не разрешена этим подключением")
+  }
   const checkHealth = async (current: RuntimeUdsClient, signal: AbortSignal) => {
     const health = await current.callTool("system_health", {}, signal)
     const machine = health.structuredContent?.machine as { matchesExpected?: boolean, hostname?: string } | undefined
@@ -43,19 +57,18 @@ export function createChatExecutor(snapshot: CatalogSnapshot, options: ChatRunti
     return connecting
   }
   return {
+    async listTools() {
+      const current = await connect()
+      return (await current.listTools()).filter(tool => allowed.has(tool.name))
+    },
     async call(action: string, input: Record<string, unknown>, signal: AbortSignal) {
-      assertToolAllowed(snapshot, action)
+      assertAllowed(action)
       signal.throwIfAborted()
       const current = await connect()
       signal.throwIfAborted()
       const health = await checkHealth(current, signal)
       if (action === "system_health") return health
-      const identity = health.structuredContent?.runtime as { buildId?: string, runtimeEpoch?: string } | undefined
-      if (!identity?.buildId || !identity.runtimeEpoch) throw new Error("Identity Runtime недоступна")
-      // Только вызываемый контракт: недоступность ввода не блокирует status/cancel.
-      assertRuntimeCompatible(contracts.get(action)!, identity.buildId, await current.listTools())
-      const after = await current.health() as { generation?: { runtimeEpoch?: string } }
-      if (after.generation?.runtimeEpoch !== identity.runtimeEpoch) throw new Error("Runtime сменился во время проверки")
+      // Runtime сам проверяет текущие schema, admission и capabilities при вызове.
       signal.throwIfAborted()
       return await current.callTool(action, input, signal)
     },

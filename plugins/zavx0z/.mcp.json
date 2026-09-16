@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "zavx0z": {
+      "command": "/Users/zavx0z/Library/Application Support/ai-macos/chat-proxy/zavx0z-mcp",
+      "args": [],
+      "env": {
+        "AI_MACOS_EXPECTED_HOSTNAME": "repositarium",
+        "META_RUNTIME_SOCKET": "/Users/zavx0z/Library/Application Support/ai-macos/run/runtime.sock",
+        "META_RUNTIME_CREDENTIAL": "/Users/zavx0z/Library/Application Support/ai-macos/run/credential.json"
+      }
+    }
+  }
+}

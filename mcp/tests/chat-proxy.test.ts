@@ -1,20 +1,16 @@
 import { expect, test } from "bun:test"
-import { mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdtemp, rm } from "node:fs/promises"
 import { hostname, tmpdir } from "node:os"
 import { join } from "node:path"
 import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { createRuntimeHost } from "@meta/runtime"
 import { z } from "@meta/shared/contracts"
-import { createCatalogSnapshot } from "../src/catalog-snapshot.ts"
 import { startChatProxy } from "../src/chat-proxy.ts"
 
 test("справка раскрывается без Runtime, выполнение требует исполнителя", async () => {
   const directory = await mkdtemp(join(tmpdir(), "chat-proxy-"))
-  const catalogPath = join(directory, "catalog.json")
-  const operation = { name: "click", description: "Нажатие мыши", inputSchema: { type: "object" as const, required: ["targetId"], properties: { targetId: { type: "string" } } }, annotations: { readOnlyHint: false, destructiveHint: true } }
-  await writeFile(catalogPath, JSON.stringify(createCatalogSnapshot("runtime:test", [operation], ["click"])))
-  const server = await startChatProxy({ catalogPath })
+  const server = await startChatProxy({ runtime: { socketPath: join(directory, "missing.sock"), credentialPath: join(directory, "missing.json"), expectedHostname: hostname() } })
   const client = new Client({ name: "chat-proxy-test", version: "1" })
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair()
   try {
@@ -26,13 +22,7 @@ test("справка раскрывается без Runtime, выполнени
     expect(tools[0]?.description).toBe("")
     expect(client.getInstructions()).toBeUndefined()
     expect((await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent).toMatchObject({ node: "root", children: [{ node: "computer" }], contract: { inputSchema: { properties: { node: { type: "string" }, action: { type: "string" }, input: { type: "object" } } } }, next: { node: "computer" } })
-    expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer" } })).structuredContent).toMatchObject({ node: "computer", children: [{ action: "click" }] })
-    for (const args of [
-      { node: "computer/click" },
-      { node: "computer/click", input: {} },
-    ]) {
-      expect((await client.callTool({ name: "zavx0z", arguments: args })).structuredContent).toMatchObject({ contract: operation, executed: false })
-    }
+    expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer" } })).isError).toBe(true)
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer", action: "not_published" } })).isError).toBe(true)
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer/click", action: "different" } })).isError).toBe(true)
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer", action: "click" } })).isError).toBe(true)
@@ -48,7 +38,6 @@ test("action выполняется через UDS ровно один раз, i
   const directory = await mkdtemp(join(tmpdir(), "chat-executor-"))
   const socketPath = join(directory, "runtime.sock")
   const credentialPath = join(directory, "credential.json")
-  const catalogPath = join(directory, "catalog.json")
   const host = await createRuntimeHost({ socketPath, credentialPath, expectedHostname: hostname(),
     loginSessionId: "login:chat", runtimeBuildId: "runtime:chat", expectedNativeBuildId: "native:chat" })
   let calls = 0
@@ -62,19 +51,27 @@ test("action выполняется через UDS ровно один раз, i
       return { calls, value: input.value, failed: input.value < 0 }
     },
   })
-  await writeFile(catalogPath, JSON.stringify(createCatalogSnapshot("runtime:chat", host.catalog.descriptors().tools,
-    ["system_health", "test_write", "get_operation"])))
-  const server = await startChatProxy({ catalogPath, runtime: { socketPath, credentialPath, expectedHostname: hostname() } })
+  const server = await startChatProxy({ runtime: { socketPath, credentialPath, expectedHostname: hostname(),
+    allowedActions: ["system_health", "test_write", "get_operation", "late_method"] } })
   const client = new Client({ name: "chat-executor-test", version: "1" })
   const [ct, st] = InMemoryTransport.createLinkedPair()
   const call = (args: Record<string, unknown>) => client.callTool({ name: "zavx0z", arguments: args })
   try {
     await Promise.all([client.connect(ct), server.connect(st)])
-    expect((await call({ node: "computer/test_write", input: { value: 7 } })).structuredContent).toMatchObject({ executed: false })
-    expect(calls).toBe(0)
+    expect((await call({})).isError).not.toBe(true)
     expect((await call({ node: "computer", action: "system_health" })).isError).toBe(true)
     await host.start()
     expect((await call({ node: "computer", action: "system_health" })).structuredContent).toMatchObject({ machine: { matchesExpected: true } })
+    expect((await call({ node: "computer/test_write", input: { value: 7 } })).structuredContent).toMatchObject({ executed: false })
+    expect(calls).toBe(0)
+    expect((await call({ node: "computer/late_method" })).isError).toBe(true)
+    host.catalog.register("late_method", {
+      title: "Новая операция", description: "Появляется без snapshot и перезапуска proxy", readOnly: true,
+      input: z.strictObject({}), output: z.strictObject({ live: z.literal(true) }),
+      async execute() { return { live: true } },
+    })
+    expect((await call({ node: "computer/late_method" })).structuredContent).toMatchObject({ contract: { name: "late_method" } })
+    expect((await call({ node: "computer", action: "late_method" })).structuredContent).toEqual({ live: true })
     expect((await call({ node: "computer", action: "test_write" })).structuredContent).toEqual({ calls: 1, value: 1, failed: false })
     const failed = await call({ node: "computer/test_write", action: "test_write", input: { value: -7 } })
     expect(failed.isError).toBe(true)

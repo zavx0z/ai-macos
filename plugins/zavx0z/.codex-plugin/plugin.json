@@ -1,0 +1,23 @@
+{
+  "name": "zavx0z",
+  "version": "0.0.0",
+  "description": "Завхоз - заведующий цифровым хозяйством",
+  "author": {
+    "name": "zavx0z"
+  },
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "zavx0z",
+    "shortDescription": "Завхоз - заведующий цифровым хозяйством",
+    "longDescription": "Единая точка входа к локальному Runtime. Начните с пустого запроса {}.",
+    "developerName": "zavx0z",
+    "category": "Productivity",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": "Вызови zavx0z с {} и прочитай возвращённую справку.",
+    "composerIcon": "./assets/logo.png",
+    "logo": "./assets/logo.png"
+  }
+}
