@@ -110,11 +110,16 @@ test("action выполняется через UDS ровно один раз, i
     const meta = { "openai/session": "first-screenshot" }
     const firstFrame = await call({ node: "computer", action: "fixture_frame" }, meta)
     expect(firstFrame.content).toContainEqual(expect.objectContaining({ type: "text", text: expect.stringContaining("CODEX_APP_OPEN_REQUIRED") }))
+    expect(firstFrame.structuredContent).toMatchObject({
+      frameRef: expect.any(String),
+      codexApp: { status: "CODEX_APP_OPEN_REQUIRED", tool: "codex_app", repeatPreviousCommand: false },
+    })
     const opened = await client.callTool({ name: "codex_app", arguments: {}, _meta: meta })
     expect(opened._meta?.viewer).toMatchObject({ version: 1, content: { kind: "image", data: png.toString("base64") } })
     const nextResponse = await call({}, meta)
     expect(nextResponse.content).not.toContainEqual(expect.objectContaining({ type: "text", text: expect.stringMatching(/^CODEX_APP_OPEN_REQUIRED:/) }))
     const secondFrame = await call({ node: "computer", action: "fixture_frame" })
+    expect(nextResponse.structuredContent?.codexApp).toBeUndefined()
     const firstScreenshot = firstFrame._meta?.screenshot as { version: number, streamId: string }
     const secondScreenshot = secondFrame._meta?.screenshot as { version: number, streamId: string }
     expect(firstFrame.content).toContainEqual({ type: "image", data: png.toString("base64"), mimeType: "image/png" })

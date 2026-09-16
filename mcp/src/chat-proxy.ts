@@ -242,7 +242,13 @@ export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
       const response = await executeRequest()
       if (name === "zavx0z") {
         try {
-          if (viewers.suggestOpen(scope)) return { ...response, content: [...response.content, {
+          if (viewers.suggestOpen(scope)) return {
+            ...response,
+            structuredContent: {
+              ...response.structuredContent,
+              codexApp: { status: "CODEX_APP_OPEN_REQUIRED", tool: "codex_app", arguments: {}, repeatPreviousCommand: false },
+            },
+            content: [...response.content, {
             type: "text",
             text: "CODEX_APP_OPEN_REQUIRED: вызови codex_app {} один раз сейчас, чтобы открыть общее приложение этой беседы. Затем продолжай задачу. Предыдущую команду НЕ повторяй. Режим fullscreen или PiP выбирается пользователем в приложении.",
           }] }
