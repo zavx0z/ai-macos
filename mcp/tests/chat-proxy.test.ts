@@ -119,7 +119,7 @@ test("action выполняется через UDS ровно один раз, i
     const nextResponse = await call({}, meta)
     expect(nextResponse.content).not.toContainEqual(expect.objectContaining({ type: "text", text: expect.stringMatching(/^CODEX_APP_OPEN_REQUIRED:/) }))
     const secondFrame = await call({ node: "computer", action: "fixture_frame" })
-    expect(nextResponse.structuredContent?.codexApp).toBeUndefined()
+    expect(nextResponse.structuredContent).not.toHaveProperty("codexApp")
     const firstScreenshot = firstFrame._meta?.screenshot as { version: number, streamId: string }
     const secondScreenshot = secondFrame._meta?.screenshot as { version: number, streamId: string }
     expect(firstFrame.content).toContainEqual({ type: "image", data: png.toString("base64"), mimeType: "image/png" })
