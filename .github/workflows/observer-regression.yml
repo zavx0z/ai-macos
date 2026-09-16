@@ -24,15 +24,19 @@ jobs:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Сохранить проверяемый исходный снимок
-        run: git archive --format=tar HEAD > "$RUNNER_TEMP/source.tar"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: observer-source-${{ github.sha }}
-          path: ${{ runner.temp }}/source.tar
-          retention-days: 3
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
+      - name: Сохранить исходники и инструменты воспроизведения
+        run: |
+          git archive --format=tar HEAD > "$RUNNER_TEMP/source.tar"
+          tar -czf "$RUNNER_TEMP/test-environment.tar.gz" node_modules -C "$HOME/.bun/bin" bun
+      - uses: actions/upload-artifact@v4
+        with:
+          name: observer-reproduction-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/source.tar
+            ${{ runner.temp }}/test-environment.tar.gz
+          retention-days: 1
       - name: Регрессии наблюдения и отмены
         run: bun test runtime/tests/observer-hub.test.ts runtime/tests/agent-view-guard.test.ts runtime/tests/heartbeat.test.ts
       - name: Проверка типов Runtime
@@ -47,7 +51,8 @@ jobs:
           persist-credentials: false
       - uses: oven-sh/setup-bun@v2
       - run: bun install --frozen-lockfile
-      - name: Native fixtures без реального ввода
-        run: sh native/scripts/check.sh
       - name: Observer fixtures без реального ввода
         run: sh native/scripts/check-observer.sh
+      - name: Native fixtures без реального ввода
+        if: '!cancelled()'
+        run: sh native/scripts/check.sh
