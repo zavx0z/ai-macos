@@ -45,6 +45,9 @@ typedef NSDictionary *_Nullable (^MetaObserverIndexFailureProvider)(void);
 // foreground receipt непосредственно вокруг main-thread observer start.
 - (void)setPreparedValidator:(nullable MetaObserverPreparedValidator)validator;
 - (void)setIndexFailureProvider:(nullable MetaObserverIndexFailureProvider)provider;
+- (BOOL)mergeTargetRecords:(NSArray<MetaObserverTargetRecord *> *)records
+                inventoryId:(NSString *)inventoryId
+          inventoryRevision:(uint64_t)inventoryRevision;
 - (NSDictionary *)handleRequest:(NSDictionary *)request;
 // Вызывается command loop только после успешной отправки prepare ACK.
 - (BOOL)activatePushForObserverInstance:(NSString *)observerInstanceRef;

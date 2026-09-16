@@ -269,6 +269,47 @@ static bool focus_notification(NSString *notification) {
   return YES;
 }
 
+- (BOOL)mergeRecords:(NSArray<MetaObserverTargetRecord *> *)records {
+  if (![records isKindOfClass:NSArray.class] ||
+      records.count > META_OBSERVER_TARGET_INDEX_MAX_RECORDS) return NO;
+  for (id value in records) {
+    if (![value isMemberOfClass:MetaObserverTargetRecord.class]) return NO;
+    MetaObserverTargetRecord *record = value;
+    if (record.element == NULL || record.pid <= 0 ||
+        record.processStartMicros == 0 ||
+        ![record.target isKindOfClass:NSDictionary.class]) return NO;
+  }
+  [_lock lock];
+  NSMutableArray<MetaObserverTargetRecord *> *merged = [NSMutableArray array];
+  for (MetaObserverTargetRecord *existing in _records) {
+    const uint64_t current =
+        _backend.process_start_micros(_backend.context, existing.pid);
+    if (current != 0 && current != existing.processStartMicros) continue;
+    [merged addObject:existing];
+  }
+  for (MetaObserverTargetRecord *incoming in records) {
+    NSIndexSet *replaced = [merged indexesOfObjectsPassingTest:
+        ^BOOL(MetaObserverTargetRecord *existing,
+              __unused NSUInteger index,
+              __unused BOOL *stop) {
+      return [existing.target isEqual:incoming.target] ||
+          (existing.pid == incoming.pid &&
+           existing.processStartMicros == incoming.processStartMicros &&
+           _backend.equal(_backend.context, existing.element,
+                          incoming.element));
+    }];
+    if (replaced.count > 0) [merged removeObjectsAtIndexes:replaced];
+    [merged addObject:incoming];
+    if (merged.count > META_OBSERVER_TARGET_INDEX_MAX_RECORDS) {
+      [_lock unlock];
+      return NO;
+    }
+  }
+  _records = [merged copy];
+  [_lock unlock];
+  return YES;
+}
+
 - (NSDictionary *)resolveFocusForPid:(pid_t)pid
                               element:(AXUIElementRef)element
                          notification:(NSString *)notification {

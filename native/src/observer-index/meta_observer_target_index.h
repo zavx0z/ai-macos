@@ -45,6 +45,7 @@ MetaObserverTargetRecord *_Nullable meta_observer_target_record_create(
 - (instancetype)init;
 - (nullable instancetype)initWithBackend:(MetaObserverTargetBackend)backend;
 - (BOOL)replaceRecords:(NSArray<MetaObserverTargetRecord *> *)records;
+- (BOOL)mergeRecords:(NSArray<MetaObserverTargetRecord *> *)records;
 - (nullable NSDictionary *)resolveFocusForPid:(pid_t)pid
                                        element:(AXUIElementRef)element
                                   notification:(NSString *)notification;

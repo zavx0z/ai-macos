@@ -214,6 +214,31 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   [_lock unlock];
 }
 
+- (BOOL)mergeTargetRecords:(NSArray<MetaObserverTargetRecord *> *)records
+                inventoryId:(NSString *)inventoryId
+          inventoryRevision:(uint64_t)inventoryRevision {
+  if (![records isKindOfClass:NSArray.class] || !identifier(inventoryId, 127) ||
+      inventoryRevision > 9007199254740991ULL) return NO;
+  [_lock lock];
+  MetaObserverPreparedIndex *prepared = _prepared;
+  BOOL available = prepared != nil && _observer != nil && _gapReason == nil &&
+      _prepareToken == nil && prepared.indexRevision < 9007199254740991ULL;
+  if (!available || ![prepared.index mergeRecords:records]) {
+    [_lock unlock];
+    return NO;
+  }
+  MetaObserverPreparedIndex *updated = meta_observer_prepared_index_create(
+      prepared.index, inventoryId, inventoryRevision,
+      prepared.indexRevision + 1);
+  if (updated == nil) {
+    [_lock unlock];
+    return NO;
+  }
+  _prepared = updated;
+  [_lock unlock];
+  return YES;
+}
+
 - (NSDictionary *)indexFailure {
   [_lock lock];
   MetaObserverIndexFailureProvider provider = _indexFailureProvider;
