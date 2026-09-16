@@ -64,6 +64,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
 - (void)shutdown:(int)code stage:(NSString *)stage;
 - (int)exitCode;
 - (void)pumpObserver;
+- (void)observerFailed:(NSString *)reason;
 @end
 
 @implementation MetaCommandController {
@@ -83,6 +84,8 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   BOOL _sealed;
   BOOL _busy;
   BOOL _observerCommandPending;
+  NSString *_observerInstance;
+  BOOL _observerGapSent;
   BOOL _requiresRecoveryDomain;
   NSString *_activeOperation;
   MetaInputJob *_job;
@@ -124,26 +127,7 @@ static NSDictionary *failure(NSString *code, NSString *message) {
   NSDictionary *batch = [_backend takeObserverPush:64];
   if (batch == nil) return;
   if (batch[@"gapReason"] != nil) {
-    NSString *reason = [batch[@"gapReason"] isKindOfClass:NSString.class]
-        ? batch[@"gapReason"]
-        : @"";
-    NSString *stage = [reason containsString:@"нового foreground application"]
-        ? @"foreground-subscription-failed"
-        : [reason containsString:@"Новое AX window"]
-            ? @"new-window-subscription-failed"
-            : [reason containsString:@"event tap"] ||
-                  [reason containsString:@"Event observation"]
-                ? @"input-observer-gap"
-                : [reason containsString:@"callback не сопоставлен"] ||
-                      [reason containsString:@"Focus event не содержит exact runtime target"]
-                    ? @"observer-target-unresolved"
-                : [reason containsString:@"overflow"]
-                    ? @"observer-buffer-overflow"
-                    : [reason containsString:@"lifecycle"] ||
-                          [reason containsString:@"Lock state"]
-                        ? @"session-lifecycle-gap"
-                        : @"observer-coverage-gap";
-    [self shutdown:75 stage:stage];
+    [self observerFailed:batch[@"gapReason"]];
     return;
   }
   NSArray *events = batch[@"events"];
@@ -152,6 +136,20 @@ static NSDictionary *failure(NSString *code, NSString *message) {
     [self send:@"event" payload:event];
     if (_requestedExit >= 0) return;
   }
+}
+
+// Неисправность observer не является неисправностью транспорта/процесса.
+- (void)observerFailed:(NSString *)reason {
+  if (_observerGapSent || _observerInstance == nil) return;
+  _observerGapSent = YES;
+  if (![reason isKindOfClass:NSString.class] || reason.length == 0) reason = @"Observer coverage недоступна";
+  if (reason.length > 1024) reason = [reason substringToIndex:1024];
+  if (_busy) [_job requestCancel];
+  [self send:@"event" payload:@{
+    @"runtimeEpoch" : _runtimeEpoch, @"loginSessionId" : _loginSessionId,
+    @"nativeGeneration" : _generation, @"observerInstanceRef" : _observerInstance,
+    @"gapReason" : reason,
+  }];
 }
 
 - (void)shutdown:(int)code {
@@ -307,11 +305,17 @@ static NSDictionary *failure(NSString *code, NSString *message) {
       if (![self->_transport enqueueFrame:@{@"channel": @"observer", @"payload": result}]) { [self shutdown:74 stage:@"transport-write-failed"]; return; }
       if ([result[@"ok"] isEqual:@YES] && [result[@"command"] isEqual:@"prepare"]) {
         NSString *instance = result[@"snapshot"][@"observerInstanceRef"];
+        self->_observerInstance = instance;
+        self->_observerGapSent = NO;
         if (![self->_backend respondsToSelector:@selector(activateObserverPush:)] ||
             ![self->_backend activateObserverPush:instance]) {
-          [self shutdown:75 stage:@"observer-push-activation-failed"];
+          [self observerFailed:@"Observer PUSH activation failed"];
           return;
         }
+      }
+      if ([result[@"ok"] isEqual:@YES] && [result[@"command"] isEqual:@"stop"]) {
+        self->_observerInstance = nil;
+        self->_observerGapSent = NO;
       }
       [self pumpObserver];
     }];

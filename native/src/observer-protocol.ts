@@ -59,6 +59,12 @@ export const nativeObserverEventEnvelopeSchema = z.strictObject({
     context.addIssue({ code: "custom", message: "Observer event и envelope принадлежат разным generation" })
   }
 })
+/** Отказ observer завершает только его поток, а не Native transport. */
+export const nativeObserverGapEnvelopeSchema = z.strictObject({
+  observerInstanceRef: opaqueIdSchema,
+  runtimeEpoch: generationIdSchema, loginSessionId: generationIdSchema, nativeGeneration: generationIdSchema,
+  gapReason: z.string().min(1).max(1024),
+})
 export type NativeObservedEvent = ObservedEvent & { readonly observerInstanceRef?: string }
 
 const response = {

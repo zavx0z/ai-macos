@@ -44,7 +44,7 @@ import { nativeHeldRecoveryRequestSchema, nativeHeldRecoveryResponseSchema } fro
 export * from "./recovery-protocol.ts"
 import { nativeDomainRecoveryRequestSchema, nativeDomainRecoveryResponseSchema } from "./domain-recovery-protocol.ts"
 export * from "./domain-recovery-protocol.ts"
-import { nativeObserverRequestSchema, nativeObserverResponseSchema, nativeObserverEventEnvelopeSchema } from "./observer-protocol.ts"
+import { nativeObserverRequestSchema, nativeObserverResponseSchema, nativeObserverEventEnvelopeSchema, nativeObserverGapEnvelopeSchema } from "./observer-protocol.ts"
 export * from "./observer-protocol.ts"
 import { nativeHitTestRequestSchema, nativeHitTestResponseSchema } from "./hit-test-protocol.ts"
 export * from "./hit-test-protocol.ts"
@@ -865,7 +865,7 @@ export const nativeTransportResponseFrameSchema = z.discriminatedUnion("channel"
   z.strictObject({ channel: z.literal("heartbeat"), payload: nativeHeartbeatAckSchema }),
   z.strictObject({ channel: z.literal("cancel"), payload: nativeCancelAckSchema }),
   z.strictObject({ channel: z.literal("drain"), payload: nativeDrainAckSchema }),
-  z.strictObject({ channel: z.literal("event"), payload: z.union([nativeObserverEventEnvelopeSchema, observedEventSchema]) }),
+  z.strictObject({ channel: z.literal("event"), payload: z.union([nativeObserverEventEnvelopeSchema, nativeObserverGapEnvelopeSchema, observedEventSchema]) }),
   z.strictObject({ channel: z.literal("cleanup"), payload: nativeCaptureCleanupResponseSchema }),
   z.strictObject({
     channel: z.literal("ledger-persist"),

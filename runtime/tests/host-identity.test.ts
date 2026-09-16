@@ -71,6 +71,15 @@ class AuditTransport implements NativeTransport {
   observerCoverageStarted?: () => void
   observerStopAttempts = 0
   observerFailureUnknown = false
+  failObserverCoverageCall?: number
+  lastObserverRequest?: Extract<NativeTransportRequestFrame, { channel: "observer" }>["payload"]
+  observerGap(reason: string): void {
+    const request = this.lastObserverRequest!
+    this.#resolve({ kind: "message", frame: { channel: "event", payload: {
+      runtimeEpoch: request.runtimeEpoch, loginSessionId: request.loginSessionId, nativeGeneration: request.nativeGeneration,
+      observerInstanceRef: `observer:host-view:${this.observerPrepareAttempts}`, gapReason: reason,
+    } } })
+  }
   #packet: Promise<NativeTransportPacket>
   #resolve!: (packet: NativeTransportPacket) => void
   #end!: () => void
@@ -115,6 +124,7 @@ class AuditTransport implements NativeTransport {
       return
     }
     if (this.fullView && frame.channel === "observer") {
+      this.lastObserverRequest = frame.payload
       if (frame.payload.command === "prepare") this.observerPrepareAttempts++
       if (frame.payload.command === "coverage") {
         this.observerCoverageCalls++
@@ -148,8 +158,10 @@ class AuditTransport implements NativeTransport {
       this.#resolve({ kind: "message", frame: { channel: "observer", payload: {
         kind: "observer-response", protocolVersion: "1", requestId: request.requestId, command: request.command,
         ...generation, nativeBuildId: "build:native-audit", ok: true,
-        snapshot: { observerInstanceRef: "observer:host-view", inventoryId: "inventory:host-view", inventoryRevision: 1, indexRevision: 1,
-          coverage: { state: "ready", ...generation, coverageStartCursor: "cursor:start", cursor: "cursor:start", nextSequence: 1,
+        snapshot: { observerInstanceRef: `observer:host-view:${this.observerPrepareAttempts}`, inventoryId: "inventory:host-view", inventoryRevision: 1, indexRevision: 1,
+          coverage: { state: request.command === "stop" || request.command === "coverage" && this.observerCoverageCalls === this.failObserverCoverageCall ? "unavailable" : "ready",
+            ...(request.command === "stop" ? { reason: "fixture observer stopped" } : request.command === "coverage" && this.observerCoverageCalls === this.failObserverCoverageCall ? { reason: "fixture coverage temporarily unavailable" } : {}),
+            ...generation, coverageStartCursor: "cursor:start", cursor: "cursor:start", nextSequence: 1,
             startedAt: now, coveredFrom: now, coveredThrough: now, heartbeatAt: now,
             coveredKinds: ["input", "focus", "window-structure", "lifecycle"], droppedEvents: 0, gapDetected: false },
           sessionReadiness: { state: "active-console", lockState: "unknown", userId: this.session.uid, auditSessionId: this.session.auditSessionId,
@@ -571,7 +583,7 @@ test("Host health показывает bounded observer retry progress с еди
   } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
 }, 5000)
 
-test("unknown observer prepare failure не повторяется и остаётся sealed", async () => {
+test("unknown observer prepare не повторяется; заблокирован только зависимый ввод", async () => {
   const directory = await mkdtemp(join(tmpdir(), "host-observer-unknown-"))
   const session = { verified: true as const, source: "darwin-audit" as const,
     uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 135 }
@@ -587,8 +599,13 @@ test("unknown observer prepare failure не повторяется и остаё
     await host.start()
     await host.ready()
     expect(transport.observerPrepareAttempts).toBe(1)
-    expect(host.doctor()).toMatchObject({ observer: { state: "unavailable", viewReady: false }, runtime: { admissionSealed: true } })
+    expect(host.doctor()).toMatchObject({ observer: { state: "unavailable", viewReady: false }, runtime: { admissionSealed: false } })
     expect(host.doctor().observer.reason).toContain("cleanup/unknown")
+    await host.ready()
+    expect(transport.observerPrepareAttempts).toBe(1)
+    const methods = host.catalog.descriptors().tools.map(tool => tool.name)
+    expect(methods).toContain("get_state")
+    expect(methods).not.toContain("click")
   } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
 })
 
@@ -609,7 +626,7 @@ test("grant revocation между clean retries запрещает следую�
     transport.permissions = { screenRecording: false }
     await host.ready()
     expect(transport.observerPrepareAttempts).toBe(1)
-    expect(host.doctor()).toMatchObject({ observer: { state: "unavailable", viewReady: false }, runtime: { admissionSealed: true } })
+    expect(host.doctor()).toMatchObject({ observer: { state: "unavailable", viewReady: false }, runtime: { admissionSealed: false } })
     expect(host.doctor().observer.reason).toContain("passive TCC grants")
   } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
 }, 5000)
@@ -676,3 +693,51 @@ for (const readinessState of ["ready", "degraded", "unavailable"] as const) {
     }
   })
 }
+
+
+test.each([false, true])("observer recovery не перезапускает Native и не повторяет input: gap=%s", async gap => {
+  const directory = await mkdtemp(join(tmpdir(), "host-observer-recovery-"))
+  const session = { verified: true as const, source: "darwin-audit" as const,
+    uid: process.getuid!(), effectiveUid: process.geteuid!(), auditUserId: process.getuid!(), auditSessionId: 140 }
+  const transport = new AuditTransport(session)
+  transport.fullView = true
+  transport.viewVersion = "1"
+  transport.readinessState = "ready"
+  transport.grantStartupPermissions()
+  if (!gap) transport.failObserverCoverageCall = 2
+  const host = await createRuntimeHost({ socketPath: join(directory, "runtime.sock"), credentialPath: join(directory, "credential.json"),
+    runtimeBuildId: "build:observer-recovery", expectedNativeBuildId: "build:native-audit", expectedHostname: hostname(), metadata: { session }, transport })
+  try {
+    await host.start()
+    await host.ready()
+    if (gap) {
+      expect(host.catalog.descriptors().tools.some(tool => tool.name === "click")).toBe(true)
+      expect(host.doctor().observer.viewReady).toBe(true)
+      const failed = new Promise<void>(resolve => {
+        const stop = host.core.subscribeCapabilities(() => {
+          if (host.doctor().observer.state === "unavailable") { stop(); resolve() }
+        })
+      })
+      transport.observerGap("fixture AX subscription failed while idle")
+      await failed
+    }
+    expect(host.doctor()).toMatchObject({ observer: { state: "unavailable", viewReady: false }, runtime: { admissionSealed: false }, native: { state: "compatible" } })
+    const methods = () => host.catalog.descriptors().tools.map(tool => tool.name)
+    expect(methods()).toContain("get_state")
+    expect(methods()).not.toContain("click")
+    expect(transport.observerPrepareAttempts).toBe(1)
+    const client = await host.core.openClientDurable("principal:observer-recovery")
+    const state = await host.catalog.dispatch(client.session, "get_state", {}, new AbortController().signal)
+    expect(state.data.complete).toBe(true)
+    // Восстанавливается только observation binding, без mutation/replay.
+    await host.ready()
+    expect(transport.observerPrepareAttempts).toBe(2)
+    expect(transport.observerStopAttempts).toBe(1)
+    expect(host.doctor().observer.viewReady).toBe(true)
+    expect(methods().filter(method => method === "click")).toHaveLength(1)
+    await host.ready()
+    expect(transport.observerPrepareAttempts).toBe(2)
+    expect(transport.mutationCalls).toBe(0)
+    expect(transport.closed).toBe(false)
+  } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }
+})

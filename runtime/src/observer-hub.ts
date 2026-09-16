@@ -69,6 +69,9 @@ export class RuntimeNativeObserverHub {
   #reader: Promise<void> | undefined
   #gap: Error | undefined
   #closed = false
+  #coveragePending: Promise<ObserverCoverage> | undefined
+  #pulse: Promise<void> | undefined
+  #wake: (() => void) | undefined
 
   constructor(options: {
     native: NativeObserverClient
@@ -167,16 +170,33 @@ export class RuntimeNativeObserverHub {
   }
 
   async coverage(signal?: AbortSignal): Promise<ObserverCoverage> {
+    if (signal?.aborted) return this.#unavailableCoverage(String(signal.reason ?? "Observer coverage отменена"), false)
+    // Одно native control-обращение на hub. Отмена одного caller не отменяет
+    // общий запрос другого caller и не создаёт конкурентные observer commands.
+    if (this.#coveragePending === undefined) {
+      const pending = this.#readCoverage().finally(() => {
+        if (this.#coveragePending === pending) this.#coveragePending = undefined
+      })
+      this.#coveragePending = pending
+    }
+    try { return structuredClone(await abortable(this.#coveragePending, signal)) }
+    catch (error) { return this.#unavailableCoverage(error instanceof Error ? error.message : String(error), false) }
+  }
+
+  async #readCoverage(): Promise<ObserverCoverage> {
     if (this.#gap !== undefined) return this.#unavailableCoverage(this.#gap.message, true)
     if (this.#closed) return this.#unavailableCoverage("Observer hub закрыт", true)
     if (this.#reader === undefined) return this.#unavailableCoverage("Observer hub consumer не запущен", false)
     const generation = this.#native.generation
     if (generation === undefined) return this.#unavailableCoverage("Native generation недоступна", true)
+    const signal = this.#readerAbort.signal
+    const requestedSequence = this.#nextSequence
+    const requestedCursor = this.#cursor
     const controller = new AbortController()
     const onAbort = () => controller.abort(signal?.reason ?? "observer coverage caller cancelled")
     signal?.addEventListener("abort", onAbort, { once: true })
     if (signal?.aborted) onAbort()
-    const timer = setTimeout(() => controller.abort("observer coverage deadline"), this.#controlTimeoutMs)
+    const timer = setTimeout(() => controller.abort(new Error("Observer coverage timeout")), this.#controlTimeoutMs)
     try {
       const deadlineAt = new Date(this.#clock.now().getTime() + this.#controlTimeoutMs).toISOString()
       const request = nativeObserverRequestSchema.parse({
@@ -188,10 +208,10 @@ export class RuntimeNativeObserverHub {
         deadlineAt,
         observerInstanceRef: this.#snapshot.observerInstanceRef,
       })
-      const response = await withTimeout(this.#native.observer(request, {
+      const response = await abortable(this.#native.observer(request, {
         signal: controller.signal,
         checkpoint: () => { controller.signal.throwIfAborted() },
-      }), this.#controlTimeoutMs, "Observer coverage timeout")
+      }), controller.signal)
       if (!response.ok) return this.#unavailableCoverage(response.error.message, false)
       if (response.snapshot.observerInstanceRef !== this.#snapshot.observerInstanceRef) {
         return this.#markGap("Observer coverage response содержит foreign instance")
@@ -200,16 +220,30 @@ export class RuntimeNativeObserverHub {
       if (coverage.coverageStartCursor !== this.#snapshot.coverage.coverageStartCursor) {
         return this.#markGap("Observer coverage start cursor изменился внутри instance")
       }
-      if (coverage.nextSequence < this.#nextSequence) {
-        return this.#markGap("Native observer coverage отстаёт от уже принятой sequence")
+      if (coverage.gapDetected || coverage.droppedEvents !== 0) {
+        return this.#markGap(coverage.reason ?? "Native observer сообщил потерю событий")
       }
-      if (coverage.nextSequence === this.#nextSequence && coverage.cursor !== this.#cursor) {
-        return this.#markGap("Observer coverage cursor расходится с hub cursor")
+      if (coverage.nextSequence < requestedSequence) {
+        return this.#markGap("Native observer coverage отстаёт от sequence на момент запроса")
+      }
+      if (coverage.state !== "ready") return structuredClone(coverage)
+      // Ответ control и PUSH доставляются независимо. Ожидаем доставку до
+      // зафиксированной отметки, не объявляя транспортное отставание потерей.
+      while (this.#nextSequence < coverage.nextSequence) {
+        this.#pulse ??= new Promise<void>(resolve => { this.#wake = resolve })
+        await abortable(this.#pulse, controller.signal)
+      }
+      controller.signal.throwIfAborted()
+      const expectedCursor = coverage.nextSequence === requestedSequence ? requestedCursor
+        : coverage.nextSequence === this.#nextSequence ? this.#cursor
+        : this.#history.find(entry => entry.event.sequence === coverage.nextSequence - 1)?.event.cursor
+      if (expectedCursor === undefined) {
+        return this.#unavailableCoverage("Observer coverage watermark вытеснен из bounded history", false)
+      }
+      if (coverage.cursor !== expectedCursor) {
+        return this.#markGap("Observer coverage cursor расходится с принятым watermark")
       }
       this.#coverage = structuredClone(coverage)
-      if (coverage.nextSequence > this.#nextSequence) {
-        return this.#unavailableCoverage("Observer hub ещё не принял все native events", false)
-      }
       return structuredClone(coverage)
     } catch (error) {
       return this.#unavailableCoverage(
@@ -226,6 +260,7 @@ export class RuntimeNativeObserverHub {
     if (this.#closed) return
     this.#closed = true
     this.#readerAbort.abort("observer hub closed")
+    await this.#coveragePending
     for (const subscriber of this.#subscribers) this.#closeSubscriber(subscriber)
     if (this.#reader !== undefined) {
       await withTimeout(this.#reader, this.#closeMs).catch(() => undefined)
@@ -279,6 +314,7 @@ export class RuntimeNativeObserverHub {
         this.#historyBytes += entry.bytes
         this.#nextSequence++
         this.#cursor = event.cursor
+        this.#notifyProgress()
         for (const subscriber of this.#subscribers) {
           if (
             subscriber.queue.length >= this.#maxEventsPerSubscriber
@@ -303,6 +339,13 @@ export class RuntimeNativeObserverHub {
         this.#markGap(error instanceof Error ? error.message : "Native observer event stream failed")
       }
     }
+  }
+
+  #notifyProgress(): void {
+    const wake = this.#wake
+    this.#wake = undefined
+    this.#pulse = undefined
+    wake?.()
   }
 
   #next(subscriber: Subscriber): Promise<IteratorResult<ObservedEvent>> {
@@ -354,7 +397,7 @@ export class RuntimeNativeObserverHub {
     return {
       ...structuredClone(this.#coverage),
       state: "unavailable",
-      gapDetected: gap || this.#coverage.gapDetected,
+      gapDetected: gap || this.#gap !== undefined || this.#coverage.gapDetected,
       reason: reason.slice(0, 1_024),
     }
   }
@@ -386,4 +429,16 @@ function deepFreeze<T>(value: T): T {
   if (value === null || typeof value !== "object") return value
   for (const child of Object.values(value)) deepFreeze(child)
   return Object.isFrozen(value) ? value : Object.freeze(value)
+}
+
+async function abortable<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (signal === undefined) return work
+  signal.throwIfAborted()
+  let onAbort!: () => void
+  const stopped = new Promise<never>((_, reject) => {
+    onAbort = () => reject(signal.reason ?? new Error("Observer ожидание отменено"))
+    signal.addEventListener("abort", onAbort, { once: true })
+  })
+  try { return await Promise.race([work, stopped]) }
+  finally { signal.removeEventListener("abort", onAbort) }
 }

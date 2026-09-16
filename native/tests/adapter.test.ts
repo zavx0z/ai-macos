@@ -588,3 +588,64 @@ describe("NativeBrokerAdapter", () => {
     await adapter.close()
   })
 })
+
+
+function observerSnapshot(instance: string, ready = true) {
+  return { observerInstanceRef: instance, inventoryId: "inventory", inventoryRevision: 1, indexRevision: 1,
+    coverage: { ...generation, state: ready ? "ready" as const : "unavailable" as const,
+      coverageStartCursor: `${instance}:start`, cursor: `${instance}:start`, nextSequence: 1,
+      startedAt: now, coveredFrom: now, coveredThrough: now, heartbeatAt: now,
+      coveredKinds: ["input", "focus", "window-structure", "lifecycle"] as const,
+      droppedEvents: 0, gapDetected: !ready, ...(!ready ? { reason: "Fixture stopped" } : {}) },
+    sessionReadiness: { state: "unknown" as const, lockState: "unknown" as const, evidence: "Fixture", observedAt: now }, secureInput: "unknown" as const }
+}
+
+test("observer gap не отравляет transport; новый prepare меняет только observer и не теряет следующий PUSH", async () => {
+  const transport = new FakeTransport()
+  const original = transport.send.bind(transport)
+  let instance = "observer:first"
+  let pushAfterPrepare = false
+  transport.send = async frame => {
+    if (frame.channel !== "observer") return original(frame)
+    transport.sent.push(frame)
+    const request = frame.payload
+    transport.push({ kind: "message", frame: { channel: "observer", payload: {
+      ...generation, kind: "observer-response", protocolVersion: "1", requestId: request.requestId,
+      command: request.command, nativeBuildId: "native-build-1", ok: true,
+      snapshot: { ...observerSnapshot(instance, request.command !== "stop"), coverage: {
+        ...observerSnapshot(instance, request.command !== "stop").coverage,
+        coveredKinds: ["input", "focus", "window-structure", "lifecycle"],
+      } },
+    } } })
+    if (pushAfterPrepare && request.command === "prepare") transport.push({ kind: "message", frame: { channel: "event", payload: {
+      ...generation, observerInstanceRef: instance, event: { ...generation,
+        eventId: `${instance}:start:s1`, cursor: `${instance}:start:s1`, sequence: 1, observedAt: now, kind: "focus", source: "unknown" },
+    } } })
+  }
+  const adapter = new NativeBrokerAdapter({ ...evidenceOptions, host: host(), transport,
+    ledgerSink: { persist: async () => { throw new Error("No input") } } })
+  const control = { signal: new AbortController().signal, checkpoint() {} }
+  try {
+    await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "gap-handshake", runtimeEpoch: generation.runtimeEpoch,
+      loginSessionId: generation.loginSessionId, runtimeBuildId: "runtime-build-1", expectedNativeBuildId: "native-build-1", capabilitySchemaVersion: "1" })
+    await adapter.observer({ kind: "observer", protocolVersion: "1", requestId: "prepare-first", ...generation, command: "prepare", deadlineAt: deadline }, control)
+    const first = adapter.events(control.signal)[Symbol.asyncIterator]()
+    const waiting = first.next()
+    void waiting.catch(() => undefined)
+    transport.push({ kind: "message", frame: { channel: "event", payload: {
+      ...generation, observerInstanceRef: instance, gapReason: "fixture subscription failed",
+    } } })
+    await expect(waiting).rejects.toThrow("fixture subscription failed")
+    expect(adapter.sessionState.state).toBe("ready")
+    await expect(adapter.heartbeat({ requestId: "gap-heartbeat", ...generation, deadlineAt: deadline }, control)).resolves.toMatchObject({ accepted: true })
+    await adapter.observer({ kind: "observer", protocolVersion: "1", requestId: "stop-first", ...generation, command: "stop", observerInstanceRef: instance, deadlineAt: deadline }, control)
+    instance = "observer:second"
+    pushAfterPrepare = true
+    await adapter.observer({ kind: "observer", protocolVersion: "1", requestId: "prepare-second", ...generation, command: "prepare", deadlineAt: deadline }, control)
+    const second = adapter.events(control.signal)[Symbol.asyncIterator]()
+    try {
+      await expect(second.next()).resolves.toMatchObject({ done: false, value: { observerInstanceRef: instance, sequence: 1, kind: "focus" } })
+    } finally { await second.return?.() }
+    expect(transport.sent.filter(frame => frame.channel === "request")).toHaveLength(0)
+  } finally { await adapter.close() }
+})

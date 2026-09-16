@@ -164,7 +164,7 @@ test("display/layout views используют exact generation и broad invali
   value.observer.push({
     kind: "window-structure",
     source: "unknown",
-    target: windowTarget("window:unrelated"),
+    target: { ...windowTarget("window:unrelated"), ref: { ...windowTarget("window:unrelated").ref, applicationRef: "application:unrelated" } },
   })
   await expect(scope.admit(layoutTicket, "operation:layout"))
     .rejects.toThrow("Relevant window structure changed")
@@ -520,3 +520,77 @@ function operation(
     }),
   })
 }
+
+
+test("Guard принимает уже пройденный watermark без ожидания счётчика назад", async () => {
+  const value = fixture()
+  const scope = value.guard.forLineage("lineage:overtake")
+  const ticket = await observe(value, "lineage:overtake", "target:overtake", target)
+  const original = value.observer.coverage.bind(value.observer)
+  let once = true
+  value.observer.coverage = async () => {
+    const snapshot = await original()
+    if (once) {
+      once = false
+      value.observer.push({ kind: "window-structure", source: "unknown", target: { ...windowTarget("window:unrelated"), ref: { ...windowTarget("window:unrelated").ref, applicationRef: "application:unrelated" } } })
+      value.observer.push({ kind: "window-structure", source: "unknown", target: { ...windowTarget("window:unrelated"), ref: { ...windowTarget("window:unrelated").ref, applicationRef: "application:unrelated" } } })
+      await Bun.sleep(0)
+    }
+    return snapshot
+  }
+  try {
+    await expect(scope.admit(ticket, "operation:overtake")).resolves.toMatchObject({
+      admissionNextSequence: 3, admissionCursor: "observer:view:start:s2",
+    })
+  } finally { await value.guard.close() }
+})
+
+test("пройденный watermark не скрывает более новое вмешательство человека", async () => {
+  const value = fixture()
+  const scope = value.guard.forLineage("lineage:takeover-race")
+  const ticket = await observe(value, "lineage:takeover-race", "target:takeover-race", target)
+  const original = value.observer.coverage.bind(value.observer)
+  value.observer.coverage = async () => {
+    const snapshot = await original()
+    value.observer.push({ kind: "focus", source: "unknown" })
+    await Bun.sleep(0)
+    return snapshot
+  }
+  try {
+    await expect(scope.admit(ticket, "operation:takeover-race")).rejects.toThrow("Observer focus")
+    expect(value.guard.available).toBe(true)
+  } finally { await value.guard.close() }
+})
+
+test("временный initial coverage отказ не кешируется навсегда и сохраняет причину", async () => {
+  const value = fixture()
+  const original = value.observer.coverage.bind(value.observer)
+  let fail = true
+  value.observer.coverage = async () => {
+    const snapshot = await original()
+    return fail ? { ...snapshot, state: "unavailable", reason: "fixture transient reply" } : snapshot
+  }
+  try {
+    await expect(value.guard.start()).rejects.toThrow("state=unavailable; fixture transient reply")
+    expect(value.guard.available).toBe(false)
+    fail = false
+    await value.guard.start()
+    expect(value.guard.available).toBe(true)
+    const ticket = await observe(value, "lineage:retry-start", "target:retry-start", target)
+    await expect(value.guard.forLineage("lineage:retry-start").admit(ticket, "operation:retry-start")).resolves.toMatchObject({ operationId: "operation:retry-start" })
+  } finally { await value.guard.close() }
+})
+
+
+test("длинная причина coverage не маскируется ошибкой лимита при invalidation", async () => {
+  const value = fixture()
+  const scope = value.guard.forLineage("lineage:long-reason")
+  const ticket = await observe(value, "lineage:long-reason", "target:long-reason", target)
+  const original = value.observer.coverage.bind(value.observer)
+  value.observer.coverage = async () => ({ ...await original(), state: "unavailable", reason: "x".repeat(1024) })
+  try {
+    await expect(scope.admit(ticket, "operation:long-reason")).rejects.toThrow("state=unavailable")
+    value.observer.coverage = original
+    await expect(scope.admit(ticket, "operation:long-reason:stale")).rejects.toThrow("coverage")
+  } finally { await value.guard.close() }
+})

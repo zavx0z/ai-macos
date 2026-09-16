@@ -44,7 +44,7 @@ import { RuntimeNativePointHitProvider } from "./input-hit-test.ts"
 import { startRuntimeRotation } from "./rotation.ts"
 import { StartupHeldRecovery } from "./startup-held-recovery.ts"
 import { FileLifetimeStore } from "./lifetime-state.ts"
-import { createNativeObserverBinding, type NativeObserverBinding } from "./native-observer-binding.ts"
+import { createNativeObserverBinding, NativeObserverPreparationError, type NativeObserverBinding } from "./native-observer-binding.ts"
 import { AgentTargetRegistry } from "./agent-targets.ts"
 import { AgentViewGuard } from "./agent-view-guard.ts"
 import { AgentViewBindings } from "./agent-view-bindings.ts"
@@ -124,6 +124,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   let observerReason = "Observer не подготовлен"
   let observerPreparation: { attempt: number, maxAttempts: 3, startedAt: string, deadlineAt: string, nextRetryAt?: string } | undefined
   let backendPreparation: Promise<void> | undefined
+  let observerCleanupUnknown = false
   const preparationAbort = new AbortController()
   let windowAdapter: NativeWindowAdapter | undefined
   let nativeCapabilities = handshake?.capabilities
@@ -292,14 +293,22 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   const catalog = new MethodRegistry(core)
   const agentMethods = registerAgentMethods(catalog, core, agentTargets, { views: {
-    observe: (session, targetId, target, capture, complete) => viewBindings === undefined
-      ? capture() : viewBindings.observe(session, targetId, target, capture, complete),
+    observe: async (session, targetId, target, capture, complete) => {
+      // Новый explicit observe может восстановить только observer. Действия
+      // не повторяются, старые tickets не переносятся между bindings.
+      if (!viewReady || viewGuard?.available === false) await beginBackendPreparation()
+      return viewBindings === undefined ? capture() : viewBindings.observe(session, targetId, target, capture, complete)
+    },
     run: (session, targetId, requestId, mode, action) => {
       if (!viewReady || viewBindings === undefined) throw new Error("Protected action требует готовый Native view admission")
       return viewBindings.run(session, targetId, requestId, mode, action)
     },
   } })
   registerAgentActionMethods(catalog, agentMethods)
+  if (native !== undefined && handshake?.viewAdmissionVersion === "1" && handshake.recoveryDomainVersion === "1") {
+    const pointer = registerAgentPointerMethods(catalog, agentMethods)
+    registerAgentAxMethods(catalog, core, agentTargets, agentMethods, agentMethods.operations, pointer)
+  }
   const recoverStartup = async (operationId?: string, signal?: AbortSignal) => {
     signal?.throwIfAborted()
     const result = await startupRecovery.recover(operationId, signal)
@@ -547,7 +556,9 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   beginBackendPreparation = () => {
     if (backendPreparation !== undefined) return backendPreparation
-    if (native === undefined) return Promise.resolve()
+    if (native === undefined || nativeError !== undefined || observerCleanupUnknown || draining || preparationAbort.signal.aborted
+      || core.activeOperationCount() !== 0) return Promise.resolve()
+    if (observerState === "ready" && (viewGuard === undefined || viewGuard.available)) return Promise.resolve()
     const source = native
     observerState = "preparing"
     observerReason = "Подготовка свежего Native AX index"
@@ -559,10 +570,19 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     backendPreparation = (async () => {
       try {
         preparationSignal.throwIfAborted()
+        viewReady = false
+        viewBindings = undefined
+        await viewGuard?.close()
+        viewGuard = undefined
+        // Новый prepare допустим только после подтверждённого stop прежнего.
+        await observerBinding?.close()
+        observerBinding = undefined
+        preparationSignal.throwIfAborted()
         observerBinding = await createNativeObserverBinding({ native: source, signal: preparationSignal, onGap(error) {
           observerState = "unavailable"
           viewReady = false
-          void viewGuard?.close()
+          viewBindings = undefined
+          void viewGuard?.close().catch(() => undefined)
           observerReason = error.message
           refreshCapabilities()
         }, async beforeAttempt(_attempt, signal) {
@@ -583,7 +603,10 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
         preparationSignal.throwIfAborted()
         const coverage = await observerBinding.coverage(preparationSignal)
         preparationSignal.throwIfAborted()
-        const preparedObserverState = coverage.state === "ready" ? "ready" : "unavailable"
+        if (coverage.state !== "ready" || coverage.gapDetected || coverage.droppedEvents !== 0) {
+          throw new Error(coverage.reason ?? "Native observer coverage недоступна после prepare")
+        }
+        const preparedObserverState = "ready" as const
         const preparedObserverReason = coverage.reason ?? "Native PUSH coverage подтверждено; session/SecureInput проверяются отдельно"
         if (preparedObserverState === "ready" && handshake?.viewAdmissionVersion === "1" && handshake.recoveryDomainVersion === "1") {
           viewGuard = new AgentViewGuard({ generation: { ...generation, nativeGeneration: handshake.nativeGeneration }, observer: observerBinding.hub,
@@ -594,8 +617,6 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
           observerReason = preparedObserverReason
           viewBindings = new AgentViewBindings(core, viewGuard)
           viewReady = true
-          const pointer = registerAgentPointerMethods(catalog, agentMethods)
-          registerAgentAxMethods(catalog, core, agentTargets, agentMethods, agentMethods.operations, pointer)
           if (permissionMode === "request-missing") {
             preparationSignal.throwIfAborted()
             try { core.unsealAdmission() }
@@ -608,23 +629,30 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
           observerReason = preparedObserverReason
         }
       } catch (error) {
-        core.sealAdmission()
-        if (preparationSignal.aborted) {
-          await viewGuard?.close().catch(() => undefined)
-          viewGuard = undefined
-          viewBindings = undefined
-          viewReady = false
-          await observerBinding?.close().catch(() => undefined)
-          observerBinding = undefined
-        }
+        if (error instanceof NativeObserverPreparationError && !error.cleanupConfirmed) observerCleanupUnknown = true
+        viewReady = false
+        viewBindings = undefined
+        await viewGuard?.close().catch(() => undefined)
+        viewGuard = undefined
+        let cleanupError: unknown
+        try { await observerBinding?.close(); observerBinding = undefined }
+        catch (cause) { cleanupError = cause }
         observerState = "unavailable"
         observerReason = error instanceof Error ? error.message : "Observer preparation failed"
+        if (cleanupError !== undefined) observerReason += `; observer stop: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`
+        // Observer failure закрывает зависимые capabilities, но не чтение
+        // и не исправные browser/clipboard пути. Recovery/drain остаются строги.
+        if (!draining && !preparationAbort.signal.aborted && nativeError === undefined
+          && (permissionFlow === undefined || permissionFlow.snapshot().state === "ready")) {
+          try { core.unsealAdmission() }
+          catch { /* Неподтверждённые операции/resources запрещают открытие. */ }
+        }
         await lifecycle?.record("observer-failed", observerReason).catch(() => undefined)
       } finally {
         observerPreparation = undefined
       }
       refreshCapabilities()
-    })()
+    })().finally(() => { backendPreparation = undefined })
     return backendPreparation
   }
   const close = () => {
@@ -663,7 +691,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
   }
   return {
     core, catalog, doctor, recoverStartup, prepareRecoveryRestart,
-    async ready() { await permissionPreparation; await backendPreparation },
+    async ready() { await permissionPreparation; await beginBackendPreparation() },
     noteLifecycle(event: RuntimeLifecycleEvent, reason?: string) { return lifecycle?.record(event, reason).catch(() => undefined) ?? Promise.resolve() },
     async start() {
       try {

@@ -206,6 +206,7 @@ export class NativeBrokerAdapter implements NativeAdapter {
   readonly #events: Array<{ event: NativeObservedEvent, bytes: number }> = []
   #eventBytes = 0
   #eventGap: Error | undefined
+  #observerInstanceRef: string | undefined
   #eventConsumerActive = false
   readonly #eventWaiters: EventWaiter[] = []
   readonly #binary = new Map<string, Uint8Array>()
@@ -817,6 +818,17 @@ export class NativeBrokerAdapter implements NativeAdapter {
   async #acceptFrame(frame: NativeTransportResponseFrame, bytes?: Uint8Array): Promise<void> {
     if (frame.channel === "event") {
       this.#assertGeneration(frame.payload)
+      if ("gapReason" in frame.payload) {
+        this.#events.length = 0
+        this.#eventBytes = 0
+        this.#eventGap = new Error(frame.payload.observerInstanceRef === this.#observerInstanceRef
+          ? frame.payload.gapReason : "Foreign observer fault instance")
+        for (const waiter of this.#eventWaiters.splice(0)) {
+          waiter.signal.removeEventListener("abort", waiter.onAbort)
+          waiter.reject(this.#eventGap)
+        }
+        return
+      }
       const event: NativeObservedEvent = "event" in frame.payload
         ? { ...frame.payload.event, observerInstanceRef: frame.payload.observerInstanceRef }
         : frame.payload
@@ -905,6 +917,18 @@ export class NativeBrokerAdapter implements NativeAdapter {
         throw new Error("Native pre-start rejection не подтверждает registered delivered capture operation")
       }
       delivery.rejectedBeforeStart = true
+    }
+    if (frame.channel === "observer" && frame.payload.ok && frame.payload.command === "prepare") {
+      const request = pending.request
+      if (request.channel !== "observer" || !nativeObserverResponseMatches(request.payload, frame.payload, this.loadedBuildId)) {
+        throw new Error("Observer prepare response не соответствует pending request")
+      }
+      // ACK предшествует PUSH нового instance. Сбрасываем старую очередь здесь,
+      // а не после await: иначе можно удалить уже пришедшие новые события.
+      this.#events.length = 0
+      this.#eventBytes = 0
+      this.#eventGap = undefined
+      this.#observerInstanceRef = frame.payload.snapshot.observerInstanceRef
     }
     this.#pending.delete(key)
     pending.resolve(frame)

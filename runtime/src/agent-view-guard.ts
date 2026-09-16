@@ -141,10 +141,18 @@ export class AgentViewGuard {
     opaqueIdSchema.parse(this.#observer.observerInstanceRef)
   }
 
+  get available(): boolean {
+    return this.#started && !this.#closed && this.#terminalError === undefined
+  }
+
   async start(): Promise<void> {
     if (this.#closed) throw new Error("Agent view guard закрыт")
     this.#startPromise ??= this.#startOnce()
-    await this.#startPromise
+    try { await this.#startPromise }
+    catch (error) {
+      if (!this.#started && this.#terminalError === undefined) this.#startPromise = undefined
+      throw error
+    }
   }
 
   async close(): Promise<void> {
@@ -358,10 +366,11 @@ export class AgentViewGuard {
     const coverage = await this.#healthyCoverage()
     const deadline = this.#clock.now().getTime() + this.#syncTimeoutMs
     while (
-      this.#nextSequence !== coverage.nextSequence
-      || this.#cursor !== coverage.cursor
+      this.#nextSequence === undefined
+      || this.#nextSequence < coverage.nextSequence
     ) {
       if (this.#terminalError !== undefined) throw this.#terminalError
+      if (this.#closed) throw new Error("Agent view guard закрыт")
       const remaining = deadline - this.#clock.now().getTime()
       if (remaining <= 0) {
         this.#invalidateAll("Observer hub watermark sync timeout")
@@ -374,28 +383,39 @@ export class AgentViewGuard {
         throw error
       }
     }
-    return coverage
+    if (this.#terminalError !== undefined) throw this.#terminalError
+    if (this.#closed) throw new Error("Agent view guard закрыт")
+    if (this.#nextSequence === coverage.nextSequence && this.#cursor !== coverage.cursor) {
+      this.#terminal(new Error("Observer hub watermark cursor mismatch"), "Observer continuity lost")
+      throw this.#terminalError
+    }
+    // Уже обработанные более новые события не откатываем к старому снимку.
+    return { ...coverage, cursor: this.#cursor!, nextSequence: this.#nextSequence! }
   }
 
   async #healthyCoverage(): Promise<ObserverCoverage> {
     const coverage = await this.#observer.coverage(this.#readerAbort.signal)
     const now = this.#clock.now().getTime()
     const requiredKinds: ObservedEvent["kind"][] = ["input", "focus", "window-structure", "lifecycle"]
-    if (
-      coverage.state !== "ready"
-      || coverage.gapDetected
-      || coverage.droppedEvents !== 0
-      || coverage.runtimeEpoch !== this.#generation.runtimeEpoch
+    const failures: string[] = []
+    if (coverage.state !== "ready") failures.push(`state=${coverage.state}`)
+    if (coverage.gapDetected) failures.push("gapDetected")
+    if (coverage.droppedEvents !== 0) failures.push(`droppedEvents=${coverage.droppedEvents}`)
+    if (coverage.runtimeEpoch !== this.#generation.runtimeEpoch
       || coverage.loginSessionId !== this.#generation.loginSessionId
-      || coverage.nativeGeneration !== this.#generation.nativeGeneration
-      || requiredKinds.some(kind => !coverage.coveredKinds.includes(kind))
-      || Date.parse(coverage.coveredThrough) < now - this.#maxCoverageLagMs
-      || Date.parse(coverage.heartbeatAt) > now + 1000
-      || this.#coverageStartCursor !== undefined
-        && coverage.coverageStartCursor !== this.#coverageStartCursor
-    ) {
-      this.#invalidateAll("Observer coverage не подтверждает healthy continuous watermark")
-      throw new Error("Observer coverage не подтверждает healthy continuous watermark")
+      || coverage.nativeGeneration !== this.#generation.nativeGeneration) failures.push("generation mismatch")
+    const missing = requiredKinds.filter(kind => !coverage.coveredKinds.includes(kind))
+    if (missing.length > 0) failures.push(`missingKinds=${missing.join(",")}`)
+    const lag = now - Date.parse(coverage.coveredThrough)
+    if (!Number.isFinite(lag) || lag > this.#maxCoverageLagMs) failures.push(`coverageLagMs=${lag}`)
+    const heartbeat = Date.parse(coverage.heartbeatAt)
+    if (!Number.isFinite(heartbeat) || heartbeat > now + 1000) failures.push("heartbeat timestamp invalid")
+    if (this.#coverageStartCursor !== undefined
+      && coverage.coverageStartCursor !== this.#coverageStartCursor) failures.push("coverageStartCursor changed")
+    if (failures.length > 0) {
+      const reason = `Observer coverage не подтверждает healthy continuous watermark: ${failures.join("; ")}${coverage.reason === undefined ? "" : `; ${coverage.reason}`}`
+      this.#invalidateAll(reason.slice(0, 1024))
+      throw new Error(reason)
     }
     return coverage
   }

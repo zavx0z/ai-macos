@@ -140,32 +140,36 @@ test.each([false, true])("parent EOF: physicalDown=%s, cleanup не ждёт и�
   }
 }, 5000)
 
-test.each([
-  ["--observer-gap", "foreground-subscription-failed"],
-  ["--observer-target-gap", "observer-target-unresolved"],
-] as const)("exit75 %s пишет privacy-safe terminal stage без payload", async (argument, stage) => {
-  const child = Bun.spawn([binary, argument], { stdin: "pipe", stdout: "pipe", stderr: "pipe" })
-  child.stdin.write(encodeNativeFrame({ channel: "handshake", payload: {
-    kind: "handshake", protocolVersion: "1", requestId: "gap-handshake",
-    runtimeEpoch: "runtime", loginSessionId: "login", runtimeBuildId: "runtime-build",
-    expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1",
-  } }))
-  await child.stdin.flush()
-  const [exit, output, errors] = await Promise.all([
-    child.exited,
-    new Response(child.stdout).arrayBuffer(),
-    new Response(child.stderr).text(),
-  ])
-  expect(exit).toBe(75)
-  expect(output.byteLength).toBeGreaterThan(0)
-  const terminal = JSON.parse(errors.trim()) as Record<string, unknown>
-  expect(terminal).toMatchObject({ kind: "native-terminal", runtimeEpoch: "runtime",
-    nativeGeneration: "native-command-fixture", exitCode: 75, stage })
-  expect(Object.keys(terminal).sort()).toEqual([
-    "exitCode", "kind", "nativeGeneration", "recordedAt", "runtimeEpoch", "stage",
-  ])
-  expect(Number.isNaN(Date.parse(String(terminal.recordedAt)))).toBe(false)
-  expect(errors).not.toContain("application")
+test.each(["--observer-gap", "--observer-target-gap"])("observer failure %s сохраняет helper, heartbeat и read-only commands", async argument => {
+  const adapter = createAdapter(undefined, [argument])
+  const control = { signal: new AbortController().signal, checkpoint() {} }
+  try {
+    await adapter.handshake({ kind: "handshake", protocolVersion: "1", requestId: "gap-handshake",
+      runtimeEpoch: "runtime", loginSessionId: "login", runtimeBuildId: "runtime-build",
+      expectedNativeBuildId: "command-fixture-build", capabilitySchemaVersion: "1" })
+    const generation = adapter.generation!
+    const deadlineAt = new Date(Date.now() + 2000).toISOString()
+    const prepared = await adapter.observer({ kind: "observer", protocolVersion: "1", requestId: "gap-prepare", ...generation, deadlineAt, command: "prepare" }, control)
+    expect(prepared.ok).toBe(true)
+    const events = adapter.events(control.signal)[Symbol.asyncIterator]()
+    await expect(events.next()).rejects.toThrow(argument === "--observer-gap" ? "foreground application" : "exact runtime target")
+    await expect(adapter.heartbeat({ requestId: "after-gap", ...generation, deadlineAt }, control)).resolves.toMatchObject({ accepted: true })
+    const version = await adapter.clipboard(nativeClipboardRequestSchema.parse({
+      kind: "request", protocolVersion: "1", requestId: "after-gap-read", ...generation, deadlineAt,
+      operation: {
+        kind: "clipboard", operationId: "after-gap-operation", clientRequestId: "after-gap-client-request",
+        clientSessionId: "client", principalId: "principal", runtimeEpoch: generation.runtimeEpoch,
+        loginSessionId: generation.loginSessionId, inventoryId: "inventory", inventoryRevision: 0, deadlineAt,
+        target: { kind: "clipboard", ref: { runtimeEpoch: generation.runtimeEpoch, loginSessionId: generation.loginSessionId, clipboardRef: "system" } },
+      },
+      command: { method: "clipboard.version", payload: {} },
+    }), control)
+    expect(version.ok).toBe(true)
+    expect(adapter.sessionState.state).toBe("ready")
+    if (!prepared.ok) throw new Error("prepare rejected")
+    await adapter.observer({ kind: "observer", protocolVersion: "1", requestId: "gap-stop", ...generation, deadlineAt, command: "stop", observerInstanceRef: prepared.snapshot.observerInstanceRef }, control)
+    await expect(adapter.heartbeat({ requestId: "after-stop", ...generation, deadlineAt }, control)).resolves.toMatchObject({ accepted: true })
+  } finally { await adapter.close() }
 })
 
 test("window transition и input используют один native fence high-water", async () => {

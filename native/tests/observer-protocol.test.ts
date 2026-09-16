@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { nativeObserverRequestSchema, nativeObserverResponseSchema, nativeObserverResponseMatches } from "../src/observer-protocol.ts"
+import { nativeObserverRequestSchema, nativeObserverResponseSchema, nativeObserverResponseMatches, nativeObserverGapEnvelopeSchema } from "../src/observer-protocol.ts"
 
 const generation = { runtimeEpoch: "runtime", loginSessionId: "login", nativeGeneration: "native" }
 const timestamp = new Date().toISOString()
@@ -57,4 +57,13 @@ test("prepare failure содержит typed cleanup proof без text inference
   expect(nativeObserverResponseSchema.safeParse({ ...failure, command: "coverage" }).success).toBe(false)
   expect(nativeObserverResponseSchema.safeParse({ ...failure,
     prepareFailure: { stage: "cleanup", retryDisposition: "unknown", transient: true } }).success).toBe(false)
+})
+
+
+test("observer fault — отдельный bounded envelope, не GUI event и не чужая generation", () => {
+  const fault = { ...generation, observerInstanceRef: "observer-instance", gapReason: "fixture gap" }
+  expect(nativeObserverGapEnvelopeSchema.safeParse(fault).success).toBe(true)
+  expect(nativeObserverGapEnvelopeSchema.safeParse({ ...fault, observerInstanceRef: undefined }).success).toBe(false)
+  expect(nativeObserverGapEnvelopeSchema.safeParse({ ...fault, gapReason: "x".repeat(1025) }).success).toBe(false)
+  expect(nativeObserverGapEnvelopeSchema.safeParse({ ...fault, inputText: "not-allowed" }).success).toBe(false)
 })

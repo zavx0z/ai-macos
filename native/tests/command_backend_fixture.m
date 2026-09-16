@@ -24,6 +24,7 @@ static bool fixtureScroll(void *context, const MetaScrollEvent *event, uint64_t 
   MetaInputExecutor *_input;
   NSString *_clipboardValue;
   NSUInteger _clipboardVersion;
+  NSUInteger _observerNumber;
 }
 - (NSDictionary *)sessionIdentity {
   return @{@"verified": @NO, @"source": @"darwin-audit", @"uid": @501, @"effectiveUid": @501,
@@ -100,6 +101,25 @@ static bool fixtureScroll(void *context, const MetaScrollEvent *event, uint64_t 
 - (NSDictionary *)supplementStatus:(NSDictionary *)status { return status; }
 - (NSDictionary *)reconcileStatus:(NSDictionary *)status { return status; }
 - (NSArray<NSString *> *)pendingOperationIds { return @[]; }
+- (NSDictionary *)observer:(NSDictionary *)request {
+  if ([request[@"command"] isEqual:@"prepare"]) _observerNumber += 1;
+  NSString *instance = [NSString stringWithFormat:@"observer:fixture:%lu", (unsigned long)_observerNumber];
+  BOOL ready = ![request[@"command"] isEqual:@"stop"];
+  NSDictionary *generation = @{@"runtimeEpoch": request[@"runtimeEpoch"], @"loginSessionId": request[@"loginSessionId"], @"nativeGeneration": request[@"nativeGeneration"]};
+  NSMutableDictionary *coverage = [generation mutableCopy];
+  [coverage addEntriesFromDictionary:@{@"state": ready ? @"ready" : @"unavailable", @"coverageStartCursor": @"cursor:start", @"cursor": @"cursor:start", @"nextSequence": @1,
+    @"startedAt": @"2026-09-15T00:00:00.000Z", @"coveredFrom": @"2026-09-15T00:00:00.000Z", @"coveredThrough": @"2026-09-15T00:00:00.000Z", @"heartbeatAt": @"2026-09-15T00:00:00.000Z",
+    @"coveredKinds": @[@"input", @"focus", @"window-structure", @"lifecycle"], @"gapDetected": @NO, @"droppedEvents": @0}];
+  if (!ready) coverage[@"reason"] = @"Fixture stopped";
+  NSMutableDictionary *response = [generation mutableCopy];
+  [response addEntriesFromDictionary:@{@"kind": @"observer-response", @"protocolVersion": @"1", @"requestId": request[@"requestId"], @"command": request[@"command"], @"nativeBuildId": @"command-fixture-build", @"ok": @YES,
+    @"snapshot": @{@"observerInstanceRef": instance, @"inventoryId": @"inventory", @"inventoryRevision": @1, @"indexRevision": @1, @"coverage": coverage,
+      @"sessionReadiness": @{@"state": @"unknown", @"lockState": @"unknown", @"evidence": @"Fixture", @"observedAt": @"2026-09-15T00:00:00.000Z"}, @"secureInput": @"unknown"}}];
+  return response;
+}
+- (BOOL)activateObserverPush:(NSString *)instanceRef {
+  return instanceRef != nil;
+}
 - (NSDictionary *)takeObserverPush:(NSUInteger)maximum {
   (void)maximum;
   return observerGap

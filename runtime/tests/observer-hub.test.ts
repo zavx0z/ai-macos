@@ -143,6 +143,7 @@ function fixture(options: {
     maxHistoryBytes: options.maxHistoryBytes,
   })
   return {
+    native,
     diagnostics,
     gaps,
     hub,
@@ -359,4 +360,129 @@ describe("C3 runtime native observer hub", () => {
     await expect(staleSubscriber.next()).rejects.toThrow("continuity")
     await stale.hub.close()
   })
+})
+
+
+// Эти тесты управляют порядком snapshot/доставки, а не скоростью event loop.
+function watermark(nextSequence: number, cursor = nextSequence === 1 ? "cursor:start" : `cursor:start:s${nextSequence - 1}`) {
+  return { ...snapshot(), coverage: { ...snapshot().coverage, nextSequence, cursor } }
+}
+function latch() {
+  let release!: () => void
+  const promise = new Promise<void>(resolve => { release = resolve })
+  return { promise, release }
+}
+
+test("coverage ждёт доставку до snapshot, не объявляя нормальное отставание gap", async () => {
+  const value = fixture()
+  value.hub.start()
+  value.setSnapshot(watermark(3))
+  let settled = false
+  const coverage = value.hub.coverage().finally(() => { settled = true })
+  await Bun.sleep(0)
+  expect(settled).toBe(false)
+  value.queue.push(event(1))
+  value.queue.push(event(2))
+  try {
+    await expect(coverage).resolves.toMatchObject({ state: "ready", nextSequence: 3, cursor: "cursor:start:s2" })
+    expect(value.gaps).toEqual([])
+  } finally { await value.hub.close() }
+})
+
+test.each([false, true])("coverage snapshot может быть обогнан PUSH; повреждённый cursor=%s", async corrupted => {
+  const value = fixture()
+  const gate = latch()
+  const original = value.native.observer.bind(value.native)
+  value.setSnapshot(watermark(2, corrupted ? "cursor:foreign" : undefined))
+  value.native.observer = async request => {
+    const reply = await original(request, { signal: new AbortController().signal, checkpoint() {} })
+    await gate.promise
+    return reply
+  }
+  value.hub.start()
+  const live = value.hub.subscribe()[Symbol.asyncIterator]()
+  const coverage = value.hub.coverage()
+  value.queue.push(event(1))
+  value.queue.push(event(2))
+  await live.next()
+  await live.next()
+  gate.release()
+  try {
+    await expect(coverage).resolves.toMatchObject({ state: corrupted ? "unavailable" : "ready", gapDetected: corrupted })
+    expect(value.gaps.length).toBe(corrupted ? 1 : 0)
+  } finally { await live.return?.(); await value.hub.close() }
+})
+
+test("coverage ниже sequence на момент запроса остаётся настоящим нарушением", async () => {
+  const value = fixture()
+  value.hub.start()
+  const live = value.hub.subscribe()[Symbol.asyncIterator]()
+  value.queue.push(event(1))
+  await live.next()
+  try {
+    await expect(value.hub.coverage()).resolves.toMatchObject({ state: "unavailable", gapDetected: true })
+    expect(value.gaps).toHaveLength(1)
+  } finally { await live.return?.(); await value.hub.close() }
+})
+
+test("конкурентные coverage используют один RPC; отмена caller не отменяет соседа", async () => {
+  const value = fixture()
+  const gate = latch()
+  const original = value.native.observer.bind(value.native)
+  let calls = 0
+  value.native.observer = async (request, control) => {
+    calls++
+    await gate.promise
+    control.signal.throwIfAborted()
+    return original(request, control)
+  }
+  value.hub.start()
+  const caller = new AbortController()
+  const first = value.hub.coverage(caller.signal)
+  const second = value.hub.coverage()
+  caller.abort(new Error("caller cancelled"))
+  try {
+    await expect(first).resolves.toMatchObject({ state: "unavailable", reason: "caller cancelled", gapDetected: false })
+    gate.release()
+    await expect(second).resolves.toMatchObject({ state: "ready" })
+    expect(calls).toBe(1)
+    expect(value.gaps).toEqual([])
+  } finally { gate.release(); await value.hub.close() }
+})
+
+test("timeout доставки локален запросу: поздние события позволяют следующий coverage", async () => {
+  const value = fixture({ controlTimeoutMs: 15 })
+  value.hub.start()
+  value.setSnapshot(watermark(2))
+  try {
+    await expect(value.hub.coverage()).resolves.toMatchObject({ state: "unavailable", gapDetected: false })
+    value.queue.push(event(1))
+    await expect(value.hub.coverage()).resolves.toMatchObject({ state: "ready", nextSequence: 2 })
+    expect(value.gaps).toEqual([])
+  } finally { await value.hub.close() }
+})
+
+test("close прерывает coverage, ожидающий доставку, без нового polling", async () => {
+  const value = fixture()
+  value.hub.start()
+  value.setSnapshot(watermark(2))
+  const pending = value.hub.coverage()
+  await Bun.sleep(0)
+  await value.hub.close()
+  await expect(pending).resolves.toMatchObject({ state: "unavailable" })
+  expect(value.gaps).toEqual([])
+})
+
+
+test("настоящий gap во время ожидания доставки сохраняется в текущем coverage", async () => {
+  const value = fixture()
+  value.hub.start()
+  value.setSnapshot(watermark(3))
+  const pending = value.hub.coverage()
+  await Bun.sleep(0)
+  value.queue.push(event(2))
+  try {
+    await expect(pending).resolves.toMatchObject({ state: "unavailable", gapDetected: true })
+    expect(value.gaps).toHaveLength(1)
+  } finally { await value.hub.close() }
 })

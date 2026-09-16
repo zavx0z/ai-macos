@@ -16,6 +16,14 @@ const OBSERVER_PREPARE_ATTEMPTS = 3
 const OBSERVER_RETRY_MS = 1_000
 const OBSERVER_PRECHECK_MS = 1_500
 
+/** Повтор prepare разрешён лишь после доказанного отсутствия живого instance. */
+export class NativeObserverPreparationError extends Error {
+  constructor(message: string, readonly cleanupConfirmed: boolean, options?: ErrorOptions) {
+    super(message, options)
+    this.name = "NativeObserverPreparationError"
+  }
+}
+
 export type NativeObserverBinding = Readonly<{
   hub: RuntimeNativeObserverHub
   snapshot: NativeObserverSnapshot
@@ -52,7 +60,7 @@ export async function createNativeObserverBinding(options: {
     try {
       await stopObserver(options.native, snapshot.observerInstanceRef)
     } catch (cleanupError) {
-      throw new AggregateError([error, cleanupError], "Observer startup и cleanup не подтверждены")
+      throw new NativeObserverPreparationError("Observer startup и cleanup не подтверждены", false, { cause: new AggregateError([error, cleanupError]) })
     }
     throw error
   }
@@ -150,14 +158,14 @@ async function prepareAttempt(
     if (!response.ok) {
       const failure = response.prepareFailure
       const retry = failure?.transient === true && failure.retryDisposition !== "unknown"
-      return { retry, error: new Error(`${response.error.message} [${failure?.stage ?? "unknown"}/${failure?.retryDisposition ?? "unknown"}]`) }
+      return { retry, error: new NativeObserverPreparationError(`${response.error.message} [${failure?.stage ?? "unknown"}/${failure?.retryDisposition ?? "unknown"}]`, failure !== undefined && failure.retryDisposition !== "unknown") }
     }
     snapshot = structuredClone(response.snapshot)
     prepareController.signal.throwIfAborted()
   } catch (error) {
     if (snapshot !== undefined) {
       await stopObserver(native, snapshot.observerInstanceRef).catch(cause => {
-        throw new Error("Observer cleanup после отмены не подтверждён", { cause })
+        throw new NativeObserverPreparationError("Observer cleanup после отмены не подтверждён", false, { cause })
       })
     } else {
       void preparing.then(async response => {
@@ -167,7 +175,7 @@ async function prepareAttempt(
         })
       }, () => undefined)
     }
-    throw error
+    throw new NativeObserverPreparationError(error instanceof Error ? error.message : String(error), snapshot !== undefined, { cause: error })
   } finally {
     clearTimeout(prepareTimer)
   }

@@ -523,8 +523,9 @@ int main(void) {
         }
         error:&error];
     assert([pending[@"poll"][@"state"] isEqual:@"pending"]);
-    assert(strcmp([pending[@"ack"][@"quarantined"] objCType],
-                  @encode(BOOL)) == 0);
+    // Objective-C encoding NSNumber не определяет переносимую проверку JSON boolean.
+    assert(CFGetTypeID((__bridge CFTypeRef)pending[@"ack"][@"quarantined"]) ==
+           CFBooleanGetTypeID());
     assert([pending[@"ack"][@"quarantined"] boolValue]);
     assert(binary_header == nil && binary_bytes == nil);
 
@@ -637,8 +638,8 @@ int main(void) {
         error:&error];
     assert(released != nil);
     assert(![released[@"alreadyReleased"] boolValue]);
-    assert(strcmp([released[@"ack"][@"quarantined"] objCType],
-                  @encode(BOOL)) == 0);
+    assert(CFGetTypeID((__bridge CFTypeRef)released[@"ack"][@"quarantined"]) ==
+           CFBooleanGetTypeID());
     NSDictionary *released_again = [binder cleanupRequest:
         cleanup_request(@"release", task_ref, 2, terminal_drained,
                         @"cleanup-release-1")
