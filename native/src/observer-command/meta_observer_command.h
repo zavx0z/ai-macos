@@ -65,6 +65,13 @@ typedef NSDictionary *_Nullable (^MetaObserverIndexFailureProvider)(void);
                                  requireOwnEvent:(BOOL)requireOwnEvent
                                    timeoutMillis:(NSUInteger)timeoutMillis
                              observerInstanceRef:(NSString *)observerInstanceRef;
+- (nullable NSDictionary *)scanInputEventsAfterCursor:(NSString *)cursor
+                                  expectedSyntheticTag:(uint64_t)tag
+                                        expectedTarget:(nullable NSDictionary *)target
+                                     allowRelatedFocus:(BOOL)allowRelatedFocus
+                                         ownInputArmed:(BOOL)ownInputArmed
+                                         timeoutMillis:(NSUInteger)timeoutMillis
+                                   observerInstanceRef:(NSString *)observerInstanceRef;
 // Возвращает один атомарный bounded снимок history и current head, не ожидая
 // новых событий и не извлекая envelopes из primary PUSH queue.
 - (nullable NSDictionary *)historySnapshotForObserverInstance:

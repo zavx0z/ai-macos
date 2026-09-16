@@ -125,6 +125,8 @@ static bool dispatch_external(void *context) {
   _observerAttached = NO;
   if (decision == MetaInputObserverForeignEvent) {
     meta_executor_note_observed_event(_executor, 0);
+  } else if (decision == MetaInputObserverUIInvalidation) {
+    [_job requestCancel];
   } else {
     meta_executor_set_observer_state(_executor, META_OBSERVER_UNAVAILABLE);
     [_job requestCancel];

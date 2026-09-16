@@ -496,3 +496,56 @@ test("foreign event during second drag point prevents second point and releases 
     cleanupUps: 1,
   })
 })
+
+const clickAction: Extract<NativeInputExecutionPayload["action"], { kind: "click" }> = {
+  kind: "click",
+  point: { x: 10, y: 10 },
+  button: "left",
+  count: 1,
+  modifiers: { names: [], flags: 0 },
+}
+
+test("related AX focus after own button-down does not claim user interference", async () => {
+  const reportPath = join(directory, `focus-down-${crypto.randomUUID()}.json`)
+  const value = await setup("--focus-after-down", reportPath)
+  try {
+    const response = await execute(value.adapter, request(clickAction, "focus-after-down"))
+    expect(response.ok).toBe(true)
+    if (!response.ok) throw new Error(response.error.message)
+    expect(response.result.status).toMatchObject({
+      execution: "finished",
+      dispatch: "finished",
+      dispatchAttempts: 3,
+      userInterference: "none-observed",
+      cleanup: "complete",
+    })
+  } finally { await value.adapter.close() }
+  expect(JSON.parse((await readFile(reportPath)).toString())).toEqual({
+    pointerPosts: 1,
+    heldDowns: 1,
+    heldUps: 1,
+    cleanupUps: 0,
+  })
+})
+
+test("related AX focus after move but before down cancels without false interference", async () => {
+  const reportPath = join(directory, `focus-move-${crypto.randomUUID()}.json`)
+  const value = await setup("--focus-after-move", reportPath)
+  try {
+    const response = await execute(value.adapter, request(clickAction, "focus-after-move"))
+    expect(response.ok).toBe(false)
+    if (response.ok) throw new Error("Expected UI invalidation")
+    expect(response.nativeStatus).toMatchObject({
+      execution: "cancelled",
+      dispatchAttempts: 1,
+      userInterference: "none-observed",
+      cleanup: "complete",
+    })
+  } finally { await value.adapter.close() }
+  expect(JSON.parse((await readFile(reportPath)).toString())).toEqual({
+    pointerPosts: 1,
+    heldDowns: 0,
+    heldUps: 0,
+    cleanupUps: 0,
+  })
+})

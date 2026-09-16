@@ -14,6 +14,8 @@ typedef NS_ENUM(NSInteger, FixtureMode) {
   FixtureModeEventDuringVerify,
   FixtureModeGapBeforeAdmit,
   FixtureModeDragForeignSecondPoint,
+  FixtureModeRelatedFocusAfterMove,
+  FixtureModeRelatedFocusAfterDown,
 };
 
 @interface AdmissionFixtureObserver : MetaNativeObserver
@@ -208,7 +210,20 @@ static bool fixture_flags(void *context, uint64_t flags) {
   if (cleanup) _cleanupUps += 1;
   else if (down) _heldDowns += 1;
   else _heldUps += 1;
-  return [self postSyntheticTag:tag];
+  BOOL posted = [self postSyntheticTag:tag];
+  if (posted && down && _mode == FixtureModeRelatedFocusAfterDown) {
+    [_observer recordFocusTarget:@{
+      @"kind" : @"window",
+      @"ref" : @{
+        @"runtimeEpoch" : @"runtime-1",
+        @"loginSessionId" : @"login-1",
+        @"nativeGeneration" : @"native-view-fixture",
+        @"applicationRef" : @"application-1",
+        @"windowRef" : @"window-1",
+      },
+    } syntheticTag:0];
+  }
+  return posted;
 }
 
 - (BOOL)postPointer:(const MetaPointerEvent *)event tag:(uint64_t)tag {
@@ -216,7 +231,20 @@ static bool fixture_flags(void *context, uint64_t flags) {
   _pointerPosts += 1;
   if (_mode == FixtureModeDragForeignSecondPoint && _pointerPosts > 1)
     return NO;
-  return [self postSyntheticTag:tag];
+  BOOL posted = [self postSyntheticTag:tag];
+  if (posted && _mode == FixtureModeRelatedFocusAfterMove) {
+    [_observer recordFocusTarget:@{
+      @"kind" : @"window",
+      @"ref" : @{
+        @"runtimeEpoch" : @"runtime-1",
+        @"loginSessionId" : @"login-1",
+        @"nativeGeneration" : @"native-view-fixture",
+        @"applicationRef" : @"application-1",
+        @"windowRef" : @"window-1",
+      },
+    } syntheticTag:0];
+  }
+  return posted;
 }
 
 - (void)recordForeignEvent {
@@ -302,6 +330,14 @@ static bool fixture_flags(void *context, uint64_t flags) {
     return [binding currentCoverage];
   }];
   MetaExecutor *executor = [_input executorOnActionWorker];
+  NSDictionary *inputAction = request[@"payload"][@"action"];
+  BOOL allowRelatedClickFocus = [inputAction[@"kind"] isEqual:@"click"] &&
+      [inputAction[@"count"] isEqual:@1] &&
+      [operation[@"target"][@"kind"] isEqual:@"window"];
+  [binding setRelatedClickFocusPolicy:allowRelatedClickFocus
+                        phaseProvider:^NSUInteger {
+    return (NSUInteger)meta_executor_status(executor).dispatch_attempts;
+  }];
   meta_executor_set_observer_state(
       executor,
       [binding currentCoverage] == nil ? META_OBSERVER_UNAVAILABLE
@@ -314,8 +350,10 @@ static bool fixture_flags(void *context, uint64_t flags) {
     MetaInputObserverPollResult value = [binding poll];
     if (value == MetaInputObserverPollContinue)
       return MetaInputObserverContinue;
-    return value == MetaInputObserverPollForeignEvent
-               ? MetaInputObserverForeignEvent
+    if (value == MetaInputObserverPollForeignEvent)
+      return MetaInputObserverForeignEvent;
+    return value == MetaInputObserverPollUIInvalidation
+               ? MetaInputObserverUIInvalidation
                : MetaInputObserverUnavailable;
   }];
   [_input setFirstDispatchGuard:^BOOL {
@@ -375,6 +413,10 @@ int main(int argc, const char **argv) {
       mode = FixtureModeGapBeforeAdmit;
     else if (argc >= 2 && strcmp(argv[1], "--drag-foreign-second") == 0)
       mode = FixtureModeDragForeignSecondPoint;
+    else if (argc >= 2 && strcmp(argv[1], "--focus-after-move") == 0)
+      mode = FixtureModeRelatedFocusAfterMove;
+    else if (argc >= 2 && strcmp(argv[1], "--focus-after-down") == 0)
+      mode = FixtureModeRelatedFocusAfterDown;
     NSString *reportPath = argc >= 3 ? @(argv[2]) : nil;
     return meta_command_loop_run(
         [[ViewAdmissionFixtureBackend alloc] initWithMode:mode

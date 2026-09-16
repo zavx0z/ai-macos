@@ -1371,13 +1371,22 @@ static NSString *clipboard_error(MetaClipboardStatus status) {
   if (!headInstalled) admissionRejected = YES;
   [job setObserverCoverageProvider:^NSDictionary * { return [binding currentCoverage]; }];
   MetaExecutor *executor = [_inputExecutor executorOnActionWorker];
+  NSDictionary *inputAction = request[@"payload"][@"action"];
+  BOOL allowRelatedClickFocus = [inputAction[@"kind"] isEqual:@"click"] &&
+      [inputAction[@"count"] isEqual:@1] &&
+      [@[@"window", @"surface"] containsObject:scope[@"kind"]];
+  [binding setRelatedClickFocusPolicy:allowRelatedClickFocus
+                        phaseProvider:^NSUInteger {
+    return (NSUInteger)meta_executor_status(executor).dispatch_attempts;
+  }];
   meta_executor_set_observer_state(executor, [binding currentCoverage] != nil ? META_OBSERVER_READY : META_OBSERVER_UNAVAILABLE);
   [_inputExecutor setInputObserverAfterBegin:^BOOL(MetaExecutor *accepted, MetaInputJob *current) {
     return headInstalled && current == job && accepted == executor && [binding registerTag:meta_executor_synthetic_tag(accepted)];
   } poll:^MetaInputObserverDecision {
     MetaInputObserverPollResult decision = [binding poll];
     return decision == MetaInputObserverPollContinue ? MetaInputObserverContinue :
-        decision == MetaInputObserverPollForeignEvent ? MetaInputObserverForeignEvent : MetaInputObserverUnavailable;
+        decision == MetaInputObserverPollForeignEvent ? MetaInputObserverForeignEvent :
+        decision == MetaInputObserverPollUIInvalidation ? MetaInputObserverUIInvalidation : MetaInputObserverUnavailable;
   }];
   [_inputExecutor setFirstDispatchGuard:^BOOL {
     BOOL allowed = headInstalled && [self->_viewAdmissions recheckOperationId:operation[@"operationId"]];

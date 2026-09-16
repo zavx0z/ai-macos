@@ -5,6 +5,7 @@
 typedef NS_ENUM(NSInteger, MetaInputObserverDecision) {
   MetaInputObserverContinue,
   MetaInputObserverForeignEvent,
+  MetaInputObserverUIInvalidation,
   MetaInputObserverUnavailable,
 };
 

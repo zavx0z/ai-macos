@@ -69,6 +69,33 @@ static NSDictionary *fixture_target(void) {
   };
 }
 
+static NSDictionary *fixture_display_target(void) {
+  return @{
+    @"kind" : @"display",
+    @"ref" : @{
+      @"runtimeEpoch" : @"runtime-1",
+      @"loginSessionId" : @"login-1",
+      @"nativeGeneration" : @"native-1",
+      @"displayRef" : @"display-1",
+      @"displayLayoutRevision" : @1,
+    },
+  };
+}
+
+static NSDictionary *fixture_surface_target(void) {
+  return @{
+    @"kind" : @"surface",
+    @"ref" : @{
+      @"runtimeEpoch" : @"runtime-1",
+      @"loginSessionId" : @"login-1",
+      @"nativeGeneration" : @"native-1",
+      @"applicationRef" : @"application-1",
+      @"surfaceRef" : @"surface-1",
+      @"ownerWindowRef" : @"window-1",
+    },
+  };
+}
+
 static NSDictionary *fixture_readiness(void) {
   return @{
     @"state" : @"active-console",
@@ -234,7 +261,7 @@ static void test_foreign_input_and_lifecycle_stop_continuation(void) {
       fixture_binding(binder, @"observer-1");
   assert([lifecycle registerTag:8]);
   [fixture.observer recordLifecycle:@"lock" nextLoginSessionId:nil];
-  assert([lifecycle poll] == MetaInputObserverPollForeignEvent);
+  assert([lifecycle poll] == MetaInputObserverPollUnavailable);
   [lifecycle stop];
 }
 
@@ -245,7 +272,7 @@ static void test_global_topology_event_cancels_without_coverage_gap(void) {
   MetaInputObserverBinding *binding = fixture_binding(binder, @"observer-1");
   assert([binding registerTag:14]);
   [fixture.observer recordGlobalWindowStructure];
-  assert([binding poll] == MetaInputObserverPollForeignEvent);
+  assert([binding poll] == MetaInputObserverPollUIInvalidation);
   NSDictionary *push = [binder takePushEnvelopes:10];
   assert([push[@"events"] count] == 1);
   assert(push[@"gapReason"] == nil);
@@ -253,6 +280,88 @@ static void test_global_topology_event_cancels_without_coverage_gap(void) {
       isEqual:@"window-structure"]);
   assert(push[@"events"][0][@"event"][@"target"] == nil);
   assert([fixture.observer.coverage[@"state"] isEqual:@"ready"]);
+  [binding stop];
+}
+
+static void test_related_focus_allowed_only_after_click_down(void) {
+  MetaInputObserverFixture fixture = {0};
+  MetaObserverCommandBinder *binder = fixture_binder(&fixture);
+  fixture_prepare(binder);
+  __block NSUInteger phase = 2;
+  MetaInputObserverBinding *allowed = fixture_binding(binder, @"observer-1");
+  [allowed setRelatedClickFocusPolicy:YES phaseProvider:^NSUInteger {
+    return phase;
+  }];
+  assert([allowed registerTag:15]);
+  [fixture.observer recordInputFromPid:getpid() syntheticTag:15];
+  [fixture.observer recordFocusTarget:fixture_target() syntheticTag:0];
+  assert([allowed poll] == MetaInputObserverPollContinue);
+  [allowed stop];
+
+  MetaInputObserverBinding *owned = fixture_binding(binder, @"observer-1");
+  [owned setRelatedClickFocusPolicy:YES phaseProvider:^NSUInteger {
+    return 2;
+  }];
+  assert([owned registerTag:20]);
+  [fixture.observer recordInputFromPid:getpid() syntheticTag:20];
+  [fixture.observer recordFocusTarget:fixture_surface_target() syntheticTag:0];
+  assert([owned poll] == MetaInputObserverPollContinue);
+  [owned stop];
+
+  MetaInputObserverBinding *beforeDown = fixture_binding(binder, @"observer-1");
+  phase = 1;
+  [beforeDown setRelatedClickFocusPolicy:YES phaseProvider:^NSUInteger {
+    return phase;
+  }];
+  assert([beforeDown registerTag:16]);
+  [fixture.observer recordInputFromPid:getpid() syntheticTag:16];
+  [fixture.observer recordFocusTarget:fixture_target() syntheticTag:0];
+  assert([beforeDown poll] == MetaInputObserverPollUIInvalidation);
+  [beforeDown stop];
+
+  MetaInputObserverBinding *keyboard = fixture_binding(binder, @"observer-1");
+  phase = 2;
+  assert([keyboard registerTag:17]);
+  [fixture.observer recordInputFromPid:getpid() syntheticTag:17];
+  [fixture.observer recordFocusTarget:fixture_target() syntheticTag:17];
+  assert([keyboard poll] == MetaInputObserverPollUIInvalidation);
+  [keyboard stop];
+}
+
+static void test_physical_input_wins_before_related_focus(void) {
+  MetaInputObserverFixture fixture = {0};
+  MetaObserverCommandBinder *binder = fixture_binder(&fixture);
+  fixture_prepare(binder);
+  MetaInputObserverBinding *binding = fixture_binding(binder, @"observer-1");
+  [binding setRelatedClickFocusPolicy:YES phaseProvider:^NSUInteger {
+    return 2;
+  }];
+  assert([binding registerTag:18]);
+  [fixture.observer recordInputFromPid:getpid() syntheticTag:18];
+  [fixture.observer recordFocusTarget:fixture_target() syntheticTag:0];
+  [fixture.observer recordInputFromPid:getpid() + 1 syntheticTag:0];
+  assert([binding poll] == MetaInputObserverPollForeignEvent);
+  [binding stop];
+}
+
+static void test_broad_scope_cannot_enable_related_focus_policy(void) {
+  MetaInputObserverFixture fixture = {0};
+  MetaObserverCommandBinder *binder = fixture_binder(&fixture);
+  fixture_prepare(binder);
+  NSDictionary *display = fixture_display_target();
+  MetaInputObserverBinding *binding = [[MetaInputObserverBinding alloc]
+      initWithObserver:binder
+      observerInstanceRef:@"observer-1"
+               operationId:@"operation-display"
+                    target:display
+             interactionId:nil];
+  [binding setRelatedClickFocusPolicy:YES phaseProvider:^NSUInteger {
+    return 2;
+  }];
+  assert([binding registerTag:19]);
+  [fixture.observer recordInputFromPid:getpid() syntheticTag:19];
+  [fixture.observer recordFocusTarget:display syntheticTag:0];
+  assert([binding poll] == MetaInputObserverPollUIInvalidation);
   [binding stop];
 }
 
@@ -329,6 +438,9 @@ int main(void) {
     test_stale_admission_head_clears_binding_fail_closed();
     test_foreign_input_and_lifecycle_stop_continuation();
     test_global_topology_event_cancels_without_coverage_gap();
+    test_related_focus_allowed_only_after_click_down();
+    test_physical_input_wins_before_related_focus();
+    test_broad_scope_cannot_enable_related_focus_policy();
     test_registration_baseline_keeps_interleaved_foreign_event();
     test_construction_baseline_keeps_pre_registration_event();
     test_instance_and_gap_invalidation_fail_closed();

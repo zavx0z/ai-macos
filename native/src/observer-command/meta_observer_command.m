@@ -685,13 +685,42 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   [observer unregisterSyntheticTag:tag];
 }
 
-- (NSDictionary *)scanEventsAfterCursor:(NSString *)cursor
-                    expectedSyntheticTag:(uint64_t)tag
-                         requireOwnEvent:(BOOL)requireOwnEvent
-                           timeoutMillis:(NSUInteger)timeoutMillis
-                     observerInstanceRef:(NSString *)observerInstanceRef {
+static NSString *event_target_relation(NSDictionary *expected,
+                                       NSDictionary *actual) {
+  if (![expected isKindOfClass:NSDictionary.class] ||
+      ![actual isKindOfClass:NSDictionary.class]) return @"missing";
+  if ([expected isEqual:actual]) return @"exact";
+  NSDictionary *expectedRef = expected[@"ref"];
+  NSDictionary *actualRef = actual[@"ref"];
+  if (![expectedRef isKindOfClass:NSDictionary.class] ||
+      ![actualRef isKindOfClass:NSDictionary.class]) return @"unrelated";
+  for (NSString *key in @[@"runtimeEpoch", @"loginSessionId",
+                            @"nativeGeneration", @"applicationRef"]) {
+    if (![expectedRef[key] isEqual:actualRef[key]]) return @"unrelated";
+  }
+  if ([expected[@"kind"] isEqual:@"window"] &&
+      [actual[@"kind"] isEqual:@"surface"] &&
+      [expectedRef[@"windowRef"] isEqual:actualRef[@"ownerWindowRef"]]) {
+    return @"owned-descendant";
+  }
+  if ([expected[@"kind"] isEqual:@"surface"] &&
+      [actual[@"kind"] isEqual:@"window"] &&
+      [expectedRef[@"ownerWindowRef"] isEqual:actualRef[@"windowRef"]]) {
+    return @"owner";
+  }
+  return @"unrelated";
+}
+
+- (NSDictionary *)scanInputEventsAfterCursor:(NSString *)cursor
+                         expectedSyntheticTag:(uint64_t)tag
+                               expectedTarget:(nullable NSDictionary *)target
+                            allowRelatedFocus:(BOOL)allowRelatedFocus
+                                ownInputArmed:(BOOL)ownInputArmed
+                                timeoutMillis:(NSUInteger)timeoutMillis
+                          observerInstanceRef:(NSString *)observerInstanceRef {
   if (!identifier(cursor, 127) || tag == 0 || timeoutMillis == 0 ||
-      timeoutMillis > 250 || !identifier(observerInstanceRef, 127)) {
+      timeoutMillis > 250 || !identifier(observerInstanceRef, 127) ||
+      (allowRelatedFocus && ![target isKindOfClass:NSDictionary.class])) {
     return nil;
   }
   NSString *expectedTag =
@@ -726,33 +755,105 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
       return nil;
     }
     if (events.count > 0) {
-      BOOL ownOnly = YES;
+      BOOL armed = ownInputArmed;
+      NSString *state = @"own-event-only";
+      NSDictionary *decisive = nil;
+      NSInteger decisiveRank = 0;
       for (NSDictionary *event in events) {
-        if (![event[@"source"] isEqual:@"synthetic"] ||
-            ![event[@"syntheticTag"] isEqual:expectedTag]) {
-          ownOnly = NO;
-          break;
+        NSString *kind = event[@"kind"];
+        BOOL exactTag = [event[@"source"] isEqual:@"synthetic"] &&
+            [event[@"syntheticTag"] isEqual:expectedTag];
+        if (exactTag && [kind isEqual:@"input"]) {
+          armed = YES;
+          continue;
+        }
+        NSString *relation = event_target_relation(target, event[@"target"]);
+        NSDictionary *candidate = @{
+          @"eventKind" : [kind isKindOfClass:NSString.class] ? kind : @"unknown",
+          @"source" : [event[@"source"] isKindOfClass:NSString.class]
+              ? event[@"source"] : @"unknown",
+          @"tagRelation" : exactTag ? @"exact" :
+              event[@"syntheticTag"] == nil ? @"missing" : @"other",
+          @"targetRelation" : relation,
+          @"ownInputArmed" : armed ? @YES : @NO,
+        };
+        NSString *candidateState = @"ui-invalidation";
+        NSInteger candidateRank = 2;
+        if ([kind isEqual:@"input"]) {
+          candidateState = @"physical-interference";
+          candidateRank = 4;
+        } else if ([kind isEqual:@"lifecycle"]) {
+          candidateState = @"lifecycle-change";
+          candidateRank = 3;
+        } else if ([kind isEqual:@"focus"] && allowRelatedFocus && armed &&
+                 [@[@"exact", @"owned-descendant", @"owner"]
+                     containsObject:relation]) {
+          candidateState = @"related-focus";
+          candidateRank = 1;
+        }
+        if (candidateRank > decisiveRank) {
+          decisiveRank = candidateRank;
+          decisive = candidate;
+          state = candidateState;
         }
       }
       NSDictionary *last = events.lastObject;
       NSMutableDictionary *result = [@{
-        @"state" : ownOnly ? @"own-event-only" : @"user-takeover",
+        @"state" : state,
         @"cursor" : last[@"cursor"],
+        @"ownInputArmed" : armed ? @YES : @NO,
       } mutableCopy];
-      if (ownOnly) result[@"syntheticTag"] = expectedTag;
+      if ([state isEqual:@"own-event-only"] ||
+          [state isEqual:@"related-focus"]) result[@"syntheticTag"] = expectedTag;
+      if (decisive != nil) result[@"decision"] = decisive;
       [_eventCondition unlock];
       return result;
     }
     if (deadline.timeIntervalSinceNow <= 0) {
       NSDictionary *result = @{
-        @"state" : requireOwnEvent ? @"unknown" : @"no-events",
+        @"state" : @"no-events",
         @"cursor" : cursor,
+        @"ownInputArmed" : ownInputArmed ? @YES : @NO,
       };
       [_eventCondition unlock];
       return result;
     }
     [_eventCondition waitUntilDate:deadline];
   }
+}
+
+- (NSDictionary *)scanEventsAfterCursor:(NSString *)cursor
+                    expectedSyntheticTag:(uint64_t)tag
+                         requireOwnEvent:(BOOL)requireOwnEvent
+                           timeoutMillis:(NSUInteger)timeoutMillis
+                     observerInstanceRef:(NSString *)observerInstanceRef {
+  NSDictionary *result = [self
+      scanInputEventsAfterCursor:cursor
+           expectedSyntheticTag:tag
+                 expectedTarget:nil
+              allowRelatedFocus:NO
+                  ownInputArmed:NO
+                  timeoutMillis:timeoutMillis
+            observerInstanceRef:observerInstanceRef];
+  if (result == nil) return nil;
+  NSString *state = result[@"state"];
+  if ([state isEqual:@"physical-interference"]) {
+    NSMutableDictionary *strict = [result mutableCopy];
+    strict[@"state"] = @"user-takeover";
+    return strict;
+  }
+  if ([state isEqual:@"ui-invalidation"] ||
+      [state isEqual:@"lifecycle-change"]) {
+    NSMutableDictionary *strict = [result mutableCopy];
+    strict[@"state"] = @"unknown";
+    return strict;
+  }
+  if (requireOwnEvent && [state isEqual:@"no-events"]) {
+    NSMutableDictionary *strict = [result mutableCopy];
+    strict[@"state"] = @"unknown";
+    return strict;
+  }
+  return result;
 }
 
 - (NSDictionary *)historySnapshotForObserverInstance:

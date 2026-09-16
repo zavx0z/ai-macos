@@ -1,5 +1,7 @@
 #include "meta_input_observer_binding.h"
 
+#include <stdio.h>
+
 static BOOL meta_input_observer_identifier(id value, NSUInteger maximum) {
   if (![value isKindOfClass:NSString.class] || [value length] == 0 ||
       [value length] > maximum) {
@@ -120,7 +122,52 @@ static BOOL meta_input_observer_same_continuity(NSDictionary *baseline,
   NSString *_cursor;
   uint64_t _tag;
   BOOL _stopped;
+  BOOL _allowRelatedClickFocus;
+  BOOL _ownInputArmed;
+  BOOL _diagnosticEmitted;
+  NSUInteger (^_phaseProvider)(void);
   NSLock *_lock;
+}
+
+- (void)setRelatedClickFocusPolicy:(BOOL)allowed
+                     phaseProvider:(NSUInteger (^)(void))phaseProvider {
+  [_lock lock];
+  if (!_stopped && _tag == 0) {
+    BOOL narrowScope = [_target[@"kind"] isEqual:@"window"] ||
+                       [_target[@"kind"] isEqual:@"surface"];
+    _allowRelatedClickFocus = allowed && narrowScope && phaseProvider != nil;
+    _phaseProvider = _allowRelatedClickFocus ? [phaseProvider copy] : nil;
+  }
+  [_lock unlock];
+}
+
+- (void)emitDecision:(NSDictionary *)scan phase:(NSUInteger)phase {
+  [_lock lock];
+  if (_diagnosticEmitted) { [_lock unlock]; return; }
+  _diagnosticEmitted = YES;
+  [_lock unlock];
+  NSDictionary *decision = [scan[@"decision"] isKindOfClass:NSDictionary.class]
+      ? scan[@"decision"] : @{};
+  NSDictionary *record = @{
+    @"kind" : @"input-observer-decision",
+    @"operationId" : _operationId,
+    @"runtimeEpoch" : _generation[@"runtimeEpoch"],
+    @"state" : [scan[@"state"] isKindOfClass:NSString.class]
+        ? scan[@"state"] : @"unavailable",
+    @"eventKind" : decision[@"eventKind"] ?: @"unknown",
+    @"source" : decision[@"source"] ?: @"unknown",
+    @"tagRelation" : decision[@"tagRelation"] ?: @"missing",
+    @"targetRelation" : decision[@"targetRelation"] ?: @"missing",
+    @"ownInputArmed" : [decision[@"ownInputArmed"] boolValue] ? @YES : @NO,
+    @"phase" : @(phase),
+  };
+  NSData *encoded = [NSJSONSerialization dataWithJSONObject:record
+                                                    options:0 error:NULL];
+  if (encoded != nil) {
+    fwrite(encoded.bytes, 1, encoded.length, stderr);
+    fputc('\n', stderr);
+    fflush(stderr);
+  }
 }
 
 - (instancetype)initWithObserver:(MetaObserverCommandBinder *)observer
@@ -235,6 +282,9 @@ static BOOL meta_input_observer_same_continuity(NSDictionary *baseline,
   NSString *cursor = [_cursor copy];
   NSDictionary *baseline = _baselineCoverage;
   BOOL stopped = _stopped;
+  BOOL ownInputArmed = _ownInputArmed;
+  BOOL allowRelatedClickFocus = _allowRelatedClickFocus;
+  NSUInteger (^phaseProvider)(void) = _phaseProvider;
   [_lock unlock];
   if (stopped || tag == 0 || cursor == nil || baseline == nil) {
     return MetaInputObserverPollUnavailable;
@@ -244,22 +294,27 @@ static BOOL meta_input_observer_same_continuity(NSDictionary *baseline,
       !meta_input_observer_same_continuity(baseline, before)) {
     return MetaInputObserverPollUnavailable;
   }
+  NSUInteger phase = phaseProvider == nil ? 0 : phaseProvider();
   NSDictionary *scan = [_observer
-      scanEventsAfterCursor:cursor
-       expectedSyntheticTag:tag
-            requireOwnEvent:NO
-              timeoutMillis:1
-        observerInstanceRef:_observerInstanceRef];
+      scanInputEventsAfterCursor:cursor
+            expectedSyntheticTag:tag
+                  expectedTarget:_target
+               allowRelatedFocus:allowRelatedClickFocus && phase >= 2
+                   ownInputArmed:ownInputArmed
+                   timeoutMillis:1
+             observerInstanceRef:_observerInstanceRef];
   if (![scan isKindOfClass:NSDictionary.class]) {
     return MetaInputObserverPollUnavailable;
   }
   NSString *state = scan[@"state"];
   NSString *nextCursor = scan[@"cursor"];
   BOOL continuing = [state isEqual:@"own-event-only"] ||
+                    [state isEqual:@"related-focus"] ||
                     [state isEqual:@"no-events"];
   if (continuing &&
       (!meta_input_observer_identifier(nextCursor, 127) ||
-       ([state isEqual:@"own-event-only"] &&
+       (([state isEqual:@"own-event-only"] ||
+         [state isEqual:@"related-focus"]) &&
         ![scan[@"syntheticTag"]
             isEqual:[NSString stringWithFormat:@"event-%016llx", tag]]))) {
     return MetaInputObserverPollUnavailable;
@@ -269,8 +324,17 @@ static BOOL meta_input_observer_same_continuity(NSDictionary *baseline,
       !meta_input_observer_same_continuity(baseline, after)) {
     return MetaInputObserverPollUnavailable;
   }
-  if ([state isEqual:@"user-takeover"] || [state isEqual:@"unknown"]) {
+  if ([state isEqual:@"physical-interference"]) {
+    [self emitDecision:scan phase:phase];
     return MetaInputObserverPollForeignEvent;
+  }
+  if ([state isEqual:@"ui-invalidation"]) {
+    [self emitDecision:scan phase:phase];
+    return MetaInputObserverPollUIInvalidation;
+  }
+  if ([state isEqual:@"lifecycle-change"] || [state isEqual:@"unknown"]) {
+    [self emitDecision:scan phase:phase];
+    return MetaInputObserverPollUnavailable;
   }
   if (!continuing) return MetaInputObserverPollUnavailable;
   [_lock lock];
@@ -279,7 +343,9 @@ static BOOL meta_input_observer_same_continuity(NSDictionary *baseline,
     return MetaInputObserverPollUnavailable;
   }
   _cursor = [nextCursor copy];
+  _ownInputArmed = [scan[@"ownInputArmed"] boolValue];
   [_lock unlock];
+  if ([state isEqual:@"related-focus"]) [self emitDecision:scan phase:phase];
   return MetaInputObserverPollContinue;
 }
 
@@ -290,6 +356,9 @@ static BOOL meta_input_observer_same_continuity(NSDictionary *baseline,
   _stopped = YES;
   _cursor = nil;
   _baselineCoverage = nil;
+  _allowRelatedClickFocus = NO;
+  _ownInputArmed = NO;
+  _phaseProvider = nil;
   [_lock unlock];
   if (tag != 0) {
     [_observer unregisterSyntheticTag:tag

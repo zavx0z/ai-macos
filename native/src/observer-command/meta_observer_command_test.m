@@ -449,9 +449,17 @@ static void test_readiness_scan_is_exact_and_nondestructive(void) {
               timeoutMillis:1
         observerInstanceRef:@"observer-1"];
   assert([quiet[@"state"] isEqual:@"no-events"]);
+  [fixture.observer recordFocusTarget:target() syntheticTag:0];
+  NSDictionary *uiInvalidation = [value
+      scanEventsAfterCursor:quiet[@"cursor"]
+       expectedSyntheticTag:42
+            requireOwnEvent:NO
+              timeoutMillis:10
+        observerInstanceRef:@"observer-1"];
+  assert([uiInvalidation[@"state"] isEqual:@"unknown"]);
   [fixture.observer recordInputFromPid:getpid() + 1 syntheticTag:42];
   NSDictionary *takeover = [value
-      scanEventsAfterCursor:quiet[@"cursor"]
+      scanEventsAfterCursor:uiInvalidation[@"cursor"]
        expectedSyntheticTag:42
             requireOwnEvent:NO
               timeoutMillis:10

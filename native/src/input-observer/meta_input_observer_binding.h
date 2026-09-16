@@ -10,6 +10,7 @@ NS_ASSUME_NONNULL_BEGIN
 typedef NS_ENUM(NSUInteger, MetaInputObserverPollResult) {
   MetaInputObserverPollContinue = 0,
   MetaInputObserverPollForeignEvent,
+  MetaInputObserverPollUIInvalidation,
   MetaInputObserverPollUnavailable,
 };
 
@@ -25,6 +26,8 @@ typedef NS_ENUM(NSUInteger, MetaInputObserverPollResult) {
 // Связывает созданный binding с exact атомарным head admission, до tag/post.
 - (BOOL)useAdmissionHead:(NSDictionary *)head;
 - (BOOL)registerTag:(uint64_t)tag;
+- (void)setRelatedClickFocusPolicy:(BOOL)allowed
+                     phaseProvider:(NSUInteger (^)(void))phaseProvider;
 - (MetaInputObserverPollResult)poll;
 - (void)stop;
 @end
