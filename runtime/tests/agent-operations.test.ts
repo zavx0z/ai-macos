@@ -651,3 +651,67 @@ describe("agent operation control", () => {
     })
   })
 })
+describe("давление на историю операций", () => {
+  test("завершённая история ограничена и не блокирует новые действия", async () => {
+    const { runtime, first, firstScope, operations } = fixture()
+
+    for (let index = 0; index < 256; index += 1) {
+      expect(await operations.runTrackedMutation(
+        first,
+        "target:window",
+        "type-text",
+        async context => {
+          runtime.records.set(context.clientRequestId, operation(
+            first,
+            context.clientRequestId,
+            `operation:retention-${index}`,
+            "completed",
+          ))
+          return index
+        },
+      )).toBe(index)
+    }
+
+    const status = await operations.getTargetStatus(first, "target:window")
+    expect(status.active).toHaveLength(0)
+    expect(status.recent).toHaveLength(64)
+    expect(status.recent.every(item => item.action === "type-text")).toBe(true)
+    expect(firstScope.retained.size).toBe(0)
+  })
+
+  test("при заполнении неизвестный cleanup сохраняется и новое действие не отправляется", async () => {
+    const { runtime, first, firstScope, operations } = fixture()
+    let executions = 0
+    const run = () => operations.runTrackedMutation(first, "target:window", "type-text", async context => {
+      executions++
+      runtime.records.set(context.clientRequestId, operation(
+        first, context.clientRequestId, `operation:unknown-${executions}`, "interrupted-unknown", "unknown",
+      ))
+    })
+    for (let index = 0; index < 128; index++) await run()
+    await expect(run()).rejects.toThrow("retention capacity")
+    expect(executions).toBe(128)
+    expect(firstScope.retained.size).toBe(128)
+  })
+
+  test("старый неизвестный cleanup переживает вытеснение завершённых действий", async () => {
+    const { runtime, first, firstScope, operations } = fixture()
+    await operations.runTrackedMutation(first, "target:window", "type-text", async context => {
+      runtime.records.set(context.clientRequestId, operation(
+        first, context.clientRequestId, "operation:unresolved", "interrupted-unknown", "unknown",
+      ))
+    })
+    for (let index = 0; index < 256; index++) {
+      await operations.runTrackedMutation(first, "target:window", "type-text", async context => {
+        runtime.records.set(context.clientRequestId, operation(
+          first, context.clientRequestId, `operation:clean-${index}`, "completed",
+        ))
+      })
+    }
+    expect(firstScope.retained.size).toBe(1)
+    const unresolved = [...runtime.records].find(([, record]) => record.context.operationId === "operation:unresolved")!
+    runtime.records.set(unresolved[0], operation(first, unresolved[0], "operation:unresolved", "completed"))
+    await operations.getTargetStatus(first, "target:window")
+    expect(firstScope.retained.size).toBe(0)
+  })
+})

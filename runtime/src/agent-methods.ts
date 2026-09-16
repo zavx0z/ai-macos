@@ -221,7 +221,7 @@ export class RuntimeAgentMethods {
   register(): void {
     this.#registry.register("get_state", {
       title: "Доступные цели",
-      description: "Возвращает короткие lineage-scoped handles точных окон и настроенных browser instances.",
+      description: "Возвращает handles окон, дисплеев и browser instances. Если пользователь просит посмотреть экран, весь экран или что сейчас на экране — запросите kind=display и используйте main display; для всех экранов используйте desktopLayout.displayTargetIds. Если названо конкретное приложение или окно — используйте kind=window.",
       input: z.strictObject({
         kind: z.enum(["window", "display", "browser"]).optional(),
         app: z.string().min(1).max(256).optional(),
@@ -259,7 +259,7 @@ export class RuntimeAgentMethods {
     })
     this.#registry.register("observe", {
       title: "Наблюдать выбранную цель",
-      description: "Возвращает fresh AX, screenshot или оба для exact target handle.",
+      description: "Возвращает fresh AX, screenshot или оба для exact target handle. Для запроса про экран, весь экран или содержимое экрана используйте display target и screenshot, а не window target; для конкретного приложения или окна используйте window target.",
       input: z.strictObject({
         targetId,
         mode: z.enum(["ax", "screenshot", "both"]),

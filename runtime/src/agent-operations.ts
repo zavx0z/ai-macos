@@ -156,6 +156,7 @@ export class AgentOperations {
     assertActionBinding(binding, targetId, this.#clock.now())
     this.#prune()
     const bucket = this.#bucket(lineage, binding)
+    this.#makeAdmissionRoom()
     if (bucket.records.length >= MAX_RECORDS_PER_TARGET
       || this.#recordCount() >= MAX_RECORDS) {
       throw new Error("Agent operation retention capacity исчерпана")
@@ -379,6 +380,26 @@ export class AgentOperations {
     record.controlReleased = true
   }
 
+  #makeAdmissionRoom(): void {
+    const evictOne = (bucket: TargetBucket): boolean => {
+      const index = bucket.records.findIndex(isEvictableHistory)
+      if (index < 0) return false
+      bucket.records.splice(index, 1)
+      return true
+    }
+    while (this.#recordCount() >= MAX_RECORDS) {
+      let evicted = false
+      for (const bucket of this.#buckets.values()) {
+        if (!evictOne(bucket)) continue
+        // Текущий bucket может уже быть захвачен вызывающим методом.
+        // Удаление из map здесь потеряет добавляемую в него новую операцию.
+        evicted = true
+        break
+      }
+      if (!evicted) break
+    }
+  }
+
   #prune(): void {
     const cutoff = this.#clock.now().getTime() - AGENT_OPERATION_RETENTION_MS
     for (const [key, bucket] of this.#buckets) {
@@ -392,6 +413,16 @@ export class AgentOperations {
         }
         return false
       })
+
+      let overflow = Math.max(0, bucket.records.length - MAX_STATUS_RECENT)
+      if (overflow > 0) {
+        bucket.records = bucket.records.filter(record => {
+          if (overflow === 0 || !isEvictableHistory(record)) return true
+          overflow -= 1
+          return false
+        })
+      }
+
       if (bucket.records.length === 0) this.#buckets.delete(key)
     }
   }
@@ -427,6 +458,15 @@ function assertControlBinding(
 
 function isTerminalOperation(operation: OperationRecord): boolean {
   return TERMINAL_OPERATION_STATES.includes(operation.state)
+}
+
+function isEvictableHistory(record: TrackedRecord): boolean {
+  if (record.terminalAtMs === undefined || !record.controlReleased) return false
+  if (record.authoritative !== undefined) {
+    return isTerminalOperation(record.authoritative)
+      && record.authoritative.outcome.cleanup.state === "complete"
+  }
+  return record.handlerSettled
 }
 
 function isLocallyTerminal(record: TrackedRecord): boolean {
