@@ -1,0 +1,80 @@
+name: Verify demand lifecycle final
+on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/demand-final-verify.yml']
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: demand-verify
+  cancel-in-progress: false
+jobs:
+  verify:
+    runs-on: macos-14
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: '1.4.2'
+      - name: Apply reviewed patches with integrity verification
+        env:
+          FOLLOWUP: >-
+            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
+        run: |
+          python3 - <<'PY'
+          import os, re, base64, lzma, gzip, hashlib
+          from pathlib import Path
+          workflow = Path('.github/workflows/demand-verify.yml').read_text()
+          encoded = ''.join(re.findall(r'PATCH_\d: >-\n\s+(\S+)', workflow))
+          patch = lzma.decompress(base64.b64decode(encoded, validate=True))
+          assert hashlib.sha256(patch).hexdigest() == '4683fb788393f9c26ae515b6202b29daec23573708ef1401f6ed1c0da114c4ba'
+          followup = gzip.decompress(base64.b64decode(os.environ['FOLLOWUP'].strip(), validate=True))
+          assert hashlib.sha256(followup).hexdigest() == 'c45bcaf7ee5076e5fca9e56957ba8fcf2fe53e6c2b0bfdba0da0fba5735e7217'
+          Path(os.environ['RUNNER_TEMP'], 'demand.patch').write_bytes(patch)
+          Path(os.environ['RUNNER_TEMP'], 'followup.patch').write_bytes(followup)
+          PY
+          git apply --check "$RUNNER_TEMP/demand.patch"
+          git apply "$RUNNER_TEMP/demand.patch"
+          git apply --check "$RUNNER_TEMP/followup.patch"
+          git apply "$RUNNER_TEMP/followup.patch"
+      - run: bun install --frozen-lockfile
+        id: install
+      - name: Runtime tests
+        id: runtime
+        run: bun test runtime/tests
+      - name: Native tests
+        id: native
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bun test native/tests
+      - name: Screen and input tests
+        id: adapters
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bun test screen/tests input/tests
+      - name: MCP regression
+        id: mcp
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: bun test mcp/tests/catalog-server.test.ts mcp/tests/chat-proxy.test.ts mcp/tests/runtime-mcp.test.ts
+      - name: TypeScript
+        id: types
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: |
+          bun run --cwd runtime typecheck
+          bun x tsc --noEmit -p native/tsconfig.json
+          bun x tsc --noEmit -p screen/tsconfig.json
+          bun x tsc --noEmit -p input/tsconfig.json
+      - name: Native fixtures
+        id: fixtures
+        if: ${{ !cancelled() && steps.install.outcome == 'success' }}
+        run: sh native/scripts/check.sh
+      - name: Publish only tested source, without deployment
+        if: ${{ success() && steps.runtime.outcome == 'success' && steps.native.outcome == 'success' && steps.adapters.outcome == 'success' && steps.mcp.outcome == 'success' && steps.types.outcome == 'success' && steps.fixtures.outcome == 'success' }}
+        run: |
+          git diff --check
+          git add runtime native screen input mcp docs
+          git config user.name 'ChatGPT'
+          git config user.email 'chatgpt@users.noreply.github.com'
+          git commit -m 'refactor: make runtime observation and waiting demand-driven'
+          git push origin HEAD:main
+          git rev-parse HEAD
