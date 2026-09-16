@@ -77,8 +77,11 @@ jobs:
                 command: { method: "clipboard.version", payload: {} },
               }), control)''')
           replace('native/src/capture-command/meta_capture_command_test.m', '''    assert(strcmp([pending[@"ack"][@"quarantined"] objCType],
-                            @encode(BOOL)) == 0);''', '''    // NSNumber's Objective-C encoding is not a portable JSON boolean test.
+                            @encode(BOOL)) == 0);''', '''    // Objective-C encoding NSNumber не определяет переносимую проверку JSON boolean.
               assert(CFGetTypeID((__bridge CFTypeRef)pending[@"ack"][@"quarantined"]) ==
+                     CFBooleanGetTypeID());''')
+          replace('native/src/capture-command/meta_capture_command_test.m', '''    assert(strcmp([released[@"ack"][@"quarantined"] objCType],
+                            @encode(BOOL)) == 0);''', '''    assert(CFGetTypeID((__bridge CFTypeRef)released[@"ack"][@"quarantined"]) ==
                      CFBooleanGetTypeID());''')
           replace('runtime/src/observer-hub.ts',
               '      gapDetected: gap || this.#coverage.gapDetected,',
@@ -99,6 +102,55 @@ jobs:
             } finally { await value.hub.close() }
           })
           ''')
+          PY
+      - name: Remove timing assumption from asynchronous capture fixture
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          p = Path('native/tests/capture-command-loop.test.ts')
+          s = p.read_text()
+          marker = 'test("production command loop проводит observer ACK перед PUSH и capture lifecycle", async () => {'
+          helper = '''type CaptureResultReply = Extract<ReturnType<typeof nativeCaptureCleanupResponseSchema.parse>, { purpose: "result" }>
+
+          // Ожидаем фактический callback fake capture, а не предполагаем завершение за 30 мс.
+          // Повторяется только чтение результата; capture.start никогда не повторяется.
+          async function finishCapture(
+            adapter: NativeBrokerAdapter,
+            captureTaskRef: string,
+            initial: CaptureResultReply,
+            requestPrefix: string,
+            operationId = "operation-1",
+          ): Promise<CaptureResultReply> {
+            const signal = AbortSignal.timeout(3_000)
+            let result = initial
+            for (let attempt = 1; result.poll.state === "pending"; attempt++) {
+              signal.throwIfAborted()
+              await Bun.sleep(5)
+              const next = await adapter.cleanup(nativeCaptureCleanupRequestSchema, {
+                control: cleanupControl("result", result.poll.status.revision,
+                  result.statusEvidence.statusEvidenceRef, `${requestPrefix}:${attempt}`, operationId),
+                payload: { captureTaskRef },
+              }, nativeCaptureCleanupResponseSchema, { signal, checkpoint() { signal.throwIfAborted() } })
+              if (next.purpose !== "result") throw new Error("Ожидался capture result")
+              result = next
+            }
+            return result
+          }
+
+          '''
+          assert s.count(marker) == 1
+          s = s.replace(marker, helper + marker)
+          start = s.index('    expect(pending.poll.state).toBe("pending")')
+          end = s.index('    expect(completed.purpose).toBe("result")', start)
+          s = s[:start] + '''    const completed = await finishCapture(adapter, started.result.captureTaskRef,
+                pending, "capture-result-complete")
+          ''' + s[end:]
+          start = s.index('    expect(layoutPending.poll.state).toBe("pending")')
+          end = s.index('    expect(layoutCompleted.purpose).toBe("result")', start)
+          s = s[:start] + '''    const layoutCompleted = await finishCapture(layoutAdapter, layoutStarted.result.captureTaskRef,
+                layoutPending, "capture-layout-complete", "operation-layout-1")
+          ''' + s[end:]
+          p.write_text(s)
           PY
       - run: bun install --frozen-lockfile
       - name: Runtime regression suite
