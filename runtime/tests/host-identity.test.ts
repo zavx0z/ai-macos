@@ -729,8 +729,10 @@ test.each([false, true])("observer recovery не перезапускает Nati
     const client = await host.core.openClientDurable("principal:observer-recovery")
     const state = await host.catalog.dispatch(client.session, "get_state", {}, new AbortController().signal)
     expect(state.data.complete).toBe(true)
-    // Восстанавливается только observation binding, без mutation/replay.
-    await host.ready()
+    // Первый обязательный system_health сам повторяет bounded observer preparation,
+    // без Native restart, input и replay старых действий.
+    const health = await host.catalog.dispatch(client.session, "system_health", {}, new AbortController().signal)
+    expect(health.data).toMatchObject({ observer: { state: "ready", viewReady: true } })
     expect(transport.observerPrepareAttempts).toBe(2)
     expect(transport.observerStopAttempts).toBe(1)
     expect(host.doctor().observer.viewReady).toBe(true)

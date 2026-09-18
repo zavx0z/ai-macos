@@ -391,9 +391,19 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     permissionsUnavailable: z.string().optional(),
   })
   catalog.register("system_health", {
-    title: "Состояние runtime", description: "Пассивная проверка машины, загруженных builds и доступности runtime.",
+    title: "Состояние runtime", description: "Проверка машины, загруженных builds и доступности runtime; при недоступном observer запускает bounded восстановление подписок без ввода и restart.",
     input: z.strictObject({}), output: doctorSchema, readOnly: true, availableDuringDrain: true,
     requiredCapabilities: ["runtime.health"], async execute(context) {
+      if (observerState !== "ready"
+        && handshake?.viewAdmissionVersion === "1"
+        && handshake.recoveryDomainVersion === "1") {
+        const recovery = beginBackendPreparation()
+        try {
+          await settleBeforeAbort(recovery, AbortSignal.any([context.signal, AbortSignal.timeout(3_000)]), "Observer recovery during system_health")
+        } catch {
+          // Preparation продолжает жить в backendPreparation; health возвращает фактический ready/preparing/unavailable.
+        }
+      }
       if (native === undefined || handshake === undefined) return { ...doctor(), permissionsUnavailable: "Native helper unavailable" }
       try {
         const signal = AbortSignal.any([context.signal, AbortSignal.timeout(1000)])
