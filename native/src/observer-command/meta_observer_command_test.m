@@ -6,11 +6,16 @@
 
 @interface FixtureObserver : MetaNativeObserver
 @property(nonatomic) BOOL stopped;
+@property(nonatomic) BOOL failStart;
 @property(nonatomic) NSDictionary *target;
 @end
 
 @implementation FixtureObserver
 - (BOOL)start {
+  if (self.failStart) {
+    [self markUnavailable:@"Fixture AX subscription failed"];
+    return NO;
+  }
   [self recordCoverageKind:@"input" available:YES reason:nil];
   [self recordCoverageKind:@"focus" available:YES reason:nil];
   [self recordCoverageKind:@"window-structure" available:YES reason:nil];
@@ -28,6 +33,7 @@ typedef struct {
   __unsafe_unretained FixtureObserver *observer;
   size_t indexCalls;
   size_t mainCalls;
+  NSTimeInterval lastMainDeadline;
   size_t factoryCalls;
   size_t readinessCalls;
   size_t idCalls;
@@ -35,6 +41,7 @@ typedef struct {
   BOOL deferMain;
   BOOL failAfterMain;
   BOOL failIndex;
+  BOOL failStart;
   __unsafe_unretained NSMutableArray *deferredMain;
   __unsafe_unretained NSMutableArray *retainedObservers;
   useconds_t indexDelayMicros;
@@ -110,8 +117,11 @@ static MetaObserverCommandBinder *binder(Fixture *fixture) {
                return meta_observer_prepared_index_create(
                    index, @"inventory-1", 1, fixture->indexCalls);
              }
-             mainExecutor:^BOOL(BOOL (^work)(void)) {
+             mainExecutor:^BOOL(__unused NSDate *deadline, BOOL (^work)(void)) {
                fixture->mainCalls += 1;
+               assert([deadline isKindOfClass:NSDate.class]);
+               fixture->lastMainDeadline = deadline.timeIntervalSince1970;
+               if (deadline.timeIntervalSinceNow <= 0) return NO;
                if (fixture->deferMain) {
                  [fixture->deferredMain addObject:[work copy]];
                  return NO;
@@ -127,6 +137,7 @@ static MetaObserverCommandBinder *binder(Fixture *fixture) {
                     FixtureObserver *observer = [[FixtureObserver alloc]
                         initWithGeneration:generationValue];
                     observer.target = target();
+                    observer.failStart = fixture->failStart;
                     fixture->observer = observer;
                     [fixture->retainedObservers addObject:observer];
                     return observer;
@@ -319,6 +330,8 @@ static void test_late_prepare_cannot_create_or_replace_observer(void) {
   assert(fixture.deferredMain.count == 1);
   assert([failed[@"prepareFailure"][@"retryDisposition"]
       isEqual:@"unknown"]);
+  assert(![failed[@"prepareFailure"][@"transient"] boolValue]);
+  assert(![failed[@"error"][@"message"] containsString:@"foreground receipt"]);
 
   fixture.deferMain = NO;
   NSDictionary *prepared =
@@ -396,7 +409,60 @@ static void test_foreground_receipt_change_stops_started_candidate(void) {
   assert([failed[@"prepareFailure"][@"stage"] isEqual:@"main-start"]);
   assert([failed[@"prepareFailure"][@"retryDisposition"]
       isEqual:@"clean-stopped"]);
+  assert([failed[@"prepareFailure"][@"transient"] boolValue]);
+  assert([failed[@"error"][@"message"] containsString:@"foreground receipt"]);
   assert(![value activatePushForObserverInstance:@"observer-1"]);
+  NSDictionary *retry = [value handleRequest:request(@"prepare", nil, nil, nil)];
+  assert([retry[@"ok"] isEqual:@YES]);
+  assert(fixture.indexCalls == 2 && fixture.factoryCalls == 2);
+  assert(candidate.stopped);
+}
+
+static void test_start_failure_keeps_cause_and_allows_clean_retry(void) {
+  Fixture fixture = {.mainSucceeds = YES, .failStart = YES};
+  NSMutableArray *retained = [NSMutableArray array];
+  fixture.retainedObservers = retained;
+  MetaObserverCommandBinder *value = binder(&fixture);
+  NSDictionary *failed = [value handleRequest:request(@"prepare", nil, nil, nil)];
+  assert([failed[@"ok"] isEqual:@NO]);
+  assert([failed[@"error"][@"message"] containsString:@"Fixture AX subscription failed"]);
+  assert(![failed[@"error"][@"message"] containsString:@"foreground receipt"]);
+  assert([failed[@"prepareFailure"][@"stage"] isEqual:@"main-start"]);
+  assert([failed[@"prepareFailure"][@"retryDisposition"] isEqual:@"clean-stopped"]);
+  assert([failed[@"prepareFailure"][@"transient"] boolValue]);
+  FixtureObserver *candidate = retained.firstObject;
+  assert(candidate.stopped);
+  assert(![value activatePushForObserverInstance:@"observer-1"]);
+  fixture.failStart = NO;
+  NSDictionary *ready = [value handleRequest:request(@"prepare", nil, nil, nil)];
+  assert([ready[@"ok"] isEqual:@YES]);
+  assert(fixture.factoryCalls == 2);
+  assert(candidate != fixture.observer && candidate.stopped);
+}
+
+static void test_foreground_changes_at_every_start_checkpoint(void) {
+  // 1: preflight; 2..6: main; 7: publication после main.
+  for (size_t invalidation = 1; invalidation <= 7; invalidation += 1) {
+    Fixture fixture = {.mainSucceeds = YES, .invalidateValidatorCall = invalidation};
+    NSMutableArray *retained = [NSMutableArray array];
+    fixture.retainedObservers = retained;
+    MetaObserverCommandBinder *value = binder(&fixture);
+    Fixture *binding = &fixture;
+    [value setPreparedValidator:^BOOL(__unused MetaObserverPreparedIndex *prepared) {
+      binding->validatorCalls += 1;
+      return binding->validatorCalls != binding->invalidateValidatorCall;
+    }];
+    NSDictionary *failed = [value handleRequest:request(@"prepare", nil, nil, nil)];
+    assert([failed[@"ok"] isEqual:@NO]);
+    assert([failed[@"error"][@"message"] containsString:@"foreground receipt"]);
+    assert([failed[@"prepareFailure"][@"transient"] boolValue]);
+    assert(![failed[@"prepareFailure"][@"retryDisposition"] isEqual:@"unknown"]);
+    for (FixtureObserver *candidate in retained) assert(candidate.stopped);
+    assert(![value activatePushForObserverInstance:@"observer-1"]);
+    NSDictionary *ready = [value handleRequest:request(@"prepare", nil, nil, nil)];
+    assert([ready[@"ok"] isEqual:@YES]);
+    assert(fixture.indexCalls == 2);
+  }
 }
 
 static void test_readiness_scan_is_exact_and_nondestructive(void) {
@@ -478,8 +544,37 @@ static void test_readiness_scan_is_exact_and_nondestructive(void) {
   [value unregisterSyntheticTag:42 observerInstanceRef:@"observer-1"];
 }
 
+
+// Recovery вызывает coverage прямо на binder, без внешнего backend observer RPC.
+// Deadline каждого вызова должен дойти до mainExecutor самостоятельно.
+static void test_each_command_owns_its_main_deadline(void) {
+  Fixture fixture = {.mainSucceeds = YES};
+  MetaObserverCommandBinder *value = binder(&fixture);
+  NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
+  formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime |
+                            NSISO8601DateFormatWithFractionalSeconds;
+  NSMutableDictionary *prepare = [request(@"prepare", nil, nil, nil) mutableCopy];
+  prepare[@"deadlineAt"] = [formatter stringFromDate:[NSDate dateWithTimeIntervalSinceNow:1]];
+  assert([[value handleRequest:prepare][@"ok"] isEqual:@YES]);
+  NSTimeInterval prepareDeadline = fixture.lastMainDeadline;
+  usleep(1100000);
+  assert(prepareDeadline < NSDate.date.timeIntervalSince1970);
+
+  NSMutableDictionary *coverage = [request(@"coverage", @"observer-1", nil, nil) mutableCopy];
+  coverage[@"deadlineAt"] = [formatter stringFromDate:[NSDate dateWithTimeIntervalSinceNow:1]];
+  assert([[value handleRequest:coverage][@"ok"] isEqual:@YES]);
+  assert(fixture.lastMainDeadline > prepareDeadline);
+  assert(fixture.lastMainDeadline == [formatter dateFromString:coverage[@"deadlineAt"]].timeIntervalSince1970);
+
+  NSMutableDictionary *stop = [request(@"stop", @"observer-1", nil, nil) mutableCopy];
+  stop[@"deadlineAt"] = [formatter stringFromDate:[NSDate dateWithTimeIntervalSinceNow:2]];
+  assert([[value handleRequest:stop][@"ok"] isEqual:@YES]);
+  assert(fixture.lastMainDeadline == [formatter dateFromString:stop[@"deadlineAt"]].timeIntervalSince1970);
+}
+
 int main(void) {
   @autoreleasepool {
+    test_each_command_owns_its_main_deadline();
     test_prepare_baseline_push_backfill_and_stop();
     test_restart_requires_exact_previous_instance();
     test_main_failure_and_gap_are_explicit();
@@ -488,6 +583,8 @@ int main(void) {
     test_started_candidate_is_stopped_after_failed_handoff();
     test_expired_prepare_stops_before_main_start();
     test_foreground_receipt_change_stops_started_candidate();
+    test_start_failure_keeps_cause_and_allows_clean_retry();
+    test_foreground_changes_at_every_start_checkpoint();
     test_readiness_scan_is_exact_and_nondestructive();
   }
   puts("observer command tests passed");

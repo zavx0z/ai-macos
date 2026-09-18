@@ -173,8 +173,22 @@ export const nativeOperationStatusSchema = z.strictObject({
   if (status.dispatch === "none" && status.dispatchAttempts !== 0) {
     context.addIssue({ code: "custom", path: ["dispatchAttempts"], message: "dispatch none требует ноль attempts" })
   }
-  if (status.dispatch !== "none" && status.targetVerified !== "verified") {
-    context.addIssue({ code: "custom", path: ["targetVerified"], message: "native dispatch требует verified target checkpoint" })
+  // После down цель может исчезнуть на следующем checkpoint. Native обязан
+  // сообщить partial/failed и результат cleanup, а не выдумывать verified или
+  // терять весь status. Это только отчёт об остановке, не разрешение dispatch.
+  // Во время durable cleanup Native ещё публикует cancelling/attempted:
+  // partial появляется после завершения cleanup, unknown — при его отказе.
+  const targetLostAfterDispatch = status.targetVerified === "failed"
+    && status.dispatchAttempts > 0
+    && !status.restorationAllowed
+    && ((status.execution === "cancelling" && status.dispatch === "attempted")
+      || (["cancelling", "failed", "quarantined"].includes(status.execution)
+        && ["partial", "unknown"].includes(status.dispatch)))
+  if (status.dispatch !== "none" && status.targetVerified !== "verified" && !targetLostAfterDispatch) {
+    context.addIssue({ code: "custom", path: ["targetVerified"], message: "native dispatch требует verified target checkpoint либо явный stop после потери цели" })
+  }
+  if (status.targetVerified === "failed" && status.restorationAllowed) {
+    context.addIssue({ code: "custom", path: ["restorationAllowed"], message: "failed target запрещает restore" })
   }
   if (status.execution === "finished" && !["partial", "finished"].includes(status.dispatch)) {
     context.addIssue({ code: "custom", path: ["dispatch"], message: "finished native execution требует фактический dispatch" })

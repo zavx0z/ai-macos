@@ -319,7 +319,7 @@ static bool fake_cleanup_up(void *context, MetaHeldEventKind kind,
       indexBuilder:^MetaObserverPreparedIndex * {
         return meta_observer_prepared_index_create([[MetaObserverTargetIndex alloc] init], @"inventory-fixture", 1, 1);
       }
-      mainExecutor:^BOOL(BOOL (^work)(void)) { return work(); }
+      mainExecutor:^BOOL(__unused NSDate *deadline, BOOL (^work)(void)) { return work(); }
       factory:^MetaNativeObserver *(NSDictionary *identity, __unused MetaObserverTargetIndex *index) {
         return [[FixtureObserver alloc] initWithGeneration:identity];
       }

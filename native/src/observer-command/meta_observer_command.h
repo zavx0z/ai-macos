@@ -24,7 +24,8 @@ MetaObserverPreparedIndex *_Nullable meta_observer_prepared_index_create(
     uint64_t indexRevision);
 
 typedef MetaObserverPreparedIndex *_Nullable (^MetaObserverIndexBuilder)(void);
-typedef BOOL (^MetaObserverMainExecutor)(BOOL (^work)(void));
+// Deadline принадлежит текущему запросу, не последнему внешнему observer RPC.
+typedef BOOL (^MetaObserverMainExecutor)(NSDate *deadline, BOOL (^work)(void));
 typedef MetaNativeObserver *_Nullable (^MetaObserverFactory)(
     NSDictionary *generation, MetaObserverTargetIndex *index);
 typedef NSDictionary *_Nullable (^MetaObserverReadinessProvider)(void);

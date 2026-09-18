@@ -376,3 +376,24 @@ describe("C3 native observer lifecycle binding", () => {
     expect(stopFailed.calls).toEqual(["prepare", "stop", "stop"])
   })
 })
+
+test("main-start clean-stopped повторяет только prepare и заново проверяет preflight", async () => {
+  const value = fixture({ prepareFailures: 2,
+    prepareFailure: { stage: "main-start", retryDisposition: "clean-stopped", transient: true } })
+  const attempts: number[] = []
+  const sleeps: number[] = []
+  const binding = await createNativeObserverBinding({ native: value.native,
+    async beforeAttempt(attempt, signal) { signal.throwIfAborted(); attempts.push(attempt) },
+    async sleep(ms, signal) { signal.throwIfAborted(); sleeps.push(ms) } })
+  expect(value.calls).toEqual(["prepare", "prepare", "prepare"])
+  expect(attempts).toEqual([1, 2, 3])
+  expect(sleeps).toEqual([1000, 1000])
+  await binding.close()
+})
+
+test("main-start clean failure исчерпывает три попытки без бесконечного retry", async () => {
+  const value = fixture({ prepareFailures: 10,
+    prepareFailure: { stage: "main-start", retryDisposition: "clean-stopped", transient: true } })
+  await expect(createNativeObserverBinding({ native: value.native, async sleep() {} })).rejects.toThrow("prepare unavailable")
+  expect(value.calls).toEqual(["prepare", "prepare", "prepare"])
+})

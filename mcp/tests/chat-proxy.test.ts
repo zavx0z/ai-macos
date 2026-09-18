@@ -156,3 +156,33 @@ test("action выполняется через UDS ровно один раз, i
     await rm(directory, { recursive: true, force: true })
   }
 })
+
+test("default proxy раскрывает recovery при sealed admission, но сохраняет запрет чужой lineage", async () => {
+  const directory = await mkdtemp(join(tmpdir(), "chat-recovery-catalog-"))
+  const socketPath = join(directory, "runtime.sock")
+  const credentialPath = join(directory, "credential.json")
+  const host = await createRuntimeHost({ socketPath, credentialPath, expectedHostname: hostname(),
+    loginSessionId: "login:recovery-catalog", runtimeBuildId: "runtime:recovery-catalog", expectedNativeBuildId: "native:recovery-catalog" })
+  const server = await startChatProxy({ runtime: { socketPath, credentialPath, expectedHostname: hostname() } })
+  const client = new Client({ name: "chat-recovery-catalog", version: "1" })
+  const [ct, st] = InMemoryTransport.createLinkedPair()
+  try {
+    await host.start()
+    host.core.sealAdmission()
+    await Promise.all([client.connect(ct), server.connect(st)])
+    const contract = await client.callTool({ name: "zavx0z", arguments: { node: "computer/recover_startup_input" } })
+    expect(contract.isError).not.toBe(true)
+    expect(contract.structuredContent).toMatchObject({ executed: false, contract: { name: "recover_startup_input" } })
+    const foreign = await client.callTool({ name: "zavx0z", arguments: {
+      node: "computer", action: "recover_startup_input", input: { operationId: "operation:foreign" },
+    } })
+    expect(foreign.isError).toBe(true)
+    expect(JSON.stringify(foreign.content)).toContain("Operation недоступна этой lineage")
+    expect(host.core.admissionSealed).toBe(true)
+  } finally {
+    await client.close()
+    await server.close()
+    await host.close()
+    await rm(directory, { recursive: true, force: true })
+  }
+})

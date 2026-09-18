@@ -771,3 +771,44 @@ describe("C1 operation outcome matrix", () => {
     expect(authorityChecked).toBe(true)
   })
 })
+
+function targetLossStatus() {
+  return {
+    requestId: "target-loss-status", runtimeEpoch, loginSessionId, nativeGeneration,
+    operationId: nativeContext().operationId, acceptedFence: nativeContext().fence, highWaterFence: nativeContext().fence,
+    execution: "failed", dispatch: "partial", cleanup: "complete", targetVerified: "failed",
+    cancellationRequested: false, userInterference: "unknown", restorationAllowed: false,
+    quarantined: false, heldCount: 0, dispatchAttempts: 2, ledgerRevision: 4, lastCheckpoint: "cleanup-up",
+    observer: { runtimeEpoch, loginSessionId, nativeGeneration, state: "unavailable",
+      coverageStartCursor: "cursor:0", cursor: "cursor:0", nextSequence: 1,
+      startedAt: now, coveredFrom: now, coveredThrough: now, heartbeatAt: now,
+      coveredKinds: [], droppedEvents: 0, gapDetected: false, reason: "fixture" },
+  }
+}
+
+test("native status сохраняет target loss после down и достоверный cleanup", () => {
+  const failed = targetLossStatus()
+  expect(nativeOperationStatusSchema.parse(failed)).toMatchObject({
+    execution: "failed", dispatch: "partial", targetVerified: "failed", cleanup: "complete", heldCount: 0,
+  })
+  expect(nativeOperationStatusSchema.safeParse({ ...failed, execution: "cancelling",
+    dispatch: "attempted", cleanup: "incomplete", heldCount: 1 }).success).toBe(true)
+  expect(nativeOperationStatusSchema.safeParse({ ...failed, execution: "cancelling",
+    cleanup: "incomplete", heldCount: 1 }).success).toBe(true)
+  expect(nativeOperationStatusSchema.safeParse({ ...failed, execution: "quarantined",
+    dispatch: "unknown", cleanup: "unknown", quarantined: true, heldCount: 1 }).success).toBe(true)
+})
+
+test("target loss не разрешает продолжение ввода, success, restore или выдуманный dispatch", () => {
+  const failed = targetLossStatus()
+  for (const invalid of [
+    { execution: "dispatching" }, { execution: "finished" }, { execution: "cancelled" },
+    { targetVerified: "unknown" }, { restorationAllowed: true }, { dispatchAttempts: 0 },
+    { dispatch: "finished" }, { dispatch: "attempted" },
+    { cleanup: "complete", heldCount: 1 },
+    { execution: "quarantined", dispatch: "unknown", quarantined: false },
+    { nativeGeneration: "native:foreign" },
+  ]) {
+    expect(nativeOperationStatusSchema.safeParse({ ...failed, ...invalid }).success).toBe(false)
+  }
+})

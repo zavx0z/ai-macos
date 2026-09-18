@@ -554,3 +554,27 @@ describe("C2 desktop input adapter", () => {
     expect(result).toMatchObject({ ok: false, error: { code: "deadline-exceeded" }, outcome: { dispatch: "none" } })
   })
 })
+
+test("post-dispatch target loss не превращает подтверждённый cleanup в unknown", async () => {
+  let statusCalls = 0
+  const value = fixture({
+    async request(request, responseSchema) {
+      const terminal = status(request.requestId, {
+        execution: "failed", dispatch: "partial", targetVerified: "failed",
+        dispatchAttempts: 2, ledgerRevision: 4, lastCheckpoint: "cleanup-up",
+      })
+      return responseSchema.parse({
+        kind: "response", protocolVersion: NATIVE_PROTOCOL_VERSION, requestId: request.requestId,
+        runtimeEpoch, loginSessionId, nativeGeneration, operationId: wire.operationId, ok: true,
+        result: { completedSteps: 0, totalSteps: 1, dispatchAttempts: 2, ledgerRevision: 4, status: terminal },
+      })
+    },
+    async status() { statusCalls++; throw new Error("inline terminal status уже достаточен") },
+  })
+  const result = await value.adapter.execute(value.context, { kind: "key", key: "enter", modifiers: [] })
+  expect(result).toMatchObject({ ok: false,
+    outcome: { dispatch: "partial", targetVerified: "failed", cleanup: { state: "complete" }, effect: { state: "unverified" } },
+    nativeStatus: { execution: "failed", targetVerified: "failed", heldCount: 0, restorationAllowed: false },
+  })
+  expect(statusCalls).toBe(0)
+})

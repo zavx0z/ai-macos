@@ -16,6 +16,9 @@ typedef struct {
   bool fail_cleanup;
   size_t dispatch_guard_calls;
   size_t reject_dispatch_call;
+  MetaExecutor *observed_executor;
+  MetaExecutorStatus observed_target_loss_status;
+  bool observed_target_loss;
   struct {
     MetaHeldEventKind kind;
     uint32_t code;
@@ -44,6 +47,13 @@ static bool fake_persist(void *context,
                          MetaLedgerPersistenceAck *ack) {
   FakeBackend *backend = context;
   backend->persist_calls += 1;
+  if (backend->observed_executor != NULL) {
+    MetaExecutorStatus status = meta_executor_status(backend->observed_executor);
+    if (status.target_verification == META_VERIFICATION_FAILED && !backend->observed_target_loss) {
+      backend->observed_target_loss_status = status;
+      backend->observed_target_loss = true;
+    }
+  }
   assert(request->snapshot.operation_id[0] != '\0');
   if (request->snapshot.entry_count > 0)
     assert(request->snapshot.entries != NULL);
@@ -442,16 +452,67 @@ static void test_target_change_stops_before_next_event(void) {
   FakeBackend backend = {.now = 100, .target_valid = true};
   MetaExecutor *value = executor(&backend, "native-1");
   assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+  meta_executor_set_observer_state(value, META_OBSERVER_READY);
   assert(meta_executor_begin(value, "operation-4", "window-1",
                              fence("runtime-1", "native-1", 1), 1000));
   assert(meta_executor_post_down(value, META_EVENT_KEY, 56));
+  backend.observed_executor = value;
   backend.target_valid = false;
   assert(!meta_executor_checkpoint(value, "before-next-event"));
   MetaExecutorStatus status = meta_executor_status(value);
   assert(status.execution == META_EXECUTOR_FAILED);
   assert(status.target_verification == META_VERIFICATION_FAILED);
+  assert(status.dispatch == META_DISPATCH_PARTIAL);
+  assert(status.dispatch_attempts == 2);
+  assert(!status.restoration_allowed);
+  // MetaInputExecutor публикует этот status перед каждым persistLedger.
+  assert(backend.observed_target_loss);
+  assert(backend.observed_target_loss_status.execution == META_EXECUTOR_CANCELLING);
+  assert(backend.observed_target_loss_status.dispatch == META_DISPATCH_ATTEMPTED);
+  assert(!backend.observed_target_loss_status.restoration_allowed);
+  assert(backend.observed_target_loss_status.cleanup == META_CLEANUP_INCOMPLETE);
   assert(status.cleanup == META_CLEANUP_COMPLETE);
+  assert(status.held_count == 0);
   assert(backend.event_count == 2);
+  assert(backend.cleanup_count == 1);
+  assert(!meta_executor_post_down(value, META_EVENT_KEY, 57));
+  assert(backend.event_count == 2);
+  meta_executor_destroy(value);
+}
+
+static void test_target_failure_before_dispatch_revokes_restoration(void) {
+  FakeBackend backend = {.now = 100, .target_valid = false};
+  MetaExecutor *value = executor(&backend, "native-1");
+  assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+  meta_executor_set_observer_state(value, META_OBSERVER_READY);
+  assert(!meta_executor_begin(value, "target-rejected", "window-1",
+                             fence("runtime-1", "native-1", 1), 1000));
+  MetaExecutorStatus status = meta_executor_status(value);
+  assert(status.execution == META_EXECUTOR_FAILED);
+  assert(status.target_verification == META_VERIFICATION_FAILED);
+  assert(status.dispatch == META_DISPATCH_NONE && status.dispatch_attempts == 0);
+  assert(!status.restoration_allowed && backend.event_count == 0);
+  meta_executor_destroy(value);
+}
+
+static void test_target_loss_with_cleanup_failure_stays_quarantined(void) {
+  FakeBackend backend = {.now = 100, .target_valid = true, .fail_cleanup = true};
+  MetaExecutor *value = executor(&backend, "native-1");
+  assert(meta_executor_open_runtime_epoch(value, "runtime-1", "login-1"));
+  meta_executor_set_observer_state(value, META_OBSERVER_READY);
+  assert(meta_executor_begin(value, "target-loss-cleanup", "window-1",
+                             fence("runtime-1", "native-1", 1), 1000));
+  assert(meta_executor_post_down(value, META_EVENT_KEY, 56));
+  backend.target_valid = false;
+  assert(!meta_executor_checkpoint(value, "before-next-event"));
+  MetaExecutorStatus status = meta_executor_status(value);
+  assert(status.execution == META_EXECUTOR_QUARANTINED);
+  assert(status.target_verification == META_VERIFICATION_FAILED);
+  assert(status.dispatch == META_DISPATCH_UNKNOWN && status.dispatch_attempts == 2);
+  assert(!status.restoration_allowed && status.quarantined);
+  assert(status.cleanup == META_CLEANUP_UNKNOWN && status.held_count == 1);
+  assert(!meta_executor_post_down(value, META_EVENT_KEY, 57));
+  assert(backend.event_count == 2 && backend.cleanup_count == 1);
   meta_executor_destroy(value);
 }
 
@@ -607,6 +668,8 @@ int main(void) {
   test_second_pending_down_failure_releases_existing_live_hold();
   test_broken_persistence_releases_all_live_owned_holds_once();
   test_target_change_stops_before_next_event();
+  test_target_failure_before_dispatch_revokes_restoration();
+  test_target_loss_with_cleanup_failure_stays_quarantined();
   test_user_takeover_and_watchdog();
   test_restored_uncertain_ledger_starts_quarantined();
   test_native_id_limits_and_login_fence();

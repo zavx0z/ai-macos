@@ -75,9 +75,9 @@ export const nativeObserverPrepareFailureSchema = z.strictObject({
   retryDisposition: z.enum(["clean-no-instance", "clean-stopped", "unknown"]),
   transient: z.boolean(),
 }).superRefine((failure, context) => {
-  if (failure.transient && (!["inventory", "index", "readiness"].includes(failure.stage)
+  if (failure.transient && (!["inventory", "index", "readiness", "main-start"].includes(failure.stage)
     || failure.retryDisposition === "unknown")) {
-    context.addIssue({ code: "custom", message: "Transient observer failure требует clean inventory/index/readiness disposition" })
+    context.addIssue({ code: "custom", message: "Transient observer failure требует clean inventory/index/readiness/main-start disposition" })
   }
 })
 export const nativeObserverResponseSchema = z.discriminatedUnion("ok", [

@@ -43,13 +43,17 @@ static NSString *bounded_reason(NSString *reason) {
                                : [reason substringToIndex:1024];
 }
 
-static BOOL request_before_deadline(NSDictionary *request) {
+static NSDate *request_deadline(NSDictionary *request) {
   NSString *value = request[@"deadlineAt"];
-  if (![value isKindOfClass:NSString.class]) return NO;
+  if (![value isKindOfClass:NSString.class]) return nil;
   NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
   formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime |
                             NSISO8601DateFormatWithFractionalSeconds;
-  NSDate *deadline = [formatter dateFromString:value];
+  return [formatter dateFromString:value];
+}
+
+static BOOL request_before_deadline(NSDictionary *request) {
+  NSDate *deadline = request_deadline(request);
   return deadline != nil && deadline.timeIntervalSinceNow > 0;
 }
 
@@ -192,7 +196,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
     // Main-runloop barrier: обработать предшествующие callbacks и проверить tap
     // непосредственно для запроса, вместо heartbeat таймера 4 раза в секунду.
     MetaNativeObserver *observer = _observer;
-    if (!self.mainExecutor(^BOOL {
+    if (!self.mainExecutor(request_deadline(request), ^BOOL {
       if (!request_before_deadline(request)) return NO;
       [observer recordHeartbeat];
       return YES;
@@ -392,16 +396,24 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   __block MetaNativeObserver *created = nil;
   __block NSString *baselineCursor = nil;
   __block BOOL candidateStopped = NO;
+  __block BOOL foregroundChanged = NO;
+  __block BOOL startFailed = NO;
+  __block NSString *startFailureReason = nil;
   __weak MetaObserverCommandBinder *weakSelf = self;
   [_lock lock];
   _mainWorkOutstanding += 1;
   [_lock unlock];
-  BOOL executed = self.mainExecutor(^BOOL {
+  BOOL executed = self.mainExecutor(request_deadline(request), ^BOOL {
     MetaObserverCommandBinder *binder = weakSelf;
     if (binder == nil) return NO;
+    BOOL (^preparedValid)(void) = ^BOOL {
+      BOOL valid = [binder preparedStillValid:prepared];
+      if (!valid) foregroundChanged = YES;
+      return valid;
+    };
     @try {
       if (!request_before_deadline(request) ||
-          ![binder preparedStillValid:prepared] ||
+          !preparedValid() ||
           ![binder prepareTokenIsCurrent:prepareToken]) {
         return NO;
       }
@@ -421,7 +433,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
       [binder->_lock unlock];
     }
     if (!request_before_deadline(request) ||
-        ![binder preparedStillValid:prepared] ||
+        !preparedValid() ||
         ![binder prepareTokenIsCurrent:prepareToken]) return NO;
     created = binder.factory(binder.generation, prepared.index);
     if (created == nil) return NO;
@@ -432,15 +444,17 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
     if (!accepted) return NO;
     [created recordCurrentSessionReadiness:readiness];
     if (!request_before_deadline(request) ||
-        ![binder preparedStillValid:prepared] ||
+        !preparedValid() ||
         ![binder prepareTokenIsCurrent:prepareToken]) return NO;
     if (![created start]) {
+      startFailed = YES;
+      startFailureReason = created.coverage[@"reason"];
       [created stop];
       candidateStopped = YES;
       [binder clearPendingObserver:created token:prepareToken];
       return NO;
     }
-    if (![binder preparedStillValid:prepared]) {
+    if (!preparedValid()) {
       [created stop];
       candidateStopped = YES;
       [binder clearPendingObserver:created token:prepareToken];
@@ -460,7 +474,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
       [weakSelf acceptEvent:event observerInstanceRef:instance];
     }];
     if (!request_before_deadline(request) ||
-        ![binder preparedStillValid:prepared] ||
+        !preparedValid() ||
         ![binder prepareTokenIsCurrent:prepareToken]) {
       [created setEventSink:nil];
       [created stop];
@@ -473,7 +487,9 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
       [binder finishMainWork];
     }
   });
-  BOOL finalPreparedValid = executed && [self preparedStillValid:prepared];
+  // NO от mainExecutor означает также отказ start() или неизвестный handoff.
+  // Это не доказательство изменения foreground receipt.
+  BOOL finalPreparedValid = !executed || [self preparedStillValid:prepared];
   [_lock lock];
   BOOL accepted = executed && created != nil && finalPreparedValid &&
                   identifier(baselineCursor, 127) &&
@@ -494,17 +510,30 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   }
   MetaNativeObserver *pending = _pendingObserver == created ? created : nil;
   if (pending != nil) _pendingObserver = nil;
+  // Данные callback читаются только после main-work completion под тем же lock.
+  // Поздний callback остаётся unknown и не разрешает повтор prepare.
+  BOOL mainFinished = _mainWorkOutstanding == 0;
+  BOOL changedForeground = !finalPreparedValid || (mainFinished && foregroundChanged);
+  BOOL failedStart = mainFinished && startFailed;
+  NSString *startReason = mainFinished ? startFailureReason : nil;
   [_lock unlock];
   [self signalEventWaiters];
   if (!accepted) {
     if (pending != nil) [self scheduleMainThreadStop:pending];
+    BOOL stopped = (mainFinished && candidateStopped) || pending != nil;
+    NSString *disposition = [self cleanDispositionStopped:stopped];
+    BOOL clean = ![disposition isEqual:@"unknown"];
+    NSString *reason = changedForeground
+        ? @"Observer foreground receipt изменился во время main-runloop start"
+        : failedStart
+            ? [@"Observer main-runloop start/subscription failed: "
+                stringByAppendingString:bounded_reason(startReason)]
+            : @"Observer main-runloop start/handoff не подтверждён";
     return [self prepareFailureResponse:request
-        reason:finalPreparedValid
-            ? @"Observer main-runloop start/subscription failed"
-            : @"Observer foreground receipt изменился во время main-runloop start"
-        stage:pending != nil ? @"cleanup" : @"main-start"
-        transient:NO
-        stopped:candidateStopped && pending == nil];
+        reason:reason
+        stage:pending != nil && !clean ? @"cleanup" : @"main-start"
+        transient:clean && (changedForeground || failedStart)
+        stopped:stopped];
   }
   return [self successResponse:request
                        command:@"prepare"
@@ -537,7 +566,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
   }
   [_lock unlock];
   __weak MetaObserverCommandBinder *weakSelf = self;
-  self.mainExecutor(^BOOL {
+  self.mainExecutor([NSDate dateWithTimeIntervalSinceNow:1], ^BOOL {
     [observer setEventSink:nil];
     [observer stop];
     MetaObserverCommandBinder *binder = weakSelf;
@@ -585,7 +614,7 @@ MetaObserverPreparedIndex *meta_observer_prepared_index_create(
 - (NSDictionary *)stop:(NSDictionary *)request {
   __block NSDictionary *snapshot = nil;
   __weak MetaObserverCommandBinder *weakSelf = self;
-  BOOL executed = self.mainExecutor(^BOOL {
+  BOOL executed = self.mainExecutor(request_deadline(request), ^BOOL {
     MetaObserverCommandBinder *binder = weakSelf;
     if (binder == nil || binder->_observer == nil) return NO;
     [binder->_observer setEventSink:nil];

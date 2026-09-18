@@ -122,7 +122,7 @@ static bool fixture_flags(void *context, uint64_t flags) {
                  return meta_observer_prepared_index_create(
                      [MetaObserverTargetIndex new], @"inventory-1", 1, 1);
                }
-               mainExecutor:^BOOL(BOOL (^work)(void)) { return work(); }
+               mainExecutor:^BOOL(__unused NSDate *deadline, BOOL (^work)(void)) { return work(); }
                     factory:^MetaNativeObserver *(
                         NSDictionary *identity,
                         __unused MetaObserverTargetIndex *index) {

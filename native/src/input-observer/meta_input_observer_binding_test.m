@@ -138,7 +138,7 @@ static MetaObserverCommandBinder *fixture_binder(
                    [[MetaObserverTargetIndex alloc] init], @"inventory-1", 1,
                    1);
              }
-             mainExecutor:^BOOL(BOOL (^work)(void)) {
+             mainExecutor:^BOOL(__unused NSDate *deadline, BOOL (^work)(void)) {
                return work();
              }
                   factory:^MetaNativeObserver *(

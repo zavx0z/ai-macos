@@ -312,7 +312,6 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
   MetaPermissionsRequestController *_permissionRequests;
   NSDictionary *_observerRequest;
   NSString *_observerInstance;
-  NSDate *_observerMainDeadline;
   NSDictionary *_recoveryRequest;
   NSLock *_asyncLock;
   NSMutableSet<NSString *> *_captureOperationIds;
@@ -619,13 +618,9 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
 }
 
 - (NSDictionary *)observer:(NSDictionary *)request {
-  NSISO8601DateFormatter *deadlineFormatter = [[NSISO8601DateFormatter alloc] init];
-  deadlineFormatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
-  _observerMainDeadline = [deadlineFormatter dateFromString:request[@"deadlineAt"]];
   if (_observerCommands == nil) {
     NSDictionary *generation = @{@"runtimeEpoch": request[@"runtimeEpoch"], @"loginSessionId": request[@"loginSessionId"], @"nativeGeneration": request[@"nativeGeneration"]};
     MetaMacOSBackend *windows = _windows;
-    __weak MetaSystemCommandBackend *weakSelf = self;
     __block uint64_t indexRevision = 0;
     MetaObserverIndexBuildContext *indexContext =
         [[MetaObserverIndexBuildContext alloc] init];
@@ -672,11 +667,11 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
         }
         return prepared;
       }
-      mainExecutor:^BOOL(BOOL (^work)(void)) {
+      mainExecutor:^BOOL(NSDate *deadline, BOOL (^work)(void)) {
+        // Внутренний recovery/coverage использует свой deadline так же, как RPC.
+        NSTimeInterval remaining = deadline.timeIntervalSinceNow;
+        if (deadline == nil || remaining <= 0) return NO;
         if (NSThread.isMainThread) return work();
-        MetaSystemCommandBackend *owner = weakSelf;
-        NSTimeInterval remaining = owner == nil ? 0 : owner->_observerMainDeadline.timeIntervalSinceNow;
-        if (remaining <= 0) return NO;
         __block BOOL completed = NO;
         __block BOOL cancelled = NO;
         NSLock *gate = [[NSLock alloc] init];
@@ -755,7 +750,6 @@ static bool input_risk(void *context, MetaInputPrimitiveRisk risk, uint32_t code
   NSISO8601DateFormatter *formatter = [[NSISO8601DateFormatter alloc] init];
   formatter.formatOptions = NSISO8601DateFormatWithInternetDateTime | NSISO8601DateFormatWithFractionalSeconds;
   request[@"deadlineAt"] = [formatter stringFromDate:[NSDate dateWithTimeIntervalSinceNow:1]];
-  _observerMainDeadline = [formatter dateFromString:request[@"deadlineAt"]];
   request[@"observerInstanceRef"] = _observerInstance;
   [request removeObjectForKey:@"previousObserverInstanceRef"];
   [request removeObjectForKey:@"afterCursor"];

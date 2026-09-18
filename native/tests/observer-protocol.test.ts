@@ -67,3 +67,19 @@ test("observer fault — отдельный bounded envelope, не GUI event и 
   expect(nativeObserverGapEnvelopeSchema.safeParse({ ...fault, gapReason: "x".repeat(1025) }).success).toBe(false)
   expect(nativeObserverGapEnvelopeSchema.safeParse({ ...fault, inputText: "not-allowed" }).success).toBe(false)
 })
+
+test("transient main-start требует доказанный clean stop; cleanup/unknown не повторяются", () => {
+  const failure = { ...base, kind: "observer-response", command: "prepare", nativeBuildId: "build", ok: false,
+    error: { code: "capability-unavailable", message: "AX subscription failed", stage: "native-observer-command",
+      retryable: false, replayAllowed: false, recoveryAction: "inspect-health" } }
+  for (const retryDisposition of ["clean-stopped", "clean-no-instance"]) {
+    expect(nativeObserverResponseSchema.safeParse({ ...failure,
+      prepareFailure: { stage: "main-start", retryDisposition, transient: true } }).success).toBe(true)
+  }
+  for (const stage of ["main-start", "cleanup"]) {
+    expect(nativeObserverResponseSchema.safeParse({ ...failure,
+      prepareFailure: { stage, retryDisposition: "unknown", transient: true } }).success).toBe(false)
+  }
+  expect(nativeObserverResponseSchema.safeParse({ ...failure,
+    prepareFailure: { stage: "cleanup", retryDisposition: "clean-stopped", transient: true } }).success).toBe(false)
+})

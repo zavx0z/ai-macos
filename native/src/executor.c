@@ -498,6 +498,7 @@ bool meta_executor_begin(MetaExecutor *executor, const char *operation_id,
                                        executor->target_ref)) {
     executor->status.execution = META_EXECUTOR_FAILED;
     executor->status.target_verification = META_VERIFICATION_FAILED;
+    executor->status.restoration_allowed = false;
     executor->active = false;
     return false;
   }
@@ -522,6 +523,7 @@ bool meta_executor_checkpoint(MetaExecutor *executor, const char *stage) {
   if (!executor->backend.verify_target(executor->backend.context,
                                        executor->target_ref)) {
     executor->status.target_verification = META_VERIFICATION_FAILED;
+    executor->status.restoration_allowed = false;
     stop_for_reason(executor, META_EXECUTOR_FAILED);
     return false;
   }
