@@ -89,6 +89,51 @@ int main(void) {
   assert([json[@"displayLayoutRevision"] unsignedLongLongValue] == 1);
   assert([json[@"layoutRef"] isEqual:@(meta_registry_snapshot(registry)->layout_ref)]);
   CFRelease(data);
+  // Synthetic UTF-8 boundaries; no live windows.
+  const char *glyphs[] = {"Z", "\xD0\x96", "\xE2\x82\xAC", "\xF0\x9F\xA7\xA0"};
+  unsigned cases = 0;
+  for (size_t g = 0; g < 4; ++g) {
+    size_t width = strlen(glyphs[g]);
+    for (size_t room = 0; room <= width; ++room) {
+      char title[META_NATIVE_TEXT_CAPACITY + 8];
+      size_t prefix = META_NATIVE_TEXT_CAPACITY - 1 - room;
+      memset(title, 65, prefix);
+      memcpy(title + prefix, glyphs[g], width + 1);
+      ax_windows[0].title = title;
+      assert(meta_registry_refresh(registry, &input));
+      @try {
+        CFDataRef probe = meta_inventory_copy_json(meta_registry_snapshot(registry), "utf8-test");
+        assert(probe != NULL);
+        NSDictionary *value = [NSJSONSerialization JSONObjectWithData:(__bridge NSData *)probe options:0 error:NULL];
+        NSString *expected = [[NSString alloc] initWithBytes:title length:prefix + (room >= width ? width : 0) encoding:NSUTF8StringEncoding];
+        assert([value[@"windows"][0][@"title"] isEqualToString:expected]);
+        CFRelease(probe);
+      } @catch (NSException *exception) {
+        fprintf(stderr, "UTF8_REGRESSION_FAILED width=%zu room=%zu %s\n", width, room, exception.reason.UTF8String);
+        meta_registry_destroy(registry);
+        return 1;
+      }
+      ++cases;
+    }
+  }
+  printf("UTF8_REGRESSION_PASSED cases=%u\n", cases);
+  for (size_t kind = 0; kind < 2; ++kind) {
+    MetaInventorySnapshot bad = *meta_registry_snapshot(registry);
+    MetaWindowRecord item = bad.windows[0];
+    memset(item.title, kind == 0 ? 0 : 65, sizeof(item.title));
+    if (kind == 0) item.title[0] = (char)0xD0;
+    bad.windows = &item;
+    bad.window_count = 1;
+    @try {
+      CFDataRef probe = meta_inventory_copy_json(&bad, "invalid-title");
+      if (probe != NULL) { CFRelease(probe); return 2; }
+    } @catch (NSException *exception) {
+      fprintf(stderr, "INVALID_TITLE_THROW kind=%zu %s\n", kind, exception.name.UTF8String);
+      meta_registry_destroy(registry);
+      return 2;
+    }
+  }
+  puts("INVALID_TITLE_REJECTION_PASSED cases=2");
   MetaCaptureDisplayRegion region = {
       .displayID = 100,
       .displayBoundsPoints = CGRectMake(0, 0, 100, 100),

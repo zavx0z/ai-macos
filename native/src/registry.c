@@ -103,7 +103,15 @@ static void release_allocation(MetaRegistry *registry, void *pointer) {
 static void copy_text(char *target, size_t capacity, const char *source) {
   if (capacity == 0) return;
   if (source == NULL) source = "";
-  snprintf(target, capacity, "%s", source);
+  size_t length = strnlen(source, capacity);
+  if (length == capacity) {
+    length = capacity - 1;
+    // Do not retain a partial UTF-8 character at the byte limit.
+    while (length > 0 && ((unsigned char)source[length] & 0xc0) == 0x80)
+      length -= 1;
+  }
+  memmove(target, source, length);
+  target[length] = 0;
 }
 
 static bool valid_generation_id(const char *value) {

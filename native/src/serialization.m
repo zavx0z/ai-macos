@@ -176,6 +176,15 @@ CFDataRef meta_inventory_copy_json(const MetaInventorySnapshot *snapshot,
     return NULL;
   }
   @autoreleasepool {
+    // Reject malformed titles through the existing serialization failure path.
+    // Never fabricate an empty title or pass nil to a dictionary literal.
+    for (size_t index = 0; index < snapshot->window_count; index += 1) {
+      const MetaWindowRecord *window = &snapshot->windows[index];
+      const size_t length = strnlen(window->title, sizeof(window->title));
+      if (length == sizeof(window->title) ||
+          [[NSString alloc] initWithBytes:window->title length:length
+                                encoding:NSUTF8StringEncoding] == nil) return NULL;
+    }
     NSMutableArray *applications = [NSMutableArray array];
     NSMutableArray *windows = [NSMutableArray array];
     NSMutableArray *displays = [NSMutableArray array];
