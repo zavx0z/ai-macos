@@ -1,13 +1,14 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { ToolSchema, type CallToolResult, type Tool } from "@modelcontextprotocol/sdk/types.js"
 import { parseWireValue, z } from "@meta/shared/contracts"
-import { ChatProxyError, createChatExecutor, type ChatRuntimeOptions } from "./chat-executor.ts"
+import type { ChatRuntimeOptions } from "./chat-executor.ts"
+import { ChatProxyError, createLazyServices, type ServiceRegistration } from "./service-client.ts"
 import { createCatalogServer } from "./catalog-server.ts"
 import { VIEWER_UI_URI, viewerUiHtml } from "./viewer-ui.ts"
 import { ViewerSessions, viewerScope } from "./viewer-session.ts"
 
 const entryInput = z.strictObject({
-  node: z.string().min(1).max(160).optional().describe("Раздел справки: root, computer или computer/<операция>. По умолчанию root."),
+  node: z.string().min(1).max(160).optional().describe("Раздел: root, <сервис> или <сервис>/<операция>. По умолчанию root."),
   action: z.string().min(1).max(127).optional().describe("Выполнить операцию из каталога выбранного раздела. Без action возвращается только справка."),
   input: z.record(z.string(), z.json()).optional().describe("Аргументы операции по её динамическому inputSchema. По умолчанию {}. Само наличие input не запускает действие."),
 })
@@ -21,11 +22,40 @@ const viewerNextInput = z.strictObject({
 const viewerWaitInput = z.strictObject({ after: z.number().int().nonnegative(), waitMs: z.number().int().min(0).max(20000).optional() })
 const demoInput = z.strictObject({ service: z.enum(["demo-a", "demo-b"]), text: z.string().min(1).max(1000) })
 const entryInputSchema = z.toJSONSchema(entryInput) as Tool["inputSchema"]
-const entryProtocol = "zavx0z выполняет команды без UI. {} — корневая справка; {node:'computer'} — каталог; {node:'computer/<операция>'} — контракт без выполнения; {node:'computer',action:'<операция>',input:{...}} — выполнение. Сначала system_health и machine.matchesExpected=true. Ввод: check_input → свежее observe → одно действие. Для экрана используйте display target, для приложения — window. Общее приложение открывается отдельным codex_app один раз на беседу; При CODEX_APP_OPEN_REQUIRED вызови codex_app {} один раз, затем продолжай задачу без повтора предыдущей команды. Если приложение уже открыто или закрыто пользователем, не открывай его снова автоматически. Fullscreen и PiP выбираются кнопками внутри того же приложения. Первый ответ любой команды предлагает открыть приложение; последующие команды обновляют его без новых карточек. Справка и health не меняют показанные данные. {node:'viewer'} описывает прототип и диагностику. Не объявляйте fullscreen или один iframe подтверждёнными по одному успешному tool call. После timeout/unknown/partial не повторяйте mutation: проверьте get_operation/list_recent_operations. Не останавливайте proxy/tunnel через этот же управляющий канал; обновление выполняется внешним scripts/chat-proxy-install.ts."
+const computerProtocol = "zavx0z выполняет команды без UI. {} — корневая справка; {node:'computer'} — каталог; {node:'computer/<операция>'} — контракт без выполнения; {node:'computer',action:'<операция>',input:{...}} — выполнение. Сначала system_health и machine.matchesExpected=true. Ввод: check_input → свежее observe → одно действие. Для экрана используйте display target, для приложения — window. Общее приложение открывается отдельным codex_app один раз на беседу; При CODEX_APP_OPEN_REQUIRED вызови codex_app {} один раз, затем продолжай задачу без повтора предыдущей команды. Если приложение уже открыто или закрыто пользователем, не открывай его снова автоматически. Fullscreen и PiP выбираются кнопками внутри того же приложения. Первый ответ любой команды предлагает открыть приложение; последующие команды обновляют его без новых карточек. Справка и health не меняют показанные данные. {node:'viewer'} описывает прототип и диагностику. Не объявляйте fullscreen или один iframe подтверждёнными по одному успешному tool call. После timeout/unknown/partial не повторяйте mutation: проверьте get_operation/list_recent_operations. Не останавливайте proxy/tunnel через этот же управляющий канал; обновление выполняется внешним scripts/chat-proxy-install.ts."
+
+const entryProtocol = "zavx0z: {} — зарегистрированные сервисы; node:<сервис> — краткий каталог; node:<сервис>/<операция> — контракт без выполнения; явный action — выполнение. Сервис загружается только при первом обращении к нему; контракт операции запрашивается только для выбранной операции. Специфические правила сервиса раскрываются в его каталоге. После неизвестного результата действие не повторять автоматически."
 
 /** Пустой запрос раскрывает протокол; только явный action запускает исполнитель. */
-export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
-  const executor = createChatExecutor(options.runtime)
+export interface ChatProxyOptions {
+  runtime?: ChatRuntimeOptions
+  knowledge?: { baseUrl?: string, idleTimeoutMs?: number }
+  services?: readonly ServiceRegistration[]
+}
+
+export async function startChatProxy(options: ChatProxyOptions = {}) {
+  const services = createLazyServices(options.services ?? [{
+    id: "computer", description: "Справка и контракты ai-macos", instructions: computerProtocol,
+    create: async () => {
+      const { createChatExecutor } = await import("./chat-executor.ts")
+      const required = (name: string) => {
+        const value = process.env[name]
+        if (!value) throw new Error(`Отсутствует ${name}`)
+        return value
+      }
+      return createChatExecutor(options.runtime ?? {
+        expectedHostname: required("AI_MACOS_EXPECTED_HOSTNAME"),
+        socketPath: required("META_RUNTIME_SOCKET"),
+        credentialPath: required("META_RUNTIME_CREDENTIAL"),
+      })
+    },
+  }, {
+    id: "knowledge", description: "Поиск и исследование в Knowledge Base",
+    create: async () => {
+      const { createKnowledgeClient } = await import("./knowledge-client.ts")
+      return createKnowledgeClient(options.knowledge)
+    },
+  }])
   const viewers = new ViewerSessions()
   const screenshotStream = crypto.randomUUID()
   let screenshotRequest = 0
@@ -119,7 +149,7 @@ export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
       }
     },
     subscribeCatalogChanged: () => () => {},
-    async callTool(name, args, signal, meta) {
+    async callTool(name, args, signal, meta, onProgress) {
       const scope = viewerScope(meta)
       const executeRequest = async (): Promise<CallToolResult> => {
         if (name === "codex_app" || name === "codex_app_next" || name === "zavx0z_viewer" || name === "zavx0z_viewer_next") {
@@ -149,21 +179,24 @@ export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
           const node = request.node ?? "root"
 
           if (node === "root" && request.action === undefined) {
+            const firstService = services.entries[0]?.id
             return result({
               name: "zavx0z",
               node,
               executed: false,
-              description: "Справка по доступным разделам. Контракты запрашиваются у Runtime при обращении к разделу.",
-              children: [{ node: "computer", description: "Справка и контракты ai-macos" }, { node: "viewer", description: "Общее приложение Codex App" }],
+              description: "Справка по доступным разделам. Контракты запрашиваются у выбранного сервиса по мере обращения.",
+              children: [...services.entries.map(({ id, description }) => ({ node: id, description })), { node: "viewer", description: "Общее приложение Codex App" }],
               viewer: { opener: "codex_app", scopeAvailable: !!scope },
               contract: { inputSchema: entryInputSchema },
               protocol: entryProtocol,
               examples: {
-                catalog: { node: "computer" },
-                contract: { node: "computer/system_health" },
-                execute: { node: "computer", action: "system_health", input: {} },
+                ...(firstService ? { catalog: { node: firstService } } : {}),
+                ...(services.has("computer") ? {
+                  contract: { node: "computer/system_health" },
+                  execute: { node: "computer", action: "system_health", input: {} },
+                } : {}),
               },
-              next: { node: "computer" },
+              ...(firstService ? { next: { node: firstService } } : {}),
             })
           }
 
@@ -185,46 +218,38 @@ export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
             throw new ChatProxyError("TOOL_NOT_ALLOWED", "Неизвестное действие viewer")
           }
 
-          if (node === "computer" && request.action === undefined) {
-            const catalog = ToolSchema.array().parse(await executor.listTools())
-            return result({
-              node,
-              description: "Справка по операциям Mac. node с путём операции раскрывает контракт; action выполняет операцию.",
-              children: catalog.map(tool => ({
-                node: `computer/${tool.name}`,
-                action: tool.name,
-                title: tool.title ?? tool.name,
-              })),
-            })
-          }
-
-          const pathAction = node.startsWith("computer/") ? node.slice("computer/".length) : undefined
-          if (node !== "computer" && pathAction === undefined) {
+          const [serviceId, pathAction, extraPath] = node.split("/")
+          if (!serviceId || !services.has(serviceId) || extraPath !== undefined || pathAction === "") {
             throw new ChatProxyError("TOOL_NOT_ALLOWED", "Неизвестный раздел")
           }
           if (pathAction !== undefined && request.action !== undefined && request.action !== pathAction) {
             throw new ChatProxyError("TOOL_NOT_ALLOWED", "action не соответствует пути node")
           }
+          const client = await services.get(serviceId)
           const action = request.action ?? pathAction
-          if (action === undefined) throw new ChatProxyError("TOOL_NOT_ALLOWED", "Не указано действие для справки")
-
+          if (action === undefined) {
+            const catalog = await client.listTools(signal)
+            return result({
+              node,
+              description: services.entries.find(item => item.id === serviceId)!.description,
+              protocol: services.entries.find(item => item.id === serviceId)?.instructions,
+              children: catalog.map(tool => ({
+                node: `${serviceId}/${tool.name}`, action: tool.name, title: tool.title ?? tool.name, description: tool.description,
+              })),
+            })
+          }
           if (request.action !== undefined) {
-            const version = ++screenshotRequest
-            const response = await executor.call(action, request.input ?? {}, signal)
-            return withScreenshot(response, version, request.input ?? {}, scope)
+            const version = serviceId === "computer" ? ++screenshotRequest : 0
+            const response = await client.call(action, request.input ?? {}, signal, onProgress)
+            return serviceId === "computer" ? withScreenshot(response, version, request.input ?? {}, scope) : response
           }
-
-          const contract = (await executor.listTools()).find(tool => tool.name === action)
-          if (!contract) {
-            throw new ChatProxyError("TOOL_UNAVAILABLE", "Операция отсутствует в текущем каталоге подключения")
-          }
+          const contract = client.getTool ? await client.getTool(action, signal)
+            : (await client.listTools(signal)).find(tool => tool.name === action)
+          if (!contract) throw new ChatProxyError("TOOL_UNAVAILABLE", `Нет операции ${serviceId}/${action}`)
           return result({
-            node: `computer/${action}`,
-            action,
-            contract: ToolSchema.parse(contract),
-            executed: false,
-            invocation: { node: "computer", action },
-            instruction: "Для выполнения добавьте action и при необходимости input по contract.inputSchema. Без action запрос только раскрывает контракт.",
+            node: `${serviceId}/${action}`, action, contract: ToolSchema.parse(contract), executed: false,
+            invocation: { node: serviceId, action },
+            instruction: "Для выполнения добавьте action и input по contract.inputSchema. Без action возвращается только контракт.",
           })
         } catch (error) {
           return {
@@ -234,13 +259,13 @@ export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
               text: error instanceof ChatProxyError
                 ? `${error.code}: ${error.message}`
                 : error instanceof Error && error.message.startsWith("VIEWER_") ? error.message
-                : "RUNTIME_UNAVAILABLE_OR_UNKNOWN: вызов не завершён подтверждённым результатом. Автоматического повтора нет. Для action проверьте get_operation/list_recent_operations; справка сама действие не выполняет.",
+                : `SERVICE_UNAVAILABLE_OR_UNKNOWN: ${request.node ?? "root"}. ${error instanceof Error ? error.message : "unknown"}. Автоматического повтора нет.`,
             }],
           }
         }
       }
       const response = await executeRequest()
-      if (name === "zavx0z") {
+      if (name === "zavx0z" && (args.node === "computer" || typeof args.node === "string" && args.node.startsWith("computer/"))) {
         try {
           if (viewers.suggestOpen(scope)) return {
             ...response,
@@ -264,27 +289,18 @@ export async function startChatProxy(options: { runtime: ChatRuntimeOptions }) {
   server.onclose = () => {
     viewers.close()
     previousOnClose?.()
-    void executor.close().catch(() => undefined)
+    void services.close().catch(() => undefined)
   }
   const close = server.close.bind(server)
   server.close = async () => {
     viewers.close()
     await close()
-    await executor.close()
+    await services.close()
   }
   return server
 }
 
 if (import.meta.main) {
-  const required = (name: string) => {
-    const value = process.env[name]
-    if (!value) throw new Error(`Отсутствует ${name}`)
-    return value
-  }
-  const server = await startChatProxy({ runtime: {
-    expectedHostname: required("AI_MACOS_EXPECTED_HOSTNAME"),
-    socketPath: required("META_RUNTIME_SOCKET"),
-    credentialPath: required("META_RUNTIME_CREDENTIAL"),
-  } })
+  const server = await startChatProxy()
   await server.connect(new StdioServerTransport())
 }

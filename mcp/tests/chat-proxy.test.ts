@@ -40,7 +40,7 @@ test("справка раскрывается без Runtime, выполнени
     const root = (await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent as Record<string, unknown>
     expect((root.contract as { inputSchema: unknown }).inputSchema).toEqual(tools[0]?.inputSchema)
     expect(root.examples).toMatchObject({ execute: { node: "computer", action: "system_health", input: {} } })
-    expect((await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent).toMatchObject({ node: "root", children: [{ node: "computer" }, { node: "viewer" }], contract: { inputSchema: { properties: { node: { type: "string" }, action: { type: "string" }, input: { type: "object" } } } }, next: { node: "computer" } })
+    expect((await client.callTool({ name: "zavx0z", arguments: {} })).structuredContent).toMatchObject({ node: "root", children: [{ node: "computer" }, { node: "knowledge" }, { node: "viewer" }], contract: { inputSchema: { properties: { node: { type: "string" }, action: { type: "string" }, input: { type: "object" } } } }, next: { node: "computer" } })
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer" } })).isError).toBe(true)
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer", action: "not_published" } })).isError).toBe(true)
     expect((await client.callTool({ name: "zavx0z", arguments: { node: "computer/click", action: "different" } })).isError).toBe(true)

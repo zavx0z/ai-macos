@@ -1,3 +1,5 @@
+import { ChatProxyError } from "./service-client.ts"
+export { ChatProxyError } from "./service-client.ts"
 import { hostname } from "node:os"
 import { RuntimeUdsClient } from "@meta/runtime"
 
@@ -6,12 +8,6 @@ export const computerActions = [
   "type_text", "press_key", "press_shortcut", "scroll", "get_target_status",
   "cancel_target", "get_operation", "list_recent_operations", "recover_startup_input",
 ] as const
-
-export class ChatProxyError extends Error {
-  constructor(readonly code: string, message: string) {
-    super(message)
-  }
-}
 
 export interface ChatRuntimeOptions {
   expectedHostname: string

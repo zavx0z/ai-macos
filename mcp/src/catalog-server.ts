@@ -1,3 +1,4 @@
+import type { ProgressSink } from "./service-client.ts"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import {
   CallToolRequestSchema,
@@ -17,6 +18,7 @@ export interface RuntimeCatalogBackend {
     args: Record<string, unknown>,
     signal: AbortSignal,
     meta?: Record<string, unknown>,
+    onProgress?: ProgressSink,
   ): Promise<CallToolResult>
   subscribeCatalogChanged(listener: () => void): (() => void) | void
   listResources?(): Promise<Resource[]> | Resource[]
@@ -53,6 +55,11 @@ export function createCatalogServer(
       request.params.arguments ?? {},
       extra.signal,
       request.params._meta,
+      request.params._meta?.progressToken === undefined ? undefined : async (progress, message) => {
+        await extra.sendNotification({ method: "notifications/progress", params: {
+          progressToken: request.params._meta!.progressToken!, progress, message,
+        } })
+      },
     )
   })
 
