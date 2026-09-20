@@ -1,4 +1,3 @@
-import { CdpHttp } from "@meta/shared"
 import {
   capabilitySetSchema,
   capturePolicySha256,
@@ -12,10 +11,9 @@ import {
   type DeviceBrowserOperationRequest,
   type DeviceBrowserOperationResult,
   type OperationTarget,
-  type RuntimeProcessRef,
   type RuntimeOperationIntent,
 } from "@meta/shared/contracts"
-import { CdpBrowserDriver, RuntimeBrowserAdapter, type BrowserDriver } from "@meta/chrome/adapter"
+import { RuntimeBrowserAdapter, type BrowserDriver } from "@meta/chrome/adapter"
 import {
   AndroidCdpDriver,
   ForwardOwnedDeviceBrowserDriver,
@@ -27,17 +25,8 @@ import {
 import type { RuntimeCore } from "./core.ts"
 import type { BrowserCaptureMethodRequest, BrowserMethodBindings, DeviceCaptureMethodRequest } from "./browser-methods.ts"
 import { lifetimeConfigFingerprint } from "./lifetime-state.ts"
-
-export type ChromeInstanceConfig = {
-  browserInstanceRef: string
-  initialTransportGeneration: string
-  endpointHost: "127.0.0.1" | "localhost" | "::1"
-  endpointPort: number
-  profilePath: string
-  profileLabel?: string
-  process?: RuntimeProcessRef
-  driver?: BrowserDriver
-}
+import { chromeDriver, chromeProvenance, chromePersistence, type ChromeInstanceConfig } from "./chrome-host-config.ts"
+export type { ChromeInstanceConfig } from "./chrome-host-config.ts"
 
 export type ChromeHostConfig = {
   bindingId: string
@@ -80,16 +69,13 @@ export function createBrowserHostComposition(
   if (config.chrome !== undefined) {
     const chrome = config.chrome
     if (chrome.instances.length < 1 || chrome.instances.length > 128) throw new Error("Chrome host requires 1..128 configured instances")
-    const drivers = new Map(chrome.instances.map(item => [
-      item.browserInstanceRef,
-      item.driver ?? new CdpBrowserDriver(new CdpHttp(item.endpointHost, item.endpointPort)),
-    ]))
+    const drivers = new Map(chrome.instances.map(item => [item.browserInstanceRef, chromeDriver(item)]))
     const rawBrowser = new RuntimeBrowserAdapter(adapterHost(runtime, "browser:host", [
       "browser.instances", "browser.targets", "browser.observe", "browser.readiness", "browser.resources",
     ]), runtime.services, chrome.instances.map(item => ({
       browserInstanceRef: item.browserInstanceRef,
       initialTransportGeneration: item.initialTransportGeneration,
-      provenance: { kind: "local-cdp" as const, endpointHost: item.endpointHost, endpointPort: item.endpointPort, profilePath: item.profilePath },
+      provenance: chromeProvenance(item),
       ...(item.profileLabel === undefined ? {} : { profileLabel: item.profileLabel }),
       ...(item.process === undefined ? {} : { process: item.process }),
       driver: drivers.get(item.browserInstanceRef)!,
@@ -107,20 +93,7 @@ export function createBrowserHostComposition(
       domain: "browser",
       adapter: browser,
       verifier: verifier(rawBrowser, drivers, proof),
-      persistence: chrome.instances.map(item => ({
-        owner: { kind: "browser" as const, browserInstanceRef: item.browserInstanceRef },
-        configFingerprint: lifetimeConfigFingerprint({
-          endpointHost: item.endpointHost,
-          endpointPort: item.endpointPort,
-          profilePath: item.profilePath,
-        }),
-        physicalOwnershipKey: {
-          kind: "chrome-cdp" as const,
-          endpointHost: item.endpointHost,
-          endpointPort: item.endpointPort,
-          profilePath: item.profilePath,
-        },
-      })),
+      persistence: chrome.instances.map(chromePersistence),
     })
     bindings.browser = {
       bindingId: chrome.bindingId,

@@ -6,7 +6,8 @@
   "main": "src/index.ts",
   "exports": {
     ".": "./src/index.ts",
-    "./adapter": "./src/adapter.ts"
+    "./adapter": "./src/adapter.ts",
+    "./existing-session": "./src/existing-session.ts"
   },
   "bin": {
     "chrome": "src/cli.ts"
@@ -19,7 +20,7 @@
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "cdp": "bash scripts/cdp.sh",
-    "cdp:check": "curl -sf http://localhost:9222/json/version | python3 -m json.tool || echo 'CDP недоступен — запустите: bun run cdp'"
+    "cdp:check": "curl -sf http://localhost:9222/json/version | python3 -m json.tool || echo 'Классический CDP недоступен. existing-session не использует /json/version; см. docs/reviews/existing-chrome-attach.md'"
   },
   "dependencies": {
     "@meta/shared": "workspace:*"

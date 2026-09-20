@@ -2,11 +2,13 @@ import { ChatProxyError } from "./service-client.ts"
 export { ChatProxyError } from "./service-client.ts"
 import { hostname } from "node:os"
 import { RuntimeUdsClient } from "@meta/runtime"
+import { chatBrowserActions, assertChatBrowserRequest, chatBrowserDescription } from "./browser-policy.ts"
 
 export const computerActions = [
   "system_health", "get_state", "observe", "show_window", "check_input", "click",
   "type_text", "press_key", "press_shortcut", "scroll", "get_target_status",
   "cancel_target", "get_operation", "list_recent_operations", "recover_startup_input",
+  ...chatBrowserActions,
 ] as const
 
 export interface ChatRuntimeOptions {
@@ -55,10 +57,14 @@ export function createChatExecutor(options: ChatRuntimeOptions) {
   return {
     async listTools() {
       const current = await connect()
-      return (await current.listTools()).filter(tool => allowed.has(tool.name))
+      return (await current.listTools()).filter(tool => allowed.has(tool.name)).map(tool => ({
+        ...tool,
+        description: chatBrowserDescription(tool.name, tool.description),
+      }))
     },
     async call(action: string, input: Record<string, unknown>, signal: AbortSignal) {
       assertAllowed(action)
+      assertChatBrowserRequest(action, input)
       signal.throwIfAborted()
       const current = await connect()
       signal.throwIfAborted()

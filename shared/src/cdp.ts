@@ -6,6 +6,8 @@ export type CdpTarget = {
   webSocketDebuggerUrl: string
   description?: string
   faviconUrl?: string
+  /** Internal target-session binding; never accepted from a wire request. */
+  sessionFactory?: (options: CdpSessionOptions) => Promise<CdpSession>
 }
 
 export type CdpTransportErrorCode =
@@ -478,7 +480,9 @@ export async function withSession<T>(
   fn: (session: CdpSession) => Promise<T>,
   options: CdpSessionOptions = {},
 ): Promise<T> {
-  const session = new CdpSession(target.webSocketDebuggerUrl, options)
+  const session = target.sessionFactory
+    ? await target.sessionFactory(options)
+    : new CdpSession(target.webSocketDebuggerUrl, options)
   try {
     return await fn(session)
   } finally {

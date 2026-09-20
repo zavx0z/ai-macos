@@ -23,6 +23,10 @@ export const lifetimePhysicalOwnershipKeySchema = z.discriminatedUnion("kind", [
     profilePath: z.string().min(1).max(4_096),
   }),
   z.strictObject({
+    kind: z.literal("chrome-user-session"),
+    userDataDir: z.string().min(1).max(4_096).startsWith("/"),
+  }),
+  z.strictObject({
     kind: z.literal("android-forward"),
     serial: z.string().min(1).max(256),
     localPort: z.number().int().min(1).max(65_535),
@@ -76,7 +80,7 @@ export const lifetimeStateRecordSchema = z.strictObject({
     context.addIssue({ code: "custom", path: ["operationIds"], message: "operation ID не должен повторяться" })
   }
   if (
-    (record.physicalOwnershipKey.kind === "chrome-cdp" && record.target.kind !== "browser-instance")
+    ((record.physicalOwnershipKey.kind === "chrome-cdp" || record.physicalOwnershipKey.kind === "chrome-user-session") && record.target.kind !== "browser-instance")
     || (record.physicalOwnershipKey.kind === "android-forward" && record.target.kind !== "device-browser-instance")
   ) {
     context.addIssue({ code: "custom", path: ["physicalOwnershipKey"], message: "Physical ownership domain не совпадает с target" })
