@@ -15,6 +15,7 @@ function fixture() {
   let retired = 0
   let ticket: AgentViewTicket | undefined
   const invalidated = new WeakSet<AgentViewTicket>()
+  const forgotten = new WeakSet<AgentViewTicket>()
   const scope: AgentViewScope = {
     async beginObservation(targetId) { return { targetId, startedAt: new Date().toISOString() } },
     async commitObservation(draft) {
@@ -30,7 +31,7 @@ function fixture() {
         observedCursor: "cursor:start", observedNextSequence: 1, admissionCursor: "cursor:start", admissionNextSequence: 1, expiresAt: value.expiresAt! }
     },
     async settleOperation() {},
-    invalidateView(value) { retired++; invalidated.add(value) },
+    invalidateView(value) { retired++; invalidated.add(value); if (forgotten.has(value)) throw new Error("View ticket не принадлежит этой lineage") },
   }
   const bindings = new AgentViewBindings(core, { forLineage: () => scope })
   const authorize = core.bindNativeViewAdmission(bindings.authorizeNative)
@@ -46,6 +47,7 @@ function fixture() {
     throw new Error("Fixture ends before native dispatch")
   }, options.signal)
   return { core, session, target, bindings, run,
+    forgetLatest: () => forgotten.add(ticket!),
     assertLatestActionable: () => scope.admit(ticket!, "operation:latest"),
     get nativeProof() { return nativeProof }, get admitted() { return admitted }, get retired() { return retired } }
 }
@@ -112,5 +114,25 @@ for (const scenario of ["ui-action", "cancelled-ui", "keyboard"] as const) {
       release()
       await value.core.closeClientLifecycle()
     }
+  })
+}
+
+for (const check of ["recover", "reject-action"] as const) {
+  test(`retirement failure ${check}`, async () => {
+    const value = fixture()
+    const observe = () => value.bindings.observe(value.session, "target:bound", value.target, async () => true, result => result)
+    try {
+      await observe()
+      value.forgetLatest()
+      await expect(observe()).rejects.toThrow("View ticket не принадлежит этой lineage")
+      if (check === "recover") {
+        await expect(observe()).resolves.toBe(true)
+        await value.assertLatestActionable()
+      } else {
+        let invoked = false
+        await expect(value.bindings.run(value.session, "target:bound", "request:after-retire", "ui-action", async () => { invoked = true; return {} })).rejects.toThrow("fresh observe")
+        expect(invoked).toBe(false)
+      }
+    } finally { await value.core.closeClientLifecycle() }
   })
 }

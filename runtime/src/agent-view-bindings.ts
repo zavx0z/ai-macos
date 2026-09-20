@@ -100,8 +100,11 @@ export class AgentViewBindings {
     const [lineage] = JSON.parse(key) as [string, string]
     const scope = this.guard.forLineage(lineage)
     // Освобождаем только захваченный ticket, даже если key уже указывает на новый observe.
-    scope.invalidateView(view.ticket, reason)
-    if (this.#views.get(key) === view) this.#views.delete(key)
+    try {
+      scope.invalidateView(view.ticket, reason)
+    } finally {
+      if (this.#views.get(key) === view) this.#views.delete(key)
+    }
   }
   #prune(): void {
     for (const [key, view] of this.#views) if (view.ticket.expiresAt !== undefined && Date.now() >= Date.parse(view.ticket.expiresAt)) this.#retire(key, "Agent view истёк", view)
