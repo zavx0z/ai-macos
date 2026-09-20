@@ -3,7 +3,15 @@ import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js"
 export type ProgressSink = (progress: number, message?: string) => void | Promise<void>
 export type ServiceToolSummary = Pick<Tool, "name" | "title" | "description">
 
+export interface ServiceRequest {
+  node: string
+  action?: string
+  input?: Record<string, unknown>
+}
+
 export interface ServiceClient {
+  /** Структурный сервис сам раскрывает вложенные адреса и контракты. */
+  request?(request: ServiceRequest, signal: AbortSignal, onProgress?: ProgressSink): Promise<CallToolResult>
   listTools(signal?: AbortSignal): Promise<ServiceToolSummary[]>
   getTool?(name: string, signal: AbortSignal): Promise<Tool | undefined>
   call(name: string, input: Record<string, unknown>, signal: AbortSignal, onProgress?: ProgressSink): Promise<CallToolResult>
@@ -11,6 +19,7 @@ export interface ServiceClient {
 }
 
 export interface ServiceRegistration {
+  routing?: "structured"
   id: string
   description: string
   instructions?: string
