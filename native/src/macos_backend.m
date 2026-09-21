@@ -155,6 +155,39 @@ static MetaTriState copy_bool_attribute(AXUIElementRef element,
   return result;
 }
 
+// Фокус окна — точное AXFocusedWindow переднего приложения, а не
+// AXFocused самого элемента окна. Последний может быть false при фокусе
+// текстового поля внутри окна. Не переносим фокус sheet на его родителя.
+static MetaTriState copy_window_focus(AXUIElementRef element, int32_t pid,
+                                       uint64_t deadline_millis) {
+  NSRunningApplication *foreground =
+      NSWorkspace.sharedWorkspace.frontmostApplication;
+  if (foreground == nil || foreground.processIdentifier <= 0)
+    return META_UNKNOWN;
+  if (foreground.processIdentifier != pid) return META_FALSE;
+  AXUIElementRef application = AXUIElementCreateApplication(pid);
+  if (application == NULL) return META_UNKNOWN;
+  if (!set_ax_timeout_before_deadline(application, deadline_millis, 100)) {
+    CFRelease(application);
+    return META_UNKNOWN;
+  }
+  CFTypeRef focused = NULL;
+  const AXError error = AXUIElementCopyAttributeValue(
+      application, kAXFocusedWindowAttribute, &focused);
+  MetaTriState result = META_UNKNOWN;
+  if (error == kAXErrorSuccess && focused != NULL &&
+      CFGetTypeID(focused) == AXUIElementGetTypeID()) {
+    result = CFEqual(focused, element) ? META_TRUE : META_FALSE;
+  }
+  if (focused != NULL) CFRelease(focused);
+  CFRelease(application);
+  NSRunningApplication *after =
+      NSWorkspace.sharedWorkspace.frontmostApplication;
+  if (after == nil || after.processIdentifier != pid ||
+      monotonic_millis() >= deadline_millis) return META_UNKNOWN;
+  return result;
+}
+
 static char *copy_string_attribute(AXUIElementRef element,
                                    CFStringRef attribute) {
   CFTypeRef value = NULL;
@@ -384,7 +417,7 @@ static bool append_ax_window(MetaMacOSBackend *backend,
   if (monotonic_millis() >= deadline_millis) goto collected_deadline_reached;
   collected.fullscreen = copy_bool_attribute(element, CFSTR("AXFullScreen"));
   if (monotonic_millis() >= deadline_millis) goto collected_deadline_reached;
-  collected.focused = copy_bool_attribute(element, kAXFocusedAttribute);
+  collected.focused = copy_window_focus(element, pid, deadline_millis);
   if (monotonic_millis() >= deadline_millis) goto collected_deadline_reached;
   collected.main = copy_bool_attribute(element, kAXMainAttribute);
   if (monotonic_millis() >= deadline_millis) goto collected_deadline_reached;

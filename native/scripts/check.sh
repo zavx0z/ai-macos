@@ -110,6 +110,22 @@ if [ "${1:-}" = "--compile-only" ]; then
   exit 0
 fi
 
+# Подменённые AX/AppKit: регрессия inventory без доступа к живым окнам.
+/usr/bin/clang \
+  -fobjc-arc -fblocks -mmacosx-version-min=13.0 \
+  -Wall -Wextra -Werror -Inative/include -Inative/src \
+  native/tests/window_focus_inventory_test.m \
+  native/src/registry.c \
+  native/src/observer-index/meta_observer_snapshot_gate.c \
+  native/src/inventory-priority/meta_inventory_priority.c \
+  native/src/owned-sheet/meta_owned_sheet_discovery.m \
+  native/src/window-actions/meta_window_readback.c \
+  -framework Foundation -framework AppKit \
+  -framework ApplicationServices -framework CoreGraphics \
+  -o "$CHECK_DIR/window-focus-inventory-test"
+
+"$CHECK_DIR/window-focus-inventory-test"
+
 /usr/bin/clang \
   -std=c17 \
   -Wall \

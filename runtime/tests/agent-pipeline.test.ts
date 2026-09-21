@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test"
-import { CAPABILITY_IDS, z } from "@meta/shared/contracts"
+import { CAPABILITY_IDS, operationRecordSchema, z } from "@meta/shared/contracts"
 import type { BrowserDriver } from "@meta/chrome/adapter"
 import { FixtureBrowserDriver } from "./browser-fixture.ts"
 import { createBrowserHostComposition } from "../src/browser-host.ts"
@@ -119,6 +119,7 @@ function fixture() {
   return { core, registry, targets, session, targetId, when, native, chrome, dispatch, driver: fixtureDriver, reads, order,
     setFocus(value: boolean) { focused = value }, fakeDialog() { fakeDialog = true }, partial() { partial = true }, deny() { deny = true },
     changeFinal() { finalChanged = true }, replaceTab() { replaceTab = true },
+    approveConnection() { allow() },
     missing(count: number) { missing = count },
     counts: () => ({ inspections, clicks, shortcuts, captures, externalCalls }),
     async dispose() { allow(); await core.stopOperations(); await core.browserLifetime.shutdownLineage(); await core.closeClientLifecycle() },
@@ -143,6 +144,26 @@ test("one external pipeline call: pending connect, local consent, two exact read
     expect(f.core.resources.quarantinedCount()).toBe(0)
   } finally { await f.dispose() }
 })
+test("уже разрешённый Chrome: два чтения и receipt без диалога и ввода", async () => {
+  const f = fixture()
+  try {
+    f.approveConnection()
+    const input = f.chrome()
+    input.steps = input.steps.filter(step => step.kind !== "chrome-consent")
+    const result = await f.dispatch(input)
+    expect(result.data.state).toBe("verified")
+    expect(result.data.connectionCleanup).toBe("confirmed-disconnected")
+    expect(f.driver.connectCalls).toBe(1)
+    expect(f.driver.disconnectCalls).toBe(1)
+    expect(f.reads).toEqual(["tab:pipeline", "tab:pipeline"])
+    expect(f.counts()).toMatchObject({ clicks: 0, shortcuts: 0, inspections: 0, captures: 1 })
+    const connection = operationRecordSchema.parse(result.data.connectionOperation)
+    expect((await f.core.getOperation(f.session, connection.context.operationId))?.state).toBe("completed")
+    expect(f.core.activeOperationCount()).toBe(0)
+    expect(f.core.resources.quarantinedCount()).toBe(0)
+  } finally { await f.dispose() }
+})
+
 test("waiting repeats observations, not key sequences; native guard order retained", async () => {
   const f = fixture()
   try {
