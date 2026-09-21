@@ -41,7 +41,7 @@ renamePath({from: "/work/project/a.ts", to: "/work/another/b.ts"})
 import {createDispatcher} from "./server/dispatch/index.ts"
 
 const tools = createDispatcher({
-  repositoryRoot: "/installed/ai", // исходники описаний и контрактов
+  repositoryRoot: "/installed/tools", // исходники описаний и контрактов
   authorize: invocation => hostPolicy.authorize(invocation), // политика вызывающего хоста
 })
 
@@ -69,21 +69,21 @@ TypeScript, `"scenarios"` — исходник теста с `executed:false`. �
 
 ```sh
 bun install
-export AI_TOOLS_ALLOWED_DIRECTORIES='["/absolute/path/to/project"]'
-export AI_TOOLS_TOKEN="$(openssl rand -hex 32)"
+export TOOLS_ALLOWED_DIRECTORIES='["/absolute/path/to/project"]'
+export TOOLS_TOKEN="$(openssl rand -hex 32)"
 bun run start
 # Альтернатива: npm run start:node
 ```
 
-По умолчанию `http://127.0.0.1:8787/tools`; адрес меняется через AI_TOOLS_HOST
-и AI_TOOLS_PORT. `.env` автоматически не загружается. Нужны Bun либо Node.js 22.6+;
+По умолчанию `http://127.0.0.1:8787/tools`; адрес меняется через TOOLS_HOST
+и TOOLS_PORT. `.env` автоматически не загружается. Нужны Bun либо Node.js 22.6+;
 для status — установленный Git. Исполнение использует только стандартные модули.
 
 GET /tools и POST /tools с {} возвращают обзор. Все запросы требуют
 `Authorization: Bearer <token>`. POST принимает ту же оболочку node/action/input.
 HTTP разрешает только пути внутри явно заданных директорий, проверяя физические
 родительские пути и оба конца rename. Это политика хоста, не аргумент тулов.
-AI_TOOLS_ROOTS больше не принимается: старые разрешения не расширяются молча.
+`TOOLS_ROOTS` не поддерживается: старые разрешения не расширяются молча.
 
 ## Границы
 

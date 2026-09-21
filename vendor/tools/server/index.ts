@@ -54,15 +54,15 @@ export async function startServer(options: ServerInput): Promise<ServerOutput> {
 
 if (process.argv[1] !== undefined && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   try {
-    const allowedDirectories = JSON.parse(process.env["AI_TOOLS_ALLOWED_DIRECTORIES"] ?? "null") as string[]
-    const host = await startServer({allowedDirectories, token: process.env["AI_TOOLS_TOKEN"] ?? "",
-      hostname: process.env["AI_TOOLS_HOST"], port: process.env["AI_TOOLS_PORT"] === undefined ? undefined : Number(process.env["AI_TOOLS_PORT"])})
-    process.stderr.write(`AI tools listening at ${host.url}\n`)
+    const allowedDirectories = JSON.parse(process.env["TOOLS_ALLOWED_DIRECTORIES"] ?? "null") as string[]
+    const host = await startServer({allowedDirectories, token: process.env["TOOLS_TOKEN"] ?? "",
+      hostname: process.env["TOOLS_HOST"], port: process.env["TOOLS_PORT"] === undefined ? undefined : Number(process.env["TOOLS_PORT"])})
+    process.stderr.write(`Tools HTTP host listening at ${host.url}\n`)
     const stop = (): void => { void host.close().catch(() => {process.exitCode = 1}) }
     process.once("SIGINT", stop)
     process.once("SIGTERM", stop)
   } catch (error) {
-    process.stderr.write(`Unable to start AI tools: ${error instanceof Error ? error.message : "invalid configuration"}\n`)
+    process.stderr.write(`Unable to start Tools HTTP host: ${error instanceof Error ? error.message : "invalid configuration"}\n`)
     process.exitCode = 1
   }
 }
