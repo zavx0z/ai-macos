@@ -1,0 +1,12 @@
+{
+  "name": "@tools/server",
+  "label": "Tool Host",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./dispatch": "./dispatch/index.ts",
+    "./request": "./request/index.ts",
+    "./discovery": "./discovery/index.ts"
+  }
+}

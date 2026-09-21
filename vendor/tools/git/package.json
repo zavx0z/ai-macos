@@ -1,0 +1,9 @@
+{
+  "name": "@tools/git",
+  "label": "Git",
+  "private": true,
+  "type": "module",
+  "exports": {
+    "./status": "./status/index.ts"
+  }
+}

@@ -55,6 +55,15 @@ export async function startChatProxy(options: ChatProxyOptions = {}) {
       const { createKnowledgeClient } = await import("./knowledge-client.ts")
       return createKnowledgeClient(options.knowledge)
     },
+  }, {
+    id: "tools", routing: "structured", description: "Универсальные файловые операции и Git status",
+    instructions: "Полный node раскрывает описание без выполнения. input.view раскрывает контракт или сценарий. Только action: run выполняет операцию. Пути абсолютные; roots/open и Interpreter отсутствуют. Не повторять mutation после unknown/partial; сначала проверить файл.",
+    create: async () => {
+      const { createToolsClient } = await import("./tools-client.ts")
+      return createToolsClient({
+        expectedHostname: options.runtime?.expectedHostname ?? process.env.AI_MACOS_EXPECTED_HOSTNAME,
+      })
+    },
   }])
   const viewers = new ViewerSessions()
   const screenshotStream = crypto.randomUUID()
@@ -219,13 +228,18 @@ export async function startChatProxy(options: ChatProxyOptions = {}) {
           }
 
           const [serviceId, pathAction, extraPath] = node.split("/")
-          if (!serviceId || !services.has(serviceId) || extraPath !== undefined || pathAction === "") {
+          const structured = services.entries.find(item => item.id === serviceId)?.routing === "structured"
+          if (!serviceId || !services.has(serviceId) || (extraPath !== undefined && !structured) || pathAction === "") {
             throw new ChatProxyError("TOOL_NOT_ALLOWED", "Неизвестный раздел")
           }
-          if (pathAction !== undefined && request.action !== undefined && request.action !== pathAction) {
+          if (!structured && pathAction !== undefined && request.action !== undefined && request.action !== pathAction) {
             throw new ChatProxyError("TOOL_NOT_ALLOWED", "action не соответствует пути node")
           }
           const client = await services.get(serviceId)
+          if (structured) {
+            if (!client.request) throw new ChatProxyError("INVALID_SERVICE", "Структурный сервис не предоставляет request")
+            return client.request({ ...request, node }, signal, onProgress)
+          }
           const action = request.action ?? pathAction
           if (action === undefined) {
             const catalog = await client.listTools(signal)

@@ -1,0 +1,25 @@
+{
+  "name": "@zavx0z/tools",
+  "label": "Tools",
+  "private": true,
+  "type": "module",
+  "workspaces": [
+    "filesystem",
+    "git",
+    "server"
+  ],
+  "scripts": {
+    "start": "bun server/index.ts",
+    "start:node": "node --experimental-strip-types server/index.ts",
+    "test": "bun test",
+    "test:node": "node --experimental-strip-types --test filesystem/*/spec/scenario.spec.ts git/*/spec/scenario.spec.ts server/*/spec/scenario.spec.ts",
+    "check": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "22.19.7",
+    "typescript": "5.8.3"
+  },
+  "engines": {
+    "node": ">=22.6.0"
+  }
+}
