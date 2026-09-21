@@ -47,7 +47,39 @@ function fakeDriver(targets: CdpTarget[] = []): BrowserDriver & { activations: s
     async waitTarget() { return ready() },
     async captureTarget() { throw new Error("not used") },
     async readConsole() { return { entries: [], droppedEvents: 0 } },
-    async readDom() { return { content: "<html></html>", truncated: false } },
+    async readDom(_targetId, request) {
+      const value = "<html></html>"
+      const content = value.slice(request.offsetBytes, request.offsetBytes + request.maxBytes)
+      const contentBytes = Buffer.byteLength(content)
+      const nextOffsetBytes = request.offsetBytes + contentBytes
+      return {
+        content,
+        contentBytes,
+        offsetBytes: request.offsetBytes,
+        nextOffsetBytes,
+        totalBytes: Buffer.byteLength(value),
+        snapshotSha256: "cd".repeat(32),
+        truncated: nextOffsetBytes < Buffer.byteLength(value),
+      }
+    },
+    async readResource(_targetId, request) {
+      const full = "{\"ok\":true}"
+      const body = full.slice(request.offsetBytes, request.offsetBytes + request.maxBytes)
+      const bodyBytes = Buffer.byteLength(body)
+      const nextOffsetBytes = request.offsetBytes + bodyBytes
+      return {
+        url: new URL(request.url, "https://same.test/").href,
+        status: 200,
+        contentType: "application/json",
+        body,
+        bodyBytes,
+        offsetBytes: request.offsetBytes,
+        nextOffsetBytes,
+        totalBytes: Buffer.byteLength(full),
+        snapshotSha256: "ab".repeat(32),
+        truncated: nextOffsetBytes < Buffer.byteLength(full),
+      }
+    },
     async readAccessibility() { return { content: "[]", nodeCount: 0, truncated: false } },
   }
 }
@@ -262,6 +294,83 @@ describe("RuntimeBrowserAdapter identity", () => {
     subject.assertConnectedExact(ref)
     await subject.recoverDisconnected(ref, async () => {})
     subject.assertDisconnectedExact(ref)
+  })
+})
+
+test("read-dom сохраняет exact byte cursor и snapshot identity", async () => {
+  const driver = fakeDriver([target("a")])
+  const subject = adapter(driver)
+  const initial = (await subject.listInstances({ signal: new AbortController().signal, checkpoint() {} })).instances[0]!.ref
+  const connected = await connect(subject, initial)
+  if (!connected.ok || connected.value.value.kind !== "instance-connected") throw new Error("Expected connected")
+  const instance = connected.value.value.instance.ref
+  const snapshot = await subject.listTargets(instance, { signal: new AbortController().signal, checkpoint() {} })
+  const targetRef = snapshot.targets[0]!.ref as BrowserTargetRef
+  const snapshotSha256 = "cd".repeat(32)
+  const request: BrowserOperationRequest = {
+    kind: "read-dom",
+    target: targetRef,
+    offsetBytes: 6,
+    maxBytes: 5,
+    expectedSnapshotSha256: snapshotSha256,
+  }
+
+  const result = await subject.execute(
+    context({ kind: "browser-target", ref: targetRef }, [resource("cdp-target", targetRef.resourceRef)]),
+    request,
+  )
+
+  expect(result.ok).toBe(true)
+  if (!result.ok || result.value.value.kind !== "dom-read") throw new Error("Expected dom-read")
+  expect(result.value.value).toMatchObject({
+    target: targetRef,
+    content: "</htm",
+    contentBytes: 5,
+    offsetBytes: 6,
+    nextOffsetBytes: 11,
+    totalBytes: 13,
+    snapshotSha256,
+    truncated: true,
+  })
+})
+
+test("read-resource сохраняет exact target и bounded same-origin result", async () => {
+  const driver = fakeDriver([target("a", "https://same.test/c/fixture")])
+  const subject = adapter(driver)
+  const initial = (await subject.listInstances({ signal: new AbortController().signal, checkpoint() {} })).instances[0]!.ref
+  const connected = await connect(subject, initial)
+  if (!connected.ok || connected.value.value.kind !== "instance-connected") throw new Error("Expected connected")
+  const instance = connected.value.value.instance.ref
+  const snapshot = await subject.listTargets(instance, { signal: new AbortController().signal, checkpoint() {} })
+  const targetRef = snapshot.targets[0]!.ref as BrowserTargetRef
+  const request: BrowserOperationRequest = {
+    kind: "read-resource",
+    target: targetRef,
+    url: "/backend-api/conversations/fixture",
+    offsetBytes: 0,
+    maxBytes: 1_024,
+    expectedSnapshotSha256: "ab".repeat(32),
+  }
+
+  const result = await subject.execute(
+    context({ kind: "browser-target", ref: targetRef }, [resource("cdp-target", targetRef.resourceRef)]),
+    request,
+  )
+
+  expect(result.ok).toBe(true)
+  if (!result.ok || result.value.value.kind !== "resource-read") throw new Error("Expected resource-read")
+  expect(result.value.value).toMatchObject({
+    target: targetRef,
+    url: "https://same.test/backend-api/conversations/fixture",
+    status: 200,
+    contentType: "application/json",
+    body: "{\"ok\":true}",
+    bodyBytes: 11,
+    offsetBytes: 0,
+    nextOffsetBytes: 11,
+    totalBytes: 11,
+    snapshotSha256: "ab".repeat(32),
+    truncated: false,
   })
 })
 

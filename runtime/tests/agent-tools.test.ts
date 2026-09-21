@@ -3,8 +3,8 @@ import { mkdtempSync, writeFileSync, readFileSync, rmSync } from "node:fs"
 import { hostname, tmpdir } from "node:os"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
-import { createToolsClient } from "../src/tools-client.ts"
+import type { RuntimeToolResult as CallToolResult } from "../src/transport.ts"
+import { createToolsClient } from "../src/agent-tools.ts"
 import { ToolError } from "../../vendor/tools/shared/errors.ts"
 import { renderToolsMetadata } from "../../scripts/tools-metadata.ts"
 
@@ -127,39 +127,4 @@ test("неизвестная ошибка не вызывает повтор", a
   expect(calls).toBe(1)
   expect(r.structuredContent?.automaticRetry).toBe(false)
   expect(readFileSync(path, "utf8")).toBe("before")
-})
-
-import { Client } from "@modelcontextprotocol/sdk/client/index.js"
-import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
-import { startChatProxy } from "../src/chat-proxy.ts"
-
-test("единый zavx0z раскрывает tools и выполняет read-write-read без нового сервера", async () => {
-  const server = await startChatProxy({ runtime: {
-    expectedHostname: hostname(), socketPath: join(directory, "missing.sock"),
-    credentialPath: join(directory, "missing.json"),
-  } })
-  const c = new Client({ name: "tools-route-test", version: "1" })
-  const [ct, st] = InMemoryTransport.createLinkedPair()
-  try {
-    await Promise.all([c.connect(ct), server.connect(st)])
-    const call = (args: Record<string, unknown>) => c.callTool({ name: "zavx0z", arguments: args })
-    const root = await call({})
-    expect(JSON.stringify(root.structuredContent)).toContain('"node":"tools"')
-    const contract = await call({ node: "tools/filesystem/write", input: { view: "contract" } })
-    expect(contract.isError).not.toBe(true)
-    expect(JSON.stringify(contract.structuredContent)).toContain("expectedHash")
-    expect(readFileSync(path, "utf8")).toBe("before")
-    const read = () => call({ node: "tools/filesystem/read", action: "run", input: { path } })
-    expect(JSON.stringify((await read()).structuredContent)).toContain("before")
-    expect((await call(request())).isError).not.toBe(true)
-    expect(JSON.stringify((await read()).structuredContent)).toContain("after")
-    expect((await call(request())).isError).toBe(true)
-    expect((await call({ node: "computer/system_health/extra" })).isError).toBe(true)
-    expect((await read()).isError).not.toBe(true)
-    expect((await c.listResources()).resources.length).toBe(1)
-    expect((await c.listTools()).tools.map(t => t.name)).toEqual(["zavx0z", "codex_app", "codex_app_next"])
-  } finally {
-    await c.close()
-    await server.close()
-  }
 })

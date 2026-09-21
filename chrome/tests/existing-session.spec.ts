@@ -33,7 +33,20 @@ function fixture(allow = true) {
             if (command.params?.flatten !== true) throw new Error("Expected flattened attach")
             result = { sessionId: `session-${command.params.targetId}` }; break
           }
-          case "Runtime.evaluate": result = { result: { value: JSON.stringify({ content: `<html>${command.sessionId}</html>`, truncated: false }) } }; break
+          case "Runtime.evaluate": {
+            const content = `<html>${command.sessionId}</html>`
+            const contentBytes = Buffer.byteLength(content)
+            result = { result: { value: JSON.stringify({
+              content,
+              contentBytes,
+              offsetBytes: 0,
+              nextOffsetBytes: contentBytes,
+              totalBytes: contentBytes,
+              snapshotSha256: "ef".repeat(32),
+              truncated: false,
+            }) } }
+            break
+          }
           default:
             socket.send(JSON.stringify({ id: command.id, sessionId: command.sessionId, error: { code: -32601, message: "Unexpected test method" } }))
             return
@@ -56,9 +69,9 @@ describe("existing Chrome connection (isolated loopback, no Chrome process)", ()
       expect(await driver.connect(signal)).toEqual({ browserVersion: "Chrome/144.0.0.0" })
       const targets = await driver.listTargets(signal)
       expect(targets.map(target => target.id)).toEqual(["a", "b"])
-      expect(await driver.readDom("a", 4096, signal)).toEqual({ content: "<html>session-a</html>", truncated: false })
-      expect(await driver.readDom("a", 4096, signal)).toEqual({ content: "<html>session-a</html>", truncated: false })
-      expect(await driver.readDom("b", 4096, signal)).toEqual({ content: "<html>session-b</html>", truncated: false })
+      expect(await driver.readDom("a", { offsetBytes: 0, maxBytes: 4096 }, signal)).toMatchObject({ content: "<html>session-a</html>", truncated: false })
+      expect(await driver.readDom("a", { offsetBytes: 0, maxBytes: 4096 }, signal)).toMatchObject({ content: "<html>session-a</html>", truncated: false })
+      expect(await driver.readDom("b", { offsetBytes: 0, maxBytes: 4096 }, signal)).toMatchObject({ content: "<html>session-b</html>", truncated: false })
       expect(f.counts.jsonRequests).toBe(1) // Only the explicitly tested legacy client.
       expect(f.counts.connections).toBe(1)
       expect(f.counts.attachments).toBe(2)

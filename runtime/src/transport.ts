@@ -1,21 +1,18 @@
 import { chmod, mkdir, readFile, unlink, writeFile } from "node:fs/promises"
 import { dirname } from "node:path"
 import {
-  parseWireJson,
   operationRecordSchema,
-  runtimeOperationIntentSchema,
   runtimeClientSessionSchema,
-  z,
-  type AdapterResult,
   type OperationRecord,
-  type RuntimeExecution,
   type RuntimeOperationContext,
-  type RuntimeOperationIntent,
-} from "@meta/shared/contracts"
-import { RuntimeCore } from "./core.ts"
+} from "../../shared/src/contracts/operations.ts"
+import { parseWireJson, parseWireValue, z } from "../../shared/src/contracts/schema.ts"
+import { runtimeOperationIntentSchema, type RuntimeOperationIntent, type AdapterResult } from "../../shared/src/contracts/adapters.ts"
+import type { RuntimeExecution } from "../../shared/src/contracts/index.ts"
+import type { RuntimeCore } from "./core.ts"
 import { RuntimeContractError, contractErrorFrom } from "./errors.ts"
 import { canonicalJson, randomIdSource, type RuntimeIdSource } from "./primitives.ts"
-import { MethodRegistry, type RuntimeMethodResponse, type RuntimeToolDescriptor } from "./method-registry.ts"
+import type { MethodRegistry, RuntimeMethodResponse, RuntimeToolDescriptor } from "./method-registry.ts"
 import { ClientRenewalCoordinator } from "./client-renewal.ts"
 
 const MAX_RUNTIME_REQUEST_BYTES = 1024 * 1024
@@ -433,6 +430,8 @@ export class RuntimeUdsClient {
       const result = methodResponseSchema.parse(await this.#request(`/v1/tools/${encodeURIComponent(name)}`, {
         method: "POST", body: args, signal, timeoutMs,
       }))
+      // Same 32-level data budget as MethodRegistry; the wire response adds one outer object.
+      parseWireValue(z.unknown(), result.data, { maxBytes: MAX_RUNTIME_RESPONSE_BYTES, maxDepth: 32 })
       const content: RuntimeToolResult["content"] = [{ type: "text", text: JSON.stringify(result.data) }]
       for (const frameRef of result.frameRefs) {
         const bytes = await this.readFrame(frameRef, signal)
@@ -576,7 +575,7 @@ export class RuntimeUdsClient {
       } finally { lease.release() }
     }
     const response = await this.#raw(path, options)
-    const body = await readResponseJson(response, this.#timeoutMs)
+    const body = await readResponseJson(response, this.#timeoutMs, path.startsWith("/v1/tools/") ? 33 : 32)
     if (!response.ok) throw new RuntimeUdsHttpError(response.status, body)
     return body
   }
@@ -692,9 +691,9 @@ export async function readBoundedText(request: Request, maxBytes: number, timeou
   return new TextDecoder().decode(joined)
 }
 
-async function readResponseJson(response: Response, timeoutMs: number): Promise<unknown> {
+async function readResponseJson(response: Response, timeoutMs: number, maxDepth = 32): Promise<unknown> {
   const text = await readBoundedResponseText(response, MAX_RUNTIME_RESPONSE_BYTES, timeoutMs)
-  return parseWireJson(z.unknown(), text, { maxBytes: MAX_RUNTIME_RESPONSE_BYTES, maxDepth: 32 })
+  return parseWireJson(z.unknown(), text, { maxBytes: MAX_RUNTIME_RESPONSE_BYTES, maxDepth })
 }
 
 export async function readBoundedResponseText(response: Response, maxBytes: number, timeoutMs: number): Promise<string> {

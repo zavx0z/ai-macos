@@ -1,40 +1,49 @@
-import { ChatProxyError } from "./service-client.ts"
-export { ChatProxyError } from "./service-client.ts"
 import { hostname } from "node:os"
-import { RuntimeUdsClient } from "@meta/runtime"
-import { chatBrowserActions, assertChatBrowserRequest, chatBrowserDescription } from "./browser-policy.ts"
-import { assertChatPipelineRequest, chatPipelineDescription } from "./pipeline-policy.ts"
-
-export const computerActions = [
-  "system_health", "get_state", "observe", "show_window", "check_input", "click",
-  "type_text", "press_key", "press_shortcut", "scroll", "get_target_status",
-  "cancel_target", "get_operation", "list_recent_operations", "recover_startup_input", "run_pipeline",
-  ...chatBrowserActions,
-] as const
+import type { CallToolResult, Tool } from "@modelcontextprotocol/sdk/types.js"
+import { RuntimeUdsClient } from "../../runtime/src/transport.ts"
+import { ChatProxyError, type ServiceClient, type ServiceRequest, type ServiceToolSummary } from "./service-client.ts"
+export { ChatProxyError } from "./service-client.ts"
 
 export interface ChatRuntimeOptions {
   expectedHostname: string
   socketPath: string
   credentialPath: string
+  /** Optional narrowing; the Runtime owns all default and nested-operation permissions. */
   allowedActions?: readonly string[]
 }
 
-/** Ленивый исполнитель: проверяет машину, использует текущий API Runtime, не повторяет операции. */
-export function createChatExecutor(options: ChatRuntimeOptions) {
+/** Stable authenticated transport. No feature names, schemas, implementations or policy tables. */
+export function createChatExecutor(options: ChatRuntimeOptions): ServiceClient {
   let client: RuntimeUdsClient | undefined
   let connecting: Promise<RuntimeUdsClient> | undefined
   let closed = false
-  const allowed = new Set<string>(options.allowedActions ?? computerActions)
-  const assertAllowed = (action: string) => {
-    if (!allowed.has(action)) throw new ChatProxyError("TOOL_NOT_ALLOWED", "Операция не разрешена этим подключением")
+  const allowedActions = options.allowedActions === undefined ? undefined : Object.freeze([...options.allowedActions])
+  const relay = async (current: RuntimeUdsClient, request: ServiceRequest, signal: AbortSignal): Promise<CallToolResult> => {
+    const response = await current.callTool("agent_request", {
+      ...request, ...(allowedActions === undefined ? {} : { allowedActions }),
+    }, signal)
+    const envelope = response.structuredContent
+    const payload = envelope?.payload
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      if (response.isError) return response
+      throw new ChatProxyError("RUNTIME_PROTOCOL_MISMATCH", "Runtime did not return agent envelope v1; no legacy execution fallback")
+    }
+    return {
+      ...response,
+      content: [{ type: "text", text: JSON.stringify(payload) }, ...response.content.filter(item => item.type === "image")],
+      structuredContent: payload as Record<string, unknown>,
+      ...(response.isError || envelope.isError === true ? { isError: true } : {}),
+    }
   }
   const checkHealth = async (current: RuntimeUdsClient, signal: AbortSignal) => {
-    const health = await current.callTool("system_health", {}, signal)
-    const machine = health.structuredContent?.machine as { matchesExpected?: boolean, hostname?: string } | undefined
-    if (health.isError || machine?.matchesExpected !== true || machine.hostname !== options.expectedHostname) {
-      throw new Error("Машина Runtime не подтверждена")
+    // Health is a fixed transport handshake, not a grant to the requested operation.
+    const response = await current.callTool("agent_request", { node: "computer", action: "system_health", input: {} }, signal)
+    const payload = response.structuredContent?.payload as Record<string, unknown> | undefined
+    const machine = payload?.machine as { matchesExpected?: boolean, hostname?: string } | undefined
+    if (response.isError || machine?.matchesExpected !== true || machine.hostname !== options.expectedHostname) {
+      throw new ChatProxyError("MACHINE_OR_PROTOCOL_MISMATCH", "Машина Runtime или agent envelope v1 не подтверждены; обходного исполнения нет")
     }
-    return health
+    return { content: [{ type: "text" as const, text: JSON.stringify(payload) }], structuredContent: payload }
   }
   const connect = async () => {
     if (closed) throw new Error("Исполнитель закрыт")
@@ -48,40 +57,36 @@ export function createChatExecutor(options: ChatRuntimeOptions) {
         if (closed) throw new Error("Исполнитель закрыт")
         client = candidate
         return candidate
-      } catch (error) {
-        await candidate.close().catch(() => undefined)
-        throw error
-      }
+      } catch (error) { await candidate.close().catch(() => undefined); throw error }
     })().finally(() => { connecting = undefined })
     return connecting
   }
+  const request = async (raw: ServiceRequest, signal: AbortSignal): Promise<CallToolResult> => {
+    const snapshot = structuredClone(raw)
+    signal.throwIfAborted()
+    const current = await connect()
+    signal.throwIfAborted()
+    await checkHealth(current, signal)
+    signal.throwIfAborted()
+    return relay(current, snapshot, signal)
+  }
   return {
-    async listTools() {
-      const current = await connect()
-      return (await current.listTools()).filter(tool => allowed.has(tool.name)).map(tool => ({
-        ...tool,
-        description: chatPipelineDescription(tool.name, chatBrowserDescription(tool.name, tool.description)),
-      }))
+    request,
+    async listTools(signal = new AbortController().signal): Promise<ServiceToolSummary[]> {
+      const result = await request({ node: "computer" }, signal)
+      const children = result.structuredContent?.children
+      if (result.isError || !Array.isArray(children)) throw new ChatProxyError("RUNTIME_CATALOG_UNAVAILABLE", "Runtime agent catalogue unavailable")
+      return children.map(child => {
+        if (!child || typeof child.action !== "string") throw new Error("Invalid runtime catalogue item")
+        return { name: child.action, title: child.title, description: child.description }
+      })
     },
-    async call(action: string, input: Record<string, unknown>, signal: AbortSignal) {
-      assertAllowed(action)
-      // Во время подключения отправитель не может подменить уже проверенный план.
-      const request = action === "run_pipeline" ? structuredClone(input) : input
-      assertChatBrowserRequest(action, request)
-      assertChatPipelineRequest(action, request, allowed)
-      signal.throwIfAborted()
-      const current = await connect()
-      signal.throwIfAborted()
-      const health = await checkHealth(current, signal)
-      if (action === "system_health") return health
-      // Runtime сам проверяет текущие schema, admission и capabilities при вызове.
-      signal.throwIfAborted()
-      return await current.callTool(action, request, signal)
+    async getTool(name, signal): Promise<Tool | undefined> {
+      const result = await request({ node: `computer/${name}` }, signal)
+      if (result.isError) return undefined
+      return result.structuredContent?.contract as Tool | undefined
     },
-    async close() {
-      closed = true
-      await connecting?.catch(() => undefined)
-      await client?.close()
-    },
+    call: (action, input, signal) => request({ node: "computer", action, input }, signal),
+    async close() { closed = true; await connecting?.catch(() => undefined); await client?.close() },
   }
 }

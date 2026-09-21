@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { assertChatBrowserRequest, chatBrowserActions, chatBrowserDescription, chatBrowserOperationKinds } from "../src/browser-policy.ts"
-import { computerActions, createChatExecutor } from "../src/chat-executor.ts"
+import { assertChatBrowserRequest, chatBrowserActions, chatBrowserDescription, chatBrowserOperationKinds } from "../src/agent-browser-policy.ts"
+import { computerActions } from "../src/agent-actions.ts"
 
 describe("ChatGPT browser connection/read policy", () => {
   test("publishes only the existing Runtime browser methods needed for attach/read/recovery", () => {
@@ -12,6 +12,7 @@ describe("ChatGPT browser connection/read policy", () => {
   })
 
   test("allows connect, disconnect, bounded reads and capture", () => {
+    expect(chatBrowserOperationKinds).toContain("read-resource")
     for (const kind of chatBrowserOperationKinds) {
       expect(() => assertChatBrowserRequest("browser_chrome_operation", { request: { kind } })).not.toThrow()
     }
@@ -26,13 +27,8 @@ describe("ChatGPT browser connection/read policy", () => {
     }
   })
 
-  test("executor rejects a forbidden browser mutation before opening any Runtime connection", async () => {
-    const executor = createChatExecutor({
-      expectedHostname: "not-this-machine.invalid", socketPath: "/does/not/exist", credentialPath: "/does/not/exist",
-    })
-    try {
-      await expect(executor.call("browser_chrome_operation", { request: { kind: "navigate-target" } }, new AbortController().signal)).rejects.toThrow("разрешены только")
-    } finally { await executor.close() }
+  test("Runtime policy rejects before any browser child is invoked", () => {
+    expect(() => assertChatBrowserRequest("browser_chrome_operation", { request: { kind: "navigate-target" } })).toThrow("разрешены только")
   })
 
   test("describes the extra restriction without changing other tool descriptions", () => {

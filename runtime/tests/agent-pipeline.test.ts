@@ -55,7 +55,23 @@ function fixture() {
   }
   driver.listTargets = async () => [{ id: replaceTab && reads.length ? "tab:replacement" : "tab:pipeline", type: "page", title: "Pipeline fixture",
     url: "https://fixture.invalid/pipeline", webSocketDebuggerUrl: "ws://fixture.invalid/not-used" }]
-  driver.readDom = async id => { reads.push(id); return { content: "<main>pipeline fixture</main>", truncated: false } }
+  driver.readDom = async (id, request) => {
+    reads.push(id)
+    const full = "<main>pipeline fixture</main>"
+    const content = full.slice(request.offsetBytes, request.offsetBytes + request.maxBytes)
+    const contentBytes = Buffer.byteLength(content)
+    const totalBytes = Buffer.byteLength(full)
+    const nextOffsetBytes = request.offsetBytes + contentBytes
+    return {
+      content,
+      contentBytes,
+      offsetBytes: request.offsetBytes,
+      nextOffsetBytes,
+      totalBytes,
+      snapshotSha256: "ef".repeat(32),
+      truncated: nextOffsetBytes < totalBytes,
+    }
+  }
   const composition = createBrowserHostComposition(core, { chrome: { bindingId: "browser:pipeline", instances: [{
     browserInstanceRef: "chrome:pipeline", initialTransportGeneration: "transport:initial",
     connectionMode: "existing-session", userDataDir: "/fixture/no-live-chrome", driver,

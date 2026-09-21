@@ -3,7 +3,7 @@ import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
 const sourceRoot = fileURLToPath(new URL("../vendor/tools/", import.meta.url))
-const destination = fileURLToPath(new URL("../mcp/src/tools-metadata.ts", import.meta.url))
+const destination = fileURLToPath(new URL("../runtime/src/tools-metadata.ts", import.meta.url))
 
 /** Производная упаковка исходников, не второй каталог контрактов. */
 export function renderToolsMetadata(root = sourceRoot): string {

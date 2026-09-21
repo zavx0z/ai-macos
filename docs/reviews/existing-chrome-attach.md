@@ -3,6 +3,11 @@
 Автор: zavx0z. Этап: реализация через GitHub; проверка на Mac не выполнена.
 База: `62b0135d796fe738587ce4a4650ecd09fb40c21a`.
 
+Историческая запись первого этапа. После переноса изменяемой логики proxy профиль
+находится в `runtime/src/agent-browser-policy.ts`, тест — в
+`runtime/tests/agent-browser-policy.test.ts`. Текущая граница описана в
+`runtime/AGENT_SERVICE.md`; утверждения о состоянии Mac ниже не являются свежим health.
+
 ## Цель и полномочия
 
 Через существующий вход `zavx0z → computer → Runtime` подключиться к обычному
@@ -93,7 +98,7 @@ Fingerprint и ключи старого HTTP-режима не меняются
 
 ```sh
 bun test shared/src/cdp.test.ts shared/src/cdp-browser.test.ts chrome/tests/existing-discovery.spec.ts chrome/tests/existing-session.spec.ts
-bun test runtime/tests/browser-config.test.ts runtime/tests/existing-browser-config.test.ts mcp/tests/browser-policy.test.ts
+bun test runtime/tests/browser-config.test.ts runtime/tests/existing-browser-config.test.ts runtime/tests/agent-browser-policy.test.ts
 bun test chrome/tests/adapter.spec.ts chrome/tests/cdp-driver.spec.ts chrome/tests/cdp-targets.spec.ts
 bun test runtime/tests mcp/tests
 ./node_modules/.bin/tsc --noEmit -p chrome/tsconfig.json

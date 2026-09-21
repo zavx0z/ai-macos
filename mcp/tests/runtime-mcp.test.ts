@@ -51,6 +51,7 @@ test("thin MCP exposes authenticated runtime health/status/cancel catalog withou
     "list_recent_operations",
     "get_operation",
     "cancel_operation",
+    "agent_request",
   ])
   const health = await client.callTool({ name: "system_health", arguments: {} })
   expect(health.structuredContent).toMatchObject({

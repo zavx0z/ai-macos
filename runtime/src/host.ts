@@ -53,6 +53,7 @@ import { registerAgentActionMethods } from "./agent-action-methods.ts"
 import { registerAgentPointerMethods } from "./agent-pointer-methods.ts"
 import { registerAgentAxMethods } from "./agent-ax-methods.ts"
 import { registerAgentPipelineMethods } from "./agent-pipeline.ts"
+import { registerAgentService } from "./agent-service.ts"
 import { RuntimeStartupPermissions, notRequiredStartupPermissions, startupPermissionsStateSchema,
   type StartupPermissionsState } from "./startup-permissions.ts"
 import { RuntimeLifecycleLog, type RuntimeLifecycleEvent } from "./lifecycle-log.ts"
@@ -555,6 +556,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     })
     return drainingPromise
   }
+  registerAgentService(catalog, core, { expectedHostname: options.expectedHostname })
   const uds = new RuntimeUdsServer({ socketPath: options.socketPath, credentialPath: options.credentialPath, core, catalog,
     admin: {
       recover: (expected, signal) => recoverStartup(expected.operationId, signal),

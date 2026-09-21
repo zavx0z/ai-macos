@@ -113,7 +113,22 @@ test("configured existing Chrome не запускается до explicit conne
     ...secondActual,
     targetId: "target:second",
   })
-  driver.readDom = async () => ({ content: "<main>bounded</main>", truncated: false })
+  driver.readDom = async (_targetId, request) => {
+    const full = "<main>bounded</main>"
+    const content = full.slice(request.offsetBytes, request.offsetBytes + request.maxBytes)
+    const contentBytes = Buffer.byteLength(content)
+    const totalBytes = Buffer.byteLength(full)
+    const nextOffsetBytes = request.offsetBytes + contentBytes
+    return {
+      content,
+      contentBytes,
+      offsetBytes: request.offsetBytes,
+      nextOffsetBytes,
+      totalBytes,
+      snapshotSha256: "ef".repeat(32),
+      truncated: nextOffsetBytes < totalBytes,
+    }
+  }
   driver.readAccessibility = async () => ({ content: "[{\"role\":\"main\"}]", nodeCount: 1, truncated: false })
   driver.readConsole = async () => ({ entries: [{ level: "info", text: "bounded", timestamp: new Date().toISOString() }], droppedEvents: 0 })
   const inventoryId = String(targets.data.inventoryId)

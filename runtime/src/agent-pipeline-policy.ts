@@ -1,8 +1,8 @@
-import { assertChatBrowserRequest } from "./browser-policy.ts"
-import { ChatProxyError } from "./service-client.ts"
+import { assertChatBrowserRequest } from "./agent-browser-policy.ts"
+import { AgentServiceError as ChatProxyError } from "./agent-service-errors.ts"
 
 // Это политика подключения, не вторая схема Runtime. Новый вид шага
-// не получает разрешение автоматически после обновления одного Runtime.
+// получает разрешение только из явной политики этого Runtime.
 const stepActions = new Map<string, readonly string[]>([
   ["wait", []],
   ["press", ["check_input", "click"]],

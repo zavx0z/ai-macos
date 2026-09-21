@@ -1,6 +1,6 @@
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { ToolSchema, type CallToolResult, type Tool } from "@modelcontextprotocol/sdk/types.js"
-import { parseWireValue, z } from "@meta/shared/contracts"
+import { parseWireValue, z } from "../../shared/src/contracts/schema.ts"
 import type { ChatRuntimeOptions } from "./chat-executor.ts"
 import { ChatProxyError, createLazyServices, type ServiceRegistration } from "./service-client.ts"
 import { createCatalogServer } from "./catalog-server.ts"
@@ -22,7 +22,6 @@ const viewerNextInput = z.strictObject({
 const viewerWaitInput = z.strictObject({ after: z.number().int().nonnegative(), waitMs: z.number().int().min(0).max(20000).optional() })
 const demoInput = z.strictObject({ service: z.enum(["demo-a", "demo-b"]), text: z.string().min(1).max(1000) })
 const entryInputSchema = z.toJSONSchema(entryInput) as Tool["inputSchema"]
-const computerProtocol = "zavx0z выполняет команды без UI. {} — корневая справка; {node:'computer'} — каталог; {node:'computer/<операция>'} — контракт без выполнения; {node:'computer',action:'<операция>',input:{...}} — выполнение. Сначала system_health и machine.matchesExpected=true. Ввод: check_input → свежее observe → одно действие. Для экрана используйте display target, для приложения — window. Общее приложение открывается отдельным codex_app один раз на беседу; При CODEX_APP_OPEN_REQUIRED вызови codex_app {} один раз, затем продолжай задачу без повтора предыдущей команды. Если приложение уже открыто или закрыто пользователем, не открывай его снова автоматически. Fullscreen и PiP выбираются кнопками внутри того же приложения. Первый ответ любой команды предлагает открыть приложение; последующие команды обновляют его без новых карточек. Справка и health не меняют показанные данные. {node:'viewer'} описывает прототип и диагностику. Не объявляйте fullscreen или один iframe подтверждёнными по одному успешному tool call. После timeout/unknown/partial не повторяйте mutation: проверьте get_operation/list_recent_operations. Не останавливайте proxy/tunnel через этот же управляющий канал; обновление выполняется внешним scripts/chat-proxy-install.ts."
 
 const entryProtocol = "zavx0z: {} — зарегистрированные сервисы; node:<сервис> — краткий каталог; node:<сервис>/<операция> — контракт без выполнения; явный action — выполнение. Сервис загружается только при первом обращении к нему; контракт операции запрашивается только для выбранной операции. Специфические правила сервиса раскрываются в его каталоге. После неизвестного результата действие не повторять автоматически."
 
@@ -34,21 +33,15 @@ export interface ChatProxyOptions {
 }
 
 export async function startChatProxy(options: ChatProxyOptions = {}) {
+  let runtimeClient: Promise<import("./service-client.ts").ServiceClient> | undefined
+  const createRuntime = () => runtimeClient ??= (async () => {
+    const { createChatExecutor } = await import("./chat-executor.ts")
+    const required = (name: string) => { const value = process.env[name]; if (!value) throw new Error(`Отсутствует ${name}`); return value }
+    return createChatExecutor(options.runtime ?? { expectedHostname: required("AI_MACOS_EXPECTED_HOSTNAME"), socketPath: required("META_RUNTIME_SOCKET"), credentialPath: required("META_RUNTIME_CREDENTIAL") })
+  })()
   const services = createLazyServices(options.services ?? [{
-    id: "computer", description: "Справка и контракты ai-macos", instructions: computerProtocol,
-    create: async () => {
-      const { createChatExecutor } = await import("./chat-executor.ts")
-      const required = (name: string) => {
-        const value = process.env[name]
-        if (!value) throw new Error(`Отсутствует ${name}`)
-        return value
-      }
-      return createChatExecutor(options.runtime ?? {
-        expectedHostname: required("AI_MACOS_EXPECTED_HOSTNAME"),
-        socketPath: required("META_RUNTIME_SOCKET"),
-        credentialPath: required("META_RUNTIME_CREDENTIAL"),
-      })
-    },
+    id: "computer", routing: "structured", description: "Справка и контракты ai-macos",
+    create: createRuntime,
   }, {
     id: "knowledge", description: "Поиск и исследование в Knowledge Base",
     create: async () => {
@@ -58,12 +51,7 @@ export async function startChatProxy(options: ChatProxyOptions = {}) {
   }, {
     id: "tools", routing: "structured", description: "Универсальные файловые операции и Git status",
     instructions: "Полный node раскрывает описание без выполнения. input.view раскрывает контракт или сценарий. Только action: run выполняет операцию. Пути абсолютные; roots/open и Interpreter отсутствуют. Не повторять mutation после unknown/partial; сначала проверить файл.",
-    create: async () => {
-      const { createToolsClient } = await import("./tools-client.ts")
-      return createToolsClient({
-        expectedHostname: options.runtime?.expectedHostname ?? process.env.AI_MACOS_EXPECTED_HOSTNAME,
-      })
-    },
+    create: createRuntime,
   }])
   const viewers = new ViewerSessions()
   const screenshotStream = crypto.randomUUID()
@@ -238,7 +226,9 @@ export async function startChatProxy(options: ChatProxyOptions = {}) {
           const client = await services.get(serviceId)
           if (structured) {
             if (!client.request) throw new ChatProxyError("INVALID_SERVICE", "Структурный сервис не предоставляет request")
-            return client.request({ ...request, node }, signal, onProgress)
+            const version = serviceId === "computer" ? ++screenshotRequest : 0
+            const response = await client.request({ ...request, node }, signal, onProgress)
+            return serviceId === "computer" ? withScreenshot(response, version, request.input ?? {}, scope) : response
           }
           const action = request.action ?? pathAction
           if (action === undefined) {

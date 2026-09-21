@@ -198,7 +198,21 @@ export const browserOperationRequestSchema = z.discriminatedUnion("kind", [
   z.strictObject({ kind: z.literal("wait-target"), target: browserTargetRefSchema, policy: readinessPolicySchema, timeoutMs: z.number().int().min(1).max(30_000) }),
   z.strictObject({ kind: z.literal("capture-target"), target: browserTargetRefSchema, capture: browserCaptureRequestSchema }),
   z.strictObject({ kind: z.literal("read-console"), target: browserTargetRefSchema, maxEvents: z.number().int().min(1).max(1_000), maxBytes: z.number().int().min(1).max(1024 * 1024) }),
-  z.strictObject({ kind: z.literal("read-dom"), target: browserTargetRefSchema, maxBytes: z.number().int().min(1).max(1024 * 1024) }),
+  z.strictObject({
+    kind: z.literal("read-dom"),
+    target: browserTargetRefSchema,
+    offsetBytes: z.number().int().safe().min(0).optional(),
+    maxBytes: z.number().int().min(1).max(1024 * 1024),
+    expectedSnapshotSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  }),
+  z.strictObject({
+    kind: z.literal("read-resource"),
+    target: browserTargetRefSchema,
+    url: z.string().min(1).max(65_536),
+    offsetBytes: z.number().int().safe().min(0).optional(),
+    maxBytes: z.number().int().min(1).max(1024 * 1024),
+    expectedSnapshotSha256: z.string().regex(/^[a-f0-9]{64}$/).optional(),
+  }),
   z.strictObject({ kind: z.literal("read-accessibility"), target: browserTargetRefSchema, maxNodes: z.number().int().min(1).max(1_500), maxBytes: z.number().int().min(1).max(1024 * 1024) }),
 ])
 export type BrowserOperationRequest = z.infer<typeof browserOperationRequestSchema>
@@ -239,7 +253,31 @@ const browserOperationValueSchema = z.discriminatedUnion("kind", [
     droppedEvents: z.number().int().safe().min(0),
     truncated: z.boolean(),
   }),
-  z.strictObject({ kind: z.literal("dom-read"), target: browserTargetRefSchema, content: z.string().max(1024 * 1024), contentBytes: z.number().int().min(0).max(1024 * 1024), truncated: z.boolean() }),
+  z.strictObject({
+    kind: z.literal("dom-read"),
+    target: browserTargetRefSchema,
+    content: z.string().max(1024 * 1024),
+    contentBytes: z.number().int().min(0).max(1024 * 1024),
+    offsetBytes: z.number().int().safe().min(0),
+    nextOffsetBytes: z.number().int().safe().min(0),
+    totalBytes: z.number().int().safe().min(0),
+    snapshotSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    truncated: z.boolean(),
+  }),
+  z.strictObject({
+    kind: z.literal("resource-read"),
+    target: browserTargetRefSchema,
+    url: z.url().max(65_536),
+    status: z.number().int().min(100).max(599),
+    contentType: z.string().max(4_096),
+    body: z.string().max(1024 * 1024),
+    bodyBytes: z.number().int().min(0).max(1024 * 1024),
+    offsetBytes: z.number().int().safe().min(0),
+    nextOffsetBytes: z.number().int().safe().min(0),
+    totalBytes: z.number().int().safe().min(0),
+    snapshotSha256: z.string().regex(/^[a-f0-9]{64}$/),
+    truncated: z.boolean(),
+  }),
   z.strictObject({ kind: z.literal("accessibility-read"), target: browserTargetRefSchema, content: z.string().max(1024 * 1024), contentBytes: z.number().int().min(0).max(1024 * 1024), nodeCount: z.number().int().min(0).max(1_500), truncated: z.boolean() }),
 ])
 
@@ -406,6 +444,7 @@ export function assertBrowserResultMatchesRequest(
     "capture-target": "target-captured",
     "read-console": "console-read",
     "read-dom": "dom-read",
+    "read-resource": "resource-read",
     "read-accessibility": "accessibility-read",
   }
   if (result.value.kind !== expectedKinds[request.kind]) throw new Error("Browser result kind не соответствует request")
@@ -463,7 +502,60 @@ export function assertBrowserResultMatchesRequest(
     }
   }
   if (request.kind === "read-dom" && result.value.kind === "dom-read") {
-    assertContentBudget(result.value.content, result.value.contentBytes, request.maxBytes, result.value.truncated)
+    const actualBytes = new TextEncoder().encode(result.value.content).byteLength
+    const requestedOffset = request.offsetBytes ?? 0
+    if (result.value.contentBytes !== actualBytes || actualBytes > request.maxBytes) {
+      throw new Error("DOM chunk нарушает requested byte budget")
+    }
+    if (result.value.offsetBytes !== requestedOffset) {
+      throw new Error("DOM chunk начинается не с requested byte offset")
+    }
+    if (result.value.nextOffsetBytes !== result.value.offsetBytes + result.value.contentBytes) {
+      throw new Error("DOM chunk cursor не соответствует фактическим bytes")
+    }
+    if (result.value.nextOffsetBytes > result.value.totalBytes) {
+      throw new Error("DOM chunk cursor выходит за totalBytes")
+    }
+    if (result.value.truncated !== (result.value.nextOffsetBytes < result.value.totalBytes)) {
+      throw new Error("DOM chunk truncated не соответствует cursor/totalBytes")
+    }
+    if (result.value.contentBytes === 0 && result.value.truncated) {
+      throw new Error("DOM chunk не обеспечивает progress")
+    }
+    if (
+      request.expectedSnapshotSha256 !== undefined
+      && result.value.snapshotSha256 !== request.expectedSnapshotSha256
+    ) {
+      throw new Error("DOM chunk принадлежит другому snapshot")
+    }
+  }
+  if (request.kind === "read-resource" && result.value.kind === "resource-read") {
+    const actualBytes = new TextEncoder().encode(result.value.body).byteLength
+    const requestedOffset = request.offsetBytes ?? 0
+    if (result.value.bodyBytes !== actualBytes || actualBytes > request.maxBytes) {
+      throw new Error("Resource result нарушает requested byte budget")
+    }
+    if (result.value.offsetBytes !== requestedOffset) {
+      throw new Error("Resource chunk начинается не с requested byte offset")
+    }
+    if (result.value.nextOffsetBytes !== result.value.offsetBytes + result.value.bodyBytes) {
+      throw new Error("Resource chunk cursor не соответствует фактическим bytes")
+    }
+    if (result.value.nextOffsetBytes > result.value.totalBytes) {
+      throw new Error("Resource chunk cursor выходит за totalBytes")
+    }
+    if (result.value.truncated !== (result.value.nextOffsetBytes < result.value.totalBytes)) {
+      throw new Error("Resource chunk truncated не соответствует cursor/totalBytes")
+    }
+    if (result.value.bodyBytes === 0 && result.value.truncated) {
+      throw new Error("Resource chunk не обеспечивает progress")
+    }
+    if (
+      request.expectedSnapshotSha256 !== undefined
+      && result.value.snapshotSha256 !== request.expectedSnapshotSha256
+    ) {
+      throw new Error("Resource chunk принадлежит другому snapshot")
+    }
   }
   if (request.kind === "read-accessibility" && result.value.kind === "accessibility-read") {
     assertContentBudget(result.value.content, result.value.contentBytes, request.maxBytes, result.value.truncated)

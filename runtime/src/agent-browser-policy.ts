@@ -1,4 +1,4 @@
-import { ChatProxyError } from "./service-client.ts"
+import { AgentServiceError as ChatProxyError } from "./agent-service-errors.ts"
 
 export const chatBrowserActions = [
   "browser_chrome_instances", "browser_chrome_targets", "browser_chrome_operation",
@@ -7,7 +7,7 @@ export const chatBrowserActions = [
 
 export const chatBrowserOperationKinds = [
   "connect-instance", "disconnect-instance", "wait-target", "capture-target",
-  "read-console", "read-dom", "read-accessibility",
+  "read-console", "read-dom", "read-resource", "read-accessibility",
 ] as const
 const allowedKinds = new Set<string>(chatBrowserOperationKinds)
 

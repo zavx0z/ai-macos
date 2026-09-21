@@ -48,6 +48,42 @@ export type BrowserDriverCapture = {
   readiness: ReadinessResult
 }
 
+export type BrowserDomReadRequest = {
+  offsetBytes: number
+  maxBytes: number
+  expectedSnapshotSha256?: string
+}
+
+export type BrowserDomReadChunk = {
+  content: string
+  contentBytes: number
+  offsetBytes: number
+  nextOffsetBytes: number
+  totalBytes: number
+  snapshotSha256: string
+  truncated: boolean
+}
+
+export type BrowserResourceReadRequest = {
+  url: string
+  offsetBytes: number
+  maxBytes: number
+  expectedSnapshotSha256?: string
+}
+
+export type BrowserResourceReadResult = {
+  url: string
+  status: number
+  contentType: string
+  body: string
+  bodyBytes: number
+  offsetBytes: number
+  nextOffsetBytes: number
+  totalBytes: number
+  snapshotSha256: string
+  truncated: boolean
+}
+
 export interface BrowserDriver {
   connect(signal: AbortSignal): Promise<{ browserVersion: string }>
   disconnect(): Promise<void>
@@ -60,7 +96,8 @@ export interface BrowserDriver {
   waitTarget(targetId: string, policy: ReadinessPolicy, timeoutMs: number, signal: AbortSignal): Promise<ReadinessResult>
   captureTarget(targetId: string, request: BrowserCaptureRequest, signal: AbortSignal): Promise<BrowserDriverCapture>
   readConsole(targetId: string, maxEvents: number, maxBytes: number, signal: AbortSignal): Promise<{ entries: Array<{ level: "log" | "info" | "warn" | "error" | "debug", text: string, timestamp: string }>, droppedEvents: number }>
-  readDom(targetId: string, maxBytes: number, signal: AbortSignal): Promise<{ content: string, truncated: boolean }>
+  readDom(targetId: string, request: BrowserDomReadRequest, signal: AbortSignal): Promise<BrowserDomReadChunk>
+  readResource(targetId: string, request: BrowserResourceReadRequest, signal: AbortSignal): Promise<BrowserResourceReadResult>
   readAccessibility(targetId: string, maxNodes: number, maxBytes: number, signal: AbortSignal): Promise<{ content: string, nodeCount: number, truncated: boolean }>
 }
 
@@ -292,9 +329,25 @@ export class RuntimeBrowserAdapter implements BrowserAdapter {
         return { kind: "console-read", target: request.target, ...bounded, droppedEvents: read.droppedEvents + bounded.droppedEvents }
       }
       case "read-dom": {
-        const read = await instance.driver.readDom(target!.id, request.maxBytes, context.control.signal)
-        const bounded = boundText(read.content, request.maxBytes)
-        return { kind: "dom-read", target: request.target, content: bounded.text, contentBytes: bounded.bytes, truncated: read.truncated || bounded.truncated }
+        const read = await instance.driver.readDom(target!.id, {
+          offsetBytes: request.offsetBytes ?? 0,
+          maxBytes: request.maxBytes,
+          ...(request.expectedSnapshotSha256 === undefined
+            ? {}
+            : { expectedSnapshotSha256: request.expectedSnapshotSha256 }),
+        }, context.control.signal)
+        return { kind: "dom-read", target: request.target, ...read }
+      }
+      case "read-resource": {
+        const read = await instance.driver.readResource(target!.id, {
+          url: request.url,
+          offsetBytes: request.offsetBytes ?? 0,
+          maxBytes: request.maxBytes,
+          ...(request.expectedSnapshotSha256 === undefined
+            ? {}
+            : { expectedSnapshotSha256: request.expectedSnapshotSha256 }),
+        }, context.control.signal)
+        return { kind: "resource-read", target: request.target, ...read }
       }
       case "read-accessibility": {
         const read = await instance.driver.readAccessibility(target!.id, request.maxNodes, request.maxBytes, context.control.signal)
@@ -452,20 +505,155 @@ export class CdpBrowserDriver implements BrowserDriver {
     return { entries, droppedEvents: droppedEvents + Math.max(0, raw.length - entries.length) }
   }
 
-  async readDom(targetId: string, maxBytes: number, signal: AbortSignal): Promise<{ content: string, truncated: boolean }> {
+  async readDom(targetId: string, request: BrowserDomReadRequest, signal: AbortSignal): Promise<BrowserDomReadChunk> {
+    const expectedSnapshot = request.expectedSnapshotSha256 ?? null
     const result = await cdpEval(await this.target(targetId, signal), `
+      const offsetBytes = ${request.offsetBytes};
+      const maxBytes = ${request.maxBytes};
+      const expectedSnapshotSha256 = ${JSON.stringify(expectedSnapshot)};
       const value = document.documentElement.outerHTML;
-      const encoder = new TextEncoder();
-      if (encoder.encode(value).byteLength <= ${maxBytes}) return {content:value,truncated:false};
-      let low = 0, high = value.length;
-      while (low < high) {
-        const middle = Math.ceil((low + high) / 2);
-        if (encoder.encode(value.slice(0, middle)).byteLength <= ${maxBytes}) low = middle;
-        else high = middle - 1;
+      const bytes = new TextEncoder().encode(value);
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+      const snapshotSha256 = Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+
+      if (expectedSnapshotSha256 !== null && snapshotSha256 !== expectedSnapshotSha256) {
+        throw new Error("DOM_SNAPSHOT_CHANGED expected=" + expectedSnapshotSha256 + " actual=" + snapshotSha256);
       }
-      return {content:value.slice(0, low),truncated:true};
+      if (offsetBytes > bytes.byteLength) {
+        throw new Error("DOM_OFFSET_OUT_OF_RANGE offset=" + offsetBytes + " total=" + bytes.byteLength);
+      }
+      if (offsetBytes < bytes.byteLength && (bytes[offsetBytes] & 0xc0) === 0x80) {
+        throw new Error("DOM_OFFSET_NOT_UTF8_BOUNDARY offset=" + offsetBytes);
+      }
+
+      let end = Math.min(bytes.byteLength, offsetBytes + maxBytes);
+      while (end > offsetBytes && end < bytes.byteLength && (bytes[end] & 0xc0) === 0x80) end -= 1;
+      if (end === offsetBytes && offsetBytes < bytes.byteLength) {
+        throw new Error("DOM_MAX_BYTES_TOO_SMALL maxBytes=" + maxBytes);
+      }
+
+      const contentBytes = end - offsetBytes;
+      return {
+        content: new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes.subarray(offsetBytes, end)),
+        contentBytes,
+        offsetBytes,
+        nextOffsetBytes: end,
+        totalBytes: bytes.byteLength,
+        snapshotSha256,
+        truncated: end < bytes.byteLength,
+      };
     `, signal)
-    return JSON.parse(result) as { content: string, truncated: boolean }
+    return JSON.parse(result) as BrowserDomReadChunk
+  }
+
+  async readResource(targetId: string, request: BrowserResourceReadRequest, signal: AbortSignal): Promise<BrowserResourceReadResult> {
+    const target = await this.target(targetId, signal)
+    let pageUrl: URL
+    let resourceUrl: URL
+    try {
+      pageUrl = new URL(target.url)
+      resourceUrl = new URL(request.url, pageUrl)
+    } catch {
+      throw new Error("Browser resource read requires a valid same-origin URL")
+    }
+    if (!["http:", "https:"].includes(pageUrl.protocol) || resourceUrl.origin !== pageUrl.origin
+      || resourceUrl.username !== "" || resourceUrl.password !== "") {
+      throw new Error("Browser resource read requires same-origin http(s) URL")
+    }
+
+    const resolvedUrl = resourceUrl.href
+    const maxResourceBytes = 16 * 1024 * 1024
+    const expectedSnapshot = request.expectedSnapshotSha256 ?? null
+    const result = await cdpEval(target, `
+      const resolvedUrl = ${JSON.stringify(resolvedUrl)};
+      const expectedOrigin = ${JSON.stringify(pageUrl.origin)};
+      if (location.origin !== expectedOrigin || new URL(resolvedUrl, location.href).origin !== location.origin) {
+        throw new Error("RESOURCE_ORIGIN_CHANGED");
+      }
+      const offsetBytes = ${request.offsetBytes};
+      const maxBytes = ${request.maxBytes};
+      const maxResourceBytes = ${maxResourceBytes};
+      const expectedSnapshotSha256 = ${JSON.stringify(expectedSnapshot)};
+      const response = await fetch(resolvedUrl, {
+        method: "GET",
+        mode: "same-origin",
+        credentials: "include",
+        redirect: "error",
+        cache: "no-store",
+      });
+      const contentType = response.headers.get("content-type") ?? "";
+      if (!(
+        contentType.startsWith("text/")
+        || contentType.includes("json")
+        || contentType.includes("javascript")
+        || contentType.includes("xml")
+      )) {
+        throw new Error("BROWSER_RESOURCE_NOT_TEXT contentType=" + contentType);
+      }
+      const reader = response.body?.getReader();
+      const chunks = [];
+      let rawBytes = 0;
+
+      if (reader) {
+        while (true) {
+          const next = await reader.read();
+          if (next.done) break;
+          const value = next.value;
+          if (!value || value.byteLength === 0) continue;
+          if (rawBytes + value.byteLength > maxResourceBytes) {
+            await reader.cancel();
+            throw new Error("BROWSER_RESOURCE_TOO_LARGE limit=" + maxResourceBytes);
+          }
+          chunks.push(value);
+          rawBytes += value.byteLength;
+        }
+      }
+
+      const bytes = new Uint8Array(rawBytes);
+      let offset = 0;
+      for (const chunk of chunks) {
+        bytes.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+
+      const digest = new Uint8Array(await crypto.subtle.digest("SHA-256", bytes));
+      const snapshotSha256 = Array.from(digest, byte => byte.toString(16).padStart(2, "0")).join("");
+      if (expectedSnapshotSha256 !== null && snapshotSha256 !== expectedSnapshotSha256) {
+        throw new Error("RESOURCE_SNAPSHOT_CHANGED expected=" + expectedSnapshotSha256 + " actual=" + snapshotSha256);
+      }
+      if (offsetBytes > bytes.byteLength) {
+        throw new Error("RESOURCE_OFFSET_OUT_OF_RANGE offset=" + offsetBytes + " total=" + bytes.byteLength);
+      }
+      if (offsetBytes < bytes.byteLength && (bytes[offsetBytes] & 0xc0) === 0x80) {
+        throw new Error("RESOURCE_OFFSET_NOT_UTF8_BOUNDARY offset=" + offsetBytes);
+      }
+
+      let end = Math.min(bytes.byteLength, offsetBytes + maxBytes);
+      while (end > offsetBytes && end < bytes.byteLength && (bytes[end] & 0xc0) === 0x80) end -= 1;
+      if (end === offsetBytes && offsetBytes < bytes.byteLength) {
+        throw new Error("RESOURCE_MAX_BYTES_TOO_SMALL maxBytes=" + maxBytes);
+      }
+
+      const body = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(bytes.subarray(offsetBytes, end));
+      const encoder = new TextEncoder();
+      const bodyBytes = encoder.encode(body).byteLength;
+      if (bodyBytes !== end - offsetBytes) {
+        throw new Error("BROWSER_RESOURCE_UTF8_INVALID");
+      }
+      return {
+        url: resolvedUrl,
+        status: response.status,
+        contentType,
+        body,
+        bodyBytes,
+        offsetBytes,
+        nextOffsetBytes: end,
+        totalBytes: bytes.byteLength,
+        snapshotSha256,
+        truncated: end < bytes.byteLength,
+      };
+    `, signal)
+    return JSON.parse(result) as BrowserResourceReadResult
   }
 
   async readAccessibility(targetId: string, maxNodes: number, maxBytes: number, signal: AbortSignal): Promise<{ content: string, nodeCount: number, truncated: boolean }> {
@@ -518,7 +706,7 @@ function quarantinedCleanup(handles: readonly RuntimeResourceHandle[], reason: s
 }
 
 function successOutcome(request: BrowserOperationRequest, cleanup: CleanupOutcome): OperationOutcome {
-  const read = ["wait-target", "capture-target", "read-console", "read-dom", "read-accessibility"].includes(request.kind)
+  const read = ["wait-target", "capture-target", "read-console", "read-dom", "read-resource", "read-accessibility"].includes(request.kind)
   return {
     dispatch: read ? "none" : "finished",
     targetVerified: "verified",
@@ -546,9 +734,40 @@ function failureOutcome(cleanup: CleanupOutcome, stage: DispatchStage): Operatio
 }
 
 function contractError(error: unknown, unknown: boolean): ContractError {
+  const message = error instanceof Error ? error.message : String(error)
+  if (message.includes("DOM_SNAPSHOT_CHANGED")) {
+    return {
+      code: "observation-stale",
+      message,
+      stage: "browser-adapter",
+      retryable: true,
+      recoveryAction: "retry-read-only",
+      replayAllowed: true,
+    }
+  }
+  if (message.includes("RESOURCE_SNAPSHOT_CHANGED")) {
+    return {
+      code: "observation-stale",
+      message,
+      stage: "browser-adapter",
+      retryable: true,
+      recoveryAction: "retry-read-only",
+      replayAllowed: true,
+    }
+  }
+  if (message.includes("Browser resource read requires")) {
+    return {
+      code: "invalid-request",
+      message,
+      stage: "browser-adapter",
+      retryable: false,
+      recoveryAction: "none",
+      replayAllowed: false,
+    }
+  }
   return {
-    code: unknown ? "deadline-exceeded" : String(error).includes("stale") || String(error).includes("not found") ? "target-stale" : "internal-error",
-    message: error instanceof Error ? error.message : String(error),
+    code: unknown ? "deadline-exceeded" : message.includes("stale") || message.includes("not found") ? "target-stale" : "internal-error",
+    message,
     stage: "browser-adapter",
     retryable: !unknown,
     recoveryAction: unknown ? "get-operation" : "refresh-inventory",

@@ -1,10 +1,10 @@
 import { posix } from "node:path"
 import { hostname } from "node:os"
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
+import type { RuntimeToolResult as CallToolResult } from "./transport.ts"
 import { createDispatcher, type DispatcherInput } from "../../vendor/tools/server/dispatch/index.ts"
 import { ToolError } from "../../vendor/tools/shared/errors.ts"
 import { toolsSources } from "./tools-metadata.ts"
-import { ChatProxyError, type ServiceClient } from "./service-client.ts"
+import { AgentServiceError as ChatProxyError, type ServiceClient } from "./agent-service-errors.ts"
 
 export interface ToolsClientOptions {
   expectedHostname?: string
@@ -26,7 +26,7 @@ function result(value: unknown): CallToolResult {
   }
 }
 
-/** Встраивание без HTTP, второго MCP, Runtime и workspace. */
+/** Runtime-owned embedding; no second HTTP/MCP server or workspace registry. */
 export function createToolsClient(options: ToolsClientOptions = {}): ServiceClient {
   const { expectedHostname, authorize = () => true } = options
   let closed = false

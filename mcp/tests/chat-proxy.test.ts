@@ -61,6 +61,7 @@ test("action выполняется через UDS ровно один раз, i
     loginSessionId: "login:chat", runtimeBuildId: "runtime:chat", expectedNativeBuildId: "native:chat" })
   let calls = 0
   host.catalog.register("test_write", {
+    agent: true,
     title: "Тестовая запись", description: "Меняет только счётчик теста", readOnly: false,
     input: z.strictObject({ value: z.number().default(1) }),
     output: z.strictObject({ calls: z.number(), value: z.number(), failed: z.boolean() }),
@@ -83,6 +84,7 @@ test("action выполняется через UDS ровно один раз, i
     expect((await call({ node: "computer", action: "system_health" })).structuredContent).toMatchObject({ machine: { matchesExpected: true } })
     const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=", "base64")
     host.catalog.register("fixture_frame", {
+      agent: true,
       title: "Снимок", description: "Изолированный кадр без доступа к экрану", readOnly: true,
       input: z.strictObject({}), output: z.strictObject({ frameRef: z.string() }),
       async execute(context) {
@@ -132,6 +134,7 @@ test("action выполняется через UDS ровно один раз, i
     expect(calls).toBe(0)
     expect((await call({ node: "computer/late_method" })).isError).toBe(true)
     host.catalog.register("late_method", {
+      agent: true,
       title: "Новая операция", description: "Появляется без snapshot и перезапуска proxy", readOnly: true,
       input: z.strictObject({}), output: z.strictObject({ live: z.literal(true) }),
       async execute() { return { live: true } },

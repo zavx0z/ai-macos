@@ -1,4 +1,5 @@
 import { bindDeadline, signalDeadline } from "./deadline.ts"
+import { defaultAgentActions } from "./agent-actions.ts"
 import { capabilityIsReady, contractJsonSchema, parseWireValue, utf8ByteLength, z, type CapabilityId, type RuntimeClientSession } from "@meta/shared/contracts"
 import type { RuntimeCore } from "./core.ts"
 import { RuntimeContractError } from "./errors.ts"
@@ -36,6 +37,8 @@ export type MethodDefinition<Input, Output> = {
   maxResponseBytes?: number
   availableDuringDrain?: boolean
   visibility?: RuntimeMethodVisibility
+  /** Explicit server-side opt-in. Request payloads/annotations cannot grant agent access. */
+  agent?: boolean
   isError?(output: Output): boolean
 }
 
@@ -48,6 +51,7 @@ export type RuntimeMethodResponse = {
 type StoredMethod = {
   descriptor: RuntimeToolDescriptor
   visibility: RuntimeMethodVisibility
+  agent: boolean
   requiredCapabilities: readonly CapabilityId[]
   availableDuringDrain: boolean
   invoke(context: RuntimeMethodContext, input: unknown): Promise<RuntimeMethodResponse>
@@ -102,6 +106,7 @@ export class MethodRegistry {
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 120_000) throw new Error("Method timeout вне bounds")
     this.#methods.set(name, {
       visibility: frozen.visibility,
+      agent: frozen.visibility === "public" && (frozen.agent ?? defaultAgentActions.has(name)),
       descriptor: {
         name, title: frozen.title, description: frozen.description,
         inputSchema: inputSchema as RuntimeToolDescriptor["inputSchema"],
@@ -151,6 +156,12 @@ export class MethodRegistry {
 
   descriptors(): { revision: number, tools: RuntimeToolDescriptor[] } {
     return this.#descriptors("public")
+  }
+
+  /** Projection for the authenticated agent gateway; annotations are never authority. */
+  agentDescriptors(): { revision: number, tools: RuntimeToolDescriptor[] } {
+    const catalog = this.descriptors()
+    return { ...catalog, tools: catalog.tools.filter(tool => this.#methods.get(tool.name)?.agent === true) }
   }
 
   /** Неизменившийся каталог не копируется и не сериализуется на каждом poll. */

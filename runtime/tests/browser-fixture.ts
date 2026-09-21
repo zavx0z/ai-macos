@@ -83,5 +83,6 @@ export class FixtureBrowserDriver implements BrowserDriver {
   async captureTarget(): Promise<never> { throw new Error("not used") }
   async readConsole(): Promise<never> { throw new Error("not used") }
   async readDom(): Promise<never> { throw new Error("not used") }
+  async readResource(): Promise<never> { throw new Error("not used") }
   async readAccessibility(): Promise<never> { throw new Error("not used") }
 }
