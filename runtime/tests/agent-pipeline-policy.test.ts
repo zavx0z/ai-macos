@@ -22,7 +22,7 @@ describe("Политика локального конвейера ChatGPT", () 
     for (const kind of ["wait", "press", "keys", "chrome-connect", "chrome-consent", "chrome-wait", "chrome-read", "chrome-disconnect"]) {
       expect(() => check([{ kind }])).not.toThrow()
     }
-    for (const mode of [undefined, "dom", "accessibility"]) expect(() => check([{ kind: "chrome-read", mode }])).not.toThrow()
+    for (const mode of [undefined, "dom", "accessibility", "resource"]) expect(() => check([{ kind: "chrome-read", mode }])).not.toThrow()
     expect(() => check(Array.from({ length: 16 }, () => ({ kind: "wait" })))).not.toThrow()
   })
 

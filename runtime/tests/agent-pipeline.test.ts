@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
-import { CAPABILITY_IDS, operationRecordSchema, z } from "@meta/shared/contracts"
+import { hostname } from "node:os"
+import { CAPABILITY_IDS, browserInstanceSnapshotSchema, operationRecordSchema, z } from "@meta/shared/contracts"
 import type { BrowserDriver } from "@meta/chrome/adapter"
 import { FixtureBrowserDriver } from "./browser-fixture.ts"
 import { createBrowserHostComposition } from "../src/browser-host.ts"
@@ -10,6 +11,8 @@ import { MethodRegistry } from "../src/method-registry.ts"
 import { pipelineInputSchema, registerAgentPipelineMethods } from "../src/agent-pipeline.ts"
 import type { PipelineObservation } from "../src/pipeline-conditions.ts"
 import { canonicalJson, sha256 } from "../src/primitives.ts"
+import { registerAgentService } from "../src/agent-service.ts"
+import { computerActions } from "../src/agent-actions.ts"
 
 function fixture() {
   const generation = { runtimeEpoch: "runtime:pipeline", loginSessionId: "login:pipeline" }
@@ -68,7 +71,7 @@ function fixture() {
       offsetBytes: request.offsetBytes,
       nextOffsetBytes,
       totalBytes,
-      snapshotSha256: "ef".repeat(32),
+      snapshotSha256: sha256(full),
       truncated: nextOffsetBytes < totalBytes,
     }
   }
@@ -82,6 +85,10 @@ function fixture() {
     output: z.object({}).passthrough(), readOnly: true, execute: (_context: unknown, value: Record<string, unknown>) => execute(value),
   })
   registry.register("system_health", method(async () => ({ machine: { matchesExpected: true } })))
+  // Gateway требует опубликованный receipt-метод, даже когда сам конвейер читает Core напрямую.
+  registry.register("get_operation", method(async value => ({
+    operation: await core.getOperation(session, String(value.operationId)),
+  })))
   const sheetVisible = () => ui.sheet && !preapproved && !fixtureDriver.connected
     && (ui.preexisting || fixtureDriver.connectCalls > 0)
   registry.register("get_state", method(async () => ({ complete: true, errors: [],
@@ -162,7 +169,7 @@ function fixture() {
   }
   const connection = () => core.getOperationByRequest(session,
     `pipeline-child:${sha256(canonicalJson(["pipeline:chrome", "start"]))}`)
-  return { core, registry, targets, session, targetId, sheetTargetId, ui, connection, when, native, chrome, dispatch, driver: fixtureDriver, reads, order,
+  return { core, registry, targets, session, targetId, sheetTargetId, ui, connection, when, native, chrome, dispatch, driver: fixtureDriver, browserDriver: driver, reads, order,
     setFocus(value: boolean) { focused = value }, fakeDialog() { fakeDialog = true }, partial() { partial = true }, deny() { deny = true },
     changeFinal() { finalChanged = true }, replaceTab() { replaceTab = true },
     approveConnection() { preapproved = true; allow() },
@@ -489,5 +496,291 @@ test("consent safety: partial sheet click stops dependent reads without replay",
     expect(f.driver.connectCalls).toBe(1)
     expect((result.data.steps as Array<{ operationIds: string[] }>)[1]!.operationIds).toContain("operation:click:1")
     expect(f.core.activeOperationCount()).toBe(0)
+  } finally { await f.dispose() }
+})
+
+// Только подставной BrowserDriver: сеть, установленный Runtime и Native не вызываются.
+function chunkSource(f: ReturnType<typeof fixture>, full: string) {
+  type Request = Parameters<BrowserDriver["readDom"]>[1]
+  const requests: Request[] = []
+  const bytes = Buffer.from(full, "utf8")
+  f.browserDriver.readDom = async (id, request) => {
+    f.reads.push(id)
+    requests.push({ ...request })
+    let end = Math.min(bytes.length, request.offsetBytes + request.maxBytes)
+    while (end > request.offsetBytes && end < bytes.length && (bytes[end]! & 0xc0) === 0x80) end--
+    const content = bytes.subarray(request.offsetBytes, end).toString("utf8")
+    return { content, contentBytes: Buffer.byteLength(content), offsetBytes: request.offsetBytes,
+      nextOffsetBytes: end, totalBytes: bytes.length, snapshotSha256: sha256(full), truncated: end < bytes.length }
+  }
+  f.browserDriver.readResource = async (id, request, signal) => {
+    const { content, contentBytes, ...chunk } = await f.browserDriver.readDom(id, request, signal)
+    return { ...chunk, body: content, bodyBytes: contentBytes,
+      url: new URL(request.url, "https://fixture.invalid/pipeline").href, status: 200, contentType: "application/json; charset=utf-8" }
+  }
+  return requests
+}
+
+function chunkPlan(f: ReturnType<typeof fixture>, options: Record<string, unknown> = {}) {
+  const plan = f.chrome()
+  return { ...plan, steps: plan.steps.filter(step => step.id !== "read-two")
+    .map(step => step.id === "read-one" ? { ...step, ...options } : step) }
+}
+
+test("порционное чтение: прежний однократный шаг теперь возвращает сам текст", async () => {
+  const f = fixture()
+  try {
+    const result = await f.dispatch(chunkPlan(f))
+    expect(result.data.state).toBe("verified")
+    expect(result.data.reads).toMatchObject([{ content: "<main>pipeline fixture</main>", truncated: false }])
+  } finally { await f.dispose() }
+})
+
+test("порционное чтение: два последовательных UTF-8 блока, BOM и полный hash", async () => {
+  const f = fixture()
+  try {
+    f.ui.sheet = true
+    const full = "\uFEFFА🌌БZ"
+    const requests = chunkSource(f, full)
+    const input = chunkPlan(f, { maxBytes: 7, maxChunks: 2 })
+    const result = await f.dispatch(input)
+    expect(result.data.state).toBe("verified")
+    expect(requests).toEqual([
+      { offsetBytes: 0, maxBytes: 7 },
+      { offsetBytes: 5, maxBytes: 7, expectedSnapshotSha256: sha256(full) },
+    ])
+    expect(result.data.reads).toMatchObject([{ stepId: "read-one", content: full, contentBytes: 12,
+      offsetBytes: 0, nextOffsetBytes: 12, totalBytes: 12, snapshotSha256: sha256(full),
+      sha256: sha256(full), truncated: false, chunks: [
+        { offsetBytes: 0, nextOffsetBytes: 5, contentBytes: 5 },
+        { offsetBytes: 5, nextOffsetBytes: 12, contentBytes: 7 },
+      ] }])
+    const steps = result.data.steps as Array<{ id: string, operationIds: string[] }>
+    expect(new Set(steps.find(step => step.id === "read-one")!.operationIds).size).toBe(2)
+    expect(result.data.connectionCleanup).toBe("confirmed-disconnected")
+    expect(f.driver.connectCalls).toBe(1)
+    expect(f.driver.disconnectCalls).toBe(1)
+    expect(f.counts().clicks).toBe(1)
+    expect((await f.dispatch(input)).data).toEqual(result.data)
+    expect(requests).toHaveLength(2)
+    expect(f.driver.connectCalls).toBe(1)
+  } finally { await f.dispose() }
+})
+
+test("порционное чтение: ограниченный префикс и явное продолжение с его cursor/hash", async () => {
+  const f = fixture()
+  try {
+    const full = "0123456789"
+    const requests = chunkSource(f, full)
+    const first = await f.dispatch(chunkPlan(f, { maxBytes: 4, maxChunks: 2 }))
+    expect(first.data.reads).toMatchObject([{ content: "01234567", contentBytes: 8,
+      nextOffsetBytes: 8, totalBytes: 10, truncated: true, snapshotSha256: sha256(full) }])
+    const prefix = (first.data.reads as Array<{ nextOffsetBytes: number, snapshotSha256: string }>)[0]!
+    f.approveConnection()
+    const inventory = await f.registry.dispatch(f.session, "browser_chrome_instances", {}, new AbortController().signal)
+    const instance = (inventory.data.instances as Array<{ ref: unknown }>)[0]!.ref
+    const next = chunkPlan(f, { maxBytes: 4, maxChunks: 2,
+      offsetBytes: prefix.nextOffsetBytes, expectedSnapshotSha256: prefix.snapshotSha256 })
+    const second = await f.dispatch({ ...next, clientRequestId: "pipeline:continuation",
+      steps: next.steps.map(step => step.kind === "chrome-connect" ? { ...step, instance } : step) })
+    expect(second.data.state).toBe("verified")
+    expect(second.data.reads).toMatchObject([{ content: "89", contentBytes: 2, offsetBytes: 8,
+      nextOffsetBytes: 10, totalBytes: 10, truncated: false, snapshotSha256: sha256(full) }])
+    expect(requests.map(request => request.offsetBytes)).toEqual([0, 4, 8])
+    expect(second.data.connectionCleanup).toBe("confirmed-disconnected")
+  } finally { await f.dispose() }
+})
+
+for (const fault of ["hash", "total", "offset", "bytes", "no-progress", "full-hash"] as const) {
+  test(`порционное чтение: ${fault} останавливает шаг без выдачи склеенного текста`, async () => {
+    const f = fixture()
+    try {
+      const requests = chunkSource(f, "0123456789")
+      const read = f.browserDriver.readDom.bind(f.browserDriver)
+      f.browserDriver.readDom = async (...args) => {
+        const chunk = await read(...args)
+        if (fault === "full-hash") chunk.snapshotSha256 = "aa".repeat(32)
+        if (requests.length === 2) {
+          if (fault === "hash") chunk.snapshotSha256 = "bb".repeat(32)
+          if (fault === "total") chunk.totalBytes++
+          if (fault === "offset") chunk.offsetBytes--
+          if (fault === "bytes") chunk.contentBytes++
+          if (fault === "no-progress") {
+            chunk.content = ""
+            chunk.contentBytes = 0
+            chunk.nextOffsetBytes = chunk.offsetBytes
+          }
+        }
+        return chunk
+      }
+      const input = chunkPlan(f, { maxBytes: 4, maxChunks: 3 })
+      const result = await f.dispatch(input)
+      expect(result.data.state).toBe("stopped")
+      expect(result.data.reads).toEqual([])
+      const adapterRejected = !["total", "full-hash"].includes(fault)
+      // Прежний coordinator карантинирует lifetime при отказе adapter.
+      // Конвейер не вправе обходить этот карантин обычным disconnect.
+      if (adapterRejected) {
+        expect(result.data.connectionCleanup).toBe("unconfirmed")
+        expect(result.data.cleanupError).toContain("active reservation")
+        expect(f.driver.disconnectCalls).toBe(0)
+        const snapshot = browserInstanceSnapshotSchema.parse((await f.registry.dispatch(f.session,
+          "browser_chrome_instances", {}, new AbortController().signal)).data)
+        const reservation = await f.core.reservations.inspect(f.session, { kind: "browser-instance", ref: snapshot.instances[0]!.ref })
+        expect(reservation?.state).toBe("quarantined")
+      } else {
+        expect(result.data.connectionCleanup).toBe("confirmed-disconnected")
+        expect(f.driver.disconnectCalls).toBe(1)
+      }
+      expect(requests).toHaveLength(fault === "full-hash" ? 3 : 2)
+      expect((await f.dispatch(input)).data).toEqual(result.data)
+      expect(f.driver.connectCalls).toBe(1)
+      expect(f.core.activeOperationCount()).toBe(0)
+    } finally { await f.dispose() }
+  })
+}
+
+test("порционное чтение: смена точной вкладки между блоками не подменяется тем же URL", async () => {
+  const f = fixture()
+  try {
+    const requests = chunkSource(f, "0123456789")
+    f.replaceTab()
+    const result = await f.dispatch(chunkPlan(f, { maxBytes: 4, maxChunks: 3 }))
+    expect(result.data.state).toBe("stopped")
+    expect(result.data.reads).toEqual([])
+    expect(requests).toHaveLength(1)
+    expect(result.data.connectionCleanup).toBe("confirmed-disconnected")
+    expect(f.driver.disconnectCalls).toBe(1)
+  } finally { await f.dispose() }
+})
+
+test("порционное чтение: same-origin ресурс возвращает тело и HTTP-метаданные", async () => {
+  const f = fixture()
+  try {
+    const full = "{\"ok\":true}"
+    const requests = chunkSource(f, full)
+    const result = await f.dispatch(chunkPlan(f, { mode: "resource", resourceUrl: "/data.json", maxBytes: 6, maxChunks: 3 }))
+    expect(result.data.state).toBe("verified")
+    expect(requests.map(request => request.offsetBytes)).toEqual([0, 6])
+    expect(result.data.reads).toMatchObject([{ content: full, contentBytes: 11, truncated: false,
+      snapshotSha256: sha256(full), resource: { url: "https://fixture.invalid/data.json", status: 200,
+        contentType: "application/json; charset=utf-8" } }])
+    expect(result.data.connectionCleanup).toBe("confirmed-disconnected")
+  } finally { await f.dispose() }
+})
+
+for (const fault of ["status", "type", "url", "metadata-changed"] as const) {
+  test(`порционное чтение ресурса: ${fault} не выдаёт успешный источник`, async () => {
+    const f = fixture()
+    try {
+      const requests = chunkSource(f, "{\"ok\":true}")
+      const read = f.browserDriver.readResource.bind(f.browserDriver)
+      f.browserDriver.readResource = async (...args) => {
+        const chunk = await read(...args)
+        if (fault === "status") chunk.status = 403
+        if (fault === "type") chunk.contentType = "image/png"
+        if (fault === "url") chunk.url = "https://foreign.invalid/data.json"
+        if (fault === "metadata-changed" && requests.length === 2) chunk.contentType = "text/plain"
+        return chunk
+      }
+      const result = await f.dispatch(chunkPlan(f, { mode: "resource", resourceUrl: "/data.json", maxBytes: 6, maxChunks: 3 }))
+      expect(result.data.state).toBe("stopped")
+      expect(result.data.reads).toEqual([])
+      if (fault === "status") expect(result.data.failure).toContain("HTTP 403")
+      expect(requests).toHaveLength(fault === "metadata-changed" ? 2 : 1)
+      expect(result.data.connectionCleanup).toBe("confirmed-disconnected")
+    } finally { await f.dispose() }
+  })
+}
+
+test("порционное чтение: пустой снимок завершается одним чтением", async () => {
+  const f = fixture()
+  try {
+    const requests = chunkSource(f, "")
+    const result = await f.dispatch(chunkPlan(f, { maxBytes: 4, maxChunks: 8 }))
+    expect(result.data.state).toBe("verified")
+    expect(requests).toHaveLength(1)
+    expect(result.data.reads).toMatchObject([{ content: "", contentBytes: 0, totalBytes: 0,
+      nextOffsetBytes: 0, snapshotSha256: sha256(""), truncated: false }])
+  } finally { await f.dispose() }
+})
+
+test("порционное чтение: недопустимые параметры и общий бюджет отвергаются до connect", async () => {
+  const f = fixture()
+  try {
+    for (const options of [
+      { offsetBytes: 1 }, { maxChunks: 9 }, { maxChunks: 0 }, { maxBytes: 32769 },
+      { maxBytes: 32768, maxChunks: 3 }, { expectedSnapshotSha256: "bad" },
+      { mode: "accessibility", maxChunks: 2 }, { mode: "accessibility", offsetBytes: 1, expectedSnapshotSha256: "aa".repeat(32) },
+      { mode: "resource" }, { resourceUrl: "/data.json" },
+      { mode: "resource", resourceUrl: "https://foreign.invalid/data.json" },
+      { mode: "resource", resourceUrl: "https://user:pass@fixture.invalid/data.json" },
+    ]) await expect(f.dispatch(chunkPlan(f, options))).rejects.toThrow()
+    const multi = f.chrome()
+    await expect(f.dispatch({ ...multi, steps: multi.steps.map(step => step.id === "read-one"
+      ? { ...step, maxChunks: 2 } : step) })).rejects.toThrow("бюджет")
+    expect(f.driver.connectCalls).toBe(0)
+    expect(f.counts().clicks).toBe(0)
+  } finally { await f.dispose() }
+})
+
+test("порционное чтение: восемь частей и 64 KiB текста с JSON-экранированием", async () => {
+  const f = fixture()
+  try {
+    const full = "\u0000".repeat(65_536)
+    const requests = chunkSource(f, full)
+    const result = await f.dispatch(chunkPlan(f, { maxBytes: 8192, maxChunks: 8 }))
+    expect(result.data.state).toBe("verified")
+    expect(requests.map(request => request.offsetBytes)).toEqual([0, 8192, 16384, 24576, 32768, 40960, 49152, 57344])
+    expect(result.data.reads).toMatchObject([{ content: full, contentBytes: 65_536,
+      nextOffsetBytes: 65_536, sha256: sha256(full), truncated: false }])
+    const steps = result.data.steps as Array<{ id: string, operationIds: string[] }>
+    expect(new Set(steps.find(step => step.id === "read-one")!.operationIds).size).toBe(8)
+    expect(Buffer.byteLength(JSON.stringify(result.data))).toBeLessThan(1024 * 1024)
+    expect(result.data.connectionCleanup).toBe("confirmed-disconnected")
+  } finally { await f.dispose() }
+})
+
+test("порционное чтение: отмена на второй части не повторяет чтение или connect", async () => {
+  const f = fixture()
+  try {
+    const requests = chunkSource(f, "0123456789")
+    const controller = new AbortController()
+    const read = f.browserDriver.readDom.bind(f.browserDriver)
+    f.browserDriver.readDom = async (...args) => {
+      const chunk = await read(...args)
+      if (requests.length === 2) controller.abort(new Error("Отмена изолированного чтения"))
+      return chunk
+    }
+    const input = chunkPlan(f, { maxBytes: 4, maxChunks: 3 })
+    await expect(f.dispatch(input, controller.signal)).rejects.toThrow()
+    const result = await f.dispatch(input)
+    expect(result.data.state).toBe("stopped")
+    expect(result.data.reads).toEqual([])
+    expect(requests).toHaveLength(2)
+    expect(f.driver.connectCalls).toBe(1)
+  } finally { await f.dispose() }
+})
+
+test("порционное чтение проходит реальный agent gateway, но не расширяет разрешения клиента", async () => {
+  const f = fixture()
+  try {
+    const full = "{\"ok\":true}"
+    const requests = chunkSource(f, full)
+    registerAgentService(f.registry, f.core, { expectedHostname: hostname() })
+    const input = { node: "computer", action: "run_pipeline",
+      input: chunkPlan(f, { mode: "resource", resourceUrl: "/data.json", maxBytes: 6, maxChunks: 3 }) }
+    await expect(f.registry.dispatch(f.session, "agent_request", { ...input,
+      allowedActions: computerActions.filter(action => action !== "browser_chrome_operation") },
+      new AbortController().signal)).rejects.toThrow("browser_chrome_operation")
+    expect(f.driver.connectCalls).toBe(0)
+    expect(requests).toHaveLength(0)
+    const response = await f.registry.dispatch(f.session, "agent_request", input, new AbortController().signal)
+    expect(response.isError).not.toBe(true)
+    expect(response.data.payload).toMatchObject({ state: "verified", connectionCleanup: "confirmed-disconnected",
+      reads: [{ content: full, nextOffsetBytes: 11, totalBytes: 11, snapshotSha256: sha256(full) }] })
+    expect(requests).toHaveLength(2)
+    expect(f.driver.connectCalls).toBe(1)
+    expect(f.driver.disconnectCalls).toBe(1)
   } finally { await f.dispose() }
 })

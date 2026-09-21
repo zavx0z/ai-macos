@@ -20,6 +20,14 @@ test("Runtime exposes one bounded pipeline without arbitrary method/script execu
     const schema = JSON.stringify(descriptor?.inputSchema)
     expect(schema).toContain("anchors")
     expect(schema).toContain("sequence")
+    expect(schema).toContain("maxChunks")
+    expect(schema).toContain("offsetBytes")
+    expect(schema).toContain("expectedSnapshotSha256")
+    expect(schema).toContain("resourceUrl")
+    const output = JSON.stringify(descriptor?.outputSchema)
+    for (const field of ["content", "snapshotSha256", "nextOffsetBytes", "totalBytes", "chunks", "resource"]) {
+      expect(output).toContain(field)
+    }
     expect(schema).not.toContain("evaluate")
     expect(schema).not.toContain("shell")
   } finally { await host.close(); await rm(directory, { recursive: true, force: true }) }

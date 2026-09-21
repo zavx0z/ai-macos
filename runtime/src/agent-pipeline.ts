@@ -1,6 +1,7 @@
 import {
   browserInstanceRefSchema, browserInstanceSnapshotSchema, browserTargetSnapshotSchema,
-  browserOperationResources, operationRecordSchema, structurallyEqual, z,
+  browserOperationResources, browserOperationResultSchema, assertBrowserResultMatchesRequest,
+  operationRecordSchema, structurallyEqual, z,
   type BrowserOperationRequest, type BrowserTargetRef, type RuntimeClientSession,
 } from "@meta/shared/contracts"
 import { planShortcuts } from "@meta/input/action-plan"
@@ -12,6 +13,8 @@ import { bindDeadline, operationDeadline, signalDeadline } from "./deadline.ts"
 import { canonicalJson, sha256 } from "./primitives.ts"
 import { RuntimeContractError } from "./errors.ts"
 import { matchPipelineCondition, pipelineConditionSchema, type PipelineCondition } from "./pipeline-conditions.ts"
+import { collectPipelineRead, pipelineReadOptionsSchema, pipelineReadResultSchema,
+  PIPELINE_READ_BUDGET, pipelineResourceUrl, validatePipelineRead } from "./pipeline-read.ts"
 
 const id = z.string().min(1).max(127)
 const stepId = z.string().regex(/^[a-z][a-z0-9-]{0,39}$/)
@@ -23,8 +26,7 @@ const stepSchema = z.discriminatedUnion("kind", [
   z.strictObject({ id: stepId, kind: z.literal("chrome-connect"), instance: browserInstanceRefSchema }),
   z.strictObject({ ...uiStep, kind: z.literal("chrome-consent") }),
   z.strictObject({ id: stepId, kind: z.literal("chrome-wait") }),
-  z.strictObject({ id: stepId, kind: z.literal("chrome-read"), url: z.string().min(1).max(4096),
-    mode: z.enum(["dom", "accessibility"]).default("dom") }),
+  z.strictObject({ id: stepId, kind: z.literal("chrome-read"), ...pipelineReadOptionsSchema.shape }),
   z.strictObject({ id: stepId, kind: z.literal("chrome-disconnect") }),
 ])
 export const pipelineInputSchema = z.strictObject({
@@ -35,8 +37,13 @@ export const pipelineInputSchema = z.strictObject({
     chromeDisconnected: z.literal(true).optional(), caption: z.string().min(1).max(512) }),
 }).superRefine((input, context) => {
   const names = new Set<string>()
+  let readBudget = 0
   let chrome: "none" | "pending" | "consented" | "connected" | "closed" = "none"
   for (const step of input.steps) {
+    if (step.kind === "chrome-read") {
+      validatePipelineRead(step, context)
+      readBudget += step.maxBytes * step.maxChunks
+    }
     if (names.has(step.id)) context.addIssue({ code: "custom", message: "Duplicate step id" })
     names.add(step.id)
     if (step.kind === "keys") {
@@ -60,6 +67,7 @@ export const pipelineInputSchema = z.strictObject({
     }
   }
   if (chrome !== "none" && chrome !== "closed") context.addIssue({ code: "custom", message: "Connection pipeline must include disconnect" })
+  if (readBudget > PIPELINE_READ_BUDGET) context.addIssue({ code: "custom", message: "Суммарный бюджет текста конвейера превышает 65536 байт" })
   if (!input.final.condition && !input.final.chromeDisconnected) context.addIssue({ code: "custom", message: "An explicit final condition is required" })
   if (input.final.chromeDisconnected && chrome !== "closed") context.addIssue({ code: "custom", message: "Missing Chrome disconnect step" })
 })
@@ -73,8 +81,7 @@ const pipelineOutputSchema = z.strictObject({
   clientRequestId: id, runtimeEpoch: id, targetId: id,
   state: z.enum(["verified", "stopped"]),
   steps: z.array(receiptSchema).max(16),
-  reads: z.array(z.strictObject({ targetId: id, url: z.string().max(4096), title: z.string().max(4096),
-    mode: z.string(), contentBytes: z.number().int().min(0), sha256: z.string(), truncated: z.boolean() })).max(16),
+  reads: z.array(pipelineReadResultSchema).max(16),
   finalVerified: z.boolean(),
   connectionCleanup: z.enum(["not-started", "confirmed-disconnected", "unconfirmed"]),
   cleanupOperationIds: z.array(id).max(4),
@@ -346,17 +353,37 @@ async function executePipeline(registry: MethodRegistry, core: RuntimeCore, cont
         remember(connectId); current.state = "completed"
       } else if (step.kind === "chrome-read") {
         if (!connected) throw new Error("Missing active Chrome instance")
-        const snapshot = browserTargetSnapshotSchema.parse((await call("browser_chrome_targets", { instance: connected })).data)
-        const found = snapshot.targets.filter(t => t.url === step.url && (!tab || structurallyEqual(t.ref, tab)))
-        if (!snapshot.complete || snapshot.errors.length || found.length !== 1) throw new Error("Exact unique tab required; never choose first or retarget")
-        tab ??= found[0]!.ref
-        const read = await browser(step.mode === "dom" ? { kind: "read-dom", target: tab, maxBytes: 32_768 }
-          : { kind: "read-accessibility", target: tab, maxBytes: 32_768, maxNodes: 300 }, snapshot, step.id)
-        const result = read.data.result as { ok?: boolean, value?: { value?: { content?: string, contentBytes?: number, truncated?: boolean } } }
-        const value = result.value?.value
-        if (result.ok !== true || typeof value?.content !== "string" || typeof value.contentBytes !== "number" || typeof value.truncated !== "boolean") throw new Error("Invalid browser read result")
-        reply.reads.push({ targetId: tab.targetId, url: step.url, title: found[0]!.title.slice(0, 4096),
-          mode: step.mode, contentBytes: value.contentBytes, sha256: sha256(value.content), truncated: value.truncated })
+        let title = ""
+        const readPart: Parameters<typeof collectPipelineRead>[1] = async (cursor, index) => {
+          // Перед каждой частью обновляется inventory, но закреплённая вкладка не подменяется.
+          const snapshot = browserTargetSnapshotSchema.parse((await call("browser_chrome_targets", { instance: connected })).data)
+          const found = snapshot.targets.filter(t => t.url === step.url && (!tab || structurallyEqual(t.ref, tab)))
+          if (!snapshot.complete || snapshot.errors.length || !structurallyEqual(snapshot.instance, connected)
+            || found.length !== 1) throw new Error("Exact unique tab required; never choose first or retarget")
+          tab ??= found[0]!.ref
+          title = found[0]!.title.slice(0, 4096)
+          const request: BrowserOperationRequest = step.mode === "accessibility"
+            ? { kind: "read-accessibility", target: tab, maxBytes: step.maxBytes, maxNodes: 300 }
+            : step.mode === "resource"
+              ? { kind: "read-resource", target: tab, url: pipelineResourceUrl(step), ...cursor }
+              : { kind: "read-dom", target: tab, ...cursor }
+          const part = await browser(request, snapshot, index === 0 ? step.id : `${step.id}:chunk:${index}`)
+          const result = part.data.result as { ok?: boolean, value?: unknown }
+          if (result.ok !== true) throw new Error("Invalid browser read result")
+          const parsed = browserOperationResultSchema.parse(result.value)
+          assertBrowserResultMatchesRequest(request, parsed)
+          return { value: parsed.value, operationId: part.record.context.operationId }
+        }
+        let collected
+        if (step.mode === "accessibility") {
+          const { value } = await readPart({ offsetBytes: 0, maxBytes: step.maxBytes }, 0)
+          if (value.kind !== "accessibility-read") throw new Error("Invalid accessibility read result")
+          collected = { content: value.content, contentBytes: value.contentBytes,
+            sha256: sha256(value.content), truncated: value.truncated }
+        } else collected = await collectPipelineRead(step, readPart)
+        // Публикуется только целиком проверенный диапазон; ошибка не оставляет смешанного текста.
+        reply.reads.push({ stepId: step.id, targetId: tab!.targetId, url: step.url, title,
+          mode: step.mode, ...collected })
         current.state = "completed"
       } else if (step.kind === "chrome-disconnect") {
         if (!connected) throw new Error("No owned connected instance")

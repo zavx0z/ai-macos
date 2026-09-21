@@ -43,8 +43,8 @@ export function assertChatPipelineRequest(
     if (kind === "chrome-disconnect") browserKind = "disconnect-instance"
     if (kind === "chrome-read") {
       const mode: unknown = step.mode
-      if (mode !== undefined && mode !== "dom" && mode !== "accessibility") denied("неизвестный режим чтения Chrome")
-      browserKind = mode === "accessibility" ? "read-accessibility" : "read-dom"
+      if (mode !== undefined && mode !== "dom" && mode !== "accessibility" && mode !== "resource") denied("неизвестный режим чтения Chrome")
+      browserKind = mode === "accessibility" ? "read-accessibility" : mode === "resource" ? "read-resource" : "read-dom"
     }
     if (browserKind) assertChatBrowserRequest("browser_chrome_operation", { request: { kind: browserKind } })
   }

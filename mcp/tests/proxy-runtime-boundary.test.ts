@@ -4,6 +4,7 @@ import { hostname, tmpdir } from "node:os"
 import { join } from "node:path"
 import { createRuntimeHost } from "../../runtime/src/host.ts"
 import { z } from "../../shared/src/contracts/schema.ts"
+import { CAPABILITY_IDS } from "../../shared/src/contracts/capabilities.ts"
 import { createChatExecutor } from "../src/chat-executor.ts"
 import { RuntimeCore } from "../../runtime/src/core.ts"
 import { MethodRegistry } from "../../runtime/src/method-registry.ts"
@@ -33,6 +34,20 @@ test("gateway transports the complete current browser contract without opening C
     const descriptor = response.structuredContent?.contract as { name?: string; inputSchema?: unknown } | undefined
     expect(descriptor?.name).toBe("browser_chrome_operation")
     expect(JSON.stringify(descriptor?.inputSchema)).toContain("read-resource")
+    // Без Native-возможностей конвейер не публикуется. Только для проверки контракта
+    // отмечаем возможности подставного host; реальные Native/Chrome не вызываются.
+    const unavailablePipeline = await proxy.request!({ node: "computer/run_pipeline" }, signal())
+    expect(unavailablePipeline.isError).toBe(true)
+    host.core.updateCapabilities({ schemaVersion: "1", scope: "runtime", producerRef: "test:pipeline-contract",
+      capabilities: CAPABILITY_IDS.map(id => ({ id, state: "ready" })) })
+    const pipeline = await proxy.request!({ node: "computer/run_pipeline" }, signal())
+    if (pipeline.isError) console.log("PIPELINE_CONTRACT_ERROR=" + JSON.stringify(pipeline.content).slice(0, 3000))
+    expect(pipeline.isError).not.toBe(true)
+    const pipelineContract = pipeline.structuredContent?.contract as { inputSchema?: unknown, outputSchema?: unknown }
+    expect(JSON.stringify(pipelineContract.inputSchema)).toContain("maxChunks")
+    expect(JSON.stringify(pipelineContract.inputSchema)).toContain("expectedSnapshotSha256")
+    expect(JSON.stringify(pipelineContract.outputSchema)).toContain("contentBytes")
+    expect(JSON.stringify(pipelineContract.outputSchema)).toContain("snapshotSha256")
     expect(driver.connectCalls).toBe(0)
   } finally { await proxy.close(); await host.close(); await rm(directory, { recursive: true, force: true }) }
 })
