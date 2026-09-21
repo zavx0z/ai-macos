@@ -4,14 +4,14 @@ import { hostname, tmpdir } from "node:os"
 import { join } from "node:path"
 import { createHash } from "node:crypto"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
-import { createAiClient } from "../src/ai-client.ts"
-import { ToolError } from "../../vendor/ai/shared/errors.ts"
-import { renderAiMetadata } from "../../scripts/ai-metadata.ts"
+import { createToolsClient } from "../src/tools-client.ts"
+import { ToolError } from "../../vendor/tools/shared/errors.ts"
+import { renderToolsMetadata } from "../../scripts/tools-metadata.ts"
 
 let directory: string
 let path: string
 beforeEach(() => {
-  directory = mkdtempSync(join(tmpdir(), "cu-ai-test-"))
+  directory = mkdtempSync(join(tmpdir(), "cu-tools-test-"))
   path = join(directory, "file.txt")
   writeFileSync(path, "before")
 })
@@ -19,15 +19,15 @@ afterEach(() => rmSync(directory, { recursive: true, force: true }))
 const signal = () => new AbortController().signal
 const hash = (s: string) => createHash("sha256").update(s).digest("hex")
 const code = (r: CallToolResult) => (r.structuredContent?.error as { code?: string })?.code
-const request = () => ({ node: "ai/filesystem/write", action: "run", input: { path, content: "after", expectedHash: hash("before") } })
-const client = () => createAiClient({ expectedHostname: hostname() })
+const request = () => ({ node: "tools/filesystem/write", action: "run", input: { path, content: "after", expectedHash: hash("before") } })
+const client = () => createToolsClient({ expectedHostname: hostname() })
 
 test("метаданные воспроизводимы", () => {
-  expect(readFileSync(new URL("../src/ai-metadata.ts", import.meta.url), "utf8")).toBe(renderAiMetadata())
+  expect(readFileSync(new URL("../src/tools-metadata.ts", import.meta.url), "utf8")).toBe(renderToolsMetadata())
 })
 
 test("файловая запись работает без отдельного допуска", async () => {
-  const c = createAiClient({ expectedHostname: hostname() })
+  const c = createToolsClient({ expectedHostname: hostname() })
   const r = await c.request!(request(), signal())
   expect(r.isError).not.toBe(true)
   expect(readFileSync(path, "utf8")).toBe("after")
@@ -35,8 +35,8 @@ test("файловая запись работает без отдельного
 
 test("описания и все заявленные views не исполняют операции", async () => {
   let calls = 0
-  const c = createAiClient({ authorize: () => { calls++; return false } })
-  const node = "ai/filesystem/write"
+  const c = createToolsClient({ authorize: () => { calls++; return false } })
+  const node = "tools/filesystem/write"
   const first = await c.request!({ node }, signal())
   expect(first.isError).not.toBe(true)
   const texts: string[] = []
@@ -52,7 +52,7 @@ test("описания и все заявленные views не исполня�
 
 test("read, write expectedHash, read и конфликт старого hash", async () => {
   const c = client()
-  const read = () => c.request!({ node: "ai/filesystem/read", action: "run", input: { path } }, signal())
+  const read = () => c.request!({ node: "tools/filesystem/read", action: "run", input: { path } }, signal())
   expect((await read()).structuredContent?.content).toBe("before")
   expect((await c.request!(request(), signal())).isError).not.toBe(true)
   expect((await read()).structuredContent?.content).toBe("after")
@@ -62,14 +62,14 @@ test("read, write expectedHash, read и конфликт старого hash", a
 
 test("другая машина не получает даже callback разрешения", async () => {
   let calls = 0
-  const c = createAiClient({ expectedHostname: "not-this-machine", authorize: () => { calls++; return true } })
+  const c = createToolsClient({ expectedHostname: "not-this-machine", authorize: () => { calls++; return true } })
   expect(code(await c.request!(request(), signal()))).toBe("MACHINE_MISMATCH")
   expect(calls).toBe(0)
   expect(readFileSync(path, "utf8")).toBe("before")
 })
 
 test("UI полномочия и input.authorize не разрешают файловую запись", async () => {
-  const c = createAiClient({ expectedHostname: hostname(), authorize: i => i.node.startsWith("computer/") })
+  const c = createToolsClient({ expectedHostname: hostname(), authorize: i => i.node.startsWith("computer/") })
   const q = request()
   const r = await c.request!({ ...q, input: { ...q.input, authorize: true } }, signal())
   expect(code(r)).toBe("AUTHORIZATION_REQUIRED")
@@ -87,7 +87,7 @@ test("отмена до допуска не выполняет запись", as
 
 test("отмена во время ожидания допуска не выполняет запись", async () => {
   const ac = new AbortController()
-  const c = createAiClient({ expectedHostname: hostname(), authorize: async () => {
+  const c = createToolsClient({ expectedHostname: hostname(), authorize: async () => {
     await Promise.resolve()
     ac.abort()
     return true
@@ -106,7 +106,7 @@ test("закрытый сервис и неизвестный action не исп
 
 test("частичная ошибка сохраняет code и details", async () => {
   const details = { applied: ["fixture"], failed: "fixture-2" }
-  const c = createAiClient({ expectedHostname: hostname(), authorize: () => {
+  const c = createToolsClient({ expectedHostname: hostname(), authorize: () => {
     throw new ToolError("PARTIAL_FAILURE", "Проверка передачи ошибки", 409, details)
   } })
   const r = await c.request!(request(), signal())
@@ -118,7 +118,7 @@ test("частичная ошибка сохраняет code и details", async
 
 test("неизвестная ошибка не вызывает повтор", async () => {
   let calls = 0
-  const c = createAiClient({ expectedHostname: hostname(), authorize: () => {
+  const c = createToolsClient({ expectedHostname: hostname(), authorize: () => {
     calls++
     throw new Error("unexpected")
   } })
@@ -133,23 +133,23 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js"
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js"
 import { startChatProxy } from "../src/chat-proxy.ts"
 
-test("единый zavx0z раскрывает ai и выполняет read-write-read без нового сервера", async () => {
+test("единый zavx0z раскрывает tools и выполняет read-write-read без нового сервера", async () => {
   const server = await startChatProxy({ runtime: {
     expectedHostname: hostname(), socketPath: join(directory, "missing.sock"),
     credentialPath: join(directory, "missing.json"),
   } })
-  const c = new Client({ name: "ai-route-test", version: "1" })
+  const c = new Client({ name: "tools-route-test", version: "1" })
   const [ct, st] = InMemoryTransport.createLinkedPair()
   try {
     await Promise.all([c.connect(ct), server.connect(st)])
     const call = (args: Record<string, unknown>) => c.callTool({ name: "zavx0z", arguments: args })
     const root = await call({})
-    expect(JSON.stringify(root.structuredContent)).toContain('"node":"ai"')
-    const contract = await call({ node: "ai/filesystem/write", input: { view: "contract" } })
+    expect(JSON.stringify(root.structuredContent)).toContain('"node":"tools"')
+    const contract = await call({ node: "tools/filesystem/write", input: { view: "contract" } })
     expect(contract.isError).not.toBe(true)
     expect(JSON.stringify(contract.structuredContent)).toContain("expectedHash")
     expect(readFileSync(path, "utf8")).toBe("before")
-    const read = () => call({ node: "ai/filesystem/read", action: "run", input: { path } })
+    const read = () => call({ node: "tools/filesystem/read", action: "run", input: { path } })
     expect(JSON.stringify((await read()).structuredContent)).toContain("before")
     expect((await call(request())).isError).not.toBe(true)
     expect(JSON.stringify((await read()).structuredContent)).toContain("after")

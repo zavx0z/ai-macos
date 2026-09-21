@@ -2,11 +2,11 @@ import { readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { fileURLToPath } from "node:url"
 
-const sourceRoot = fileURLToPath(new URL("../vendor/ai/", import.meta.url))
-const destination = fileURLToPath(new URL("../mcp/src/ai-metadata.ts", import.meta.url))
+const sourceRoot = fileURLToPath(new URL("../vendor/tools/", import.meta.url))
+const destination = fileURLToPath(new URL("../mcp/src/tools-metadata.ts", import.meta.url))
 
 /** Производная упаковка исходников, не второй каталог контрактов. */
-export function renderAiMetadata(root = sourceRoot): string {
+export function renderToolsMetadata(root = sourceRoot): string {
   const sources: Record<string, string> = {}
   function visit(directory: string, prefix = "") {
     for (const entry of readdirSync(directory, { withFileTypes: true }).sort((a, b) => a.name.localeCompare(b.name, "en"))) {
@@ -23,15 +23,15 @@ export function renderAiMetadata(root = sourceRoot): string {
     }
   }
   visit(root)
-  return "// Создано scripts/ai-metadata.ts из vendor/ai. Не редактировать вручную.\n"
-    + "export const aiSources: Readonly<Record<string, string>> = Object.freeze("
+  return "// Создано scripts/tools-metadata.ts из vendor/tools. Не редактировать вручную.\n"
+    + "export const toolsSources: Readonly<Record<string, string>> = Object.freeze("
     + JSON.stringify(sources, null, 2) + ")\n"
 }
 
 if (import.meta.main) {
-  const rendered = renderAiMetadata()
+  const rendered = renderToolsMetadata()
   if (process.argv.includes("--check")) {
-    if (readFileSync(destination, "utf8") !== rendered) throw new Error("Обновите метаданные: bun scripts/ai-metadata.ts")
+    if (readFileSync(destination, "utf8") !== rendered) throw new Error("Обновите метаданные: bun scripts/tools-metadata.ts")
   } else writeFileSync(destination, rendered)
-  console.log("AI_METADATA_OK")
+  console.log("TOOLS_METADATA_OK")
 }

@@ -1,6 +1,6 @@
 {
-  "name": "@zavx0z/ai",
-  "label": "AI Tools",
+  "name": "@zavx0z/tools",
+  "label": "Tools",
   "private": true,
   "type": "module",
   "workspaces": [

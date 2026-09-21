@@ -17,21 +17,21 @@ test("all eleven bindings have colocated contracts and executable scenarios", ()
     }
   }
   const discovery = createDiscovery({repositoryRoot, runnable: new Set(handlers.keys())})
-  assert.equal(discovery.has("ai/filesystem/read"), true)
-  for (const node of ["ai/filesystem/roots", "ai/filesystem/open", "ai/filesystem/shared"]) {
+  assert.equal(discovery.has("tools/filesystem/read"), true)
+  for (const node of ["tools/filesystem/roots", "tools/filesystem/open", "tools/filesystem/shared"]) {
     assert.equal(discovery.has(node), false)
     assert.throws(() => discovery.describe(node), hasCode("UNKNOWN_NODE"))
   }
 })
 test("discovery supports nested addresses without executing source", () => fixture(directory => {
-  writeFileSync(join(directory, "package.json"), JSON.stringify({name: "@test/ai", workspaces: ["filesystem"]}))
+  writeFileSync(join(directory, "package.json"), JSON.stringify({name: "@test/tools", workspaces: ["filesystem"]}))
   mkdirSync(join(directory, "filesystem/group/tool"), {recursive: true})
   writeFileSync(join(directory, "filesystem/package.json"), JSON.stringify({name: "@test/filesystem", exports: {"./group/tool": "./group/tool/index.ts"}}))
   writeFileSync(join(directory, "filesystem/group/tool/index.ts"), "/** Safe description. @packageDocumentation */\nthrow new Error('must not execute')\n")
-  const discovery = createDiscovery({repositoryRoot: directory, runnable: new Set(["ai/filesystem/group/tool"])})
-  const category = discovery.describe("ai/filesystem/group") as {children: Array<{node: string}>}
-  assert.equal(category.children[0]?.node, "ai/filesystem/group/tool")
-  const tool = discovery.describe("ai/filesystem/group/tool") as {description: string; views: string[]}
+  const discovery = createDiscovery({repositoryRoot: directory, runnable: new Set(["tools/filesystem/group/tool"])})
+  const category = discovery.describe("tools/filesystem/group") as {children: Array<{node: string}>}
+  assert.equal(category.children[0]?.node, "tools/filesystem/group/tool")
+  const tool = discovery.describe("tools/filesystem/group/tool") as {description: string; views: string[]}
   assert.equal(tool.description, "Safe description.")
   assert.deepEqual(tool.views, ["overview"])
 }))

@@ -1,21 +1,21 @@
 import { posix } from "node:path"
 import { hostname } from "node:os"
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js"
-import { createDispatcher, type DispatcherInput } from "../../vendor/ai/server/dispatch/index.ts"
-import { ToolError } from "../../vendor/ai/shared/errors.ts"
-import { aiSources } from "./ai-metadata.ts"
+import { createDispatcher, type DispatcherInput } from "../../vendor/tools/server/dispatch/index.ts"
+import { ToolError } from "../../vendor/tools/shared/errors.ts"
+import { toolsSources } from "./tools-metadata.ts"
 import { ChatProxyError, type ServiceClient } from "./service-client.ts"
 
-export interface AiClientOptions {
+export interface ToolsClientOptions {
   expectedHostname?: string
   authorize?: DispatcherInput["authorize"]
 }
 
 function readSource(name: string, optional = false): string | null {
   name = posix.normalize(name)
-  if (Object.hasOwn(aiSources, name)) return aiSources[name]!
+  if (Object.hasOwn(toolsSources, name)) return toolsSources[name]!
   if (optional) return null
-  throw new ToolError("METADATA_MISSING", "Нет упакованных метаданных ai", 500)
+  throw new ToolError("METADATA_MISSING", "Нет упакованных метаданных tools", 500)
 }
 
 function result(value: unknown): CallToolResult {
@@ -27,11 +27,11 @@ function result(value: unknown): CallToolResult {
 }
 
 /** Встраивание без HTTP, второго MCP, Runtime и workspace. */
-export function createAiClient(options: AiClientOptions = {}): ServiceClient {
+export function createToolsClient(options: ToolsClientOptions = {}): ServiceClient {
   const { expectedHostname, authorize = () => true } = options
   let closed = false
   function assertHost() {
-    if (closed) throw new ChatProxyError("SERVICE_CLOSED", "Сервис ai закрыт")
+    if (closed) throw new ChatProxyError("SERVICE_CLOSED", "Сервис tools закрыт")
     if (!expectedHostname || hostname() !== expectedHostname) {
       throw new ChatProxyError("MACHINE_MISMATCH", "Ожидаемая машина не подтверждена")
     }
@@ -43,12 +43,12 @@ export function createAiClient(options: AiClientOptions = {}): ServiceClient {
     },
     request: async (request, signal) => {
       try {
-        if (closed) throw new ChatProxyError("SERVICE_CLOSED", "Сервис ai закрыт")
+        if (closed) throw new ChatProxyError("SERVICE_CLOSED", "Сервис tools закрыт")
         signal.throwIfAborted()
         const { node, action, input } = request
         if (action !== undefined && action !== "run") throw new ToolError("ACTION_NOT_ALLOWED", "Только action: run выполняет операцию")
         const dispatcher = createDispatcher({
-          repositoryRoot: "embedded:ai", readSource, signal,
+          repositoryRoot: "embedded:tools", readSource, signal,
           authorize: async invocation => {
             assertHost()
             const allowed = await authorize?.(invocation)

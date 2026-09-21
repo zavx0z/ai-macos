@@ -1,5 +1,5 @@
 {
-  "name": "@ai/git",
+  "name": "@tools/git",
   "label": "Git",
   "private": true,
   "type": "module",

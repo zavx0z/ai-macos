@@ -14,7 +14,7 @@ export function directoryAuthorizer(values: string[]): (invocation: ToolInvocati
   return invocation => {
     // Do not silently accept a configured boundary that has become a symlink.
     if (directories.some(path => lstatSync(path).isSymbolicLink() || realpathSync(path) !== path || !lstatSync(path).isDirectory())) return false
-    const removesEntry = invocation.node === "ai/filesystem/remove" || invocation.node === "ai/filesystem/rename"
+    const removesEntry = invocation.node === "tools/filesystem/remove" || invocation.node === "tools/filesystem/rename"
     return invocation.paths.every(value => {
       const path = resolvePath(value, {missing: true, finalSymlink: true})
       return directories.some(directory => within(directory, path) && !(removesEntry && directory === path))

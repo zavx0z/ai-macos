@@ -9,7 +9,7 @@ import {fixture, hasCode} from "../../../filesystem/shared/spec-fixture.ts"
 import {repositoryRoot, token, post} from "./fixture.ts"
 
 const appFor = (directory: string) => createRequestHandler({authorize: directoryAuthorizer([directory]), token, repositoryRoot})
-const run = (name: string, input: Record<string, unknown>) => post({node: `ai/filesystem/${name}`, action: "run", input})
+const run = (name: string, input: Record<string, unknown>) => post({node: `tools/filesystem/${name}`, action: "run", input})
 
 test("HTTP GET and empty POST discover the same root", () => fixture(async directory => {
   const app = appFor(directory)
@@ -28,10 +28,10 @@ test("HTTP discovers contracts and scenarios without executing", () => fixture(a
   const path = join(directory, "file")
   writeFileSync(path, "unchanged")
   const app = appFor(directory)
-  assert.equal((await (await app.handle(post({node: "ai/filesystem/write"}))).json()).runnable, true)
-  const contract = await app.handle(post({node: "ai/filesystem/write", input: {view: "contract"}}))
+  assert.equal((await (await app.handle(post({node: "tools/filesystem/write"}))).json()).runnable, true)
+  const contract = await app.handle(post({node: "tools/filesystem/write", input: {view: "contract"}}))
   assert.match((await contract.json()).input, /expectedHash/)
-  const scenario = await app.handle(post({node: "ai/filesystem/write", input: {view: "scenarios"}}))
+  const scenario = await app.handle(post({node: "tools/filesystem/write", input: {view: "scenarios"}}))
   assert.equal((await scenario.json()).executed, false)
   assert.equal(readFileSync(path, "utf8"), "unchanged")
 }))
@@ -46,13 +46,13 @@ test("HTTP rejects imports, technical nodes, removed tools and invalid envelopes
   const app = appFor(directory)
   for (const [body, status] of [
     [{node: "../../etc/passwd", action: "run"}, 404],
-    [{node: "ai/server/request", action: "run"}, 403],
-    [{node: "ai/server/dispatch", action: "run"}, 403],
-    [{node: "ai/filesystem/roots"}, 404],
-    [{node: "ai/filesystem/open", action: "run"}, 404],
-    [{node: "ai/filesystem/read", action: "execute"}, 400],
-    [{node: "ai/filesystem/read", input: {path: join(directory, "file")}}, 400],
-    [{node: "ai/filesystem/read", action: "run", input: []}, 400],
+    [{node: "tools/server/request", action: "run"}, 403],
+    [{node: "tools/server/dispatch", action: "run"}, 403],
+    [{node: "tools/filesystem/roots"}, 404],
+    [{node: "tools/filesystem/open", action: "run"}, 404],
+    [{node: "tools/filesystem/read", action: "execute"}, 400],
+    [{node: "tools/filesystem/read", input: {path: join(directory, "file")}}, 400],
+    [{node: "tools/filesystem/read", action: "run", input: []}, 400],
     [{extra: true}, 400], [[], 400],
   ] as const) assert.equal((await app.handle(post(body))).status, status)
 }))
@@ -107,7 +107,7 @@ test("real loopback listener reads through the same tools without Interpreter", 
   const host = await startServer({allowedDirectories: [directory], token, repositoryRoot, port: 0, log: false})
   try {
     const response = await fetch(host.url, {method: "POST", headers: {authorization: `Bearer ${token}`, "content-type": "application/json"},
-      body: JSON.stringify({node: "ai/filesystem/read", action: "run", input: {path}})})
+      body: JSON.stringify({node: "tools/filesystem/read", action: "run", input: {path}})})
     assert.equal(response.status, 200)
     assert.equal((await response.json()).content, "network")
   } finally { await host.close() }

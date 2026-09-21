@@ -1,4 +1,4 @@
-# AI Tools
+# Tools
 
 Универсальные TypeScript-инструменты для файлов и Git. **10 файловых операций
 и Git status**, без workspace/session-модели, регистрации корней, `roots`,
@@ -45,9 +45,9 @@ const tools = createDispatcher({
   authorize: invocation => hostPolicy.authorize(invocation), // политика вызывающего хоста
 })
 
-await tools.dispatch({node: "ai/filesystem/read", input: {view: "contract"}})
+await tools.dispatch({node: "tools/filesystem/read", input: {view: "contract"}})
 await tools.dispatch({
-  node: "ai/filesystem/read", action: "run",
+  node: "tools/filesystem/read", action: "run",
   input: {path: "/work/project/src/index.ts"},
 })
 ```

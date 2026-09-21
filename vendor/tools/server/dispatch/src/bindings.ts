@@ -22,16 +22,16 @@ function bind<I>(run: (input: I) => unknown, fields: readonly string[], write = 
 /** Fixed public functions, not a second schema catalogue or dynamic imports. */
 export function bindings(): ReadonlyMap<string, Binding> {
   return new Map([
-    ["ai/filesystem/stat", bind(statPath, ["path"])],
-    ["ai/filesystem/read", bind(readFile, ["path"])],
-    ["ai/filesystem/read-many", bind(readFiles, ["paths"])],
-    ["ai/filesystem/list", bind(listFiles, ["path"])],
-    ["ai/filesystem/write", bind(writeFile, ["path"], true)],
-    ["ai/filesystem/create", bind(createFile, ["path"], true)],
-    ["ai/filesystem/mkdir", bind(makeDirectory, ["path"], true)],
-    ["ai/filesystem/remove", bind(removePath, ["path"], true)],
-    ["ai/filesystem/rename", bind(renamePath, ["from", "to"], true)],
-    ["ai/filesystem/apply-patch", bind(applyPatch, ["directory"], true)],
-    ["ai/git/status", bind(gitStatus, ["path"])],
+    ["tools/filesystem/stat", bind(statPath, ["path"])],
+    ["tools/filesystem/read", bind(readFile, ["path"])],
+    ["tools/filesystem/read-many", bind(readFiles, ["paths"])],
+    ["tools/filesystem/list", bind(listFiles, ["path"])],
+    ["tools/filesystem/write", bind(writeFile, ["path"], true)],
+    ["tools/filesystem/create", bind(createFile, ["path"], true)],
+    ["tools/filesystem/mkdir", bind(makeDirectory, ["path"], true)],
+    ["tools/filesystem/remove", bind(removePath, ["path"], true)],
+    ["tools/filesystem/rename", bind(renamePath, ["from", "to"], true)],
+    ["tools/filesystem/apply-patch", bind(applyPatch, ["directory"], true)],
+    ["tools/git/status", bind(gitStatus, ["path"])],
   ])
 }

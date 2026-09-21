@@ -54,7 +54,7 @@ export function createDispatcher(options: DispatcherInput): DispatcherOutput {
       if (!Array.isArray(value) || value.length === 0 || value.length > 50) throw new ToolError("INVALID_INPUT", "paths must contain 1 to 50 strings")
       return value.map(absolutePath)
     })
-    const effect = handler.write && !(node === "ai/filesystem/apply-patch" && input["dryRun"] === true) ? "write" : "read"
+    const effect = handler.write && !(node === "tools/filesystem/apply-patch" && input["dryRun"] === true) ? "write" : "read"
     const invocation: ToolInvocation = Object.freeze({node, input, paths: Object.freeze(paths), effect})
     if (await authorize(invocation) !== true) throw new ToolError("AUTHORIZATION_REQUIRED", "The calling host did not authorize this invocation", 403)
     options.signal?.throwIfAborted()

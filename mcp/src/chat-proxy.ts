@@ -56,11 +56,11 @@ export async function startChatProxy(options: ChatProxyOptions = {}) {
       return createKnowledgeClient(options.knowledge)
     },
   }, {
-    id: "ai", routing: "structured", description: "Универсальные файловые операции и Git status",
+    id: "tools", routing: "structured", description: "Универсальные файловые операции и Git status",
     instructions: "Полный node раскрывает описание без выполнения. input.view раскрывает контракт или сценарий. Только action: run выполняет операцию. Пути абсолютные; roots/open и Interpreter отсутствуют. Не повторять mutation после unknown/partial; сначала проверить файл.",
     create: async () => {
-      const { createAiClient } = await import("./ai-client.ts")
-      return createAiClient({
+      const { createToolsClient } = await import("./tools-client.ts")
+      return createToolsClient({
         expectedHostname: options.runtime?.expectedHostname ?? process.env.AI_MACOS_EXPECTED_HOSTNAME,
       })
     },

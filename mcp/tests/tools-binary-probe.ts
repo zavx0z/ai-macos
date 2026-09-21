@@ -24,10 +24,10 @@ async function run(args: Record<string, unknown>) {
 try {
   await c.connect(transport)
   assert(JSON.stringify(await run({})).includes('"node":"ai"'))
-  const node = "ai/filesystem/write"
+  const node = "tools/filesystem/write"
   assert(JSON.stringify(await run({ node, input: { view: "contract" } })).includes("expectedHash"))
   assert(JSON.stringify(await run({ node, input: { view: "scenarios" } })).includes("typescript"))
-  const read = () => run({ node: "ai/filesystem/read", action: "run", input: { path } })
+  const read = () => run({ node: "tools/filesystem/read", action: "run", input: { path } })
   assert.equal((await read()).content, "before")
   const q = { node, action: "run", input: { path, content: "after", expectedHash: createHash("sha256").update("before").digest("hex") } }
   await run(q)

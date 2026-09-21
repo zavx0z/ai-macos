@@ -1,5 +1,5 @@
 {
-  "name": "@ai/server",
+  "name": "@tools/server",
   "label": "Tool Host",
   "private": true,
   "type": "module",
