@@ -183,36 +183,77 @@ async function executePipeline(registry: MethodRegistry, core: RuntimeCore, cont
       throw error
     }
   }
-  const windowReady = async () => {
+  const windowState = async () => {
     const state = (await call("get_state", { kind: "window" })).data
     const windows = state.windows as Array<{ targetId: string, pid: number, focused: string, visibility: string, hidden: string, minimized: string }>
     const apps = state.applications as Array<{ pid: number, bundleId?: string, axStatus: string }>
+    const surfaces = state.surfaces as Array<{ targetId: string, ownerTargetId: string, kind: string, role: string, actionability: string }> | undefined
     const matches = windows.filter(w => w.targetId === input.targetId)
     const window = matches[0]
-    if (matches.length !== 1 || !window || window.focused !== "true" || window.visibility !== "current"
+    if (matches.length !== 1 || !window || window.visibility !== "current"
       || window.hidden !== "false" || window.minimized !== "false") throw new Error("Unexpected window focus/visibility; no input sent")
     const owners = apps.filter(a => a.pid === window.pid)
     if (owners.length !== 1 || owners[0]!.bundleId !== input.expectedBundleId || owners[0]!.axStatus !== "ready") throw new Error("Exact window owner is not ready")
+    if (!Array.isArray(surfaces)) throw new Error("Native surface inventory unavailable")
+    return { window, surfaces }
   }
-  const liveConnect = async () => {
+  const windowReady = async () => {
+    const state = await windowState()
+    if (state.window.focused !== "true") throw new Error("Unexpected window focus; no input sent")
+    return state
+  }
+  const pendingConnect = async () => {
+    checkpoint()
     if (!connectId) throw new Error("No own connection operation")
     const record = await core.getOperation(session, connectId)
+    if (record?.state === "completed" && record.outcome.dispatch === "finished" && !record.error) return false
     if (!record || !["registered", "dispatching", "observing"].includes(record.state)
       || Date.now() >= Date.parse(record.context.deadlineAt)) throw new Error("Connection no longer pending; consent must not be sent")
+    return true
   }
-  const condition = async (expected: PipelineCondition, consent = false) => {
+  const observeCondition = async (targetId: string, expected: PipelineCondition) => {
+    const observed = (await call("observe", { targetId, mode: "ax" })).data
+    const match = matchPipelineCondition(observed, targetId, expected)
+    if (current) { current.condition = match.state; current.observedAt = new Date().toISOString() }
+    if (match.state !== "matched" && match.state !== "not-found") throw new Error(`${match.state}: ${match.reason}`)
+    return match
+  }
+  const condition = async (expected: PipelineCondition) => {
     for (;;) {
       checkpoint()
-      if (consent) await liveConnect()
       await windowReady()
-      const observed = (await call("observe", { targetId: input.targetId, mode: "ax" })).data
-      const match = matchPipelineCondition(observed, input.targetId, expected)
-      if (current) { current.condition = match.state; current.observedAt = new Date().toISOString() }
+      const match = await observeCondition(input.targetId, expected)
       if (match.state === "matched") return match
-      if (match.state !== "not-found") throw new Error(`${match.state}: ${match.reason}`)
       // Retry only a read, never the action preceding this expectation.
       await pause(signal)
     }
+  }
+  const consentCondition = async (expected: PipelineCondition, selectedTargetId?: string) => {
+    for (;;) {
+      // The same plan accepts an already approved connection without probing input.
+      if (!await pendingConnect()) return undefined
+      const { window, surfaces } = await windowState()
+      const owned = surfaces.filter(surface => surface.ownerTargetId === input.targetId)
+      if (owned.length > 1) throw new Error("Ambiguous owned consent surfaces; no input sent")
+      const surface = owned[0]
+      let targetId = input.targetId
+      if (surface) {
+        if (surface.actionability !== "ax" || !(surface.kind === "sheet" && surface.role === "AXSheet" || surface.role === "AXDialog")) {
+          throw new Error("Owned native consent surface is unavailable")
+        }
+        // Native click still validates this exact surface's focus, generation,
+        // ownership and fresh view. The parent is never declared focused here.
+        targetId = surface.targetId
+      } else if (window.focused !== "true") throw new Error("Unexpected window focus without an owned consent surface")
+      if (selectedTargetId && targetId !== selectedTargetId) throw new Error("Consent surface changed after input readiness; no retargeting")
+      const match = await observeCondition(targetId, expected)
+      if (match.state === "matched") return { targetId, match }
+      await pause(signal)
+    }
+  }
+  const inputCompleted = (action: RuntimeMethodResponse) => {
+    const outcome = action.data.outcome as { state?: string, dispatch?: string, cleanup?: string }
+    if (outcome?.state !== "completed" || outcome.dispatch !== "finished" || outcome.cleanup !== "complete") throw new Error("Input outcome unknown/partial; dependent steps stopped")
   }
   const browserInventory = async () => browserInstanceSnapshotSchema.parse((await call("browser_chrome_instances", {})).data)
   const browser = async (request: BrowserOperationRequest, snapshot: { inventoryId: string, inventoryRevision: number }, step: string, start = false) => {
@@ -240,23 +281,45 @@ async function executePipeline(registry: MethodRegistry, core: RuntimeCore, cont
       if (step.kind === "wait") {
         const matched = await condition(step.when)
         current.selectedElementId = matched.selected.elementId; current.state = "observed"
-      } else if (step.kind === "keys" || step.kind === "press" || step.kind === "chrome-consent") {
+      } else if (step.kind === "chrome-consent") {
+        let selected = await consentCondition(step.when)
+        if (selected && await pendingConnect()) {
+          const readiness = (await call("check_input", {})).data
+          if (readiness.inputReady !== true) throw new Error("Input readiness is not confirmed")
+          // A probe invalidates the earlier view: observe the SAME target again.
+          selected = await consentCondition(step.when, selected.targetId)
+        } else selected = undefined
+        if (!selected || !await pendingConnect()) {
+          current.state = "completed"
+          current.reason = "Connection already completed; no consent input sent"
+          remember(connectId)
+          continue
+        }
+        current.selectedElementId = selected.match.selected.elementId
+        if (!selected.match.selected.actions.includes("AXPress")) throw new Error("Matched element has no AXPress; no coordinate fallback")
+        inputCompleted(await call("click", { targetId: selected.targetId, elementId: selected.match.selected.elementId }))
+        current.state = "dispatched"
+      } else if (step.kind === "keys" || step.kind === "press") {
         const readiness = (await call("check_input", {})).data
         if (readiness.inputReady !== true) throw new Error("Input readiness is not confirmed")
-        const matched = await condition(step.when, step.kind === "chrome-consent")
+        const matched = await condition(step.when)
         current.selectedElementId = matched.selected.elementId
-        if (step.kind === "chrome-consent") await liveConnect()
         let action: RuntimeMethodResponse
         if (step.kind === "keys") action = await call("press_shortcut", { targetId: input.targetId, sequence: step.sequence, delayMs: 0 })
         else {
           if (!matched.selected.actions.includes("AXPress")) throw new Error("Matched element has no AXPress; no coordinate fallback")
           action = await call("click", { targetId: input.targetId, elementId: matched.selected.elementId })
         }
-        const outcome = action.data.outcome as { state?: string, dispatch?: string, cleanup?: string }
-        if (outcome?.state !== "completed" || outcome.dispatch !== "finished" || outcome.cleanup !== "complete") throw new Error("Input outcome unknown/partial; dependent steps stopped")
+        inputCompleted(action)
         current.state = "dispatched" // Delivery is not the application effect. The final condition verifies that.
       } else if (step.kind === "chrome-connect") {
-        await windowReady()
+        const before = await windowReady()
+        const consent = input.steps.find(candidate => candidate.kind === "chrome-consent")
+        if (consent?.kind === "chrome-consent") {
+          if (before.surfaces.some(surface => surface.ownerTargetId === input.targetId)) throw new Error("Pre-existing owned surface cannot grant a new connection")
+          const previousDialog = await observeCondition(input.targetId, consent.when)
+          if (previousDialog.state !== "not-found") throw new Error("Consent dialog already present before this connection")
+        }
         const snapshot = await browserInventory()
         const found = snapshot.instances.filter(i => structurallyEqual(i.ref, step.instance))
         if (!snapshot.complete || snapshot.errors.length || found.length !== 1 || found[0]!.state !== "disconnected") throw new Error("Exact disconnected Chrome instance required")

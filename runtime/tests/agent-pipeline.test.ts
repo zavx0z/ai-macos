@@ -9,6 +9,7 @@ import { AgentTargetRegistry } from "../src/agent-targets.ts"
 import { MethodRegistry } from "../src/method-registry.ts"
 import { pipelineInputSchema, registerAgentPipelineMethods } from "../src/agent-pipeline.ts"
 import type { PipelineObservation } from "../src/pipeline-conditions.ts"
+import { canonicalJson, sha256 } from "../src/primitives.ts"
 
 function fixture() {
   const generation = { runtimeEpoch: "runtime:pipeline", loginSessionId: "login:pipeline" }
@@ -22,6 +23,15 @@ function fixture() {
     applicationRef: "application:chrome", windowRef: "window:chrome" } }
   const { targetId } = targets.forLineage(core.clients.lineage(session)).registerTarget(target,
     { inventoryId: "native-inventory:1", inventoryRevision: 1 })
+  const { targetId: sheetTargetId } = targets.forLineage(core.clients.lineage(session)).registerTarget({
+    kind: "surface", ref: { ...generation, nativeGeneration: "native:fixture",
+      applicationRef: "application:chrome", surfaceRef: "surface:consent", ownerWindowRef: "window:chrome" },
+  }, { inventoryId: "native-inventory:1", inventoryRevision: 1 })
+  const ui = { sheet: false, owner: targetId, count: 1, actionable: true, complete: true,
+    preexisting: false, replaced: false, duplicateButton: false,
+    onObserve: undefined as (() => Promise<void>) | undefined,
+    onProbe: undefined as (() => Promise<void>) | undefined }
+  let chromePlan = false, preapproved = false
   let focused = true, fakeDialog = false, partial = false, deny = false, missing = 0, finalChanged = false, replaceTab = false
   let inspections = 0, clicks = 0, shortcuts = 0, captures = 0, probes = 0, externalCalls = 0
   let allow!: () => void
@@ -56,12 +66,21 @@ function fixture() {
     output: z.object({}).passthrough(), readOnly: true, execute: (_context: unknown, value: Record<string, unknown>) => execute(value),
   })
   registry.register("system_health", method(async () => ({ machine: { matchesExpected: true } })))
+  const sheetVisible = () => ui.sheet && !preapproved && !fixtureDriver.connected
+    && (ui.preexisting || fixtureDriver.connectCalls > 0)
   registry.register("get_state", method(async () => ({ complete: true, errors: [],
-    windows: [{ targetId, pid: 101, focused: String(focused), visibility: "current", hidden: "false", minimized: "false" }],
+    windows: [{ targetId, pid: 101, focused: String(focused && !sheetVisible()), visibility: "current", hidden: "false", minimized: "false" }],
     applications: [{ pid: 101, bundleId: "com.google.Chrome", axStatus: "ready" }],
+    surfaces: sheetVisible() ? Array.from({ length: ui.count }, (_, index) => ({
+      targetId: index || ui.replaced ? `${sheetTargetId}:replacement:${index}` : sheetTargetId,
+      ownerTargetId: ui.owner, kind: "sheet", role: "AXSheet", title: "",
+      actionability: ui.actionable ? "ax" : "unavailable",
+    })) : [],
   })))
   registry.register("check_input", method(async () => {
-    probes++; order.push("probe"); return { inputReady: true, operationId: `operation:probe:${probes}` }
+    probes++; order.push("probe")
+    const hook = ui.onProbe; ui.onProbe = undefined; await hook?.()
+    return { inputReady: true, operationId: `operation:probe:${probes}` }
   }))
   registry.register("observe", { ...method(async value => {
     if (value.mode === "screenshot" || value.mode === "both") {
@@ -72,24 +91,33 @@ function fixture() {
     }
     inspections++; order.push("observe")
     const frame = (x: number, y: number, width: number, height: number) => ({ x, y, width, height })
-    const root = { elementId: `root:${inspections}`, role: "AXWindow", subrole: "AXStandardWindow", title: "Chrome",
+    const isSheet = value.targetId === sheetTargetId
+    const root = { elementId: `root:${inspections}`, role: isSheet ? "AXSheet" : "AXWindow", subrole: isSheet ? "" : "AXStandardWindow", title: "Chrome",
       frame: frame(0, 0, 800, 600), actions: [] }
     const web = { elementId: `web:${inspections}`, parentElementId: root.elementId, role: "AXWebArea", subrole: "", title: "Page", frame: frame(0, 0, 800, 600), actions: [] }
     const dialog = { elementId: `dialog:${inspections}`, parentElementId: fakeDialog ? web.elementId : root.elementId,
       role: "AXGroup", subrole: "AXApplicationAlertDialog", title: "Consent fixture", frame: frame(200, 200, 400, 200), actions: [] }
     const button = { elementId: `allow:${inspections}`, parentElementId: dialog.elementId, role: "AXButton", subrole: "", title: "Allow",
       frame: frame(480, 340, 100, 30), actions: ["AXPress"] }
-    lastObservation = { targetId, state: "", complete: true, errors: [], elements: [root,
-      ...(inspections <= missing ? [] : [...(fakeDialog ? [web] : []), dialog, button])] }
+    const showDialog = inspections > missing && (!chromePlan || !preapproved && (ui.preexisting || fixtureDriver.connectCalls > 0))
+      && (!ui.sheet || isSheet)
+    lastObservation = { targetId: String(value.targetId), state: "", complete: ui.complete, errors: [], elements: [root,
+      ...(showDialog ? [...(fakeDialog ? [web] : []), dialog, button,
+        ...(ui.duplicateButton ? [{ ...button, elementId: `allow-duplicate:${inspections}` }] : [])] : [])] }
+    if (fixtureDriver.connectCalls > 0) {
+      const hook = ui.onObserve; ui.onObserve = undefined; await hook?.()
+    }
     return lastObservation
   }), frames: value => value.imageId ? ["frame:final"] : [] })
   registry.register("click", { ...method(async value => {
     expect(order.at(-1)).toBe("observe")
     expect(probes).toBeGreaterThan(clicks + shortcuts)
+    expect(value.targetId).toBe(lastObservation?.targetId)
+    if (ui.sheet) expect(value.targetId).toBe(sheetTargetId)
     expect(value.elementId).toBe(lastObservation?.elements.at(-1)?.elementId)
     clicks++; order.push("click")
     if (!partial && !deny) allow()
-    return { targetId, operationId: `operation:click:${clicks}`,
+    return { targetId: value.targetId, operationId: `operation:click:${clicks}`,
       outcome: { state: partial ? "interrupted-unknown" : "completed", dispatch: partial ? "unknown" : "finished", cleanup: partial ? "unknown" : "complete" } }
   }), readOnly: false, isError: () => deny })
   registry.register("press_shortcut", { ...method(async () => {
@@ -106,22 +134,24 @@ function fixture() {
     final: { condition: when, caption: "Isolated final frame" } }
   const native = (requestId = "pipeline:native") => pipelineInputSchema.parse({ ...base, clientRequestId: requestId,
     steps: [{ id: "keys", kind: "keys", when, sequence: ["cmd+l", "escape"] }] })
-  const chrome = () => pipelineInputSchema.parse({ ...base, clientRequestId: "pipeline:chrome", steps: [
+  const chrome = () => { chromePlan = true; return pipelineInputSchema.parse({ ...base, clientRequestId: "pipeline:chrome", steps: [
     { id: "start", kind: "chrome-connect", instance: { ...generation, browserInstanceRef: "chrome:pipeline", transportGeneration: "transport:initial" } },
     { id: "consent", kind: "chrome-consent", when }, { id: "connected", kind: "chrome-wait" },
     { id: "read-one", kind: "chrome-read", url: "https://fixture.invalid/pipeline" },
     { id: "read-two", kind: "chrome-read", url: "https://fixture.invalid/pipeline" },
     { id: "disconnect", kind: "chrome-disconnect" },
-  ], final: { chromeDisconnected: true, caption: "Isolated final Chrome frame" } })
+  ], final: { chromeDisconnected: true, caption: "Isolated final Chrome frame" } }) }
   const dispatch = (input: unknown, signal = new AbortController().signal) => {
     externalCalls++; return registry.dispatch(session, "run_pipeline", input, signal)
   }
-  return { core, registry, targets, session, targetId, when, native, chrome, dispatch, driver: fixtureDriver, reads, order,
+  const connection = () => core.getOperationByRequest(session,
+    `pipeline-child:${sha256(canonicalJson(["pipeline:chrome", "start"]))}`)
+  return { core, registry, targets, session, targetId, sheetTargetId, ui, connection, when, native, chrome, dispatch, driver: fixtureDriver, reads, order,
     setFocus(value: boolean) { focused = value }, fakeDialog() { fakeDialog = true }, partial() { partial = true }, deny() { deny = true },
     changeFinal() { finalChanged = true }, replaceTab() { replaceTab = true },
-    approveConnection() { allow() },
+    approveConnection() { preapproved = true; allow() },
     missing(count: number) { missing = count },
-    counts: () => ({ inspections, clicks, shortcuts, captures, externalCalls }),
+    counts: () => ({ inspections, clicks, shortcuts, captures, probes, externalCalls }),
     async dispose() { allow(); await core.stopOperations(); await core.browserLifetime.shutdownLineage(); await core.closeClientLifecycle() },
   }
 }
@@ -297,5 +327,151 @@ test("second different pipeline cannot interleave on the same exact window", asy
     await expect(f.dispatch(f.native("pipeline:second"))).rejects.toThrow("already")
     expect((await first).data.state).toBe("verified")
     expect(f.counts().shortcuts).toBe(1)
+  } finally { await f.dispose() }
+})
+
+test("consent regression: same plan skips consent for an already approved connection", async () => {
+  const f = fixture()
+  try {
+    f.approveConnection()
+    const result = await f.dispatch(f.chrome())
+    expect(result.data.state).toBe("verified")
+    expect(result.data.connectionCleanup).toBe("confirmed-disconnected")
+    expect(f.counts()).toMatchObject({ clicks: 0, shortcuts: 0, probes: 0, captures: 1 })
+    expect(f.driver.connectCalls).toBe(1)
+    expect(f.driver.disconnectCalls).toBe(1)
+    expect(f.reads).toEqual(["tab:pipeline", "tab:pipeline"])
+  } finally { await f.dispose() }
+})
+
+test("consent regression: owned AXSheet is the action target while parent is unfocused", async () => {
+  const f = fixture()
+  try {
+    f.ui.sheet = true
+    const result = await f.dispatch(f.chrome())
+    expect(result.data.state).toBe("verified")
+    expect(result.data.connectionCleanup).toBe("confirmed-disconnected")
+    expect(f.counts()).toMatchObject({ clicks: 1, shortcuts: 0, probes: 1, captures: 1 })
+    expect(f.driver.connectCalls).toBe(1)
+    expect(f.driver.disconnectCalls).toBe(1)
+    expect(f.reads).toEqual(["tab:pipeline", "tab:pipeline"])
+    expect(f.core.activeOperationCount()).toBe(0)
+    expect(f.core.resources.quarantinedCount()).toBe(0)
+  } finally { await f.dispose() }
+})
+
+for (const fault of ["foreign-owner", "ambiguous-surfaces", "unavailable-surface", "web-imitation", "incomplete-observation", "duplicate-button"] as const) {
+  test(`consent safety: ${fault} cannot receive input`, async () => {
+    const f = fixture()
+    try {
+      f.ui.sheet = true
+      if (fault === "foreign-owner") f.ui.owner = "target:foreign-window"
+      if (fault === "ambiguous-surfaces") f.ui.count = 2
+      if (fault === "unavailable-surface") f.ui.actionable = false
+      if (fault === "web-imitation") f.fakeDialog()
+      if (fault === "incomplete-observation") f.ui.onObserve = async () => { f.ui.complete = false }
+      if (fault === "duplicate-button") f.ui.duplicateButton = true
+      const result = await f.dispatch(f.chrome())
+      expect(result.data.state).toBe("stopped")
+      expect(f.counts().clicks).toBe(0)
+      expect(f.reads).toEqual([])
+      expect(f.driver.connectCalls).toBe(1)
+      expect(f.core.activeOperationCount()).toBe(0)
+      // A cancelled pending connect is not proof of physical disconnection.
+      // Preserve the Core receipt/quarantine instead of manufacturing clean success.
+      const connection = operationRecordSchema.parse(result.data.connectionOperation)
+      expect(result.data.connectionCleanup).toBe("unconfirmed")
+      expect(connection.state).not.toBe("completed")
+      expect(connection.outcome.cleanup.state).not.toBe("pending")
+      expect(f.core.resources.quarantinedCount()).toBe(connection.outcome.cleanup.resources
+        .filter(resource => resource.outcome === "quarantined").length)
+      if (fault === "foreign-owner") console.log("ISOLATED_CONSENT_REFUSAL=" + JSON.stringify({
+        failure: result.data.failure, connectionState: connection.state,
+        cleanup: connection.outcome.cleanup, error: connection.error,
+      }))
+    } finally { await f.dispose() }
+  })
+}
+
+for (const sheet of [false, true]) {
+  test(`consent safety: pre-existing ${sheet ? "sheet" : "window dialog"} is not attributed to a new connection`, async () => {
+    const f = fixture()
+    try {
+      f.ui.sheet = sheet; f.ui.preexisting = true
+      const result = await f.dispatch(f.chrome())
+      expect(result.data.state).toBe("stopped")
+      expect(f.driver.connectCalls).toBe(0)
+      expect(f.counts()).toMatchObject({ clicks: 0, probes: 0 })
+    } finally { await f.dispose() }
+  })
+}
+
+for (const fault of ["owner-changed", "surface-replaced", "connection-cancelled", "connection-expired"] as const) {
+  test(`consent safety: ${fault} during readiness is rechecked before the click`, async () => {
+    const f = fixture()
+    const getOperation = f.core.getOperation.bind(f.core)
+    try {
+      f.ui.sheet = true
+      f.ui.onProbe = async () => {
+        if (fault === "owner-changed") f.ui.owner = "target:foreign-window"
+        if (fault === "surface-replaced") f.ui.replaced = true
+        const record = await f.connection()
+        expect(record).toBeDefined()
+        if (fault === "connection-cancelled") await f.core.cancelOperation(f.session, record!.context.operationId, "isolated consent cancellation")
+        if (fault === "connection-expired") {
+          f.core.getOperation = async (...args) => {
+            const value = await getOperation(...args)
+            return value && value.context.operationId === record!.context.operationId
+              ? { ...value, context: { ...value.context, deadlineAt: new Date(0).toISOString() } } : value
+          }
+        }
+      }
+      const result = await f.dispatch(f.chrome())
+      expect(result.data.state).toBe("stopped")
+      expect(f.counts()).toMatchObject({ probes: 1, clicks: 0 })
+      expect(f.reads).toEqual([])
+      expect(f.driver.connectCalls).toBe(1)
+      expect(f.core.activeOperationCount()).toBe(0)
+    } finally { f.core.getOperation = getOperation; await f.dispose() }
+  })
+}
+
+async function approveAndSettle(f: ReturnType<typeof fixture>) {
+  f.approveConnection()
+  for (let attempt = 0; attempt < 300; attempt++) {
+    if ((await f.connection())?.state === "completed") return
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+  throw new Error("Isolated connection did not settle")
+}
+for (const moment of ["observation", "readiness"] as const) {
+  test(`consent safety: connection completing during ${moment} never receives a late click`, async () => {
+    const f = fixture()
+    try {
+      f.ui.sheet = true
+      if (moment === "observation") f.ui.onObserve = () => approveAndSettle(f)
+      else f.ui.onProbe = () => approveAndSettle(f)
+      const result = await f.dispatch(f.chrome())
+      expect(result.data.state).toBe("verified")
+      expect(result.data.connectionCleanup).toBe("confirmed-disconnected")
+      expect(f.counts()).toMatchObject({ clicks: 0, probes: moment === "observation" ? 0 : 1 })
+      expect(f.driver.connectCalls).toBe(1)
+      expect(f.driver.disconnectCalls).toBe(1)
+      expect(f.reads).toEqual(["tab:pipeline", "tab:pipeline"])
+    } finally { await f.dispose() }
+  })
+}
+
+test("consent safety: partial sheet click stops dependent reads without replay", async () => {
+  const f = fixture()
+  try {
+    f.ui.sheet = true; f.partial()
+    const result = await f.dispatch(f.chrome())
+    expect(result.data.state).toBe("stopped")
+    expect(f.counts()).toMatchObject({ clicks: 1, probes: 1 })
+    expect(f.reads).toEqual([])
+    expect(f.driver.connectCalls).toBe(1)
+    expect((result.data.steps as Array<{ operationIds: string[] }>)[1]!.operationIds).toContain("operation:click:1")
+    expect(f.core.activeOperationCount()).toBe(0)
   } finally { await f.dispose() }
 })
