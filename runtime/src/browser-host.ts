@@ -220,12 +220,13 @@ export class BrowserFrameProofAuthority {
     inventoryRevision: number,
     displayLayoutRevision: number,
   ): void {
+    const ttlMs = 60_000
     const proof = this.runtime.proofs.issue({
       kind: "target-resolution",
       subject: target,
       inventoryRevision,
       displayLayoutRevision,
-      ttlMs: 60_000,
+      ttlMs,
     })
     this.runtime.targets.register(
       target,
@@ -234,6 +235,9 @@ export class BrowserFrameProofAuthority {
       `browser-evidence:${proof.proofRef}`,
       proof.proofRef,
       displayLayoutRevision,
+      undefined,
+      // Chrome targets share their proof lifetime across chat calls; Native/Android keep the default.
+      target.kind === "browser-instance" || target.kind === "browser-target" ? ttlMs : undefined,
     )
   }
 }
