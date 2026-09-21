@@ -9,6 +9,7 @@ import {
   deviceBrowserOperationResultSchema,
   lifetimeReservationHandleSchema,
   operationOutcomeSchema,
+  runtimeOperationIntentSchema,
   reservationCleanupReceiptSchema,
   structurallyEqual,
   type AdapterResult,
@@ -33,6 +34,7 @@ import {
   type RuntimeOperationIntent,
 } from "@meta/shared/contracts"
 import { ClientSessionRegistry } from "./client-sessions.ts"
+import { signalDeadline } from "./deadline.ts"
 import { canonicalJson, randomIdSource, systemClock, type RuntimeClock, type RuntimeIdSource } from "./primitives.ts"
 import {
   lifetimeBindingPersistenceSchema,
@@ -225,6 +227,55 @@ export class BrowserLifetimeCoordinator {
     requestValue: unknown,
     signal?: AbortSignal,
   ): Promise<RuntimeExecution<Result>> {
+    return this.#execute(session, bindingId, intent, requestValue, signal)
+  }
+
+  /** Acknowledges the existing durable operation; it does not create a second task or connection. */
+  async startConnect(
+    session: RuntimeClientSession,
+    bindingId: string,
+    intentValue: RuntimeOperationIntent,
+    requestValue: unknown,
+    signal?: AbortSignal,
+  ): Promise<RuntimeExecution<Result> | { operation: OperationRecord, pending: true }> {
+    const binding = this.#bindings.get(bindingId)
+    const request = browserOperationRequestSchema.parse(requestValue)
+    if (binding?.domain !== "browser" || request.kind !== "connect-instance") {
+      throw new Error("Fast return requires Chrome connect-instance")
+    }
+    const intent = runtimeOperationIntentSchema.parse(intentValue)
+    // Keep the old bounded deadline, but let Core own its timer after the RPC returns.
+    // Do not bindDeadline on admission.signal: Core must not rely on the disposed RPC timer.
+    intent.deadlineAt = new Date(Math.min(Date.parse(intent.deadlineAt),
+      this.#clock.now().getTime() + 30_000, signalDeadline(signal) ?? Infinity)).toISOString()
+    const admission = new AbortController()
+    const abort = () => admission.abort(signal?.reason ?? "connect admission cancelled")
+    signal?.addEventListener("abort", abort, { once: true })
+    if (signal?.aborted) abort()
+    let acknowledge!: (reply: { operation: OperationRecord, pending: true }) => void
+    const accepted = new Promise<{ operation: OperationRecord, pending: true }>(resolve => { acknowledge = resolve })
+    const completion = this.#execute(session, bindingId, intent, request, admission.signal, record => {
+      if (admission.signal.aborted) return
+      // From this durable acceptance onward, operation deadline, cancel, client disconnect
+      // and Runtime drain remain authoritative; finishing this start RPC is not cancellation.
+      signal?.removeEventListener("abort", abort)
+      acknowledge({ operation: structuredClone(record), pending: true })
+    })
+    try {
+      // Both completion and rejection stay observed even when the pending reply wins.
+      // Deduplicated requests use Core's original promise/result, never another dispatch.
+      return await Promise.race([accepted, completion])
+    } finally { signal?.removeEventListener("abort", abort) }
+  }
+
+  async #execute(
+    session: RuntimeClientSession,
+    bindingId: string,
+    intent: RuntimeOperationIntent,
+    requestValue: unknown,
+    signal?: AbortSignal,
+    registered?: (record: OperationRecord) => void,
+  ): Promise<RuntimeExecution<Result>> {
     await this.#clients.assertActive(session, this.#clock.now())
     const binding = this.#bindings.get(bindingId)
     if (binding === undefined) throw new Error("Lifetime adapter не настроен")
@@ -281,6 +332,13 @@ export class BrowserLifetimeCoordinator {
           existing.operationIds.add(received.wire.operationId)
           slot = existing
           await this.#persistSlot(existing, binding, existing.state)
+        }
+        if (registered !== undefined) {
+          // Core has persisted registration before invoking lifecycle.before; the exact
+          // lifetime slot is now recorded too. No success/result is claimed by this receipt.
+          const record = this.#lookup(received.wire.operationId)
+          if (record === undefined) throw new Error("Connect registration absent from own journal")
+          registered(record)
         }
       },
       stage: async (record, result) => {

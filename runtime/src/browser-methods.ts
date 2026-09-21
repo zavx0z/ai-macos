@@ -122,6 +122,18 @@ const browserExecutionSchema = z.strictObject({
   result: adapterResultSchema(browserOperationResultSchema),
 })
 
+const browserOperationReplySchema = browserExecutionSchema.extend({
+  result: adapterResultSchema(browserOperationResultSchema).optional(),
+  pending: z.literal(true).optional(),
+}).superRefine((reply, context) => {
+  if ((reply.pending === true) === (reply.result !== undefined)) {
+    context.addIssue({ code: "custom", message: "Expected pending receipt OR completed execution result" })
+  }
+  if (reply.pending && !["registered", "dispatching", "observing", "cancelling"].includes(reply.operation.state)) {
+    context.addIssue({ code: "custom", message: "Pending reply must not claim a terminal operation" })
+  }
+})
+
 const deviceExecutionSchema = z.strictObject({
   operation: operationRecordSchema,
   result: adapterResultSchema(deviceBrowserOperationResultSchema),
@@ -160,9 +172,17 @@ function registerChromeMethods(registry: MethodRegistry, runtime: RuntimeCore, b
   })
   registry.register("browser_chrome_operation", {
     title: "Chrome operation",
-    description: "Выполняет exact Chrome operation через lifetime coordinator",
-    input: z.strictObject({ intent: runtimeOperationIntentSchema, request: publicBrowserOperationRequestSchema }),
-    output: browserExecutionSchema,
+    description: "Выполняет exact Chrome operation. Для connect-instance waitForCompletion=false возвращает pending и operation.context.operationId до согласия Chrome; затем observe/подтверждение и get_operation той же операции, без повторного connect. По умолчанию ожидает итог.",
+    input: z.strictObject({
+      intent: runtimeOperationIntentSchema,
+      request: publicBrowserOperationRequestSchema,
+      waitForCompletion: z.boolean().optional(),
+    }).superRefine((input, context) => {
+      if (input.waitForCompletion === false && input.request.kind !== "connect-instance") {
+        context.addIssue({ code: "custom", path: ["waitForCompletion"], message: "Fast return requires connect-instance" })
+      }
+    }),
+    output: browserOperationReplySchema,
     readOnly: false,
     destructive: true,
     timeoutMs: 30_000,
@@ -171,6 +191,10 @@ function registerChromeMethods(registry: MethodRegistry, runtime: RuntimeCore, b
     requiredCapabilities: ["browser.targets", "runtime.operations"],
     async execute(context, input) {
       if (context.signal.aborted) throw new DOMException("Browser operation aborted", "AbortError")
+      if (input.waitForCompletion === false) {
+        return browserOperationReplySchema.parse(await runtime.browserLifetime.startConnect(
+          context.session, binding.bindingId, input.intent, input.request, context.signal))
+      }
       const request = input.request.kind === "capture-target"
         ? await binding.reserveCapture(context.session, input.intent, input.request)
         : browserOperationRequestSchema.parse(input.request)
@@ -186,10 +210,10 @@ function registerChromeMethods(registry: MethodRegistry, runtime: RuntimeCore, b
           execution.result.value.value.capture.observation,
         )
       }
-      return execution
+      return browserExecutionSchema.parse(execution)
     },
-    frames: output => frameRefs(output.result),
-    isError: output => !output.result.ok,
+    frames: output => output.result === undefined ? [] : frameRefs(output.result),
+    isError: output => output.result !== undefined && !output.result.ok,
   })
   registerLifetimeMethods(registry, runtime, "browser_chrome", "browser.instances")
   registry.register("browser_chrome_recover", {
