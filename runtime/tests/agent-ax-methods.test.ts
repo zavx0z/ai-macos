@@ -17,6 +17,7 @@ import {
   type RuntimeResourceHandle,
 } from "@meta/shared/contracts"
 import { registerAgentAxMethods } from "../src/agent-ax-methods.ts"
+import { registerAgentPipelineMethods } from "../src/agent-pipeline.ts"
 import { registerAgentMethods } from "../src/agent-methods.ts"
 import { AgentTargetRegistry } from "../src/agent-targets.ts"
 import { AgentViewBindings } from "../src/agent-view-bindings.ts"
@@ -152,6 +153,40 @@ test("modal surface AXPress использует exact surface и replacement н
   await fixture.guard.close()
 })
 
+test("pipeline AXPress passes the existing real view/operation admission path", async () => {
+  const fixture = createFixture()
+  fixture.windows.pipelineTree = true
+  fixture.registry.register("check_input", {
+    title: "Isolated readiness", description: "No real input", input: z.strictObject({}),
+    output: z.strictObject({ inputReady: z.boolean() }), readOnly: true,
+    async execute() { return { inputReady: true } },
+  })
+  registerAgentPipelineMethods(fixture.registry, fixture.core, fixture.targets)
+  const session = fixture.core.openClient("principal:pipeline-view").session
+  try {
+    const state = await fixture.registry.dispatch(session, "get_state", { kind: "window" }, new AbortController().signal)
+    const targetId = (state.data.windows as Array<{ targetId: string }>)[0]!.targetId
+    const condition = { anchors: [{ name: "save", selector: { role: "AXButton", text: "Save" } }], select: "save" }
+    const result = await fixture.registry.dispatch(session, "run_pipeline", {
+      clientRequestId: "pipeline:real-view", runtimeEpoch: generation.runtimeEpoch,
+      targetId, expectedBundleId: "com.fixture.ax", steps: [{ id: "press", kind: "press", when: condition }],
+      final: { condition, caption: "No screenshot provider in this fixture" },
+    }, new AbortController().signal)
+    expect(fixture.windows.presses).toHaveLength(1)
+    expect(fixture.windows.admissions).toBe(1)
+    const steps = result.data.steps as Array<{ state: string, operationIds: string[] }>
+    expect(steps).toHaveLength(1)
+    expect(steps[0]!.state).toBe("dispatched")
+    expect(steps[0]!.operationIds).toHaveLength(1)
+    const operationId = steps[0]!.operationIds[0]!
+    expect(typeof operationId).toBe("string")
+    expect((await fixture.core.getOperation(session, operationId))?.outcome.cleanup.state).toBe("complete")
+    // Missing capture is reported, never fabricated from the successful AXPress.
+    expect(result.data.state).toBe("stopped")
+    expect(result.data.finalCaptureError).toBeDefined()
+  } finally { await fixture.guard.close(); await fixture.core.closeClientLifecycle() }
+})
+
 function createFixture() {
   const native = new FixtureNative()
   const core = new RuntimeCore({ generation, runtimeBuildId: "build:agent-ax", nativeGeneration,
@@ -224,6 +259,7 @@ class FixtureWindows implements RuntimeWindowAdapter {
   admissions = 0
   #snapshot = 0
   inspections = 0
+  pipelineTree = false
   #started!: () => void
   started = new Promise<void>(resolve => { this.#started = resolve })
 
@@ -244,6 +280,17 @@ class FixtureWindows implements RuntimeWindowAdapter {
     this.#snapshot++
     this.inspections++
     const snapshotId = `snapshot:agent-ax:${this.#snapshot}`
+    if (this.pipelineTree) {
+      const ref = { ...generation, nativeGeneration, applicationRef: windowRef.applicationRef, snapshotId }
+      const root = { ...ref, elementRef: "element:root" }
+      return { snapshotId, target: request.target, complete: true, nodeCount: 2, encodedBytes: 300, errors: [], nodes: [
+        { elementRef: root, role: "AXWindow", subrole: "AXStandardWindow", title: "Fixture AX", actions: [],
+          frame: { x: 0, y: 0, width: 640, height: 480 } },
+        { elementRef: { ...ref, elementRef: `element:save:${this.#snapshot}` }, parentElementRef: root,
+          role: "AXButton", subrole: "", title: "Save", actions: ["AXPress"],
+          frame: { x: 400, y: 350, width: 100, height: 30 } },
+      ] }
+    }
     return {
       snapshotId,
       target: request.target,
@@ -385,7 +432,7 @@ function inventory(surface?: ReturnType<typeof surfaceRecord>) {
     errors: [],
     applications: [{ ref: { ...generation, nativeGeneration, applicationRef: windowRef.applicationRef,
       pid: 101, launchedAt: "2026-09-15T10:00:00.000Z", registrationNonce: "registration:agent-ax" },
-      name: "Fixture AX", hidden: "false", axStatus: "ready", windowCount: 1 }],
+      name: "Fixture AX", bundleId: "com.fixture.ax", hidden: "false", axStatus: "ready", windowCount: 1 }],
     windows: [{ kind: "ax-window", ref: windowRef, surfaces: surface === undefined ? [] : [surface], ownerPid: 101, cgWindowId: 77,
       title: "Fixture AX", role: "AXWindow", subrole: "AXStandardWindow",
       frame: { x: 0, y: 0, width: 640, height: 480 }, applicationHidden: "false",

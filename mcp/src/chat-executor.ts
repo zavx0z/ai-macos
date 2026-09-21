@@ -3,11 +3,12 @@ export { ChatProxyError } from "./service-client.ts"
 import { hostname } from "node:os"
 import { RuntimeUdsClient } from "@meta/runtime"
 import { chatBrowserActions, assertChatBrowserRequest, chatBrowserDescription } from "./browser-policy.ts"
+import { assertChatPipelineRequest, chatPipelineDescription } from "./pipeline-policy.ts"
 
 export const computerActions = [
   "system_health", "get_state", "observe", "show_window", "check_input", "click",
   "type_text", "press_key", "press_shortcut", "scroll", "get_target_status",
-  "cancel_target", "get_operation", "list_recent_operations", "recover_startup_input",
+  "cancel_target", "get_operation", "list_recent_operations", "recover_startup_input", "run_pipeline",
   ...chatBrowserActions,
 ] as const
 
@@ -59,12 +60,15 @@ export function createChatExecutor(options: ChatRuntimeOptions) {
       const current = await connect()
       return (await current.listTools()).filter(tool => allowed.has(tool.name)).map(tool => ({
         ...tool,
-        description: chatBrowserDescription(tool.name, tool.description),
+        description: chatPipelineDescription(tool.name, chatBrowserDescription(tool.name, tool.description)),
       }))
     },
     async call(action: string, input: Record<string, unknown>, signal: AbortSignal) {
       assertAllowed(action)
-      assertChatBrowserRequest(action, input)
+      // Во время подключения отправитель не может подменить уже проверенный план.
+      const request = action === "run_pipeline" ? structuredClone(input) : input
+      assertChatBrowserRequest(action, request)
+      assertChatPipelineRequest(action, request, allowed)
       signal.throwIfAborted()
       const current = await connect()
       signal.throwIfAborted()
@@ -72,7 +76,7 @@ export function createChatExecutor(options: ChatRuntimeOptions) {
       if (action === "system_health") return health
       // Runtime сам проверяет текущие schema, admission и capabilities при вызове.
       signal.throwIfAborted()
-      return await current.callTool(action, input, signal)
+      return await current.callTool(action, request, signal)
     },
     async close() {
       closed = true

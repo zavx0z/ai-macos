@@ -52,6 +52,7 @@ import { registerAgentMethods } from "./agent-methods.ts"
 import { registerAgentActionMethods } from "./agent-action-methods.ts"
 import { registerAgentPointerMethods } from "./agent-pointer-methods.ts"
 import { registerAgentAxMethods } from "./agent-ax-methods.ts"
+import { registerAgentPipelineMethods } from "./agent-pipeline.ts"
 import { RuntimeStartupPermissions, notRequiredStartupPermissions, startupPermissionsStateSchema,
   type StartupPermissionsState } from "./startup-permissions.ts"
 import { RuntimeLifecycleLog, type RuntimeLifecycleEvent } from "./lifecycle-log.ts"
@@ -314,6 +315,7 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     },
   } })
   registerAgentActionMethods(catalog, agentMethods)
+  registerAgentPipelineMethods(catalog, core, agentTargets)
   if (native !== undefined && handshake?.viewAdmissionVersion === "1" && handshake.recoveryDomainVersion === "1") {
     const pointer = registerAgentPointerMethods(catalog, agentMethods)
     registerAgentAxMethods(catalog, core, agentTargets, agentMethods, agentMethods.operations, pointer)
