@@ -622,12 +622,23 @@ export class RuntimeCore implements RuntimeAdapter {
     return () => { this.#admissionListeners.delete(listener) }
   }
 
-  async drainOperations(): Promise<void> {
+  /** Останавливает активную работу, но не выдаёт quarantine за подтверждённую очистку. */
+  async stopOperations(): Promise<void> {
     this.sealAdmission()
     const active = [...this.#journal.values()].filter(entry => !entry.settled)
     for (const entry of active) entry.controller.abort("runtime drain")
     await Promise.all(active.map(entry => entry.promise?.catch(() => undefined)))
+    if (this.activeOperationCount() > 0) throw new Error("Runtime stop оставил active operations")
+  }
+
+  /** Вызывается после domain-owned cleanup; никогда не освобождает ресурсы сама. */
+  assertOperationsDrained(): void {
     if (this.resources.quarantinedCount() > 0 || this.activeOperationCount() > 0) throw new Error("Runtime drain оставил unknown/active operations")
+  }
+
+  async drainOperations(): Promise<void> {
+    await this.stopOperations()
+    this.assertOperationsDrained()
   }
 
   async retainForRecoveryRestart(): Promise<{ journalDurable: true, operationIds: readonly string[] }> {

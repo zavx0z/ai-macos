@@ -499,6 +499,26 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
       })
     }
   }
+  // Общий порядок для drain и recovery restart. Не переносить итоговую
+  // проверку quarantine перед domain-owned cleanup: она сделает cleanup недостижимой.
+  const stopOperationsAndBrowserLifetimes = async (signal?: AbortSignal) => {
+    let phase = "operations-stop"
+    try {
+      signal?.throwIfAborted()
+      await core.stopOperations()
+      signal?.throwIfAborted()
+      phase = "client-grace"
+      await core.drainClientGrace()
+      signal?.throwIfAborted()
+      phase = "browser-lifetime-cleanup"
+      await core.browserLifetime.shutdownLineage(undefined, signal)
+      signal?.throwIfAborted()
+    } catch (error) {
+      // Только фиксированная фаза и счётчики: сообщение adapter может содержать URL или payload.
+      await lifecycle?.record("drain-failed", `cleanup:${phase};active=${core.activeOperationCount()};quarantined=${core.resources.quarantinedCount()}`).catch(() => undefined)
+      throw error
+    }
+  }
   const performDrain = async (signal?: AbortSignal) => {
     draining = true
     await lifecycle?.record("drain-start").catch(() => undefined)
@@ -508,9 +528,8 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     unsubscribeClientExpiries?.()
     if (clientSweep !== undefined) clearTimeout(clientSweep)
     await heartbeat?.stop()
-    await core.drainOperations()
-    await core.drainClientGrace()
-    await core.browserLifetime.shutdownLineage(undefined, signal)
+    await stopOperationsAndBrowserLifetimes(signal)
+    core.assertOperationsDrained()
     await permissionPreparation?.catch(() => undefined)
     await backendPreparation
     await viewGuard?.close()
@@ -554,10 +573,9 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     return prepareQuarantinedRestart({ signal,
       seal() { core.sealAdmission(); preparationAbort.abort("Recovery restart") },
       async retain(control) {
+        await stopOperationsAndBrowserLifetimes(control)
         const retained = await core.retainForRecoveryRestart()
         control.throwIfAborted()
-        await core.drainClientGrace()
-        await core.browserLifetime.shutdownLineage(undefined, control)
         return retained
       },
       async stopOwnedNative() {
