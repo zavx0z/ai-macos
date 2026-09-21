@@ -9,12 +9,12 @@ import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js"
 // Проверяет отдельный кандидат; рабочий tunnel, Runtime и proxy не затрагивает.
 const binary = process.argv[2]
 assert(binary && isAbsolute(binary), "Нужен абсолютный путь собранного кандидата")
-const directory = mkdtempSync(join(tmpdir(), "cu-ai-binary-"))
+const directory = mkdtempSync(join(tmpdir(), "cu-tools-binary-"))
 const path = join(directory, "file.txt")
 writeFileSync(path, "before")
 const transport = new StdioClientTransport({ command: binary, cwd: directory,
   env: { PATH: process.env.PATH ?? "/usr/bin:/bin", AI_MACOS_EXPECTED_HOSTNAME: hostname() }, stderr: "pipe" })
-const c = new Client({ name: "ai-binary-probe", version: "1" })
+const c = new Client({ name: "tools-binary-probe", version: "1" })
 const call = (args: Record<string, unknown>) => c.callTool({ name: "zavx0z", arguments: args }, undefined, { timeout: 10000 })
 async function run(args: Record<string, unknown>) {
   const r = await call(args)
@@ -23,7 +23,7 @@ async function run(args: Record<string, unknown>) {
 }
 try {
   await c.connect(transport)
-  assert(JSON.stringify(await run({})).includes('"node":"ai"'))
+  assert(JSON.stringify(await run({})).includes('"node":"tools"'))
   const node = "tools/filesystem/write"
   assert(JSON.stringify(await run({ node, input: { view: "contract" } })).includes("expectedHash"))
   assert(JSON.stringify(await run({ node, input: { view: "scenarios" } })).includes("typescript"))
