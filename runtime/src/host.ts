@@ -256,7 +256,24 @@ async function createLockedHost(options: RuntimeHostOptions, releaseLock: () => 
     })
   }
   browserHost = createBrowserHostComposition(core, options.browser ?? {})
-  await core.browserLifetime.restorePersisted()
+  const restoredLifetimes = await core.browserLifetime.restorePersisted()
+  // Host lock уже удерживается; UDS ещё не принимает клиентов. Чистим только
+  // незавершённые Chrome connect без handle, а не активные reservations.
+  let recoveredBrowserConnect = false
+  let browserCleanupSignal: AbortSignal | undefined
+  for (const restored of restoredLifetimes) {
+    if (restored.owner.kind !== "browser" || restored.handle !== undefined
+      || restored.runtimeEpoch === generation.runtimeEpoch || restored.loginSessionId !== generation.loginSessionId) continue
+    try {
+      browserCleanupSignal ??= AbortSignal.any([preparationAbort.signal, AbortSignal.timeout(5_000)])
+      await core.browserLifetime.recoverRestoredConnect(restored.operationId, browserCleanupSignal)
+      recoveredBrowserConnect = true
+    } catch {
+      // Не скрываем unknown и не открываем admission после неподтверждённого cleanup.
+      core.quarantineStartup(`Startup Chrome cleanup не подтверждён: ${restored.operationId}`)
+    }
+  }
+  if (recoveredBrowserConnect) await core.refreshStartupRecovery(true)
   const unsubscribeLineageCleanup = core.subscribeLineageCleanup(lineageId => {
     viewBindings?.releaseLineage(lineageId)
     viewGuard?.releaseLineage(lineageId)

@@ -989,18 +989,44 @@ export class RuntimeCore implements RuntimeAdapter {
       if (entry === undefined || !entry.settled) throw new Error("Recovery journal entry отсутствует или active")
       if (entry.record.outcome.cleanup.state === "complete") return []
       const handles = entry.record.resources
-      for (const handle of handles) {
-        const current = this.resources.handleByLeaseId(handle.leaseId)
-        if (current === undefined || current.operationId !== id || current.leaseGeneration !== handle.leaseGeneration
-          || current.state !== "quarantined") throw new Error("Recovery resource generation не совпадает")
-      }
       const cleanup = releasedCleanup(handles)
       const record = operationRecordSchema.parse({
         ...entry.record,
         outcome: { ...entry.record.outcome, cleanup },
         updatedAt: this.#clock.now().toISOString(),
       })
-      const prepared = this.resources.prepareCleanup(id, handles, cleanup, "quarantined")
+      let prepared: ReturnType<ResourceRegistry["prepareCleanup"]>
+      if (entry.record.context.runtimeEpoch !== this.generation.runtimeEpoch) {
+        // Вызывается только lifetime coordinator после recoverRemoval + verifyRemoved.
+        // Старые leases не импортируются в ResourceRegistry нового Runtime.
+        const evidence = this.#recoveryEvidence.find(item => item.record.context.operationId === id)
+        const wire = entry.record.context
+        const handle = handles[0]
+        if (evidence === undefined || canonicalJson(evidence.record) !== canonicalJson(entry.record)
+          || wire.loginSessionId !== this.generation.loginSessionId || wire.kind !== "browser"
+          || wire.target.kind !== "browser-instance" || handles.length !== 1 || handle?.kind !== "cdp-target"
+          || handle.resourceRef !== wire.target.ref.browserInstanceRef || handle.operationId !== id
+          || handle.runtimeEpoch !== wire.runtimeEpoch || handle.loginSessionId !== wire.loginSessionId
+          || handle.clientSessionId !== entry.record.clientSessionId || handle.principalId !== entry.record.principalId) {
+          throw new Error("Startup lifetime cleanup не соответствует exact old Chrome operation")
+        }
+        prepared = {
+          receipt: cleanupAuthorityReceiptSchema.parse({
+            receiptId: this.#ids.next("startup-browser-cleanup"), authorityRef: "runtime:browser-startup-recovery",
+            operationId: id, runtimeEpoch: wire.runtimeEpoch, loginSessionId: wire.loginSessionId,
+            issuedAt: record.updatedAt, state: "complete",
+            leases: handles.map(value => ({ leaseId: value.leaseId, leaseGeneration: value.leaseGeneration })),
+          }),
+          commit() {},
+        }
+      } else {
+        for (const handle of handles) {
+          const current = this.resources.handleByLeaseId(handle.leaseId)
+          if (current === undefined || current.operationId !== id || current.leaseGeneration !== handle.leaseGeneration
+            || current.state !== "quarantined") throw new Error("Recovery resource generation не совпадает")
+        }
+        prepared = this.resources.prepareCleanup(id, handles, cleanup, "quarantined")
+      }
       return [{ entry, record, prepared }]
     })
     for (const { entry, record, prepared } of staged) await this.#persist(entry, record, prepared.receipt)
@@ -1013,6 +1039,9 @@ export class RuntimeCore implements RuntimeAdapter {
           result: { ...entry.result.result, outcome: record.outcome },
         }
       }
+      // Commit вызывается после durable released lifetime, не после одного disconnect.
+      const recovered = new Set(staged.map(({ record }) => record.context.operationId))
+      this.#recoveryEvidence = this.#recoveryEvidence.filter(item => !recovered.has(item.record.context.operationId))
     }
   }
 

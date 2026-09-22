@@ -69,6 +69,7 @@ test("manual denial остаётся waiting до bounded timeout без restart
 })
 
 test("unsupported official request завершается failed сразу, без десятиминутного ожидания", async () => {
+  const initial = response("status", "missing")
   const unsupported = response("request-missing", "missing")
   const value = { beforeGranted: false, currentGranted: false, requestState: "unsupported" as const,
     promptRequested: false, requestFinished: false, restartNeeded: false, restartState: "unknown" as const,
@@ -76,7 +77,7 @@ test("unsupported official request завершается failed сразу, б�
   unsupported.permissions = { accessibility: value, screenRecording: value, postEvents: value, inputMonitoring: value }
   unsupported.requestsFinished = true
   unsupported.restartState = "unknown"
-  const native = new PermissionsFixture([response("status", "missing"), unsupported])
+  const native = new PermissionsFixture([initial, unsupported])
   const flow = new RuntimeStartupPermissions({ native })
   expect(await flow.start(new AbortController().signal)).toMatchObject({ state: "failed", requestIssued: true, missing: STARTUP_PERMISSION_NAMES })
   expect(native.commands).toEqual(["status", "request-missing"])
@@ -94,6 +95,7 @@ test("owner verification failure не вызывает prompt и passive health 
 })
 
 test("доказанный restart-required возвращается как состояние без автоматического restart loop", async () => {
+  const initial = response("status", "missing")
   const required = response("request-missing", "denied")
   const value = { beforeGranted: false, currentGranted: false, requestState: "finished" as const,
     promptRequested: true, requestFinished: true, requestReturnedGranted: true,
@@ -101,7 +103,7 @@ test("доказанный restart-required возвращается как со
   required.permissions = { accessibility: value, screenRecording: value, postEvents: value, inputMonitoring: value }
   required.restartNeeded = true
   required.restartState = "required"
-  const native = new PermissionsFixture([response("status", "missing"), required])
+  const native = new PermissionsFixture([initial, required])
   const flow = new RuntimeStartupPermissions({ native })
   expect(await flow.start(new AbortController().signal)).toMatchObject({ state: "restart-needed", restartNeeded: true, restartState: "required" })
   expect(native.commands).toEqual(["status", "request-missing"])

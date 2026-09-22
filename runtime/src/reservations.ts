@@ -447,6 +447,45 @@ export class BrowserLifetimeCoordinator {
     const slots = [...this.#slots.values()].filter(slot => {
       return slot.state !== "released" && (lineageId === undefined || slot.lineageId === lineageId)
     })
+    await this.#shutdownSlots(slots, signal)
+  }
+
+  /** Только host startup до приёма клиентов: незавершённый connect прежнего Runtime. */
+  async recoverRestoredConnect(operationId: string, signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
+    const matches = [...this.#slots.values()].filter(slot => slot.durable?.operationId === operationId)
+    const slot = matches.length === 1 ? matches[0] : undefined
+    const durable = slot?.durable
+    const binding = slot === undefined ? undefined : this.#bindings.get(slot.bindingId)
+    const persistence = binding === undefined || slot === undefined ? undefined : persistenceForTarget(binding, slot.target)
+    const operation = this.#lookup(operationId)
+    if (slot === undefined || durable === undefined || binding?.domain !== "browser" || persistence === undefined
+      || slot.state !== "quarantined" || durable.state !== "quarantined" || slot.handle !== undefined || durable.handle !== undefined
+      || durable.runtimeEpoch === this.#generation.runtimeEpoch || durable.loginSessionId !== this.#generation.loginSessionId
+      || durable.bindingId !== slot.bindingId || durable.lineageId !== slot.lineageId
+      || persistence.configFingerprint !== durable.configFingerprint || physicalKey(persistence) !== physicalKey(durable)
+      || !structurallyEqual(slot.target, durable.target) || !structurallyEqual(durable.target, durable.initialTarget)
+      || slot.target.kind !== "browser-instance" || slot.operationId !== operationId
+      || slot.target.ref.runtimeEpoch !== durable.runtimeEpoch || slot.target.ref.loginSessionId !== durable.loginSessionId
+      || slot.operationIds.size !== 1 || !slot.operationIds.has(operationId)
+      || operation?.context.kind !== "browser" || !structurallyEqual(operation.context.target, slot.target)
+      || operation.context.runtimeEpoch !== durable.runtimeEpoch || operation.context.loginSessionId !== durable.loginSessionId
+      || this.#clients.historicalLineage(operation.clientSessionId, operation.principalId) !== slot.lineageId
+      || operation.resources.length !== 1 || operation.resources[0]?.kind !== "cdp-target"
+      || operation.resources[0]?.resourceRef !== slot.target.ref.browserInstanceRef) {
+      throw new Error("Startup cleanup требует exact orphaned Chrome connect прежней generation")
+    }
+    const now = this.#clock.now().getTime()
+    if (this.#clients.snapshot().some(stored => stored.lineageId === slot.lineageId
+      && !stored.disconnected && !stored.revoked && stored.session.runtimeEpoch === this.#generation.runtimeEpoch
+      && stored.session.loginSessionId === this.#generation.loginSessionId && Date.parse(stored.session.expiresAt) > now)) {
+      throw new Error("Startup cleanup запрещён: lineage уже имеет действующего клиента")
+    }
+    await this.#shutdownSlots([slot], signal)
+  }
+
+  async #shutdownSlots(slots: readonly Slot[], signal?: AbortSignal): Promise<void> {
+    signal?.throwIfAborted()
     for (const slot of slots) {
       if (slot.children.size > 0 || slot.disconnecting !== undefined) {
         throw new Error("Lifetime shutdown требует drained child operations и отсутствие disconnect in-flight")
